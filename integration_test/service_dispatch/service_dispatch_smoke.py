@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone process smoke: python3 service_dispatch_smoke.py --binary /path/to/kvcm.
 
-Uses only the standard library, a temporary cwd, memory coordination and a local
-registry without persistence. The only storage root is inside that temporary cwd.
+Uses a temporary cwd, memory coordination and a local registry without persistence.
+The only storage root is inside that temporary cwd. Bazel supplies the gRPC stubs.
 """
 
 import argparse
@@ -15,6 +15,10 @@ import socket
 import subprocess
 import tempfile
 import time
+
+import grpc
+from kv_cache_manager.protocol.protobuf import admin_service_pb2, admin_service_pb2_grpc
+from kv_cache_manager.protocol.protobuf import meta_service_pb2, meta_service_pb2_grpc
 
 
 def check(condition, message):
@@ -56,9 +60,22 @@ def check_endpoints(process, ports, timeout):
     check(status == 200 and missing["header"]["status"]["code"] == "INSTANCE_NOT_EXIST", missing)
     status, health = http_json(ports[3], "/api/checkHealth", {"trace_id": "dispatch-smoke-admin"})
     check(status == 200 and health["header"]["status"]["code"] == "OK" and health["is_health"], health)
+    with grpc.insecure_channel(f"127.0.0.1:{ports[0]}") as channel:
+        meta = meta_service_pb2_grpc.MetaServiceStub(channel)
+        cluster = meta.GetClusterInfo(meta_service_pb2.GetClusterInfoRequest(trace_id="smoke-grpc"), timeout=2)
+        check(cluster.header.status.code == meta_service_pb2.OK and cluster.self_node_id, cluster)
+        try:
+            channel.unary_unary("/kv_cache_manager.proto.meta.MetaService/UnknownMethod")(b"", timeout=2)
+            raise AssertionError("unknown method unexpectedly succeeded")
+        except grpc.RpcError as error:
+            check(error.code() == grpc.StatusCode.UNIMPLEMENTED, error)
+    with grpc.insecure_channel(f"127.0.0.1:{ports[2]}") as channel:
+        admin = admin_service_pb2_grpc.AdminServiceStub(channel)
+        health = admin.CheckHealth(admin_service_pb2.CheckHealthRequest(trace_id="smoke-admin-grpc"), timeout=2)
+        check(health.header.status.code == admin_service_pb2.OK and health.is_health, health)
 
 
-def run_case(binary, name, timeout, mode=None, conflict=None):
+def run_case(binary, name, timeout, mode=None, conflict=None, shared_rpc=False):
     reservations = []
     process = None
     with tempfile.TemporaryDirectory(prefix="kvcm-dispatch-") as temporary:
@@ -72,6 +89,8 @@ def run_case(binary, name, timeout, mode=None, conflict=None):
                 listener.bind(("127.0.0.1", 0))
                 listener.listen(1)
             ports = [listener.getsockname()[1] for listener in reservations]
+            if shared_rpc:
+                ports[2] = ports[0]
             # An empty startup_config would install the built-in /tmp/nfs root.
             storage_root = workdir / "storage"
             storage_root.mkdir()
@@ -126,6 +145,9 @@ def run_case(binary, name, timeout, mode=None, conflict=None):
                     code = process.wait(timeout=timeout)
                     check(code == 255, f"bind failure exit code={code}, expected main return -1 (255)")
             output = log_path.read_text(errors="replace")
+            if conflict is None:
+                check(f"received signal {signal.SIGTERM}" in output, "termination signal was not logged")
+                check("service request executor stopped:" in output, "missing final executor metrics summary")
             if conflict is not None:
                 failure = "Failed to start rpc server" if conflict == 0 else "Failed to start admin rpc server"
                 check(failure in output, f"missing expected startup error: {failure}")
@@ -154,8 +176,10 @@ def main():
     binary = args.binary.resolve()
     check(binary.is_file() and os.access(binary, os.X_OK), f"not an executable: {binary}")
     check(args.timeout > 0, "--timeout must be positive")
-    run_case(binary, "default discard_pending / HTTP / SIGTERM", args.timeout)
-    run_case(binary, "drain / HTTP / SIGTERM", args.timeout, mode="drain")
+    run_case(binary, "separate ports / default discard_pending / HTTP+gRPC / SIGTERM", args.timeout)
+    run_case(binary, "separate ports / drain / HTTP+gRPC / SIGTERM", args.timeout, mode="drain")
+    run_case(binary, "shared RPC port / discard_pending / HTTP+gRPC / SIGTERM", args.timeout, shared_rpc=True)
+    run_case(binary, "shared RPC port / drain / HTTP+gRPC / SIGTERM", args.timeout, mode="drain", shared_rpc=True)
     run_case(binary, "Meta RPC bind failure", args.timeout, conflict=0)
     run_case(binary, "Admin RPC bind failure after Meta started", args.timeout, conflict=2)
 

@@ -176,7 +176,7 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `service.query_counter` | counter | Total query count |
 | `service.error_counter` | counter | Total error count |
 | `service.query_rt_us` | gauge | Last query response time (us) |
-| `service.request_queue_size` | gauge | Reserved; queue depth is not currently collected |
+| `service.request_queue_size` | gauge | Legacy uncollected placeholder; use the interval metric `service.request_queue_length` for the Meta worker queue |
 | `grpc.response_counter` | counter | Total gRPC responses, labeled by `server` (`meta`/`admin`), `method` (`Service/Method`), and `grpc_code` (standard status name); counted once per RPC |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
@@ -193,13 +193,21 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 `grpc.response_counter` counts the final gRPC status the server prepares to send, including framework
 `RESOURCE_EXHAUSTED` rejections when the thread quota is exhausted; this status can also indicate other
 resource limits. When the main and Admin services share a gRPC port, both use `server=meta`. Business
-errors in response bodies remain in `service.error_counter`.
+errors produced by ServiceImpl remain in `service.error_counter`.
 `method` omits the protobuf package prefix, e.g. `MetaService/GetCacheLocation`; methods absent from the protobuf descriptors use `unknown`.
+
+Async Meta workers and CQ pollers are outside the `grpc_max_threads` synchronous-thread quota. Meta no longer emits RESOURCE_EXHAUSTED because of that synchronous-thread limit; other resource limits can still produce it. The default unlimited queue requires monitoring `service.request_queue_length`, request latency and process memory. Queue-full/closed rejection and shutdown discard use gRPC OK with SERVICE_NOT_READY in the body. They do not increment RESOURCE_EXHAUSTED or enter ServiceCallGuard's `service.error_counter`; use the rejected/discarded metrics instead.
+
+The four executor metrics have no request/Instance labels and are sampled every `kvcm.metrics.report_interval_ms` (20 seconds by default). Counters are cumulative and support rate/increase in Prometheus; dots in names become underscores through the exporter. Shutdown takes a final sample and writes a summary log, but a final Prometheus scrape before the endpoint closes is not guaranteed. The legacy request_queue_size is not an alias for request_queue_length.
 
 ### Interval Metrics
 
 | Metric | Type | Description |
 |---|---|---|
+| `service.request_queue_length` | gauge | Meta HTTP/gRPC tasks waiting to be claimed; excludes running tasks and discard callbacks |
+| `service.request_running` | gauge | Tasks claimed by workers whose task functions have not finished |
+| `service.request_rejected` | counter | Cumulative submissions rejected because admission is closed or the queue is full |
+| `service.request_discarded` | counter | Cumulative queued tasks discarded during discard_pending shutdown |
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
 | `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |

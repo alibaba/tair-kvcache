@@ -109,6 +109,12 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_grpc_memory_quota_bytes_ = parsed;
          return true;
      }},
+    {"kvcm.service.grpc_cq_thread_num",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_grpc_cq_thread_num_) &&
+                config->service_grpc_cq_thread_num_ > 0;
+     }},
     {"kvcm.service.worker_thread_num",
      [](const std::string &value, ServerConfig *config) {
          return !value.empty() && value.front() != '-' &&
@@ -428,6 +434,7 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 void ServerConfig::UpdateDefaultConfig() {
     service_grpc_max_threads_ = 0;
     service_grpc_memory_quota_bytes_ = 0;
+    service_grpc_cq_thread_num_ = 2;
     service_worker_thread_num_ = 0;
     service_worker_queue_capacity_ = 0;
     service_worker_shutdown_mode_ = "discard_pending";

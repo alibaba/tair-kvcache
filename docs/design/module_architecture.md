@@ -237,7 +237,7 @@ client（MetaClient/gRPC 或 HTTP）→ service（协议适配 → ServiceReques
 
 除 `GetClusterInfo`、健康检查、集群监控和 Leader 运维等少数接口外，元数据面与管控面的读写请求都由 Leader 处理；Follower 返回 `SERVER_NOT_LEADER`，客户端重新发现 Leader 后重试。
 
-Meta HTTP 在原 IO 线程解析请求，协程挂起等待共享业务池，完成后回原 IO 组装响应；Meta gRPC 使用 AsyncService 和单独的 CQ 轮询线程接收及完成请求，CQ 仅建立轻量 RequestContext，可能等待业务锁的 collector 查找和绑定交给 worker。业务 worker 从共享 FIFO 队列取任务，不绑定 HTTP 连接。Server 管理这些组件的启动与停机，CommandLine 主线程执行阻塞停机；信号处理只通知。
+Meta HTTP 在原 IO 线程解析请求，协程挂起等待共享业务池，完成后回原 IO 组装响应；Meta gRPC 使用 AsyncService 和单独的 CQ 轮询线程接收及完成请求，CQ 线程还承担 typed protobuf 请求解析、网络推进，以及最后引用在该线程释放时的请求/响应析构；应用在 CQ 上建立轻量 RequestContext，可能等待业务锁的 collector 查找和绑定交给 worker。业务 worker 从共享 FIFO 队列取任务，不绑定 HTTP 连接。Server 管理这些组件的启动与停机，CommandLine 主线程执行阻塞停机；信号处理只通知。
 
 Admin（含健康检查）、Debug 和 Optimizer 保留原执行路径。Leader 准入仍由 ServiceImpl 在真正开始业务时判断，降级不停止业务池。详细的默认配置、等待队列及停机丢弃语义见 [服务请求分发设计](service_request_dispatch.md)。模块间依赖方向不变。
 

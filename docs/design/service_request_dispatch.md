@@ -9,7 +9,7 @@
 ```mermaid
 flowchart LR
     H[Meta HTTP IO：解析请求、建立上下文] --> Q[Meta HTTP/gRPC 共享任务队列]
-    G[Meta gRPC CQ 接入：建立上下文] --> Q
+    G[Meta gRPC CQ：解析 protobuf、建立上下文] --> Q
     Q --> W[空闲 worker 取任务]
     W --> S[现有 MetaServiceImpl]
     S --> C[完成通知]
@@ -51,7 +51,7 @@ flowchart LR
 | Instance 隔离 | 仍由原 ServiceImpl/manager 按 instance_id 处理，不新增跨 Instance 复用 |
 | 顺序 | 不改变同一 HTTP 连接的框架处理顺序；不同连接/RPC 间不新增顺序保证 |
 | 排队 | Meta 新增显式业务队列，调度顺序和延迟分布会变化；Meta HTTP 与 gRPC 共享业务容量 |
-| 过载 | 默认继续排队，不因队列满拒绝，在这一点上与原来行为基本等价；显式配置正数上限后才启用队列满拒绝，详见第 4 节 |
+| 过载 | HTTP 保持不因业务繁忙主动返回队列满错误；Meta gRPC 从同步线程配额耗尽时可能返回 RESOURCE_EXHAUSTED，改为默认不限长排队，行为不同。正数队列上限返回 gRPC OK + SERVICE_NOT_READY，也不等价于原 transport 错误，详见第 4 节 |
 | 停机 | 默认丢弃尚在队列中的 Meta 任务，可配置为继续执行；已被 worker 领取的任务均继续执行。被丢弃及关闭提交后新提交的请求，尚能回包时返回 SERVICE_NOT_READY；两种模式都要等待协议收尾，详见第 2.2、6.2 节 |
 
 ### 2.1 本次范围决策：只迁移 Meta，Admin 与健康检查保留原路径
@@ -85,7 +85,7 @@ Admin 的业务解耦不在本 PR 内。后续如有必要，可独立评估复�
 | **Meta 两种协议入口的容量隔离** | Meta HTTP 与 gRPC 使用不同执行线程；Admin HTTP 有独立 IO 池，Admin gRPC 可单独配置 server | Meta HTTP/gRPC 共用 FIFO 池后会相互占用业务容量，Meta 的 GetClusterInfo 也需排队。Admin 与健康检查按第 2.1 节保留原路径，不加入该队列；不宣称整个进程资源完全隔离 |
 | **业务并发与旧配置的实际作用** | HTTP 业务并发受各自 IO 线程数影响，gRPC 同步服务在框架配额内按需增加执行线程 | `worker_thread_num` 成为 Meta 跨协议的共享上限，既可能收紧原并发，也可能增加单入口对后端的压力。已有 IO 配置仍控制 IO 池，但不再直接控制 Meta 业务并发；Admin 的原配置作用保留。`2C` 不是旧容量的等价换算 |
 | **客户端超时/断开后的晚到执行** | 已开始的同步业务不会因客户端停止等待而自动取消；一些请求仍未被读取或调度 | 新 IO 可提前接收更多请求，客户端在业务尚未开始时超时，排队写请求仍可能随后执行。“超时不保证未写入”的原则不变，但窗口和出现频率可能增加。不因客户端超时自动取消任务；停机时的丢弃策略单独配置，需实测，不额外引入重试或幂等改造 |
-| **停机时的新返回与执行范围** | 先 Shutdown gRPC，再 Stop HTTP；前一阶段 HTTP 仍可处理请求，未处理的连接数据可能随关闭丢弃 | 先 CloseAdmission 会让尚可回包的新 Meta 请求收到 SERVICE_NOT_READY，即使容量为 `0` 也成立。默认 `discard_pending` 使仍在队列中的任务不再执行业务，按同样错误形式收尾；选择 `drain` 才继续执行这些任务，可能增加停机时长和写入范围。两种模式都等待已领取任务及协议收尾，Admin/healthy 不新增这条拒绝路径 |
+| **停机时的新返回与执行范围** | 先停止 LeaderElector，关闭 Leader 请求门禁，再 Shutdown gRPC、Stop HTTP；清理期间可进入业务门禁的请求返回 SERVER_NOT_LEADER，GetClusterInfo 仍可调用 | 保留先停止 LeaderElector 的顺序，避免整个清理阶段变为 SERVICE_NOT_READY。随后 CloseAdmission 仍新增停止提交及默认丢弃返回；这些错误不会触发客户端原有的 NOT_LEADER 切主路径。drain 继续准备任务并检查门禁，Leader-only 请求通常返回 SERVER_NOT_LEADER，并不保证执行积压写入；两种模式均等待已领取任务及协议收尾 |
 | **指标、访问日志和 trace 的时间范围** | RequestContext 创建前等待 IO 调度的时间未计入基于该上下文的耗时 | 新队列位于 Context 创建之后，访问日志、部分事件指标、根 trace span 会包含排队时间；ServiceCallGuard 的业务范围和子业务 span 仍不包含。字段不改，但数值不能直接解释为业务变慢 |
 | **请求执行时看到的状态与顺序** | 不同连接/RPC 之间本就没有全局顺序保证，但同 IO 的同步业务实际串行 | worker 会并行执行来自同 IO 的不同连接，且排队可跨越 Leader 切换、Instance 删除/重建。仍在真正进入 ServiceImpl 时检查角色和业务状态；不能把 FIFO 当作全局业务完成顺序或入队时状态快照 |
 | **gRPC collector 准备与错误优先级** | 原同步入口在业务前查询 collector，初版调度实现也在 CQ 提交前查询 | collector 查找可能等待 Instance 生命周期锁，现移入 worker，避免独占 CQ 停顿。`Full` / `Closed` / 停机丢弃直接返回 SERVICE_NOT_READY，优先于尚未执行的 Instance 检查；已接受请求按 worker 准备时的 Instance 状态处理 |
@@ -135,6 +135,7 @@ Join()                           // 退出并回收 worker
 | `kvcm.service.worker_thread_num` | `0`，自动取 `2 × max(1, hardware_concurrency())` | Meta HTTP/gRPC 共享的进程级业务 worker 数，不限制 Admin 并发；正数显式指定，负数非法 |
 | `kvcm.service.worker_queue_capacity` | `0` | Meta 最大等待队列长度，不含正在执行的任务；`0` 表示不设上限、不因队列满拒绝，正数启用上限，负数非法 |
 | `kvcm.service.worker_shutdown_mode` | `discard_pending` | 停机丢弃仍在队列中的 Meta 任务；可设为 `drain` 继续执行队列。两种模式均等待已领取任务及协议收尾；其他值非法 |
+| `kvcm.service.grpc_cq_thread_num` | `2` | 同一个 Meta gRPC CQ 的轮询线程数，必须为正整数；不计入 worker 或同步 gRPC 线程配额，独立 Admin server 不使用 |
 | 已有 `kvcm.service.io_thread_num` | 保持当前规则 | 继续控制各 HTTP server 的 IO 池，不改含义、不自动调小 |
 
 2026-10-23 参数讨论修订：令 `C = max(1, hardware_concurrency())`，把业务 worker 的初始建议由 `C` 调整为 `2C`。业务线程会在同步 Redis 调用、连接池和锁等位置等待，CPU 数不能直接代表合适的业务并发数。`2C` 是初始默认值，尚未用真实阻塞后端对照 `C / 2C / 4C` 进行容量压测，不保证足够，也不据此宣称吞吐收益。
@@ -145,19 +146,52 @@ Join()                           // 退出并回收 worker
 
 `hardware_concurrency()` 是硬件线程数的提示值，不是部署业务容量的测量结果。已知容器 CPU 配额或业务并发预算时优先显式配置；本次不增加 CPU 配额识别和自适应调参机制。
 
-默认值 `0` 用于保持“不因业务繁忙而主动返回队列满错误”的行为；它不表示零容量，也不表示无限内存。配置正数时按请求数限制等待队列，**不是整个进程的内存硬上限**。已读入报文、框架缓冲和大请求仍占内存；本次不扩展为按字节配额、连接数治理或全局流量控制系统。
+默认值 `0` 表示“不因业务繁忙而主动返回队列满错误”，保留原 HTTP 在此方面的行为；Meta gRPC 原有同步线程配额拒绝不再适用于这些异步方法，不能宣称等价。它不表示零容量，也不表示无限内存。配置正数时按请求数限制等待队列，**不是整个进程的内存硬上限**。已读入报文、框架缓冲和大请求仍占内存；本次不扩展为按字节配额、连接数治理或全局流量控制系统。
 
 停机模式与队列容量独立：容量为 `0` 或正数都默认采用 `discard_pending`。该默认值按 2026-10-23 讨论确定，目的是避免停机时继续执行整批积压业务；它不改变正常运行时的排队策略，也不应用于 Leader 降级或客户端超时。
 
-Meta gRPC 使用一个显式 CQ 和一个固定轮询线程，不新增 CQ 配置项。该线程只接收、分发和处理完成事件，不计入业务 worker 数；其接入开销与吞吐需结合实际负载验证，不能把这个初始规模预先视为足够。
+Meta gRPC 使用一个显式 CQ，默认两个轮询线程，由 `grpc_cq_thread_num` 配置。轮询线程还承担 typed protobuf 反序列化、网络推进及可能的请求/响应析构，不计入业务 worker 数；目标容量仍需结合实际负载验证，不能把默认规模视为所有部署都足够；对照方法及后续方向见第 5.2.4 节。
 
 2026-11-04 rebase 补充：保留 main 的 `ConfigureGrpcServer`、`grpc_max_threads` 和 `grpc_memory_quota_bytes`。线程配额继续约束 Admin/Debug/Optimizer 等同步 gRPC 处理线程，不约束自建的 Meta worker 和 CQ 轮询线程；Meta 业务并发由 `worker_thread_num` 控制。内存配额仍由 gRPC 处理，不把它解释为业务等待队列或整个进程的内存上限。
 
+### 3.3 Future work：按业务类型隔离并发和排队容量
+
+当前 Meta HTTP/gRPC 共用一个 FIFO 业务池。某类慢请求或批量请求持续积压时，可能占满 worker 或排在其他请求之前，使轻量请求也必须等待。
+
+一个具体边界是 MetricsLifecycle：RemoveInstance 持写锁等待迁移退出时，gRPC collector 未命中的请求在 worker 中等待读锁；未知 Instance 会反复走慢路径。等待者达到 worker 数时，两种协议的 Meta 业务都可能停顿，即使其他 Instance 的 collector 已缓存。CQ 和同步 Admin 仍可推进，不代表 Meta 池有剩余容量。现有迁移轮询的 5 秒是累计等待预算，不是持锁墙钟时间的严格上界。回归需覆盖池被全部占满后恢复；本次不扩大到 manager 生命周期锁重构。
+
+后续评估按业务类型划分多个池，为延迟敏感业务保留执行容量，并分别限制不同业务的并发和等待任务数。
+
+- **按业务特点分组**：结合实际耗时、CPU 开销、后端阻塞和延迟目标，先评估少量有明显差异的业务分组。例如，若压测确认部分 ReportEvent 或批量操作较重，再评估与查询请求分池；不预设所有查询都轻量。同类 HTTP/gRPC 请求仍进入同一业务池。
+- **独立容量与整体预算**：各池分别配置 worker 数和等待队列容量，同时核对合计线程数、内存以及下游连接和处理能力，避免分池后无意放大对后端的并发压力。
+- **验证收益与利用率取舍**：在混合负载及单类请求持续过载时，对比各类请求的排队时间、P95/P99 延迟、拒绝数、整体吞吐和 worker 利用率。固定分池可能出现一个池空闲、另一个池仍在排队，需要衡量隔离收益与容量利用率。
+- **明确隔离边界**：多个池隔离的是 worker 和业务队列容量，进程 CPU、共享锁、Redis 连接等资源仍可能相互影响，不能据此保证各类请求完全互不干扰。
+
+这一方向解决不同业务争抢执行和排队容量的问题；第 5.2.4 节的 CQ 扩展解决接入及完成事件处理能力不足的问题，两者独立评估。多业务池作为后续独立 PR 的方向，当前 PR 继续采用单个 Meta 共享业务池。
+
+### 3.4 Future work：最长排队时间控制
+
+当前只支持等待任务数量上限，没有最长排队时间配置。后续评估为业务池或请求类别设置排队时长上限：任务等待超时且尚未被 worker 领取时，不再执行业务，填写明确错误并完成 HTTP/gRPC 收尾。目标是限制等待和减少过期请求的晚到执行，不代表查询能够更快成功。
+
+- **区分排队与执行**：明确从成功入队到 worker 领取的计时边界；已领取或正在执行的任务不因排队超时被强制中断。客户端 deadline/超时与服务端队列过期之间的关系需单独定义，不能把客户端停止等待视为服务端已经取消业务。
+- **明确超时通知时机**：仅在 worker 取任务时检查过期，可以避免执行过期任务，但不能保证到达阈值就及时返回。若要限制客户端等待队列结果的时长，需评估主动过期处理及其开销，不把出队检查宣传为严格等待上限。
+- **明确返回与生命周期**：后续设计确定错误码、消息和配置默认值，保留 request_id，确保过期、正常领取和停机丢弃只有一个完成方；验证被判定为队列过期的写请求未进入业务，并让 HTTP 完成凭据和 gRPC CallState 正常收尾。该策略属于新增外部行为，独立评审。
+
+### 3.5 Future work：短查询加速
+
+后续评估减少短查询被长任务拖延的调度方式，可结合第 3.3 节的独立业务池、保留 worker 容量或优先级队列。请求分类应结合接口、请求规模和实测耗时，不能仅凭“查询”名称认定其始终轻量。
+
+- **优先级与执行容量配合**：优先级只改变待执行任务的取出顺序，不能抢占正在运行的长任务。若全部 worker 已被占满，短查询即使排到队首仍需等待，因此需评估保留执行容量的收益与利用率代价。
+- **定义免排队的实际含义**：独立短查询池仍可能因自身繁忙而排队。若要求某类请求不等待，就需在无可用执行容量时明确拒绝；不通过让 HTTP IO/CQ 线程直接执行业务来绕过容量限制。也可结合第 3.4 节设置较短的排队时长上限。
+- **验证延迟与公平性**：在长短请求混合、短查询突发及持续过载下，对比短查询的排队时间、P95/P99 延迟和拒绝数，同时观察普通任务是否长期得不到执行、整体吞吐及后端压力。
+
+最长排队时间与短查询加速作为后续独立 PR 的方向；当前 PR 不新增这些配置或调度分支，继续采用 Meta 共享 FIFO 队列。
+
 ## 4. 排队策略与请求完成
 
-**默认 `worker_queue_capacity = 0`，不设置显式等待队列长度上限，不因队列满拒绝请求。** worker 全忙时，新任务继续排队等待执行。从“不主动因业务繁忙返回队列满错误”的角度，与原来的等待行为基本等价；线程池、异步交接与停机设计保持不变。
+**默认 `worker_queue_capacity = 0`，不设置显式等待队列长度上限，不因队列满拒绝请求。** worker 全忙时，新任务继续排队等待执行。该默认值按本次范围决策保留，但只在“不新增队列满拒绝”这一点上接近原 HTTP 行为。原 Meta gRPC 同步服务受 `grpc_max_threads` 配额约束，耗尽时可能返回 RESOURCE_EXHAUSTED；异步 Meta 不再使用该同步线程配额，过载会先表现为队列、延迟和内存增长。配置正数队列上限返回的 SERVICE_NOT_READY 仍是不同的错误语义，不会恢复原 transport 拒绝。
 
-这一等价性不覆盖资源占用和延迟：原来 IO 线程被业务占住时，部分请求还等待网络读取或框架调度；拆分后 IO 可以继续读取、解析，更多请求会携带 protobuf、RequestContext 和协程状态进入业务队列。默认模式可能更快积压应用内存，仍可能发生客户端超时或资源耗尽。验证中需要观察持续过载时的队列长度、等待时间和内存变化，不承诺无限接收。
+资源占用和延迟也不同：原来 IO 线程被业务占住时，部分请求还等待网络读取或框架调度；拆分后 IO 可以继续读取、解析，更多请求会携带 protobuf、RequestContext 和协程状态进入业务队列。默认模式可能更快积压应用内存，仍可能发生客户端超时或资源耗尽。验证中需要观察持续过载时的队列长度、等待时间和内存变化，不承诺无限接收。
 
 **仅在显式配置 `worker_queue_capacity > 0` 时启用队列满拒绝。** 此时有界队列用于限制等待任务数量，满时快速返回，复用现有 Meta `SERVICE_NOT_READY`，不新增协议枚举。以下排队及拒绝策略只适用于 Meta；停机的 `Closed` 拒绝在两种容量模式下都生效：
 
@@ -170,9 +204,9 @@ Meta gRPC 使用一个显式 CQ 和一个固定轮询线程，不新增 CQ 配�
 | 停机采用 `discard_pending`，已接收但仍在队列中的 Meta 任务 | 不进入 ServiceImpl；HTTP 200 / gRPC OK + 原响应 `header.status.code = SERVICE_NOT_READY`，消息为 `service is stopping`；仍须完成协议收尾 |
 | Admin HTTP/gRPC、`/api/healthy` | 不提交到业务池，继续原执行和返回规则，不产生上述 `Full` / `Closed` 拒绝 |
 
-`Full` 与 `Closed` 的错误消息分别为 `service request queue is full` 和 `service is stopping`。对已建立上下文的 Meta 请求填入同一个 request_id。协议解析失败仍先发生。HTTP 的未注册 Instance 检查保留在提交前；gRPC 为避免阻塞唯一 CQ，将 collector/Instance 检查移到 worker，因此提交失败及停机丢弃优先返回 SERVICE_NOT_READY，不能再承诺未注册 Instance 总是优先返回。
+`Full` 与 `Closed` 的错误消息分别为 `service request queue is full` 和 `service is stopping`。对已建立上下文的 Meta 请求填入同一个 request_id。协议解析失败仍先发生。HTTP 的未注册 Instance 检查保留在提交前；gRPC 为避免阻塞 CQ 轮询，将 collector/Instance 检查移到 worker，因此提交失败及停机丢弃优先返回 SERVICE_NOT_READY，不能再承诺未注册 Instance 总是优先返回。
 
-**`Closed` 是停机期间的特殊情况。** 正常运行时，容量为 `0` 的 Meta 队列继续接收并排队，不因业务繁忙触发 `Full` 或 `Closed`。开始停机并调用 `CloseAdmission(shutdown_mode)` 后，后续提交的 Meta 请求才会被拒绝；在协议入口尚能回包的窗口返回 SERVICE_NOT_READY（`service is stopping`）。默认丢弃仍在队列中的任务并完成错误响应；配置 `drain` 时才继续执行这些任务。已被 worker 领取的任务始终继续执行并收尾，随后框架关闭接入。Admin 与健康检查不受这个提交开关影响。
+**`Closed` 是停机期间的特殊情况。** 正常运行时，容量为 `0` 的 Meta 队列继续接收并排队，不因业务繁忙触发 `Full` 或 `Closed`。先停止 LeaderElector，待其回调及清理完成后调用 `CloseAdmission(shutdown_mode)`，此后后续提交的 Meta 请求才会被拒绝；在协议入口尚能回包的窗口返回 SERVICE_NOT_READY（`service is stopping`）。默认丢弃仍在队列中的任务并完成错误响应；配置 `drain` 时才继续执行这些任务。已被 worker 领取的任务始终继续执行并收尾，随后框架关闭接入。Admin 与健康检查不受这个提交开关影响。
 
 停机丢弃的任务此前已返回 `Accepted`，与入口提交失败的 `Closed` 是两条不同的内部路径，只复用相同的外部错误格式；丢弃时保留原 request_id，不产生写入副作用，也不伪造 ServiceCallGuard 业务执行。不能直接销毁任务而不通知等待方。
 
@@ -180,7 +214,7 @@ Meta gRPC 使用一个显式 CQ 和一个固定轮询线程，不新增 CQ 配�
 
 - 当前 C++ SDK 会把 SERVICE_NOT_READY 映射为 `ER_SERVICE_INTERNAL_ERROR`。本 PR 保留该映射，不承诺自动退避或重试。
 - 健康检查和 Admin 请求不占用新业务池容量；Meta 队列满或关闭提交不直接改变其返回。原 Admin IO 阻塞及共享资源竞争仍可能影响探活，边界见第 2.1 节。
-- 拒绝任务不进入 ServiceImpl，不产生写入副作用，也不伪造一次 ServiceCallGuard 业务执行。使用少量提交拒绝计数/限频日志观察这一新路径。
+- 拒绝任务不进入 ServiceImpl，不产生写入副作用，也不伪造一次 ServiceCallGuard 业务执行。使用提交拒绝计数，并在指标采样周期内至多汇总一次拒绝日志；停机另记最终汇总，不逐请求打印。
 - 不新增排队超时、自动重试或客户端断开后的业务取消。客户端超时不代表写入未发生，这一原则与现有同步业务一致；新队列扩大了“业务尚未开始、客户端已经停止等待”的窗口，不能据此声称取消/断连的整体行为等价。
 
 每个已接收请求只有一个发起完成的路径：worker 执行，或停机协调线程执行丢弃回调。两者均由 adapter 通过 HTTP Promise 或 gRPC response writer 发起完成；入队失败则由入口处理，池不会再拿到该任务。gRPC 还要等 Finish 完成事件后回收请求状态。业务及丢弃收尾中的异常也必须走完成路径，不能让请求永久等待。
@@ -232,12 +266,12 @@ Meta gRPC 使用一个显式 CQ 和一个固定轮询线程，不新增 CQ 配�
 
 #### 5.2.2 实现：接收、业务和完成事件分开
 
-Meta adapter 使用生成的 `MetaService::AsyncService`，不再实现 callback controller 方法。`Server` 注册该服务并调用 `AddCompletionQueue()` 创建一个显式 CQ，由一个固定接入线程持续 `Next(tag, ok)`。Admin 保留同步 Service，Debug/Optimizer 保留原注册接口；不修改 proto 生成选项。接口形态参考 [固定版本官方异步示例](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/examples/cpp/helloworld/greeter_async_server.cc)，其简化示例不替代本稿的异常、取消与停机处理。
+Meta adapter 使用生成的 `MetaService::AsyncService`，不再实现 callback controller 方法。`Server` 注册该服务并调用 `AddCompletionQueue()` 创建一个显式 CQ，由配置数量的接入线程持续 `AsyncNext(tag, ok, deadline)`。Admin 保留同步 Service，Debug/Optimizer 保留原注册接口；不修改 proto 生成选项。接口形态参考 [固定版本官方异步示例](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/examples/cpp/helloworld/greeter_async_server.cc)，其简化示例不替代本稿的异常、取消与停机处理。
 
 ```text
 CQ 线程收到 Request 完成事件（新请求到达）
   → 补挂下一个接收槽，建立不含 collector 的上下文，TrySubmit
-  → 立即继续 Next，接收其他事件
+  → 立即继续 AsyncNext，接收其他事件（超时仅用于补挂重试）
 worker 查询并绑定 collector，检查准备结果后执行业务
   → writer.Finish(response, status, finish_tag)，异步交给 gRPC 发送
 CQ 线程收到 Finish 完成事件
@@ -249,8 +283,8 @@ CQ 线程收到 Finish 完成事件
 1. **启动与接收**：创建 CQ 后先启动轮询线程，再 BuildAndStart；成功后才为每个 Meta unary 方法预挂一个 `RequestXxx` 接收槽，避免已匹配请求存在时没有轮询线程。每次接收成功，若未进入停止补挂状态，先补挂下一个槽，再建立 RequestContext，记录 request_id、开始时间、根 trace 和 peer/client_ip；collector 留待 worker 查询。接收槽不是业务并发上限，不为每个请求创建线程。
 2. **任务分发**：CQ 线程只做上述轻量初始化、快速提交和完成事件处理，不获取 collector 或 Instance 业务锁，不阻塞等待 worker。collector 查找、ReportEvent 附加 collector 准备、ServiceImpl、guard、日志和指标都在业务 worker；提交失败由 CQ 接入路径填写错误并发起 Finish，停机丢弃由 `on_discard` 发起 Finish。
 3. **请求所有权**：adapter 的轻量 `CallState` 持有 ServerContext、protobuf 请求/响应、ServerAsyncResponseWriter 和 RequestContext。独立的小接收/完成 tag 与已接收的任务分别持有其生命周期引用；在提交异步操作前建立引用，避免 tag 作为 CallState 成员强引用自身形成环。Finish 完成事件可能早于 worker 返回，须等事件引用与任务引用均释放后才能销毁。worker 发起 Finish 后不再读写请求态；**Finish 返回不等于对象可以释放**。
-4. **事件分类**：接收 tag 的 `ok=false` 表示该接收槽没有取得请求，只回收，不调用业务、不发送 Finish；Finish tag 的 `ok=false` 也代表该操作已终结，仍必须释放状态，不能忽略或断言 `ok`。`Next` 返回 false 表示 CQ 已关闭且事件排空，此时轮询线程才退出。初版只管理接收和完成两类事件，不抽取通用 RPC 状态机。
-5. **恰好一次完成**：准备/提交失败、业务成功或失败、业务异常、停机丢弃均走各自唯一完成路径。正常业务错误仍为 protobuf header + gRPC OK；C++ 异常保持原 `UNKNOWN` 与 `Unexpected error in RPC handling`。collector 宏的提前返回局部改为完成当前调用，不重构整个宏体系。CQ 循环必须隔离单请求异常，不能因一个请求退出而停止整个 server 的接入。
+4. **事件分类**：接收 tag 的 `ok=false` 表示该接收槽没有取得请求，只回收，不调用业务、不发送 Finish；Finish tag 的 `ok=false` 也代表该操作已终结，仍必须释放状态，不能忽略或断言 `ok`。`AsyncNext` 返回 SHUTDOWN 表示 CQ 已关闭且事件排空，此时轮询线程才退出；TIMEOUT 只处理必要的补挂重试，不退出。初版只管理接收和完成两类事件，不抽取通用 RPC 状态机。
+5. **恰好一次完成**：准备/提交失败、业务成功或失败、业务异常、停机丢弃均走各自唯一完成路径。正常业务错误仍为 protobuf header + gRPC OK；C++ 异常保持原 `UNKNOWN` 与 `Unexpected error in RPC handling`。collector 宏的提前返回局部改为完成当前调用，不重构整个宏体系。可恢复的准备、业务和拒绝填包异常转为 UNKNOWN。补挂接收槽在分配失败、尚未提交底层操作时登记重试，由 CQ 每 100 ms 至多重试一次，既不改变当前请求的结果，也不永久丢失该方法的接收槽。StopAccepting 与重试共用接收锁，关闭后不再补挂。若 Next/AsyncNext 或 Finish 自身抛异常，无法确认底层操作是否已部分提交，则输出错误并 fail-fast；不捕获后静默继续、不盲目重复 Finish，也不承诺内存耗尽时每个请求都可恢复。
 
 生命周期依据：[ServerAsyncResponseWriter::Finish](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/include/grpcpp/impl/codegen/async_unary_call.h#L218)、[CQ 关闭与排空约定](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/include/grpcpp/impl/codegen/completion_queue.h#L220)、[原同步异常映射](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/include/grpcpp/impl/codegen/method_handler_impl.h#L39)。
 
@@ -260,6 +294,30 @@ CQ 线程收到 Finish 完成事件
 - **错误 protobuf**：typed AsyncService 会在框架内部以 `INTERNAL / Unable to parse request` 取消解析失败的调用，并重新挂接收槽，不把该事件交给应用。与原同步错误消息可能存在差异，必须对照记录状态码和消息，不宣称全部 transport 错误文本逐字不变；若有外部依赖则在选型验证阶段解决或重新评估。内部重挂也必须被停机时的 CallState 存活等待覆盖，不能只观察业务队列。依据见 [PayloadAsyncRequest](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/include/grpcpp/impl/codegen/server_interface.h#L249)。
 - **gRPC 响应指标**：保留 main 的响应 interceptor，正常 Meta 响应、业务拒绝（transport OK）及 UNKNOWN 均走 `PRE_SEND_STATUS` 统计。固定版本 typed AsyncService 的 protobuf 解析失败会在建立 interceptor 前由 core 取消，未进入该上报路径；因此 `grpc.response_counter` 不覆盖这类异步解析失败，不能当作全部 transport 错误的完整计数。本次不为补齐它改成自定义解码或修改第三方库。
 - **取消/deadline**：不因客户端取消自动终止已接收业务，不新增运行中取消策略；原接入前取消、入队后取消和执行中取消分别对照。初版不新增 AsyncNotifyWhenDone，也不在不满足异步 API 前提时读取 IsCancelled；对象按接收/Finish 事件与任务引用收尾。默认停机丢弃仍按第 6.2 节处理。
+
+#### 5.2.4 CQ 容量验证与轮询线程扩展
+
+方案初版使用单 CQ、单轮询线程。内存命中对照压测显示单线程接近占满一核，扩展到两个轮询线程有吞吐收益，因此保留同一个 CQ、默认两个轮询线程，并提供 `grpc_cq_thread_num` 配置。四个线程没有显示额外收益，不把线程数默认扩大到硬件线程数。业务移出 CQ 后，typed AsyncService 仍在 Next/AsyncNext 内反序列化 protobuf；接收槽补挂、上下文创建、任务提交、完成事件处理也有开销。Call 最后一个引用若在 CQ 释放，大请求/响应的析构也在该线程执行；底层网络推进同样依赖轮询。尤其在业务很快、QPS 较高时，接入侧可能先于 worker 池达到瓶颈。
+
+合入前完成内存命中、高 QPS 场景与改造前的对照，不能只因功能回归通过就认为 CQ 容量足够。容量验证与后续扩展方向：
+
+- **验证目标容量**：覆盖快速内存命中与同步后端等待两类负载，记录 CQ 线程 CPU、worker 利用率、业务队列长度、吞吐及请求 P95/P99 延迟；同端口部署同时观察 Admin 和健康检查的响应。
+- **定位接入瓶颈**：若 CQ 接近占满一核、worker 仍有空闲且吞吐不再增长，结合性能采样确认开销是否集中在接收和完成事件处理，避免仅增加业务 worker。
+- **按需扩展轮询线程**：本次已对比同一个 CQ 的 1 / 2 / 4 个轮询线程；后续按负载调整启动配置，继续对照收益与竞争开销。当前固定版本明确允许多个线程同时调用同一 CQ 的 `Next()`，不要求先引入多 CQ 架构；依据见 [CQ 线程安全约定](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/include/grpcpp/impl/codegen/completion_queue.h#L23)。
+- **验证并发与生命周期**：增加轮询线程时，重新验证接收槽补挂、恰好一次完成、CallState 引用释放、停止接收及 CQ 排空，并覆盖启动失败和同端口 Admin 场景。gRPC 的 CQ 接口线程安全不代表应用层状态天然支持并行处理；CQ 线程仍不执行业务或等待业务队列。
+
+当前 PR 只扩展同一个 CQ 的轮询线程数，并用 1 / 2 / 4 个线程运行请求、拒绝、取消、启动失败、Leader 停机及 CQ 收尾回归；不引入多 CQ 调度结构。同步后端等待及生产目标容量仍需按实际部署验证。业务池的容量隔离方向另见第 3.3 节。
+
+内存命中对照并非所有负载都提速：高并发单 key 查询受益于共享 worker 与两个 CQ 轮询线程；单并发的快速请求增加线程交接开销，64-key 批量查询也观察到吞吐回退，而且该批量场景的 CQ 未跑满。扩大 worker 或 CQ 数只能部分改善，不能把默认线程数当作原容量的等价换算。该边界需要按部署的批量大小、目标 QPS 与后端等待情况继续评估，不在本次顺带改写业务算法、指标锁或序列化体系。
+
+
+#### 5.2.5 Future work：将 protobuf 请求解析下放 worker
+
+若性能采样证明 protobuf 解析占用显著，可独立评估固定版本已有的 `WithRawMethod_*`：CQ 接收 `grpc::ByteBuffer` 并提交到业务池，worker 再解析 protobuf、准备上下文和执行业务。它保留原 RPC 方法与线上的 protobuf 编码，客户端调用方式无需改变，不要求升级 gRPC；参见 [固定版本 Raw unary 测试](https://github.com/grpc/grpc/blob/109c570727c3089fef655edcdd0dd02cc5958010/test/cpp/end2end/raw_end2end_test.cc#L191)。
+
+这需要 adapter 接手解析失败和响应编码，保留原 transport 错误语义，并明确 trace_id 提取、到达时间记录、字节缓冲生命周期，以及未解析任务的队列拒绝/丢弃优先级。网络协议处理仍由 gRPC 完成；不能把它描述为移走全部 CQ 工作。可同时评估在 worker 释放不再使用的请求对象，但响应和 Call 的释放仍须遵守 Finish 生命周期。
+
+本 PR 保留 typed AsyncService，不实现 Raw 适配；已采用同一 CQ 多轮询线程的局部扩展。后移解析仅作为有性能数据支持后的独立优化，避免为了移动一项工作扩大当前适配范围。
 
 ### 5.3 日志、指标与序列化位置
 
@@ -312,7 +370,7 @@ CQ 线程收到 Finish 完成事件
 3. 释放队列锁后，停机协调线程逐项调用 `on_discard`。adapter 填入原 request_id、SERVICE_NOT_READY 和 `service is stopping`，不调用 ServiceImpl 或创建 ServiceCallGuard；HTTP 通过 Promise 把错误结果及已有完成凭据交回原 IO，gRPC 调用 `writer.Finish(response, OK, finish_tag)` 并保留 CallState 至完成事件。回调不访问 HTTP connection、不等待 IO/CQ、不执行业务或整份 HTTP 响应序列化。
 4. 每项完成通知后再减少丢弃收尾计数。HTTP 异常仍通过 `exception_ptr` 和凭据回到原 IO，gRPC 异常仍走原 UNKNOWN 完成规则；不能只记录异常而漏掉 Promise/Finish，也不能在通知前直接析构任务。大量丢弃任务仍需逐项收尾，不能宣称立即退出。
 
-mode 来自启动配置，首次关闭决定策略；重复 CloseAdmission/Stop 不切换模式、不重复调用完成回调。`drain` 模式保留队列，继续由 worker 执行业务。两种模式都要等待业务池 Drain、HTTP 完成凭据及独立的 gRPC CallState/CQ 收尾，见下节。
+mode 来自启动配置，首次关闭决定策略；重复 CloseAdmission/Stop 不切换模式、不重复调用完成回调。`drain` 模式保留队列，由 worker 继续准备并调用原业务入口；仍按执行时门禁判断，不能理解为所有积压写请求都会写入。两种模式都要等待业务池 Drain、HTTP 完成凭据及独立的 gRPC CallState/CQ 收尾，见下节。
 
 #### 6.2.2 停机顺序与生命周期
 
@@ -322,10 +380,10 @@ Meta 新增异步等待后，**队列空或 worker 执行结束，不等于协�
 
 `Server::Stop` 按以下依赖顺序调整：
 
-1. `CloseAdmission(worker_shutdown_mode)` 关闭 Meta 业务提交，并停止应用侧补挂新的 gRPC 接收槽。补挂操作及 CallState 登记与该停止标志同步，避免停机漏记新状态。默认模式锁外逐项发出丢弃完成通知；`drain` 模式保留队列。此时 HTTP IO、CQ、业务 worker、gRPC 对象和 ServiceImpl 均须存活。Admin 与健康检查不受业务提交开关控制。
-2. 沿用 main 的 `LeaderElector::Stop()` 等待选主回调收尾，此时 ServiceImpl、manager、worker 和 IO/CQ 均仍存活。保留 `DisableSubscriptions()` 在 gRPC Shutdown 之前的顺序，结束既有 Optimizer 订阅；按现有 server 边界执行 gRPC Server Shutdown。**CQ 轮询和 worker 持续工作**：已接收 Meta 请求继续 Finish，未匹配的接收槽返回 `ok=false`，同步 Admin/Debug 等服务按框架规则结束。不能先停止 CQ 再等待 Server Shutdown。
+1. 先调用 `LeaderElector::Stop()`，同步撤销 Leader-only 请求准入，再等待角色回调及清理。此时业务队列保持开放，Meta HTTP/gRPC、ServiceImpl、manager、worker 和 IO/CQ 均存活；能够通过原准备步骤的 Leader-only 请求按原路径返回 SERVER_NOT_LEADER。GetClusterInfo 仍可调用，但选主器停止刷新后不保证它返回新 Leader 地址，客户端仍需其他存活种子节点。
+2. 然后 `CloseAdmission(worker_shutdown_mode)` 关闭 Meta 提交，并 `StopAccepting()` 停止应用补挂接收槽。默认模式锁外完成被丢弃任务，drain 保留队列；两者仍保持 worker 和 IO/CQ 存活。随后 `DisableSubscriptions()`，再按 server 边界执行 gRPC Shutdown；CQ 持续处理 Finish 及未匹配接收槽的 `ok=false`，同步 Admin/Debug 等按原框架路径结束。关闭提交仍早于传输层关闭。
 3. 等业务池 Drain 和 Meta HTTP 完成凭据释放；HTTP 凭据覆盖业务执行或丢弃通知、IO 恢复和最外层 handler 收尾。另等 Meta gRPC adapter 的全部 CallState/操作处理收尾，包括预挂接收、入池失败直接拒绝和正在完成的请求；不能用业务池计数代替这项等待。
-4. 确认 CallState 已释放、CQ 事件处理代码也不再持有会发起新操作的状态，没有路径会再调用 RequestXxx/Finish 后，执行 CQ Shutdown。轮询线程继续 Next，直到返回 false，才 join 并回收该线程；`ok=false` 的单个事件不是退出循环的理由。
+4. 确认 CallState 已释放、CQ 事件处理代码也不再持有会发起新操作的状态，没有路径会再调用 RequestXxx/Finish 后，执行 CQ Shutdown。轮询线程继续 AsyncNext，直到返回 SHUTDOWN，才 join 并回收该线程；`ok=false` 的单个事件不是退出循环的理由。
 5. 按既有顺序停止 Meta/Admin/Debug HTTP server，退出并 join 业务 worker；停止并 join metrics 定时线程后采集和上报最终快照、记录丢弃总数，再沿用 Wait 收尾。最后释放 server、adapter、ServiceImpl、executor 和 CQ 等对象。
 
 HTTP 完成凭据只跟踪成功提交的任务，其计数增加与成功入队、关闭提交在同一锁下完成，并早于任务对 worker 可见；被丢弃的任务也须保留凭据至 handler 退出。执行或丢弃异常同样走此路径。关闭后直接拒绝的新 HTTP 请求不增加业务池凭据，仍由 HTTP 框架处理；**gRPC 的直接拒绝仍有 Finish 事件，必须进入 adapter 的 CallState 收尾统计**。
@@ -336,4 +394,4 @@ gRPC CallState 从预挂接收起就登记存活，直至最后事件和任务�
 
 本次不额外保证响应已经送达客户端：HTTP Stop 仍可能关闭连接，gRPC Finish 的完成事件也不代表客户端业务已经读取响应。这里保证请求对象保持到所需交接结束，且异步恢复不投递到已销毁的 IO/CQ。已有同步后端无限阻塞时仍可能拖延停机，不引入强制终止线程或新的全局 deadline。
 
-这一顺序也有可见变化：原先 gRPC Shutdown 等待期间 HTTP 仍可执行请求，新增 CloseAdmission 会让 Meta 提前返回 stopping 错误；默认丢弃队列时，已接收但未领取的请求也按该格式完成。`drain` 才执行完全部积压业务，两种模式都仍可能完成已领取的写请求。Admin HTTP 与健康检查在原框架 Stop 阶段前仍沿原路径处理，不因该开关提前拒绝，但等待 Meta 收尾可能推迟它们最终关闭的时刻。`discard_pending` 减少积压业务的执行等待，不保证固定退出时长；两种模式的返回、时长与实际写入范围均须对照验证。
+这一顺序保留 Leader 清理阶段的原门禁行为，但不能保证整个停机窗口对客户端透明：随后关闭提交及默认丢弃仍返回 SERVICE_NOT_READY，Python/Java 的 NOT_LEADER 重试分支不会因此触发，C++ 初始化也不会按 NOT_LEADER 继续尝试种子地址。该窗口持续到传输层关闭；已有 collector/Instance 提前返回仍先于业务门禁。drain 会完成准备、门禁检查和协议交接，Leader-only 请求通常返回 SERVER_NOT_LEADER，不代表继续执行整批写入；失去 Leader 门禁前已进入的请求仍按原规则完成。Admin HTTP 与健康检查保留原路径，但最终关闭时刻可能受 Meta 收尾影响。两个停机模式都不保证固定退出时长。

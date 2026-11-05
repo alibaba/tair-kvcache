@@ -318,7 +318,7 @@ bool Server::StartRpcServer() {
     if (!use_separate_admin_server && config_.IsEnableDebugService()) {
         builder.RegisterService(debug_service_.get());
     }
-    if (!meta_service_->PrepareCompletionQueue(builder)) {
+    if (!meta_service_->PrepareCompletionQueue(builder, config_.GetServiceGrpcCqThreadNum())) {
         KVCM_LOG_ERROR("Failed to start Meta RPC completion queue");
         return false;
     }
@@ -563,6 +563,14 @@ bool Server::StartMetricsReportThread() {
 void Server::ReportMetrics(bool final_snapshot) {
     if (request_executor_) {
         const auto state = request_executor_->GetSnapshot();
+        // Aggregate at most once per reporting interval, outside admission's
+        // hot-path lock. Stop also retains an unconditional final summary.
+        if (!final_snapshot && state.rejected != last_request_rejected_) {
+            KVCM_LOG_WARN("service request submissions rejected: total=%zu, queued=%zu, running=%zu",
+                          state.rejected,
+                          state.queued,
+                          state.running);
+        }
         if (metrics_registry_) {
             metrics_registry_->GetGauge("service.request_queue_length") = state.queued;
             metrics_registry_->GetGauge("service.request_running") = state.running;
@@ -589,6 +597,12 @@ void Server::Stop() {
         return;
     }
     KVCM_LOG_INFO("server stopping...");
+    // Revoke Leader readiness before closing the business queue. During the
+    // potentially slow cleanup, requests must still reach the original
+    // SERVER_NOT_LEADER gate and GetClusterInfo must remain callable.
+    if (leader_elector_) {
+        leader_elector_->Stop();
+    }
     if (request_executor_) {
         request_executor_->CloseAdmission(config_.GetServiceWorkerShutdownMode() == "drain"
                                               ? ServiceRequestExecutor::ShutdownMode::kDrain
@@ -596,10 +610,6 @@ void Server::Stop() {
     }
     if (meta_service_) {
         meta_service_->StopAccepting();
-    }
-    // Lifecycle callbacks need the service gates and managers to remain alive.
-    if (leader_elector_) {
-        leader_elector_->Stop();
     }
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();

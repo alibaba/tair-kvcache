@@ -40,11 +40,15 @@ cc_test(
 cc_test(
     name = "MetaServiceGRpcDispatchTest",
     srcs = ["meta_service_grpc_dispatch_test.cc"],
+    copts = ["-fno-access-control"],
     linkstatic = True,
     deps = [
         "//kv_cache_manager/common:request_context",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/service",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/metrics:metrics_lifecycle",

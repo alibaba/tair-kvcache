@@ -162,7 +162,7 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.query_counter` | counter | 总查询次数 |
 | `service.error_counter` | counter | 总错误次数 |
 | `service.query_rt_us` | gauge | 最近一次查询响应时间（微秒） |
-| `service.request_queue_size` | gauge | 预留指标，当前未采集队列深度 |
+| `service.request_queue_size` | gauge | 旧预留项，未采集；Meta 业务队列请使用周期指标 `service.request_queue_length` |
 | `grpc.response_counter` | counter | gRPC 响应总数，按 `server`（`meta`/`admin`）、`method`（`Service/Method`）和 `grpc_code`（标准状态码名称）区分，每个 RPC 计一次 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
@@ -181,13 +181,21 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 `grpc.response_counter` 统计服务端准备发送的最终 gRPC 状态，包含线程配额耗尽时框架返回的
 `RESOURCE_EXHAUSTED`；该状态也可能来自其他资源不足。主服务与 Admin 共用 gRPC 端口时统一记为
-`server=meta`，业务响应体中的错误仍由 `service.error_counter` 统计。
+`server=meta`，ServiceImpl 产生的业务错误仍由 `service.error_counter` 统计。
 `method` 省略 protobuf 包名前缀，例如 `MetaService/GetCacheLocation`；无法在 protobuf 描述中识别的方法统一记为 `unknown`。
+
+异步 Meta 的 worker 和 CQ 不受 `grpc_max_threads` 同步线程配额约束，原 Meta 因同步线程耗尽产生的 RESOURCE_EXHAUSTED 信号不再适用；其他资源限制仍可能产生该状态。默认队列不限长，应结合 `service.request_queue_length`、请求延迟和进程内存监控积压。正数队列容量拒绝、关闭提交及停机丢弃使用 gRPC OK + SERVICE_NOT_READY，因此不会增加 RESOURCE_EXHAUSTED，也不进入 ServiceCallGuard 的 `service.error_counter`，应分别查看 rejected/discarded 指标。
+
+四项业务池指标不带请求/Instance 标签，按 `kvcm.metrics.report_interval_ms` 采样（默认 20 秒）；counter 值累计，Prometheus 中可使用 rate/increase，名称中的点按 exporter 规则转换为下划线。停机补采最终值并记录汇总日志，但不保证 Prometheus 在端口关闭前抓到该值。旧 request_queue_size 不等于新的队列长度指标。
 
 ### 周期性指标
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
+| `service.request_queue_length` | gauge | Meta HTTP/gRPC 共享池待领取任务数，不含执行中或丢弃收尾任务 |
+| `service.request_running` | gauge | 已被 worker 领取、尚未完成任务函数的任务数 |
+| `service.request_rejected` | counter | 提交因队列满或关闭被拒绝的累计次数 |
+| `service.request_discarded` | counter | 停机 discard_pending 丢弃待执行任务的累计数量 |
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
 | `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |

@@ -56,12 +56,18 @@ TEST_F(CommandLineTest, TestParseCmdLine) {
 }
 
 TEST_F(CommandLineTest, TerminationSignalOnWorkerOnlyNotifiesMainThread) {
-    CommandLine command;
-    auto previous = std::signal(SIGTERM, SIG_DFL);
-    command.RegisterSignal();
-    // No Server is installed: invoking Stop from the signal handler would fail.
-    std::thread worker([] { std::raise(SIGTERM); });
-    command.WaitForTerminationSignal();
-    worker.join();
-    std::signal(SIGTERM, previous);
+    // RegisterSignal also installs crash handlers and alternate signal-stack
+    // state. Keep all of those process-wide side effects in the child.
+    ASSERT_EXIT(
+        {
+            CommandLine command;
+            command.RegisterSignal();
+            // No Server is installed: stopping inside the handler would fail.
+            std::thread worker([] { std::raise(SIGTERM); });
+            command.WaitForTerminationSignal();
+            worker.join();
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0),
+        "");
 }

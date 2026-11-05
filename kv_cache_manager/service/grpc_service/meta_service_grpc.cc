@@ -1,7 +1,11 @@
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -9,6 +13,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -20,9 +27,9 @@
 
 namespace kv_cache_manager {
 
-// The CQ only accepts calls and observes completion. Business code always runs
-// on the shared executor; in particular, this thread must keep polling when
-// synchronous Admin/Debug/Optimizer services share the server.
+// Next/AsyncNext also deserialize typed protobuf requests and drive network IO;
+// the last Call reference may release request/response storage on this thread.
+// Business code and potentially blocking preparation run on the shared executor.
 class MetaServiceGRpc::AsyncCalls {
 public:
     AsyncCalls(MetaServiceGRpc *service, std::shared_ptr<ServiceRequestExecutor> executor)
@@ -58,27 +65,51 @@ public:
         ShutdownCompletionQueueAndJoin();
     }
 
-    bool PrepareCompletionQueue(grpc::ServerBuilder &builder) {
-        assert(!cq_);
+    bool PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count) {
+        assert(!cq_ && poller_count > 0);
         cq_ = builder.AddCompletionQueue();
         try {
-            poller_ = std::thread([this] {
-                void *raw_tag = nullptr;
-                bool ok = false;
-                while (cq_->Next(&raw_tag, &ok)) {
-                    std::unique_ptr<Tag> tag(static_cast<Tag *>(raw_tag));
-                    tag->Complete(ok);
-                }
-            });
+            pollers_.reserve(poller_count);
+            for (std::size_t i = 0; i < poller_count; ++i) {
+                pollers_.emplace_back([this] {
+#ifdef __linux__
+                    pthread_setname_np(pthread_self(), "kvcm_meta_cq");
+#endif
+                    try {
+                        auto retry_at = std::chrono::system_clock::now() + std::chrono::milliseconds(100);
+                        for (;;) {
+                            void *raw_tag = nullptr;
+                            bool ok = false;
+                            const auto event = cq_->AsyncNext(&raw_tag, &ok, retry_at);
+                            if (event == grpc::CompletionQueue::SHUTDOWN) {
+                                break;
+                            }
+                            if (event == grpc::CompletionQueue::GOT_EVENT) {
+                                std::unique_ptr<Tag> tag(static_cast<Tag *>(raw_tag));
+                                tag->Complete(ok);
+                            }
+                            if (std::chrono::system_clock::now() >= retry_at) {
+                                if (retry_pending_.exchange(false)) {
+                                    for (const auto &method : methods_) {
+                                        method->Post(true);
+                                    }
+                                }
+                                retry_at = std::chrono::system_clock::now() + std::chrono::milliseconds(100);
+                            }
+                        }
+                    } catch (...) {
+                        // Request exceptions are handled below. An exception from
+                        // gRPC Next/Finish may leave an operation partially issued;
+                        // continuing would risk lost tags, hung shutdown or UAF.
+                        FatalCompletionFailure();
+                    }
+                });
+            }
         } catch (const std::exception &error) {
             KVCM_LOG_ERROR("start Meta gRPC completion queue poller failed: %s", error.what());
-            cq_->Shutdown();
-            void *tag = nullptr;
-            bool ok = false;
-            while (cq_->Next(&tag, &ok)) {
-                delete static_cast<Tag *>(tag);
-            }
-            cq_.reset();
+            // No receive slots have been posted before BuildAndStart. Join
+            // any pollers already created before releasing their empty CQ.
+            ShutdownCompletionQueueAndJoin();
             return false;
         }
         return true;
@@ -109,13 +140,22 @@ public:
         if (cq_) {
             cq_->Shutdown();
         }
-        if (poller_.joinable()) {
-            poller_.join();
+        for (auto &poller : pollers_) {
+            if (poller.joinable()) {
+                poller.join();
+            }
         }
+        pollers_.clear();
         cq_.reset();
     }
 
 private:
+    [[noreturn]] static void FatalCompletionFailure() noexcept {
+        // Avoid allocating another error/status object when memory is exhausted.
+        std::fputs("fatal: Meta gRPC completion failed; cannot safely continue polling or finishing calls\n", stderr);
+        std::abort();
+    }
+
     struct Tag {
         virtual ~Tag() = default;
         virtual void Complete(bool ok) = 0;
@@ -123,7 +163,7 @@ private:
 
     struct MethodBase {
         virtual ~MethodBase() = default;
-        virtual void Post() = 0;
+        virtual void Post(bool retry_only = false) = 0;
     };
 
     // Declared first in Call, so it is destroyed after context/writer and after
@@ -156,17 +196,36 @@ private:
         Method(AsyncCalls *owner, RequestFn request, PrepareFn prepare, RunFn run)
             : owner_(owner), request_(std::move(request)), prepare_(std::move(prepare)), run_(std::move(run)) {}
 
-        void Post() override {
+        void Post(bool retry_only = false) override {
             // Serialize RequestX with StopAccepting, including registration of
             // the CallState in the shutdown count.
             std::lock_guard<std::mutex> lock(owner_->accept_mutex_);
-            if (!owner_->accepting_) {
+            if (!owner_->accepting_ || (retry_only && !retry_post_)) {
                 return;
             }
-            auto call = std::make_shared<Call>(owner_);
-            auto tag = std::make_unique<CallTag>(this, call, true);
-            request_(&call->context, &call->request, &call->writer, owner_->cq_.get(), tag.get());
-            tag.release();
+            if (retry_only && std::chrono::steady_clock::now() < retry_after_) {
+                owner_->retry_pending_.store(true);
+                return;
+            }
+            try {
+                auto call = std::make_shared<Call>(owner_);
+                auto tag = std::make_unique<CallTag>(this, call, true);
+                // In pinned gRPC 1.19.1, RequestX's C++ allocations precede
+                // IssueRequest (a C API call); no C++ work follows a posted call.
+                request_(&call->context, &call->request, &call->writer, owner_->cq_.get(), tag.get());
+                tag.release();
+                retry_post_ = false;
+            } catch (const std::bad_alloc &) {
+                if (!retry_post_) {
+                    std::fputs("Meta gRPC receive allocation failed; will retry posting the receive slot\n", stderr);
+                }
+                retry_post_ = true;
+                retry_after_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+                owner_->retry_pending_.store(true);
+            } catch (...) {
+                // Only pre-post allocation failure has a verified retry path.
+                FatalCompletionFailure();
+            }
         }
 
     private:
@@ -195,22 +254,33 @@ private:
             bool accept;
         };
 
-        void Finish(const std::shared_ptr<Call> &call, const grpc::Status &status = grpc::Status::OK) {
-            auto tag = std::make_unique<CallTag>(this, call, false);
-            call->writer.Finish(call->response, status, tag.get());
-            tag.release();
+        void Finish(const std::shared_ptr<Call> &call, const grpc::Status &status = grpc::Status::OK) noexcept {
+            try {
+                auto tag = std::make_unique<CallTag>(this, call, false);
+                call->writer.Finish(call->response, status, tag.get());
+                tag.release();
+            } catch (...) {
+                // Do not let WorkerLoop swallow this exception and strand an
+                // accepted RPC, or retry an operation that might already exist.
+                FatalCompletionFailure();
+            }
         }
 
-        void Reject(const std::shared_ptr<Call> &call, const char *message) {
-            auto *header = call->response.mutable_header();
-            header->set_request_id(call->request_context->request_id());
-            header->mutable_status()->set_code(proto::meta::SERVICE_NOT_READY);
-            header->mutable_status()->set_message(message);
+        void Reject(const std::shared_ptr<Call> &call, const char *message) noexcept {
+            try {
+                auto *header = call->response.mutable_header();
+                header->set_request_id(call->request_context->request_id());
+                header->mutable_status()->set_code(proto::meta::SERVICE_NOT_READY);
+                header->mutable_status()->set_message(message);
+            } catch (...) {
+                Finish(call, unexpected_error_);
+                return;
+            }
             Finish(call);
         }
 
         void Accepted(const std::shared_ptr<Call> &call) {
-            grpc::Status error;
+            bool failed = false;
             const char *rejection = nullptr;
             try {
                 Post();
@@ -221,15 +291,15 @@ private:
                 call->request_context->set_client_ip(ExtractIpFromPeer(call->context.peer()));
                 ServiceRequestExecutor::Task task;
                 task.run = [this, call](ServiceRequestExecutor::CompletionToken) {
-                    grpc::Status status;
                     try {
                         if (prepare_(call->request_context.get(), &call->request, &call->response)) {
                             run_(call->request_context.get(), &call->request, &call->response);
                         }
                     } catch (...) {
-                        status = grpc::Status(grpc::StatusCode::UNKNOWN, "Unexpected error in RPC handling");
+                        Finish(call, unexpected_error_);
+                        return;
                     }
-                    Finish(call, status);
+                    Finish(call);
                 };
                 task.on_discard = [this, call](ServiceRequestExecutor::CompletionToken) {
                     Reject(call, "service is stopping");
@@ -240,15 +310,13 @@ private:
                 }
                 rejection = result == ServiceRequestExecutor::SubmitResult::kFull ? "service request queue is full"
                                                                                   : "service is stopping";
-            } catch (...) {
-                error = grpc::Status(grpc::StatusCode::UNKNOWN, "Unexpected error in RPC handling");
-            }
+            } catch (...) { failed = true; }
             // Queue rejection never performs a collector lookup. Finish is
             // terminal, even on failure.
             if (rejection) {
                 Reject(call, rejection);
             } else {
-                Finish(call, error);
+                Finish(call, failed ? unexpected_error_ : grpc::Status::OK);
             }
         }
 
@@ -256,6 +324,9 @@ private:
         RequestFn request_;
         PrepareFn prepare_;
         RunFn run_;
+        const grpc::Status unexpected_error_{grpc::StatusCode::UNKNOWN, "Unexpected error in RPC handling"};
+        bool retry_post_ = false; // Protected by accept_mutex_.
+        std::chrono::steady_clock::time_point retry_after_;
     };
 
     template <typename Request, typename Response, typename RequestFn, typename PrepareFn, typename RunFn>
@@ -265,9 +336,10 @@ private:
 
     std::shared_ptr<ServiceRequestExecutor> executor_;
     std::unique_ptr<grpc::ServerCompletionQueue> cq_;
-    std::thread poller_;
+    std::vector<std::thread> pollers_;
     std::mutex accept_mutex_;
     bool accepting_ = false;
+    std::atomic<bool> retry_pending_{false};
     std::mutex calls_mutex_;
     std::condition_variable calls_drained_;
     size_t live_calls_ = 0;
@@ -287,8 +359,8 @@ MetaServiceGRpc::~MetaServiceGRpc() = default;
 
 void MetaServiceGRpc::Init() { MetaServiceMetricsBase::InitMetrics(); }
 
-bool MetaServiceGRpc::PrepareCompletionQueue(grpc::ServerBuilder &builder) {
-    return async_calls_->PrepareCompletionQueue(builder);
+bool MetaServiceGRpc::PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count) {
+    return async_calls_->PrepareCompletionQueue(builder, poller_count);
 }
 
 void MetaServiceGRpc::StartAccepting() { async_calls_->StartAccepting(); }

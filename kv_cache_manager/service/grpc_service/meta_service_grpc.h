@@ -29,7 +29,7 @@ public:
 
     void Init();
     // Prepare before BuildAndStart; post application requests only after it succeeds.
-    bool PrepareCompletionQueue(grpc::ServerBuilder &builder);
+    bool PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count = 1);
     void StartAccepting();
     void StopAccepting();
     // The gRPC server must be shut down while the CQ poller and executor still run.

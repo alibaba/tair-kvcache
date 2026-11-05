@@ -9,7 +9,10 @@
 #include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/coordination_memory_backend.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -20,6 +23,7 @@
 #include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/service_request_executor.h"
 #include "stub.h"
 
@@ -65,6 +69,15 @@ void ThrowingGetClusterInfo(MetaServiceImpl *,
 }
 
 std::atomic<bool> migration_wait_entered{false};
+std::atomic<int> failed_receive_posts{0};
+
+void FailReceivePost(grpc::ServerInterface::RegisteredAsyncRequest *,
+                     void *,
+                     grpc_byte_buffer **,
+                     grpc::ServerCompletionQueue *) {
+    ++failed_receive_posts;
+    throw std::bad_alloc();
+}
 
 std::vector<int64_t> KeepMigrationActive(const MigrationManager *, const std::string &instance_id) {
     if (instance_id == "removing-instance") {
@@ -84,7 +97,7 @@ void ObserveQueuedRequestContext(MetaServiceImpl *,
     response->set_leader_node_id(context->client_ip());
 }
 
-class MetaServiceGrpcDispatchTest : public TESTBASE {
+class MetaServiceGrpcDispatchTest : public TESTBASE, public ::testing::WithParamInterface<std::size_t> {
 public:
     void TearDown() override {
         ReleaseWorker();
@@ -110,13 +123,16 @@ public:
     }
 
 protected:
-    void Start(std::size_t capacity = 0, bool mixed_admin = true, std::size_t worker_count = 1) {
+    void Start(std::size_t capacity = 0,
+               bool mixed_admin = true,
+               std::size_t worker_count = 1,
+               std::shared_ptr<LeaderElector> elector = nullptr) {
         executor_ = std::make_shared<ServiceRequestExecutor>(worker_count, capacity);
         metrics_ = std::make_shared<MetricsRegistry>();
         metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
         registry_ = std::make_shared<RegistryManager>("", metrics_);
         cache_manager_ = std::make_shared<CacheManager>(metrics_, registry_, metrics_lifecycle_);
-        impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, nullptr, nullptr);
+        impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, nullptr, std::move(elector));
         service_ = std::make_shared<MetaServiceGRpc>(metrics_, impl_, registry_, executor_, metrics_lifecycle_);
         service_->Init();
         grpc_reporter_ = std::make_shared<LocalMetricsReporter>();
@@ -130,7 +146,7 @@ protected:
         if (mixed_admin) {
             builder.RegisterService(&admin_);
         }
-        ASSERT_TRUE(service_->PrepareCompletionQueue(builder));
+        ASSERT_TRUE(service_->PrepareCompletionQueue(builder, GetParam()));
         server_ = builder.BuildAndStart();
         ASSERT_NE(nullptr, server_);
         ASSERT_GT(port_, 0);
@@ -243,7 +259,7 @@ protected:
     int port_ = 0;
 };
 
-TEST_F(MetaServiceGrpcDispatchTest, QueuedMetaDoesNotBlockSharedOrIndependentAdmin) {
+TEST_P(MetaServiceGrpcDispatchTest, QueuedMetaDoesNotBlockSharedOrIndependentAdmin) {
     Start();
     BlockWorker();
     auto pending = BeginGetClusterInfo();
@@ -270,7 +286,7 @@ TEST_F(MetaServiceGrpcDispatchTest, QueuedMetaDoesNotBlockSharedOrIndependentAdm
     EXPECT_EQ(1u, GrpcResponseCount("OK"));
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, DefaultQueueDoesNotRejectWhenWorkerIsBusy) {
+TEST_P(MetaServiceGrpcDispatchTest, DefaultQueueDoesNotRejectWhenWorkerIsBusy) {
     Start();
     BlockWorker();
     std::vector<std::future<RpcResult>> pending;
@@ -287,7 +303,7 @@ TEST_F(MetaServiceGrpcDispatchTest, DefaultQueueDoesNotRejectWhenWorkerIsBusy) {
     }
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, CollectorPreparationPreservesArrivalContextAcrossQueueWait) {
+TEST_P(MetaServiceGrpcDispatchTest, CollectorPreparationPreservesArrivalContextAcrossQueueWait) {
     Start();
     BlockWorker();
     Stub stub;
@@ -303,7 +319,7 @@ TEST_F(MetaServiceGrpcDispatchTest, CollectorPreparationPreservesArrivalContextA
     EXPECT_EQ(0, result.response.header().request_id().find("dispatch-test_"));
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, RemoveInstanceMigrationWaitDoesNotBlockCqOrSharedAdmin) {
+TEST_P(MetaServiceGrpcDispatchTest, RemoveInstanceMigrationWaitDoesNotBlockCqOrSharedAdmin) {
     Start(0, true, 2);
     ASSERT_TRUE(registry_->Init());
     ASSERT_TRUE(cache_manager_->Init());
@@ -340,7 +356,83 @@ TEST_F(MetaServiceGrpcDispatchTest, RemoveInstanceMigrationWaitDoesNotBlockCqOrS
     EXPECT_TRUE(GetClusterInfo().status.ok());
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, BusinessExceptionPreservesSynchronousGrpcStatus) {
+TEST_P(MetaServiceGrpcDispatchTest, ColdCollectorLookupsCanOccupyAllWorkersButSharedAdminStillProgresses) {
+    Start(0, true, 2);
+    std::unique_lock<std::shared_mutex> hold_lifecycle(metrics_lifecycle_->mut_);
+    auto first = std::async(std::launch::async, [this] { return GetMissingInstance(10s); });
+    auto second = std::async(std::launch::async, [this] { return GetMissingInstance(10s); });
+    EXPECT_TRUE(WaitUntil([this] { return executor_->GetSnapshot().running == 2; }));
+    auto warm = BeginGetClusterInfo();
+    EXPECT_TRUE(WaitUntil([this] { return executor_->GetSnapshot().queued == 1; }));
+    // A warm collector does not bypass the shared worker budget. The CQ and
+    // synchronous Admin still progress even though all workers wait on the lock.
+    CheckAdmin(channel_);
+    EXPECT_EQ(std::future_status::timeout, warm.wait_for(20ms));
+    hold_lifecycle.unlock();
+    EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, first.get().second.header().status().code());
+    EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, second.get().second.header().status().code());
+    EXPECT_TRUE(warm.get().status.ok());
+}
+
+TEST_P(MetaServiceGrpcDispatchTest, StopKeepsLeaderErrorsAndDiscoveryDuringLeaderCleanup) {
+    auto backend = std::make_shared<CoordinationMemoryBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri("memory://")));
+    auto elector = std::make_shared<LeaderElector>(backend, "stop-test", "leader-node", 10000, 20);
+    Start(0, true, 1, elector);
+    Server coordinator;
+    coordinator.request_executor_ = executor_;
+    coordinator.meta_service_ = service_;
+    coordinator.rpc_server_ = std::move(server_);
+    coordinator.leader_elector_ = elector;
+
+    std::promise<void> promoted, cleanup_entered, release_cleanup;
+    auto cleanup = release_cleanup.get_future().share();
+    elector->SetBecomeLeaderHandler([&] {
+        impl_->EnableLeaderOnlyRequests();
+        promoted.set_value();
+    });
+    elector->SetLeadershipLostHandler([&] { impl_->DisableLeaderOnlyRequests(); });
+    elector->SetNoLongerLeaderHandler([&] {
+        impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        cleanup_entered.set_value();
+        cleanup.wait();
+    });
+    ASSERT_TRUE(elector->Start());
+    EXPECT_EQ(std::future_status::ready, promoted.get_future().wait_for(5s));
+    // Use an API with a global collector so this test isolates the Leader gate,
+    // rather than an unrelated missing-Instance early return.
+    auto leader_request = [this] {
+        auto stub = proto::meta::MetaService::NewStub(channel_);
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + 5s);
+        proto::meta::GetInstanceInfoRequest request;
+        proto::meta::GetInstanceInfoResponse response;
+        auto status = stub->GetInstanceInfo(&context, request, &response);
+        EXPECT_TRUE(status.ok());
+        return response.header().status().code();
+    };
+    BlockWorker();
+    auto queued = std::async(std::launch::async, leader_request);
+    EXPECT_TRUE(WaitUntil([this] { return executor_->GetSnapshot().queued == 1; }));
+    auto stopped = std::async(std::launch::async, [&] { coordinator.Stop(); });
+    EXPECT_EQ(std::future_status::ready, cleanup_entered.get_future().wait_for(5s));
+    ReleaseWorker();
+    EXPECT_EQ(proto::meta::SERVER_NOT_LEADER, queued.get());
+    EXPECT_EQ(proto::meta::SERVER_NOT_LEADER, leader_request());
+    auto discovery = GetClusterInfo();
+    EXPECT_TRUE(discovery.status.ok());
+    EXPECT_EQ(proto::meta::OK, discovery.response.header().status().code());
+    // The stopping elector may no longer know a Leader; discovery remains
+    // callable, but it is not a guarantee of a new Leader endpoint.
+    EXPECT_EQ("leader-node", discovery.response.self_node_id());
+    EXPECT_EQ(0, executor_->GetSnapshot().rejected);
+    EXPECT_EQ(0, executor_->GetSnapshot().discarded);
+    release_cleanup.set_value();
+    EXPECT_EQ(std::future_status::ready, stopped.wait_for(5s));
+    stopped.get();
+}
+
+TEST_P(MetaServiceGrpcDispatchTest, BusinessExceptionPreservesSynchronousGrpcStatus) {
     Start();
     {
         Stub stub;
@@ -354,7 +446,41 @@ TEST_F(MetaServiceGrpcDispatchTest, BusinessExceptionPreservesSynchronousGrpcSta
     EXPECT_EQ(1u, GrpcResponseCount("OK"));
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, ConfiguredQueueLimitReturnsBusinessError) {
+TEST_P(MetaServiceGrpcDispatchTest, FailedReceiveAllocationDoesNotFailCurrentRpcOrLoseMethodSlot) {
+    Start();
+    failed_receive_posts = 0;
+    {
+        // Failure occurs before the fixed-version IssueRequest posts its C-core
+        // receive operation. The accepted RPC must still complete normally.
+        Stub stub;
+        using RegisteredRequest = grpc::ServerInterface::RegisteredAsyncRequest;
+        stub.set(ADDR(RegisteredRequest, IssueRequest), FailReceivePost);
+        const auto result = GetClusterInfo();
+        EXPECT_TRUE(result.status.ok());
+        EXPECT_GT(failed_receive_posts.load(), 0);
+        CheckAdmin(channel_);
+    }
+    // No other call can trigger a repost for this method: the poller's bounded
+    // retry must restore its slot even when the CQ has no incoming events.
+    EXPECT_TRUE(GetClusterInfo().status.ok());
+    EXPECT_TRUE(GetClusterInfo().status.ok());
+}
+
+TEST_P(MetaServiceGrpcDispatchTest, StopAcceptingPreventsDeferredReceiveRetry) {
+    Start();
+    failed_receive_posts = 0;
+    Stub stub;
+    using RegisteredRequest = grpc::ServerInterface::RegisteredAsyncRequest;
+    stub.set(ADDR(RegisteredRequest, IssueRequest), FailReceivePost);
+    EXPECT_TRUE(GetClusterInfo().status.ok());
+    service_->StopAccepting();
+    const auto stopped_count = failed_receive_posts.load();
+    EXPECT_GT(stopped_count, 0);
+    std::this_thread::sleep_for(250ms);
+    EXPECT_EQ(stopped_count, failed_receive_posts.load());
+}
+
+TEST_P(MetaServiceGrpcDispatchTest, ConfiguredQueueLimitReturnsBusinessError) {
     Start(1);
     BlockWorker();
     auto pending = BeginGetClusterInfo();
@@ -380,7 +506,7 @@ TEST_F(MetaServiceGrpcDispatchTest, ConfiguredQueueLimitReturnsBusinessError) {
     EXPECT_EQ(2u, GrpcResponseCount("OK"));
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, DiscardPendingCompletesCallsWithoutWaitingForBusyWorker) {
+TEST_P(MetaServiceGrpcDispatchTest, DiscardPendingCompletesCallsWithoutWaitingForBusyWorker) {
     Start();
     BlockWorker();
     auto pending = BeginGetClusterInfo();
@@ -410,7 +536,7 @@ TEST_F(MetaServiceGrpcDispatchTest, DiscardPendingCompletesCallsWithoutWaitingFo
     }
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, DrainKeepsQueuedCallsAliveThroughServerShutdown) {
+TEST_P(MetaServiceGrpcDispatchTest, DrainKeepsQueuedCallsAliveThroughServerShutdown) {
     Start();
     BlockWorker();
     auto pending = BeginGetClusterInfo();
@@ -427,7 +553,7 @@ TEST_F(MetaServiceGrpcDispatchTest, DrainKeepsQueuedCallsAliveThroughServerShutd
     service_->WaitForCalls();
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, DeadlineAndCancellationStillDrainFinishEvents) {
+TEST_P(MetaServiceGrpcDispatchTest, DeadlineAndCancellationStillDrainFinishEvents) {
     Start();
     BlockWorker();
     grpc::ClientContext deadline_context;
@@ -451,7 +577,7 @@ TEST_F(MetaServiceGrpcDispatchTest, DeadlineAndCancellationStillDrainFinishEvent
     EXPECT_TRUE(GetClusterInfo().status.ok());
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, PureAsyncServerHandlesUnknownMethodAndMalformedProtobuf) {
+TEST_P(MetaServiceGrpcDispatchTest, PureAsyncServerHandlesUnknownMethodAndMalformedProtobuf) {
     Start(0, false);
     EXPECT_EQ(grpc::StatusCode::UNIMPLEMENTED,
               RawUnary("/kv_cache_manager.proto.meta.MetaService/UnknownMethod", "").error_code());
@@ -494,7 +620,7 @@ TEST_F(MetaServiceGrpcDispatchTest, PureAsyncServerHandlesUnknownMethodAndMalfor
     EXPECT_TRUE(GetClusterInfo().status.ok());
 }
 
-TEST_F(MetaServiceGrpcDispatchTest, FailedBindCanStopPreparedPollerWithoutPostingRequests) {
+TEST_P(MetaServiceGrpcDispatchTest, FailedBindCanStopPreparedPollerWithoutPostingRequests) {
     Start();
     MetaServiceGRpc second(metrics_, impl_, registry_, executor_);
     second.Init();
@@ -502,7 +628,7 @@ TEST_F(MetaServiceGrpcDispatchTest, FailedBindCanStopPreparedPollerWithoutPostin
     builder.AddChannelArgument("grpc.so_reuseport", 0);
     builder.AddListeningPort("127.0.0.1:" + std::to_string(port_), grpc::InsecureServerCredentials());
     builder.RegisterService(&second);
-    ASSERT_TRUE(second.PrepareCompletionQueue(builder));
+    ASSERT_TRUE(second.PrepareCompletionQueue(builder, GetParam()));
     auto failed = builder.BuildAndStart();
     EXPECT_EQ(nullptr, failed);
     second.StopAccepting();
@@ -510,6 +636,8 @@ TEST_F(MetaServiceGrpcDispatchTest, FailedBindCanStopPreparedPollerWithoutPostin
     second.ShutdownCompletionQueueAndJoin();
     EXPECT_TRUE(GetClusterInfo().status.ok());
 }
+
+INSTANTIATE_TEST_SUITE_P(PollerCounts, MetaServiceGrpcDispatchTest, ::testing::Values(1u, 2u, 4u));
 
 } // namespace
 } // namespace kv_cache_manager

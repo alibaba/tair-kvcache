@@ -175,6 +175,22 @@ TEST_F(ServerConfigTest, GrpcMemoryQuotaEnvironmentOverride) {
     EXPECT_TRUE(config.Check());
 }
 
+TEST_F(ServerConfigTest, GrpcCompletionQueueThreads) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(2u, config.GetServiceGrpcCqThreadNum());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_cq_thread_num", "4"}}));
+    EXPECT_EQ(4u, config.GetServiceGrpcCqThreadNum());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(2u, config.GetServiceGrpcCqThreadNum());
+    for (const auto *value : {"0", "-1", "12x", "", "4294967296"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_cq_thread_num", value}}));
+    }
+    ScopedEnv env("kvcm_service_grpc_cq_thread_num", "3");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(3u, config.GetServiceGrpcCqThreadNum());
+}
+
 TEST_F(ServerConfigTest, ServiceRequestExecutorConfig) {
     ServerConfig config;
     ASSERT_TRUE(config.Parse("", {}));

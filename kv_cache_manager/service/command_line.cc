@@ -138,6 +138,7 @@ int CommandLine::Run(int argc, const char *argv[]) {
         return -1;
     }
     WaitForTerminationSignal();
+    KVCM_LOG_INFO("received signal %d, stopping server", G_STOP_SIGNAL.load(std::memory_order_relaxed));
     server_->Stop();
     server_->Wait();
     server_.reset();
