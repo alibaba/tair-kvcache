@@ -392,10 +392,3 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 ## 5. 修改功能前的提示
 
 修改某个模块前，先对照第 3 节的依赖关系图与第 4 节的运行时流程，确认它的上游（谁依赖它、会被它影响）和下游（它依赖谁、受谁约束），不要遗漏被依赖方带来的约束。尤其注意 3.2 的两条反向边、`CacheLocation` 的生命周期与状态流转约束，以及改动 `protocol` proto 时需遵循 [proto 修改指南](../develop/proto_modification_guide.md)。涉及元数据面行为时，同时检查 C++ `MetaClient`、Python `KvCacheManagerClient`/`manager_client` 与 Java `client_java` 的语义一致性；涉及 EventReport 时，先确认 reporter lifecycle、snapshot generation 与 Leader-only 约束。
-
-### 存储指标生命周期
-
-`DataStorageManager` 在卸载和清理存储时，使用现有存储写锁串行关闭后端、删除其 `unique_name` 指标并移除注册项。
-周期采样在存储锁外读取后端状态，只在短暂的 `PublishMetricsIfCurrent` 共享锁中校验后端身份并注册/发布指标；
-已卸载或同名替换的后端不能重新发布。KMonitor 入队前同样校验存储身份与 gauge 句柄，避免复用已脱离注册表的 collector。
-锁内不执行后端网络探测。follower 尚有存储时仅移除该存储的容量序列，不扫描历史序列，也不改变实际健康/可写状态。

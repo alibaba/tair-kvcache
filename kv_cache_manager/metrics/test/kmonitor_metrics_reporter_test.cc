@@ -51,6 +51,16 @@ void CaptureEventAges(kmonitor::MutableMetric *metric, const kmonitor::MetricsTa
     }
 }
 
+class FixedUsageNfsBackend : public NfsBackend {
+public:
+    FixedUsageNfsBackend(std::shared_ptr<MetricsRegistry> registry, double usage)
+        : NfsBackend(std::move(registry)), usage_(usage) {}
+    double GetStorageUsageRatio(const std::string &) const override { return usage_; }
+
+private:
+    const double usage_;
+};
+
 thread_local std::vector<ReportedLifetime> reported_storage;
 thread_local std::function<void()> before_storage_report;
 
@@ -465,7 +475,7 @@ TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritab
     EXPECT_TRUE(ratios->GetMetricsValues().empty());
 }
 
-TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingRejectsOldCollectors) {
+TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingAllowsOnlyCurrentRoundSnapshot) {
     auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
     registry_manager_->data_storage_manager_ = manager;
     reporter_->SetStorageUsageProvider([] { return true; });
@@ -474,7 +484,7 @@ TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingRejectsOldC
         &kmonitor::MutableMetric::Report);
     stub.set(report, CaptureStorage);
     for (bool replace : {false, true}) {
-        auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+        auto backend = std::make_shared<FixedUsageNfsBackend>(metrics_registry_, 1.0);
         backend->SetOpen(true);
         backend->SetAvailable(true);
         manager->storage_map_["reused_store"] = backend;
@@ -482,7 +492,7 @@ TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingRejectsOldC
         before_storage_report = [&, replace] {
             EXPECT_EQ(EC_OK, manager->DoCleanup());
             if (replace) {
-                auto replacement = std::make_shared<NfsBackend>(metrics_registry_);
+                auto replacement = std::make_shared<FixedUsageNfsBackend>(metrics_registry_, 0.25);
                 replacement->SetOpen(true);
                 replacement->SetAvailable(true);
                 manager->storage_map_["reused_store"] = replacement;
@@ -495,11 +505,26 @@ TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingRejectsOldC
         };
         reporter_->ReportInterval();
         EXPECT_FALSE(before_storage_report);
+        // Accepted push-path window: the sampled collector survives this
+        // round even though Local registry cleanup has already completed.
+        int capacity_samples = 0;
         for (const auto &sample : reported_storage) {
-            EXPECT_NE("data_storage.healthy_status", sample.name);
-            EXPECT_NE("data_storage.writable_status", sample.name);
-            EXPECT_NE("data_storage.storage_usage_ratio", sample.name);
+            if (sample.name == "data_storage.storage_usage_ratio") {
+                ++capacity_samples;
+                EXPECT_DOUBLE_EQ(1.0, sample.value);
+            }
         }
+        EXPECT_EQ(1, capacity_samples);
+        reported_storage.clear();
+        reporter_->ReportInterval();
+        capacity_samples = 0;
+        for (const auto &sample : reported_storage) {
+            if (sample.name == "data_storage.storage_usage_ratio") {
+                ++capacity_samples;
+                EXPECT_DOUBLE_EQ(0.25, sample.value);
+            }
+        }
+        EXPECT_EQ(replace ? 1 : 0, capacity_samples);
         before_storage_report = {};
     }
 }

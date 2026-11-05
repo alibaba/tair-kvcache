@@ -158,6 +158,7 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
+        "@cpp_stub",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",

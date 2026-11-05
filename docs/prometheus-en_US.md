@@ -230,7 +230,9 @@ behavior. The new metric does not participate in quota or reclaim decisions.
 
 For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
 
-Storage unload removes all metric series tagged with its unique name, including health, writability and capacity. Sampling checks backend identity before publishing; KMonitor also rejects collectors detached by cleanup or replacement. Unloaded backends disappear rather than reporting artificial zero values. While a follower still has loaded backends, health and writability remain actual observations and capacity is omitted.
+Storage unload removes all metric series tagged with its unique name, including health, writability and capacity. Local sampling checks backend identity before publishing so unloaded backends cannot re-register old series. Unloaded backends are removed from the local registry rather than reporting artificial zero values. While a follower still has loaded backends, health and writability remain actual observations and capacity is omitted.
+
+Known KMonitor limitation: demotion, unload or same-name replacement between Local sampling and KMonitor submission may still allow the current round to push old samples, including capacity. The next Local interval refreshes collectors and capacity eligibility. Stopping pushes does not retract data already sent; downstream expiry and alert windows determine how long old values can affect alerts.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.

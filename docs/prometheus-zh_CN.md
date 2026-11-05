@@ -215,7 +215,9 @@ local 和 cached 模式均统计当前本地索引；恢复期间只反映已经
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
 
-存储卸载时同步移除带有其 unique_name 的所有指标序列，包括健康、可写和容量指标。在途采样发布前校验后端身份，KMonitor 也会拒绝已被清理或替换的旧 collector；已卸载后端的指标消失，不再用零值占位。follower 尚保留后端时，健康及可写指标继续反映实际状态，容量指标不输出。
+存储卸载时同步移除带有其 unique_name 的所有指标序列，包括健康、可写和容量指标。Local 在途采样发布前校验后端身份，防止卸载后重新注册旧指标；已卸载后端的指标从本地注册表移除，不再用零值占位。follower 尚保留后端时，健康及可写指标继续反映实际状态，容量指标不输出。
+
+KMonitor 已知限制：Local 完成采样后、KMonitor 提交前发生降级、卸载或同名重建时，本轮仍可能提交旧样本（包括旧容量值）。下一轮 Local 采样刷新 collector 和容量输出控制；停止推送不撤回已经发送的数据，下游旧值何时不再影响告警取决于其过期策略和告警窗口。
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。

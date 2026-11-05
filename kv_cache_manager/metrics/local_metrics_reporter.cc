@@ -149,7 +149,8 @@ void LocalMetricsReporter::ReportInterval() {
                 if (!report_storage_usage_) {
                     // A follower may still have a backend awaiting cleanup.
                     // Omit its capacity without scanning historical series.
-                    metrics_registry_->Remove("data_storage.storage_usage_ratio", tags);
+                    metrics_registry_->Remove(
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio), tags);
                 }
                 const auto p = std::make_shared<DataStorageIntervalMetricsCollector>(metrics_registry_, tags);
                 if (!p->Init(report_storage_usage_)) {
