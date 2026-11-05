@@ -68,6 +68,15 @@ public:
                                 const std::string &unique_name,
                                 const std::vector<DataStorageUri> &src_uris,
                                 const std::vector<DataStorageUri> &dst_uris);
+    bool SupportsAsyncCopy(const std::string &unique_name) const;
+    AsyncCopySubmitResult CopyAsync(RequestContext *request_context,
+                                    const std::string &unique_name,
+                                    const std::vector<DataStorageUri> &src_uris,
+                                    const std::vector<DataStorageUri> &dst_uris,
+                                    const std::string &operation_id,
+                                    const AsyncCopyOptions &options,
+                                    AsyncCopyCompletion completion);
+    ErrorCode RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id);
     std::vector<bool>
     Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);

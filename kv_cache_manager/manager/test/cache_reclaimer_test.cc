@@ -11,13 +11,13 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
-
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
@@ -6904,6 +6904,60 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     EXPECT_TRUE(out[3].empty()) << "preparing copy target should be protected before location id is bound";
 }
 
+TEST_F(CacheReclaimerTest, TestFilterLocIDAllowsSourceAndAbandonedCopyTargetWithoutActiveTask) {
+    const auto ins_info = InstanceInfoFactory();
+    const int64_t source_create_time = 123;
+    auto source = std::make_shared<CacheLocation>(
+        "persistent_source",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot/persistent_source")});
+    source->set_create_time(source_create_time);
+    auto target = std::make_shared<CacheLocation>(
+        "persistent_target",
+        CacheLocationStatus::CLS_WRITING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/persistent_target")});
+
+    CacheLocationMap loc_map;
+    loc_map.emplace(source->id(), source);
+    loc_map.emplace(target->id(), target);
+    batch_get_loc_out_maps = {loc_map};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGroupBytesWaterLevelExceed(true);
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    // Without a write-session manager, ordinary WRITING eligibility cannot
+    // be established. Removing CopyGuard must not weaken that existing rule.
+    EXPECT_EQ((std::vector<std::string>{"persistent_source"}), out[0]);
+
+    auto write_location_manager = std::make_shared<WriteLocationManager>();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
+    ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_EQ((std::set<std::string>{"persistent_source", "persistent_target"}),
+              (std::set<std::string>(out[0].begin(), out[0].end())));
+}
+
 /* -------- keep_both 分层淘汰优先级（多副本保冷弃热）stub + test -------- */
 namespace {
 std::shared_ptr<const InstanceGroup> g_cold_ig;
@@ -7252,6 +7306,43 @@ std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
     return std::vector<ErrorCode>(requests.size(), ErrorCode::EC_OK);
 }
 
+namespace {
+std::vector<MigrationManager::MigrationRequest> limited_copy_accepted_reqs;
+std::vector<ErrorCode> limited_copy_results;
+
+// This dispatch fixture stubs metadata and does not exercise actual backend
+// submission. Model the BatchSubmit group gate separately from its candidate
+// input; the real gate/byte-credit path is covered in MigrationManagerTest.
+std::vector<ErrorCode> MigrationManager_BatchSubmitWithGroupLimit_stub(
+    void *obj,
+    const std::string &trace_id,
+    std::vector<MigrationManager::MigrationRequest> requests,
+    MigrationManager::CopyConcurrencyLimit copy_limit,
+    bool lifecycle_lock_held) {
+    MigrationManager_BatchSubmit_stub(obj, trace_id, requests, copy_limit, lifecycle_lock_held);
+    auto *manager = static_cast<MigrationManager *>(obj);
+    const auto active = manager->ActiveTaskCountForGroup(copy_limit.instance_group_name);
+    auto available = copy_limit.enabled()
+                         ? (copy_limit.max_concurrency > active ? copy_limit.max_concurrency - active : 0)
+                         : SIZE_MAX;
+    limited_copy_accepted_reqs.clear();
+    limited_copy_results.assign(requests.size(), EC_OUT_OF_LIMIT);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (copy_limit.enabled() && requests[i].instance_group_name != copy_limit.instance_group_name) {
+            limited_copy_results[i] = EC_BADARGS;
+            continue;
+        }
+        if (available == 0) {
+            continue;
+        }
+        limited_copy_results[i] = EC_OK;
+        limited_copy_accepted_reqs.push_back(requests[i]);
+        --available;
+    }
+    return limited_copy_results;
+}
+} // namespace
+
 ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
                                                    const std::string &instance_id,
                                                    const std::vector<std::int64_t> &block_keys,
@@ -7290,7 +7381,7 @@ MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, 
 }
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
-    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmitWithGroupLimit_stub);
     stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
 
     cache_reclaimer_->job_state_flag_ = true; // 让 IsRunning() 为真，无需启动 cron 线程
@@ -7303,6 +7394,8 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
         config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
         config->set_migration_copy_max_concurrency(static_cast<int64_t>(copy_limit));
+        // Async Prepare does not imply ASYNC_REQUIRED Copy: use the SYNC limit.
+        config->set_migration_async_copy_max_concurrency(static_cast<int64_t>(copy_limit + 16));
         config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
         instance_group->set_cache_config(config);
         EnableAsyncMigration(instance_group, ins_info);
@@ -7355,9 +7448,16 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        // 3 个合格候选，预算 2 -> 只提交 2 个
-        ASSERT_EQ(2u, captured_copy_reqs.size());
-        for (const auto &req : captured_copy_reqs) {
+        // 候选不能按 slot 数提前截断；全部 3 项交给 BatchSubmit 的 group
+        // 硬准入，只有 2 项成功，第三项明确返回 EC_OUT_OF_LIMIT。
+        ASSERT_EQ(3u, captured_copy_reqs.size());
+        ASSERT_FALSE(captured_copy_limits.empty());
+        ASSERT_TRUE(captured_copy_limits.back().enabled());
+        ASSERT_EQ(ins_info->instance_group_name(), captured_copy_limits.back().instance_group_name);
+        ASSERT_EQ(2u, captured_copy_limits.back().max_concurrency);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OUT_OF_LIMIT}), limited_copy_results);
+        ASSERT_EQ(2u, limited_copy_accepted_reqs.size());
+        for (const auto &req : limited_copy_accepted_reqs) {
             ASSERT_TRUE(req.block_key == 20 || req.block_key == 21 || req.block_key == 22);
             ASSERT_EQ("hot_01", req.src_storage_name);
         }
@@ -7381,7 +7481,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_EQ("cold_01", captured_mark_target);
     }
 
-    // ---- 场景 D：copy + mark 互斥分发，copy 优先；copy 槽位外才 mark ----
+    // ---- 场景 D：copy + mark 互斥分发，copy 优先；硬准入拒绝的候选回落 mark ----
     {
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
@@ -7394,10 +7494,17 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        ASSERT_EQ(2u, captured_copy_reqs.size());
+        ASSERT_EQ(3u, captured_copy_reqs.size());
+        ASSERT_FALSE(captured_copy_limits.empty());
+        ASSERT_TRUE(captured_copy_limits.back().enabled());
+        ASSERT_EQ(ins_info->instance_group_name(), captured_copy_limits.back().instance_group_name);
+        ASSERT_EQ(2u, captured_copy_limits.back().max_concurrency);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OUT_OF_LIMIT}), limited_copy_results);
+        ASSERT_EQ(2u, limited_copy_accepted_reqs.size());
         ASSERT_EQ(1u, captured_mark_keys.size());
+        ASSERT_EQ(22, captured_mark_keys.front());
         std::vector<std::int64_t> copied_keys;
-        for (const auto &req : captured_copy_reqs) {
+        for (const auto &req : limited_copy_accepted_reqs) {
             copied_keys.push_back(req.block_key);
             ASSERT_FALSE(VecContains(captured_mark_keys, req.block_key));
         }
