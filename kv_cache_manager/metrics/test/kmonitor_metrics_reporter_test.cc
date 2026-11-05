@@ -27,6 +27,15 @@ thread_local MetricsTags reported_grpc_tags;
 thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
 thread_local std::map<std::string, std::vector<double>> reported_dispatch_samples;
 thread_local std::map<std::string, kmonitor::MetricType> reported_dispatch_types;
+thread_local std::map<std::pair<std::string, MetricsTags>, std::vector<double>> reported_queue_wait;
+
+void CaptureQueueWait(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    const auto offset = metric->metric_name_.find("service.request_queue_wait_seconds_");
+    if (offset != std::string::npos) {
+        EXPECT_EQ(kmonitor::GAUGE, metric->GetMetricType());
+        reported_queue_wait[{metric->metric_name_.substr(offset), tags->GetTagsMap()}].push_back(value);
+    }
+}
 
 void CaptureMetaCacheUsage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
@@ -336,6 +345,54 @@ TEST_F(KmonitorMetricsReporterTest, DispatchMetricsReportCurrentGaugesAndCumulat
     }
     EXPECT_EQ(5u, rejected.Get());
     EXPECT_EQ(7u, discarded.Get());
+}
+
+TEST_F(KmonitorMetricsReporterTest, QueueWaitReportsCumulativeBucketsAndSumInSeconds) {
+    const std::string family = "service.request_queue_wait_seconds";
+    const MetricsTags finite_tags{{"le", "0.001000"}};
+    const MetricsTags inf_tags{{"le", "+Inf"}};
+    auto finite = metrics_registry_->GetCounter(family + "_bucket", finite_tags);
+    auto inf = metrics_registry_->GetCounter(family + "_bucket", inf_tags);
+    auto sum = metrics_registry_->GetCounter(family + "_sum");
+    auto count = metrics_registry_->GetCounter(family + "_count");
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureQueueWait);
+    reported_queue_wait.clear();
+    reporter_->ReportInterval();
+    EXPECT_TRUE(reported_queue_wait.empty());
+
+    finite += 0;
+    inf += 0;
+    sum += 0;
+    count += 0;
+    reporter_->ReportInterval();
+    finite += 2;
+    inf += 3;
+    sum += 2500;
+    count += 3;
+    reporter_->ReportInterval();
+    reporter_->ReportInterval();
+    inf += 1;
+    sum += 500000;
+    count += 1;
+    reporter_->ReportInterval();
+
+    const std::map<std::pair<std::string, MetricsTags>, std::vector<double>> expected{
+        {{family + "_bucket", finite_tags}, {0, 2, 2, 2}},
+        {{family + "_bucket", inf_tags}, {0, 3, 3, 4}},
+        {{family + "_sum", {}}, {0, 0.0025, 0.0025, 0.5025}},
+        {{family + "_count", {}}, {0, 3, 3, 4}},
+    };
+    ASSERT_EQ(expected.size(), reported_queue_wait.size());
+    for (const auto &[key, samples] : expected) {
+        ASSERT_EQ(samples.size(), reported_queue_wait[key].size());
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            EXPECT_DOUBLE_EQ(samples[i], reported_queue_wait[key][i]);
+        }
+    }
+    EXPECT_EQ(502500u, sum.Get()); // Reporting never resets the registry.
 }
 
 TEST_F(KmonitorMetricsReporterTest, RequestOutcomeControlsKmonitorAndLocalErrorCounts) {

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -48,6 +50,18 @@ public:
         kDrain
     };
 
+    // Fixed upper bounds in microseconds. The last bucket holds larger waits.
+    inline static constexpr std::array<uint64_t, 21> kQueueWaitBoundsUs{
+        1,     5,     10,    25,     50,     100,    250,     500,     1000,     2500,    5000,
+        10000, 25000, 50000, 100000, 250000, 500000, 1000000, 5000000, 10000000, 60000000};
+
+    struct QueueWaitStats {
+        uint64_t count = 0;
+        uint64_t sum_us = 0;
+        // Non-cumulative bins: each claimed task increments exactly one bin.
+        std::array<uint64_t, kQueueWaitBoundsUs.size() + 1> buckets{};
+    };
+
     struct Snapshot {
         std::size_t queued = 0;
         std::size_t running = 0;
@@ -55,6 +69,7 @@ public:
         std::size_t completion_tokens = 0;
         std::size_t rejected = 0;
         std::size_t discarded = 0;
+        QueueWaitStats queue_wait;
     };
 
     explicit ServiceRequestExecutor(std::size_t worker_count, std::size_t queue_capacity = 0);

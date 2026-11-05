@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <future>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -48,6 +49,37 @@ private:
 
 Executor::Task MakeTask(std::function<void(Token)> run) {
     return {std::move(run), [](Token) { ADD_FAILURE() << "unexpected task discard"; }};
+}
+
+TEST(ServiceRequestExecutorTest, QueueWaitEndsWhenWorkerClaimsTask) {
+    Gate gate;
+    Executor executor(1);
+    EXPECT_EQ(0u, executor.GetSnapshot().queue_wait.count);
+    EXPECT_EQ(Result::kAccepted, executor.TrySubmit(MakeTask([&](Token) { gate.Enter(); })));
+    EXPECT_TRUE(gate.WaitForArrivals(1));
+    const auto first = executor.GetSnapshot().queue_wait;
+    EXPECT_EQ(1u, first.count);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(Result::kAccepted, executor.TrySubmit(MakeTask([](Token) {})));
+    }
+    std::this_thread::sleep_for(20ms);
+    const auto blocked = executor.GetSnapshot().queue_wait;
+    // The running task's business time and tasks not yet claimed add no samples.
+    EXPECT_EQ(first.count, blocked.count);
+    EXPECT_EQ(first.sum_us, blocked.sum_us);
+    EXPECT_EQ(first.buckets, blocked.buckets);
+    executor.CloseAdmission(Mode::kDrain);
+    gate.Open();
+    executor.Drain();
+    const auto done = executor.GetSnapshot().queue_wait;
+    EXPECT_EQ(3u, done.count);
+    EXPECT_GE(done.sum_us - first.sum_us, 40000u);
+    EXPECT_EQ(done.count, std::accumulate(done.buckets.begin(), done.buckets.end(), uint64_t{0}));
+    for (std::size_t i = 0; i < Executor::kQueueWaitBoundsUs.size(); ++i) {
+        if (Executor::kQueueWaitBoundsUs[i] <= 10000) {
+            EXPECT_EQ(first.buckets[i], done.buckets[i]);
+        }
+    }
 }
 
 TEST(ServiceRequestExecutorTest, WorkersShareQueueAndBoundBusinessConcurrency) {
@@ -157,6 +189,7 @@ TEST(ServiceRequestExecutorTest, PositiveCapacityCountsOnlyWaitingTasks) {
     executor.Join();
     EXPECT_EQ(2u, completed.load());
     EXPECT_EQ(2u, executor.GetSnapshot().rejected);
+    EXPECT_EQ(3u, executor.GetSnapshot().queue_wait.count);
 }
 
 TEST(ServiceRequestExecutorTest, DefaultCloseDiscardsPendingOutsideQueueMutex) {
@@ -186,6 +219,7 @@ TEST(ServiceRequestExecutorTest, DefaultCloseDiscardsPendingOutsideQueueMutex) {
     executor.CloseAdmission();
     EXPECT_EQ(8u, discarded);
     EXPECT_EQ(8u, executor.GetSnapshot().discarded);
+    EXPECT_EQ(1u, executor.GetSnapshot().queue_wait.count);
     EXPECT_EQ(0u, executor.GetSnapshot().discarding);
     EXPECT_EQ(0u, running_completed.load());
     gate.Open();
@@ -271,6 +305,10 @@ TEST(ServiceRequestExecutorTest, ConcurrentCloseAndDequeueChooseExactlyOneCallba
         opener.join();
         executor.Drain();
         executor.Join();
+        const auto snapshot = executor.GetSnapshot();
+        EXPECT_EQ(kTasks + 2, snapshot.queue_wait.count + snapshot.discarded);
+        EXPECT_EQ(snapshot.queue_wait.count,
+                  std::accumulate(snapshot.queue_wait.buckets.begin(), snapshot.queue_wait.buckets.end(), uint64_t{0}));
         for (const auto &visit : visits) {
             EXPECT_EQ(1u, visit.load()) << "round=" << round;
         }

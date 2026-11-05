@@ -1,5 +1,7 @@
 #include "kv_cache_manager/service/service_request_executor.h"
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <stdexcept>
@@ -13,6 +15,7 @@ struct ServiceRequestExecutor::State {
     struct Entry {
         Task task;
         CompletionToken completion;
+        std::chrono::steady_clock::time_point enqueued_at;
     };
 
     explicit State(std::size_t capacity) : queue_capacity(capacity) {}
@@ -28,6 +31,7 @@ struct ServiceRequestExecutor::State {
     std::size_t completion_tokens = 0;
     std::size_t rejected = 0;
     std::size_t discarded = 0;
+    QueueWaitStats queue_wait;
 };
 
 struct ServiceRequestExecutor::CompletionLease {
@@ -89,9 +93,12 @@ ServiceRequestExecutor::SubmitResult ServiceRequestExecutor::TrySubmit(Task task
             ++state_->rejected;
             return SubmitResult::kFull;
         }
-        state_->queue.push_back({std::move(task), CompletionToken(lease)});
+        state_->queue.push_back({std::move(task), CompletionToken(lease), {}});
         ++state_->completion_tokens;
         lease->accepted = true;
+        // Timestamp only successful admission, after any deque allocation and
+        // before a worker can claim the task. Wall-clock changes do not matter.
+        state_->queue.back().enqueued_at = std::chrono::steady_clock::now();
     }
     state_->work_available.notify_one();
     return SubmitResult::kAccepted;
@@ -124,9 +131,7 @@ void ServiceRequestExecutor::CloseAdmission(ShutdownMode mode) {
                 entry.task.on_discard(std::move(entry.completion));
             } catch (const std::exception &e) {
                 KVCM_LOG_ERROR("service request discard callback threw: %s", e.what());
-            } catch (...) {
-                KVCM_LOG_ERROR("service request discard callback threw an unknown exception");
-            }
+            } catch (...) { KVCM_LOG_ERROR("service request discard callback threw an unknown exception"); }
         }
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
@@ -161,7 +166,8 @@ ServiceRequestExecutor::Snapshot ServiceRequestExecutor::GetSnapshot() const {
             state_->discarding,
             state_->completion_tokens,
             state_->rejected,
-            state_->discarded};
+            state_->discarded,
+            state_->queue_wait};
 }
 
 void ServiceRequestExecutor::WorkerLoop(const std::shared_ptr<State> &state) {
@@ -177,14 +183,22 @@ void ServiceRequestExecutor::WorkerLoop(const std::shared_ptr<State> &state) {
                 entry = std::move(state->queue.front());
                 state->queue.pop_front();
                 ++state->running;
+                const auto wait_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                               std::chrono::steady_clock::now() - entry.enqueued_at)
+                                                               .count());
+                const auto bucket = std::lower_bound(kQueueWaitBoundsUs.begin(), kQueueWaitBoundsUs.end(), wait_us) -
+                                    kQueueWaitBoundsUs.begin();
+                // Reuse the dequeue lock for three integer updates. No metric
+                // lookup, allocation or per-request reporting on this path.
+                ++state->queue_wait.count;
+                state->queue_wait.sum_us += wait_us;
+                ++state->queue_wait.buckets[bucket];
             }
             try {
                 entry.task.run(std::move(entry.completion));
             } catch (const std::exception &e) {
                 KVCM_LOG_ERROR("service request callback threw: %s", e.what());
-            } catch (...) {
-                KVCM_LOG_ERROR("service request callback threw an unknown exception");
-            }
+            } catch (...) { KVCM_LOG_ERROR("service request callback threw an unknown exception"); }
         }
         {
             std::lock_guard<std::mutex> lock(state->mutex);

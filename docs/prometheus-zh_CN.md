@@ -186,7 +186,26 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 异步 Meta 的 worker 和 CQ 不受 `grpc_max_threads` 同步线程配额约束，原 Meta 因同步线程耗尽产生的 RESOURCE_EXHAUSTED 信号不再适用；其他资源限制仍可能产生该状态。默认队列不限长，应结合 `service.request_queue_length`、请求延迟和进程内存监控积压。正数队列容量拒绝、关闭提交及停机丢弃使用 gRPC OK + SERVICE_NOT_READY，因此不会增加 RESOURCE_EXHAUSTED，也不进入 ServiceCallGuard 的 `service.error_counter`，应分别查看 rejected/discarded 指标。
 
-四项业务池指标不带请求/Instance 标签，按 `kvcm.metrics.report_interval_ms` 采样（默认 20 秒）；counter 值累计，Prometheus 中可使用 rate/increase，名称中的点按 exporter 规则转换为下划线。停机补采最终值并记录汇总日志，但不保证 Prometheus 在端口关闭前抓到该值。旧 request_queue_size 不等于新的队列长度指标。
+业务池指标不带请求/协议/Instance 标签，按 `kvcm.metrics.report_interval_ms` 采样（默认 20 秒）；counter 值累计，Prometheus 中可使用 rate/increase，名称中的点按 exporter 规则转换为下划线。排队耗时直方图的桶另带 `le` 标签。停机补采最终值并记录汇总日志，但不保证 Prometheus 在端口关闭前抓到该值。旧 request_queue_size 不等于新的队列长度指标。
+
+### Meta 请求排队耗时
+
+`service.request_queue_wait_seconds` 统计 Meta HTTP/gRPC 从成功入队到 worker 领取的等待时间，使用单调时钟，包含零等待样本。被领取后准备失败或业务返回错误的任务也计入；提交被拒绝、停机丢弃和尚未领取的任务不计入。它不含业务执行和响应交接时间，也不包含提交前获取队列锁的等待。持续过载时应同时观察队列长度，不能把尚未出队的任务当作零耗时。
+
+直方图输出 `kvcm_service_request_queue_wait_seconds_bucket{le="..."}`、`_sum`、`_count`，桶上界和总耗时单位均为秒。固定桶从 1 微秒覆盖到 60 秒，另有 `+Inf`；P95/P99 是分桶估算，不能用最大有限桶精确表示超过 60 秒的尾部。以下查询聚合选中进程的最近 5 分钟样本，无样本时结果可能为 NaN；可按部署标签筛选或分组。计算方式见 [Prometheus 直方图说明](https://prometheus.io/docs/practices/histograms/)。
+
+```promql
+# 平均排队时间（秒）
+sum(rate(kvcm_service_request_queue_wait_seconds_sum[5m]))
+/
+sum(rate(kvcm_service_request_queue_wait_seconds_count[5m]))
+
+# P95（秒）；P99 将 0.95 改为 0.99
+histogram_quantile(0.95,
+  sum by (le) (rate(kvcm_service_request_queue_wait_seconds_bucket[5m])))
+```
+
+KMonitor 显式上报 `service.request_queue_wait_seconds_bucket`、`_sum`、`_count`，均沿用累计 GAUGE 约定，`le` 标签保留；总耗时转换为秒。按时间窗口的累计值增量计算分布和均值，不把重复上报的累计值当作新增请求累加。服务内只维护固定分桶，分位数在查询端计算。
 
 ### 周期性指标
 
@@ -196,6 +215,7 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.request_running` | gauge | 已被 worker 领取、尚未完成任务函数的任务数 |
 | `service.request_rejected` | counter | 提交因队列满或关闭被拒绝的累计次数 |
 | `service.request_discarded` | counter | 停机 discard_pending 丢弃待执行任务的累计数量 |
+| `service.request_queue_wait_seconds` | histogram | Meta 成功入队至 worker 领取的等待时间分布，单位秒；输出 `_bucket`、`_sum`、`_count` |
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
 | `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |

@@ -149,6 +149,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service",
         "//kv_cache_manager/service:service_request_executor",
     ],

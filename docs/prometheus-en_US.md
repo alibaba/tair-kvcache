@@ -198,7 +198,26 @@ errors produced by ServiceImpl remain in `service.error_counter`.
 
 Async Meta workers and CQ pollers are outside the `grpc_max_threads` synchronous-thread quota. Meta no longer emits RESOURCE_EXHAUSTED because of that synchronous-thread limit; other resource limits can still produce it. The default unlimited queue requires monitoring `service.request_queue_length`, request latency and process memory. Queue-full/closed rejection and shutdown discard use gRPC OK with SERVICE_NOT_READY in the body. They do not increment RESOURCE_EXHAUSTED or enter ServiceCallGuard's `service.error_counter`; use the rejected/discarded metrics instead.
 
-The four executor metrics have no request/Instance labels and are sampled every `kvcm.metrics.report_interval_ms` (20 seconds by default). Counters are cumulative and support rate/increase in Prometheus; dots in names become underscores through the exporter. Shutdown takes a final sample and writes a summary log, but a final Prometheus scrape before the endpoint closes is not guaranteed. The legacy request_queue_size is not an alias for request_queue_length.
+Executor metrics have no request/protocol/Instance labels and are sampled every `kvcm.metrics.report_interval_ms` (20 seconds by default). Counters are cumulative and support rate/increase in Prometheus; dots in names become underscores through the exporter. Queue-wait histogram buckets additionally carry `le`. Shutdown takes a final sample and writes a summary log, but a final Prometheus scrape before the endpoint closes is not guaranteed. The legacy request_queue_size is not an alias for request_queue_length.
+
+### Meta request queue wait
+
+`service.request_queue_wait_seconds` measures Meta HTTP/gRPC time from successful admission until a worker claims the task, using a monotonic clock and including zero waits. Claimed tasks count even if preparation or business execution later fails. Rejected, discarded and still-queued tasks do not contribute samples. Business execution, response handoff and waiting to acquire the admission mutex are excluded. During sustained overload, also inspect queue length: tasks not yet claimed have no wait sample, not a zero wait.
+
+The histogram exports `kvcm_service_request_queue_wait_seconds_bucket{le="..."}`, `_sum` and `_count`; bounds and sums are in seconds. Fixed buckets span 1 microsecond to 60 seconds, plus `+Inf`. P95/P99 are bucket estimates; the largest finite bucket cannot precisely represent tails above 60 seconds. These queries aggregate selected processes over five minutes; no observations can yield NaN. Add deployment-label filters or grouping as needed. See [Prometheus histogram guidance](https://prometheus.io/docs/practices/histograms/).
+
+```promql
+# Mean queue wait (seconds)
+sum(rate(kvcm_service_request_queue_wait_seconds_sum[5m]))
+/
+sum(rate(kvcm_service_request_queue_wait_seconds_count[5m]))
+
+# P95 (seconds); replace 0.95 with 0.99 for P99
+histogram_quantile(0.95,
+  sum by (le) (rate(kvcm_service_request_queue_wait_seconds_bucket[5m])))
+```
+
+KMonitor explicitly reports `service.request_queue_wait_seconds_bucket`, `_sum` and `_count` as cumulative GAUGEs, preserving `le` and converting the sum to seconds. Calculate distributions and means from counter changes over the chosen window; repeated cumulative reports are not new observations. The service only maintains fixed buckets; quantiles are calculated at query time.
 
 ### Interval Metrics
 
@@ -208,6 +227,7 @@ The four executor metrics have no request/Instance labels and are sampled every 
 | `service.request_running` | gauge | Tasks claimed by workers whose task functions have not finished |
 | `service.request_rejected` | counter | Cumulative submissions rejected because admission is closed or the queue is full |
 | `service.request_discarded` | counter | Cumulative queued tasks discarded during discard_pending shutdown |
+| `service.request_queue_wait_seconds` | histogram | Meta wait from successful admission until a worker claims the task, in seconds; exports `_bucket`, `_sum` and `_count` |
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
 | `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |

@@ -578,6 +578,24 @@ void Server::ReportMetrics(bool final_snapshot) {
             metrics_registry_->GetCounter("service.request_discarded") += state.discarded - last_request_discarded_;
             last_request_rejected_ = state.rejected;
             last_request_discarded_ = state.discarded;
+
+            // Publish cumulative histogram buckets from one consistent snapshot.
+            // The existing exporter stores sums in microseconds and emits seconds.
+            const std::string family = "service.request_queue_wait_seconds";
+            metrics_registry_->RegisterHistogramFamily(family);
+            for (const auto *suffix : {"_bucket", "_sum", "_count"}) {
+                metrics_registry_->MapMetricToFamily(family + suffix, family);
+            }
+            uint64_t cumulative_delta = 0;
+            for (std::size_t i = 0; i < state.queue_wait.buckets.size(); ++i) {
+                cumulative_delta += state.queue_wait.buckets[i] - last_queue_wait_.buckets[i];
+                const auto &bounds = ServiceRequestExecutor::kQueueWaitBoundsUs;
+                const auto le = i < bounds.size() ? std::to_string(static_cast<double>(bounds[i]) / 1e6) : "+Inf";
+                metrics_registry_->GetCounter(family + "_bucket", {{"le", le}}) += cumulative_delta;
+            }
+            metrics_registry_->GetCounter(family + "_sum") += state.queue_wait.sum_us - last_queue_wait_.sum_us;
+            metrics_registry_->GetCounter(family + "_count") += state.queue_wait.count - last_queue_wait_.count;
+            last_queue_wait_ = state.queue_wait;
         }
         if (final_snapshot) {
             KVCM_LOG_INFO("service request executor stopped: queued=%zu, running=%zu, rejected=%zu, discarded=%zu",

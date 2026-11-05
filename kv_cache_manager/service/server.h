@@ -7,6 +7,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/service/server_config.h"
+#include "kv_cache_manager/service/service_request_executor.h"
 
 namespace grpc {
 class Server;
@@ -34,7 +35,6 @@ class MetricsReporter;
 class MetricsReporterFactory;
 struct MetricsLifecycle;
 class LoopThread;
-class ServiceRequestExecutor;
 
 class Server {
 public:
@@ -94,5 +94,6 @@ private:
     // Accessed by the report thread, then by Stop after that thread is joined.
     uint64_t last_request_rejected_ = 0;
     uint64_t last_request_discarded_ = 0;
+    ServiceRequestExecutor::QueueWaitStats last_queue_wait_;
 };
 } // namespace kv_cache_manager

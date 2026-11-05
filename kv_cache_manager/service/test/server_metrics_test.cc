@@ -6,6 +6,7 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/service_request_executor.h"
 
@@ -151,9 +152,35 @@ TEST_F(ServerMetricsTest, StopReportsDiscardsBeforeNextIntervalAndIsIdempotent) 
     EXPECT_EQ(2u, reports.back().rejected);
     EXPECT_EQ(1u, reports.back().discarded);
     EXPECT_EQ(1u, server_.metrics_registry_->GetCounter("service.request_discarded").Get());
+    const auto wait = server_.request_executor_->GetSnapshot().queue_wait;
+    EXPECT_EQ(1u, wait.count); // Rejection and pending discard do not add wait samples.
+    EXPECT_EQ(wait.count, server_.metrics_registry_->GetCounter("service.request_queue_wait_seconds_count").Get());
+    EXPECT_EQ(wait.sum_us, server_.metrics_registry_->GetCounter("service.request_queue_wait_seconds_sum").Get());
 
     server_.Stop();
     EXPECT_EQ(2u, reporter_->Reports().size());
+}
+
+TEST_F(ServerMetricsTest, QueueWaitHistogramExportsSecondsAndDoesNotCountRepeatedSnapshots) {
+    server_.ReportMetrics();
+    EXPECT_EQ(0u, server_.metrics_registry_->GetCounter("service.request_queue_wait_seconds_count").Get());
+    ASSERT_NO_FATAL_FAILURE(BlockWorker());
+    const auto wait = server_.request_executor_->GetSnapshot().queue_wait;
+    server_.ReportMetrics();
+    server_.ReportMetrics();
+    const auto output = PrometheusExporter::Expose(*server_.metrics_registry_, "kvcm", {});
+    EXPECT_NE(std::string::npos, output.find("# TYPE kvcm_service_request_queue_wait_seconds histogram\n"));
+    EXPECT_NE(std::string::npos, output.find("kvcm_service_request_queue_wait_seconds_count 1\n"));
+    EXPECT_NE(std::string::npos, output.find("kvcm_service_request_queue_wait_seconds_bucket{le=\"+Inf\"} 1\n"));
+    const std::string prefix = "kvcm_service_request_queue_wait_seconds_sum ";
+    const auto offset = output.find(prefix);
+    ASSERT_NE(std::string::npos, offset);
+    const auto expected_seconds = static_cast<double>(wait.sum_us) / 1e6;
+    EXPECT_NEAR(expected_seconds, std::stod(output.substr(offset + prefix.size())), expected_seconds * 1e-5 + 1e-12);
+    EXPECT_EQ(wait.sum_us, server_.metrics_registry_->GetCounter("service.request_queue_wait_seconds_sum").Get());
+    gate_.Open();
+    server_.Stop();
+    EXPECT_EQ(1u, server_.metrics_registry_->GetCounter("service.request_queue_wait_seconds_count").Get());
 }
 
 TEST_F(ServerMetricsTest, RepeatedSamplesAccumulateOnlyNewCounts) {
