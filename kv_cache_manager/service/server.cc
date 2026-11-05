@@ -536,10 +536,12 @@ bool Server::StartMetricsReportThread() {
 }
 
 void Server::Stop() {
-    if (stop_) {
-        return;
-    }
-    stop_ = true;
+    // 重复或并发的关闭请求（信号路径与启动失败路径）只执行一次完整关闭，
+    // 其余调用者在这里等待该次关闭完成后返回。
+    std::call_once(stop_once_, [this] { DoStop(); });
+}
+
+void Server::DoStop() {
     KVCM_LOG_INFO("server stopping...");
     // Lifecycle callbacks need the service gates and managers to remain alive.
     if (leader_elector_) {

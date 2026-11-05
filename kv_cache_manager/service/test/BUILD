@@ -5,6 +5,8 @@ cc_test(
     srcs = ["service_impl_base_test.cc"],
     copts = ["-fno-access-control"],
     deps = [
+        "//kv_cache_manager/common:loop_thread",
+        "//kv_cache_manager/common:shutdown_controller",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/config:leader_elector_base",
@@ -71,6 +73,19 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "CommandLineShutdownTest",
+    srcs = [
+        "command_line_shutdown_test.cc",
+    ],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
     ],
 )
 

@@ -204,6 +204,22 @@ cc_test(
 )
 
 cc_test(
+    name = "leader_elector_shutdown_test",
+    srcs = [
+        "leader_elector_shutdown_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:loop_thread",
+        "//kv_cache_manager/common:shutdown_controller",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+    ],
+)
+
+cc_test(
     name = "leader_elector_reconcile_test",
     srcs = ["leader_elector_reconcile_test.cc"],
     copts = ["-fno-access-control"],
