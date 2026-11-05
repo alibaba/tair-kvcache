@@ -116,7 +116,11 @@ void LocalMetricsReporter::ReportInterval() {
     // purge with EmplaceMetricsCollector calls below
     std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
 
+    const auto &provider = GetStorageUsageProvider();
+
     do {
+        report_storage_usage_ = !provider || provider();
+        data_storage_interval_metrics_collectors_.Reset();
         // for data storage metrics
         const auto registry_manager = cache_manager_->GetRegistryManager();
         if (!registry_manager) {
@@ -127,21 +131,40 @@ void LocalMetricsReporter::ReportInterval() {
             break;
         }
 
-        data_storage_interval_metrics_collectors_.Reset();
         const auto storage_names = data_storage_manager->GetAllStorageNames();
         for (const auto &unique_name : storage_names) {
             const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
             if (storage_backend == nullptr) {
                 continue;
             }
-            const auto p =
-                data_storage_interval_metrics_collectors_.EmplaceMetricsCollector<DataStorageIntervalMetricsCollector>(
-                    metrics_registry_,
-                    MetricsTags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}});
-            SET_METRICS_(p, data_storage, healthy_status, storage_backend->Available() ? 1.0 : 0.0);
-            SET_METRICS_(p, data_storage, writable_status, storage_backend->Writable() ? 1.0 : 0.0);
-            SET_METRICS_(
-                p, data_storage, storage_usage_ratio, storage_backend->GetStorageUsageRatio("trace_report_interval"));
+            // Potentially slow backend observations run outside the storage
+            // lifecycle lock. Cleanup may finish while they are in flight.
+            const double healthy = storage_backend->Available() ? 1.0 : 0.0;
+            const double writable = storage_backend->Writable() ? 1.0 : 0.0;
+            const double usage_ratio = report_storage_usage_
+                                           ? storage_backend->GetStorageUsageRatio("trace_report_interval")
+                                           : 0.0;
+            data_storage_manager->PublishMetricsIfCurrent(unique_name, storage_backend, [&]() {
+                const MetricsTags tags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}};
+                if (!report_storage_usage_) {
+                    // A follower may still have a backend awaiting cleanup.
+                    // Omit its capacity without scanning historical series.
+                    metrics_registry_->Remove(
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio), tags);
+                }
+                const auto p = std::make_shared<DataStorageIntervalMetricsCollector>(metrics_registry_, tags);
+                if (!p->Init(report_storage_usage_)) {
+                    return;
+                }
+                data_storage_interval_metrics_collectors_.AddMetricsCollector(p);
+                SET_METRICS_(p, data_storage, healthy_status, healthy);
+                SET_METRICS_(p, data_storage, writable_status, writable);
+                // Preserve default zero; an unknown negative value does not
+                // overwrite the last valid observation in this backend lifetime.
+                if (report_storage_usage_ && usage_ratio >= 0.0) {
+                    SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);
+                }
+            });
         }
     } while (false);
 

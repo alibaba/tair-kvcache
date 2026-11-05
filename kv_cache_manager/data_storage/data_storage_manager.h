@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -36,6 +37,13 @@ public:
     RegisterStorage(RequestContext *request_context, const std::string &name, const StorageConfig &storage_config);
     ErrorCode UnRegisterStorage(const std::string &name);
     ErrorCode DoCleanup();
+
+    // Publish only while this exact backend is still registered. The callback
+    // must be short, perform no backend/network I/O and not reenter this manager.
+    // Unregister/cleanup use the same storage lock to detach metric series.
+    bool PublishMetricsIfCurrent(const std::string &name,
+                                 const std::shared_ptr<DataStorageBackend> &backend,
+                                 const std::function<void()> &publish) const;
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
                                                              const std::string &unique_name,

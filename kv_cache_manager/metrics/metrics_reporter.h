@@ -1,8 +1,10 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -24,7 +26,15 @@ public:
     virtual std::shared_ptr<MetricsRegistry> GetMetricsRegistry() = 0;
     const MetricsTags &GetCommonTags() const { return common_tags_; }
 
+    // Optional capacity eligibility check, sampled once per interval.
+    // Callers without a provider retain normal capacity reporting.
+    using StorageUsageProvider = std::function<bool()>;
+    void SetStorageUsageProvider(StorageUsageProvider provider) { storage_usage_provider_ = std::move(provider); }
+
 protected:
+    StorageUsageProvider storage_usage_provider_;
+    const StorageUsageProvider &GetStorageUsageProvider() const { return storage_usage_provider_; }
+
     // Process-level tags resolved at startup. Each backend decides how to
     // export them; they never participate in MetricsRegistry series identity.
     MetricsTags common_tags_;

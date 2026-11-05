@@ -735,22 +735,24 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // for data storage metrics
-        // these metrics are already updated by local metrics reporter
-        // so report them directly to kmonitor
+        // Report the Local snapshot without taking storage lifecycle locks.
+        // Known limitation: unload/replacement after sampling can leave one
+        // round of old samples to push. The next Local interval refreshes it.
         const auto &vec = data_storage_interval_metrics_collectors_.GetMetricsCollectors();
         for (const auto &mc : vec) {
             if (const auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc); p != nullptr) {
                 const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
                 double healthy_status_v;
                 double writable_status_v;
-                double storage_usage_ratio_v;
                 GET_METRICS_(p, data_storage, healthy_status, healthy_status_v);
                 REPORT_METRICS(data_storage, healthy_status, healthy_status_v);
                 GET_METRICS_(p, data_storage, writable_status, writable_status_v);
                 REPORT_METRICS(data_storage, writable_status, writable_status_v);
-                GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
-                REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                if (report_storage_usage_) {
+                    double storage_usage_ratio_v;
+                    GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                    REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                }
             }
         }
     } while (false);

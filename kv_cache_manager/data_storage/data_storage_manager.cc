@@ -137,6 +137,9 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
                       ec);
         return ec;
     }
+    if (metrics_registry_) {
+        metrics_registry_->RemoveByTagFilter({{"unique_name", name}});
+    }
     storage_map_.erase(iter);
     return ec;
 }
@@ -156,11 +159,28 @@ ErrorCode DataStorageManager::DoCleanup() {
                           ec);
             result = ec;
         }
+        // The backend is unloaded even if Close failed. Detach all of its
+        // metric handles before permitting any new publication or registration.
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"unique_name", pair.first}});
+        }
     }
     storage_map_.clear();
 
     KVCM_LOG_INFO("data storage manager cleanup completed");
     return result;
+}
+
+bool DataStorageManager::PublishMetricsIfCurrent(const std::string &name,
+                                                const std::shared_ptr<DataStorageBackend> &backend,
+                                                const std::function<void()> &publish) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const auto it = storage_map_.find(name);
+    if (!backend || it == storage_map_.end() || it->second != backend) {
+        return false;
+    }
+    publish();
+    return true;
 }
 
 std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(const DataStorageType &type) {

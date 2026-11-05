@@ -158,6 +158,7 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
+        "@cpp_stub",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
@@ -182,5 +183,21 @@ cc_test(
         "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/service:admin_service_impl",
+    ],
+)
+
+cc_test(
+    name = "ServerStorageUsageMetricsTest",
+    srcs = ["server_storage_usage_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
     ],
 )

@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
 #include <thread>
@@ -477,6 +478,236 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
     }
 }
 
+
+namespace {
+// NfsBackend with a controllable usage ratio, used to verify how
+// ReportInterval handles valid readings, default zero and negative values.
+class FakeRatioNfsBackend : public NfsBackend {
+public:
+    explicit FakeRatioNfsBackend(std::shared_ptr<MetricsRegistry> registry) : NfsBackend(std::move(registry)) {}
+    double GetStorageUsageRatio(const std::string & /*trace_id*/) const override {
+        ++usage_queries_;
+        return ratio_;
+    }
+    mutable int usage_queries_ = 0;
+    void SetUsageRatio(double ratio) { ratio_ = ratio; }
+    bool Writable() override { return Available() && writable_; }
+    void SetWritable(bool writable) { writable_ = writable; }
+
+private:
+    double ratio_ = -1.0;
+    bool writable_ = true;
+};
+} // namespace
+
+
+TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeValues) {
+    auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    be->SetOpen(true);
+    be->SetAvailable(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("ratio_store", be);
+
+    auto published_ratio = [this]() {
+        const auto mc_vec = reporter_->data_storage_interval_metrics_collectors_.GetMetricsCollectors();
+        EXPECT_GE(mc_vec.size(), 1u);
+        auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc_vec.front());
+        EXPECT_TRUE(p);
+        double v = -12345.0;
+        GET_METRICS_(p, data_storage, storage_usage_ratio, v);
+        return v;
+    };
+
+    // A valid ratio gets published.
+    be->SetUsageRatio(0.75);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // Negative values are not valid readings and must not be exported.
+    // Backends are not required to return a negative value on query failure.
+    be->SetUsageRatio(-1.0);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // Preserve the existing default-zero behavior, including after an error:
+    // zero replaces a previous reading while health still reflects failure.
+    be->SetUsageRatio(0.0);
+    be->SetAvailable(false);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, published_ratio());
+    EXPECT_DOUBLE_EQ(0.0,
+                     metrics_registry_->GetGauge("data_storage.healthy_status",
+                                                 MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}}).Get());
+    be->SetUsageRatio(0.75);
+    be->SetAvailable(true);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // A backend that never had a valid ratio leaves its gauge at the
+    // registry default, and the exported text never shows a bogus full
+    // reading (or the raw sentinel) for it.
+    auto never_ok = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    never_ok->SetOpen(true);
+    never_ok->SetAvailable(false);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("never_ok_store", never_ok);
+    reporter_->ReportInterval();
+    const auto mc_vec = reporter_->data_storage_interval_metrics_collectors_.GetMetricsCollectors();
+    ASSERT_EQ(2u, mc_vec.size());
+    for (const auto &mc : mc_vec) {
+        auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc);
+        ASSERT_TRUE(p);
+        double v = -12345.0;
+        GET_METRICS_(p, data_storage, storage_usage_ratio, v);
+        EXPECT_TRUE(v == 0.75 || v == 0.0) << "unexpected published usage ratio: " << v;
+    }
+    const std::string exported_text = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
+    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
+
+    // Filtering a negative ratio must not suppress the backend health signal.
+    // An unavailable backend still exports healthy_status 0; a healthy one
+    // continues to export healthy_status 1.
+    auto exported_value = [&exported_text](const std::string &metric, const std::string &unique_name) {
+        const std::string tag = "unique_name=\"" + unique_name + "\"} ";
+        size_t pos = 0;
+        while ((pos = exported_text.find(metric + "{", pos)) != std::string::npos) {
+            auto line_end = exported_text.find('\n', pos);
+            if (line_end == std::string::npos) {
+                line_end = exported_text.size();
+            }
+            const auto tag_pos = exported_text.find(tag, pos);
+            if (tag_pos != std::string::npos && tag_pos < line_end) {
+                const auto value_begin = tag_pos + tag.size();
+                return exported_text.substr(value_begin, line_end - value_begin);
+            }
+            pos = line_end + 1;
+        }
+        return std::string{};
+    };
+    EXPECT_EQ("0", exported_value("kvcm_data_storage_healthy_status", "never_ok_store"));
+    EXPECT_EQ("1", exported_value("kvcm_data_storage_healthy_status", "ratio_store"));
+}
+
+TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageStates) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("role_store", backend);
+
+    bool leader = false;
+    int role_samples = 0;
+    reporter_->SetStorageUsageProvider([&]() {
+        ++role_samples;
+        return leader;
+    });
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "role_store"}};
+    const auto verify = [&](double expected_ratio) {
+        const int previous_queries = backend->usage_queries_;
+        role_samples = 0;
+        reporter_->ReportInterval();
+        EXPECT_EQ(1, role_samples);
+        EXPECT_EQ(previous_queries + (leader ? 1 : 0), backend->usage_queries_);
+        if (leader) {
+            EXPECT_DOUBLE_EQ(expected_ratio,
+                             metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+        } else {
+            const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
+            EXPECT_TRUE(!ratios || ratios->GetMetricsValues().empty());
+        }
+        EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0,
+                         metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+        EXPECT_DOUBLE_EQ(backend->Writable() ? 1.0 : 0.0,
+                         metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+
+        // Check the text exposed by /metrics, including connectivity signals.
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        const std::string labels = "{type=\"file\",unique_name=\"role_store\"} ";
+        const auto expect_export = [&](const std::string &metric, const std::string &value) {
+            EXPECT_NE(std::string::npos, output.find("kvcm_data_storage_" + metric + labels + value + "\n"));
+        };
+        if (!leader) {
+            EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_storage_usage_ratio"));
+        }
+        expect_export("healthy_status", backend->Available() ? "1" : "0");
+        expect_export("writable_status", backend->Writable() ? "1" : "0");
+    };
+
+    // Cold follower, including a failed capacity query and failed health check.
+    verify(0.0);
+    for (bool available : {false, true}) {
+        for (bool writable : {false, true}) {
+            backend->SetAvailable(available);
+            backend->SetWritable(writable);
+            for (double ratio : {-1.0, 0.0, 0.75, 1.0}) {
+                SCOPED_TRACE(::testing::Message() << "available=" << available << " writable=" << writable
+                                                 << " ratio=" << ratio);
+                // A real full reading must remain visible on the leader.
+                leader = true;
+                backend->SetUsageRatio(1.0);
+                verify(1.0);
+                backend->SetUsageRatio(ratio);
+                verify(ratio < 0.0 ? 1.0 : ratio);
+
+                // Demotion clears even a retained 100% reading. Repeated
+                // follower reports omit capacity independently of backend state.
+                leader = false;
+                verify(0.0);
+                verify(0.0);
+
+                // Promotion resumes normal sampling; unknown usage retains
+                // the last published value until a valid reading arrives.
+                leader = true;
+                verify(ratio < 0.0 ? 0.0 : ratio);
+                backend->SetUsageRatio(0.75);
+                verify(0.75);
+            }
+        }
+    }
+}
+
+TEST_F(LocalMetricsReporterTest, DemotionCleanupRemovesPreviouslyPublishedCapacity) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(1.0);
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    manager->storage_map_.emplace("demoted_store", backend);
+    bool leader = true;
+    reporter_->SetStorageUsageProvider([&]() { return leader; });
+    reporter_->ReportInterval();
+
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "demoted_store"}};
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+
+    // Server::OnNoLongerLeader closes and removes storage before the next
+    // metrics tick. Exercise that real cleanup path, not just a role toggle.
+    ASSERT_EQ(EC_OK, manager->DoCleanup());
+    ASSERT_TRUE(manager->GetAllStorageNames().empty());
+    // A report that still sees leader=true after cleanup must not recreate
+    // metrics for the unloaded backend.
+    reporter_->ReportInterval();
+    leader = false;
+    for (int i = 0; i < 2; ++i) {
+        reporter_->ReportInterval();
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_storage_usage_ratio"));
+    }
+
+    // Recovering the same storage on promotion resumes real measurements.
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(0.25);
+    manager->storage_map_.emplace("demoted_store", backend);
+    leader = true;
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+}
+
 TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
     {
         cache_manager_->meta_indexer_manager_ = nullptr;
@@ -720,4 +951,102 @@ TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {
     expect_health(1.0);
     backend->SetOpen(false);
     expect_health(0.0);
+}
+
+
+TEST_F(LocalMetricsReporterTest, DemotionCleanupClearsRemovedBackendHealth) {
+    auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    manager->storage_map_.emplace("demoted_store", backend);
+    bool leader = true;
+    reporter_->SetStorageUsageProvider([&]() { return leader; });
+    reporter_->ReportInterval();
+
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "demoted_store"}};
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+
+    // Server::OnNoLongerLeader closes and removes storage before the next
+    // metrics tick. Exercise that real cleanup path, not just a role toggle.
+    ASSERT_EQ(EC_OK, manager->DoCleanup());
+    ASSERT_TRUE(manager->GetAllStorageNames().empty());
+    // A report that still sees leader=true after cleanup must not recreate
+    // metrics for the unloaded backend.
+    reporter_->ReportInterval();
+    leader = false;
+    for (int i = 0; i < 2; ++i) {
+        reporter_->ReportInterval();
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        for (const auto &name : {"healthy_status", "writable_status"}) {
+            EXPECT_EQ(std::string::npos, output.find(std::string("kvcm_data_storage_") + name));
+        }
+    }
+
+    // Recovering the same storage on promotion resumes real measurements.
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    manager->storage_map_.emplace("demoted_store", backend);
+    leader = true;
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+}
+
+namespace {
+class BlockingUsageBackend : public NfsBackend {
+public:
+    explicit BlockingUsageBackend(std::shared_ptr<MetricsRegistry> registry)
+        : NfsBackend(std::move(registry)), release_(released.get_future().share()) {}
+    double GetStorageUsageRatio(const std::string &) const override {
+        entered.set_value();
+        release_.wait();
+        return 1.0;
+    }
+    mutable std::promise<void> entered;
+    std::promise<void> released;
+    std::shared_future<void> release_;
+};
+} // namespace
+
+TEST_F(LocalMetricsReporterTest, CleanupDuringCapacitySamplingCannotRecreateUnloadedSeries) {
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    auto old_backend = std::make_shared<BlockingUsageBackend>(metrics_registry_);
+    old_backend->SetOpen(true);
+    old_backend->SetAvailable(true);
+    manager->storage_map_.emplace("reused_store", old_backend);
+    reporter_->SetStorageUsageProvider([] { return true; });
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "reused_store"}};
+    metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags) = 1.0;
+    auto sampling = std::async(std::launch::async, [&] { reporter_->ReportInterval(); });
+    const auto started = old_backend->entered.get_future().wait_for(std::chrono::seconds(2));
+    if (started != std::future_status::ready) {
+        old_backend->released.set_value();
+        FAIL() << "capacity sampling did not start";
+    }
+    auto cleanup = std::async(std::launch::async, [&] { return registry_manager_->DoCleanup(); });
+    const bool cleanup_ready = cleanup.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(cleanup_ready) << "cleanup must not wait for backend capacity I/O";
+    if (!cleanup_ready) {
+        old_backend->released.set_value();
+        cleanup.wait();
+        sampling.wait();
+        return;
+    }
+    EXPECT_EQ(EC_OK, cleanup.get());
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("unique_name=\"reused_store\""));
+    auto replacement = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    replacement->SetOpen(true);
+    replacement->SetAvailable(true);
+    replacement->SetUsageRatio(0.25);
+    manager->storage_map_.emplace("reused_store", replacement);
+    old_backend->released.set_value();
+    sampling.get();
+    // The old 100% result must not be published for the new backend of the same name.
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("unique_name=\"reused_store\""));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
 }

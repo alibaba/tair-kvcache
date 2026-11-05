@@ -330,6 +330,14 @@ TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, data_storage, writable_status), 1.);
 }
 
+TEST_F(MetricsCollectorTest, HealthOnlyCollectorDoesNotRegisterCapacity) {
+    DataStorageIntervalMetricsCollector collector(metrics_registry_, {{"unique_name", "follower_store"}});
+    ASSERT_TRUE(collector.Init(false));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio"));
+    EXPECT_NE(nullptr, metrics_registry_->GetMetricsData("data_storage.healthy_status"));
+    EXPECT_NE(nullptr, metrics_registry_->GetMetricsData("data_storage.writable_status"));
+}
+
 TEST_F(MetricsCollectorTest, MetaIndexerAccumulativeMetricsCollectorTest) {
     metrics_collector_ = std::make_shared<MetaIndexerAccumulativeMetricsCollector>(metrics_registry_);
     metrics_collector_->Init();
