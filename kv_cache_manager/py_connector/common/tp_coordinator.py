@@ -3,11 +3,21 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import zmq
 
+import os
+
 from kv_cache_manager.py_connector.common.logger import logger
+
+_TRACE = os.environ.get("KVCM_TRACE") == "1"
+
+#: How many completed load ids the query socket keeps. Long enough for a rank
+#: that polls a few steps late, short enough that a leak cannot grow.
+_HISTORY = 8192
+#: The query socket lives next to the PUSH/PULL one. Both ends derive it.
+_QUERY_PORT_OFFSET = 1
 
 
 @dataclass
@@ -129,6 +139,14 @@ class TpCoordinatorServer:
         self._coordinator_thread.start()
 
         self._finished_loading = []
+        # A completion a rank may *ask* for, instead of only being told once.
+        # The worker whose output the engine consumes is not known to this
+        # process (vLLM takes `output[0]` from the executor, and under pipeline
+        # parallelism that need not be global rank 0), so a single consumable
+        # list would deliver the barrier to a rank whose report is dropped.
+        # Bounded: a stale entry costs a lookup, not a leak.
+        self._loading_history: List[str] = []
+        self._loading_history_lock = threading.Lock()
         self._failed_loading_block_idxs = []
         self._finished_loading_lock = threading.Lock()
         self._finished_saving = []
@@ -140,7 +158,29 @@ class TpCoordinatorServer:
         socket = context.socket(zmq.PULL)
         port = self._base_port
         socket.bind("tcp://%s:%d" % (self._host_ip, port))
+        query = context.socket(zmq.REP)
+        query.bind("tcp://%s:%d" % (self._host_ip, port + _QUERY_PORT_OFFSET))
         logger.warning("TairKvCacheConnector coordinator started")
+
+        def serve_queries() -> None:
+            """Answers "which loads are complete?" for every rank.
+
+            A PULL socket hands each message to exactly one consumer, so the
+            completion a PULL-based report consumed could never be re-read by
+            another rank. This socket is how a rank that was *not* the one the
+            engine listens to still learns the global barrier fired.
+            """
+            while True:
+                try:
+                    query.recv()
+                    with self._loading_history_lock:
+                        payload = "\n".join(self._loading_history)
+                    query.send(payload.encode())
+                except Exception as exc:  # noqa: BLE001 - a dead query socket is logged
+                    logger.warning("[coordinator] query socket failed: %s", exc)
+                    return
+
+        threading.Thread(target=serve_queries, daemon=True).start()
 
         running_load: Dict[RunningId, LoadContext] = {}
         running_save: Dict[RunningId, SaveContext] = {}
@@ -209,7 +249,23 @@ class TpCoordinatorServer:
                 load_id = RunningId(str(content.epoch), content.request_id)
                 if load_id not in running_load:
                     running_load[load_id] = LoadContext()
+                    if _TRACE:
+                        logger.info(
+                            "[coordinator] load %s first rank %d of %d",
+                            load_id,
+                            content.tp_rank,
+                            self._tp_world_size,
+                        )
                 running_load[load_id].add_new_rank(content.tp_rank)
+                if _TRACE:
+                    logger.info(
+                        "[coordinator] load %s ranks %d/%d (new %d, epoch %s)",
+                        load_id,
+                        running_load[load_id].get_size(),
+                        self._tp_world_size,
+                        content.tp_rank,
+                        content.epoch,
+                    )
                 if running_load[load_id].get_size() == self._tp_world_size:
                     running_load.pop(load_id)
 
@@ -217,6 +273,9 @@ class TpCoordinatorServer:
                     self._failed_loading_block_idxs.extend(content.failed_block_idxs)
                     self._finished_loading.append(content.request_id)
                     self._finished_loading_lock.release()
+                    with self._loading_history_lock:
+                        self._loading_history.append(content.request_id)
+                        del self._loading_history[:-_HISTORY]
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)
             else:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
@@ -251,6 +310,14 @@ class TpCoordinatorClient:
         self._host_ip = host_ip
         self._port = port
         self._lock = threading.Lock()
+        #: The query socket is kept, not re-created per call: every rank asking
+        #: every step over a fresh TCP connection is a fan-in the coordinator
+        #: serializes, and it was measured to stall the engine (see the worker's
+        #: load poller). `query_count` exists so a run can show that queries
+        #: scale with loads and not with steps.
+        self._query_lock = threading.Lock()
+        self._query_socket: Optional[zmq.Socket] = None
+        self.query_count = 0
 
         self._zmq_context = zmq.Context()
         # all rank need report finishing (include rank0)
@@ -261,3 +328,38 @@ class TpCoordinatorClient:
     def send(self, param: bytes) -> None:
         with self._lock:
             self._socket.send(param)
+
+    def _query_connection(self, timeout_ms: int) -> "zmq.Socket":
+        """The one query socket this rank keeps open."""
+        if self._query_socket is None:
+            socket = self._zmq_context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            socket.connect(
+                "tcp://%s:%d" % (self._host_ip, self._port + _QUERY_PORT_OFFSET)
+            )
+            self._query_socket = socket
+        return self._query_socket
+
+    def finished_loads(self, timeout_ms: int = 1000) -> Set[str]:
+        """The loads the coordinator has folded completely, or an empty set.
+
+        Called by the worker's load poller, never from a step. One socket is
+        reused for the process's life: a fresh REQ socket per call means a fresh
+        TCP connection per call, and thirty-two ranks doing that every step is
+        the fan-in that stalled the engine.
+        """
+        with self._query_lock:
+            socket = self._query_connection(timeout_ms)
+            try:
+                socket.send(b"loads")
+                self.query_count += 1
+                payload = socket.recv().decode()
+            except Exception:  # noqa: BLE001 - no answer is not an error
+                # A REQ socket that timed out still owes a reply, so it cannot be
+                # reused; drop it and let the next call reconnect.
+                socket.close(linger=0)
+                self._query_socket = None
+                return set()
+            return {line for line in payload.split("\n") if line}

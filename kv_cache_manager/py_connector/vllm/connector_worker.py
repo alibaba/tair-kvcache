@@ -67,6 +67,24 @@ def _client_span(kvcm_py_client: Any, span: "HostSpan") -> Any:
     return client_span
 
 
+def _multi_group_invalid_block_recovery() -> bool:
+    """Whether the engine can act on a failed load whose block table has >1 group.
+
+    vLLM 0.29's own recovery unpacks ``(req_block_ids,) = ...get_block_ids(...)``,
+    so upstream can only be told about a single-group table; telling it about a
+    hybrid one raises there instead of recovering. An engine that backports
+    vLLM #50388 marks its patched ``Scheduler``; with that mark the recovery
+    resets the request's computed tokens to 0 for any group's block id, so
+    reporting is both safe and necessary -- the alternative is decoding from
+    whatever bytes a partial load left in the paged cache.
+    """
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception:  # noqa: BLE001 - a probe must not decide a load's fate
+        return False
+    return bool(getattr(Scheduler, "_tpu_hybrid_kv_load_failure_patch", False))
+
+
 class ConnectorWorker:
     """State and hooks for the worker-role connector instance (one per worker
     rank; see worker_rank)."""
@@ -430,11 +448,17 @@ class ConnectorWorker:
         gbs = group.block_size
         out = []
         for mb in manager_block_idxes:
-            logical = ((mb + 1) * mbs - 1) // gbs
-            assert logical < len(block_table), (
-                f"group block {logical} out of range (len={len(block_table)})"
-            )
-            out.append(block_table[logical])
+            # The group block whose *last token* is the boundary the manager
+            # block ends at: the engine hands off `blocks[idx]` for
+            # `boundary=(idx+1)*block_size` (MambaManager.cache_blocks), and its
+            # slot invariant is "slot p holds the state after exactly
+            # (p+1)*block_size tokens". The quotient would select the block that
+            # *starts* at the boundary -- one state ahead of the KV a reader gets.
+            # A position before or past the table means the engine never
+            # materialized that boundary, which is the null block id (0) the
+            # transfer task already understands as "no state here".
+            logical = ((mb + 1) * mbs) // gbs - 1
+            out.append(block_table[logical] if 0 <= logical < len(block_table) else 0)
         return out
 
     # ------------------------------------------------------------------ #
@@ -586,31 +610,36 @@ class ConnectorWorker:
             # Remove the gating once upstream supports multi-group
             # invalid-block recovery.
             report_ids = []
-            report_failures = len(load_req.all_block_ids) == 1
+            report_failures = (
+                len(load_req.all_block_ids) == 1
+                or _multi_group_invalid_block_recovery()
+            )
             if report_failures:
-                # With exactly one vLLM block table the transferred group is
-                # group 0, and it must be an attention group: a lone state
-                # group would feed state block ids into upstream's
-                # token-granular recovery math (it divides by block_size).
-                # Both hold for every supported single-group model today;
-                # assert so a future unsupported shape fails loudly instead
-                # of reporting nonsense.
-                only = self._group_metas[0]
-                assert isinstance(only, AttentionGroupMeta), (
-                    f"single vLLM block table but the transferred group is "
-                    f"{type(only).__name__}, not attention; cannot report "
-                    f"invalid blocks"
+                # Report against the *attention* group: upstream's single-group
+                # recovery, and a downstream multi-group one alike, resolve an
+                # invalid id against the request's block tables, and the token
+                # granularity its truncation is expressed in is the attention
+                # group's block size. A lone state group would feed state block
+                # ids into that math (it divides by block_size), which is why the
+                # single-table case still insists the transferred group is
+                # attention.
+                only = next(
+                    (
+                        meta
+                        for meta in self._group_metas
+                        if isinstance(meta, AttentionGroupMeta)
+                    ),
+                    None,
                 )
-                assert only.group_idx == 0, (
-                    f"single vLLM block table but the transferred group is "
-                    f"group {only.group_idx}; group-index alignment broken"
-                )
-                table = load_req.all_block_ids[0]
-                gbs = only.block_size
-                report_ids = [
-                    table[(mb * self._manager_block_size) // gbs]
-                    for mb in load_req.manager_block_idxes
-                ]
+                if only is None or only.group_idx >= len(load_req.all_block_ids):
+                    report_failures = False
+                else:
+                    table = load_req.all_block_ids[only.group_idx]
+                    gbs = only.block_size
+                    report_ids = [
+                        table[(mb * self._manager_block_size) // gbs]
+                        for mb in load_req.manager_block_idxes
+                    ]
             done_cb = self._backend.create_load_done_callback(
                 load_req.req_id,
                 self._tp_rank,

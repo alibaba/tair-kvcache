@@ -15,6 +15,7 @@ failures cannot be reported). The worker side lives in connector_worker; both
 speak the vllm_common vocabulary.
 """
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -53,6 +54,30 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+
+#: How many times the write-location call is retried before a save is given up on.
+#:
+#: The store refuses in bursts: measured, 9 of one request's 10 saves
+#: came back `{"error_msg":["some internal error when GenWriteLocation"]}` with the
+#: store 10% full, and the refusals cluster after an idle period or a provider
+#: restart. A refused save is a prefix that will not be there later, and the call
+#: runs on the connector's own pool (never the scheduler thread), so a bounded
+#: retry costs latency nobody waits for and buys back the writes.
+#:
+#: The trace id is stable across the attempts (it is `req_id_epoch`, fixed when
+#: the save was announced), so the manager sees one logical request, not several.
+#:
+#: Measured (one 124k-token prompt = 30 manager blocks):
+#: with 3 attempts x 0.2 s every one of that request's saves was refused and the
+#: prefix never became reusable (`first.cached=0 second.cached=0`, four repeats);
+#: with 8 attempts x 1.0 s the same prompt serves 49152 tokens on the repeat.
+#: The burst is the store's own address-manager allocation failing,
+#: and it clears within seconds, so waiting is what buys the prefix.
+_START_WRITE_ATTEMPTS = int(os.environ.get("KVCM_START_WRITE_ATTEMPTS", "8"))
+
+#: Pause between those attempts, seconds.
+_START_WRITE_RETRY_S = float(os.environ.get("KVCM_START_WRITE_RETRY_S", "1.0"))
 
 
 @dataclass
@@ -110,8 +135,18 @@ class ConnectorScheduler:
         self._coordinator_client = coordinator_client
 
         self._epoch = 0
+        # One pool serves two very different calls: the per-request location
+        # query (on the critical path of a match -- a starved query defers the
+        # request) and `start_save_kvcache_async` (off the critical path, and
+        # the one that can hang on a manager that is slow to open a write
+        # session). Four threads was the original sizing and it deadlocks the
+        # engine under sustained traffic: measured, ~0.5 saves/s with the
+        # manager answering `GenWriteLocation` slowly filled the queue, every
+        # location query starved, and the scheduler sat at `Running: 0,
+        # Deferred: N` with 0 tokens/s for the rest of the run. The save side
+        # has no backpressure, so the pool has to be sized for the sum.
         self._http_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="kvcm_http_"
+            max_workers=32, thread_name_prefix="kvcm_http_"
         )
         self._location_query_manager = LocationQueryManager(
             manager_client,
@@ -131,6 +166,19 @@ class ConnectorScheduler:
         # External-match discipline; cleaned at retirement.
         self._load_failed: set = set()
         self._load_attempted: set = set()
+        # The engine's own answer to "which physical page holds the recurrent
+        # state at boundary B", per request: {req_id: {gid: {boundary: page}}}.
+        # It is the only authoritative source. A hybrid request's state group
+        # block table is an allocation log, not the current mapping: the engine
+        # replaces a boundary's page (copy-on-write) and frees the old ones, and
+        # vLLM reports only *newly allocated* blocks, so an append-only mirror
+        # keeps pages the engine has already released. Publishing such a page
+        # advertises a state that belongs to another request -- measured: a
+        # 4-block save whose engine table was [8, 0, 0, 19, 20] was published
+        # with mask [1, 1, 1, 1], i.e. blocks 1 and 2 claimed states the engine
+        # had already freed. Fed from `boundary_state_offloads` and pruned
+        # against the same step's block-table snapshot.
+        self._state_pages: Dict[str, Dict[int, Dict[int, int]]] = {}
 
     def shutdown(self) -> None:
         self._location_query_manager.shutdown()
@@ -149,30 +197,100 @@ class ConnectorScheduler:
                 return meta.block_size
         raise KeyError(f"no such transferred group: {group_idx}")
 
+    def _record_state_offers(self, scheduler_output: "SchedulerOutput") -> None:
+        """Updates the authoritative boundary -> page map for every request.
+
+        ``boundary_state_offloads`` is the scheduler's explicit hand-off: only a
+        boundary listed there may be copied out, and the page it names is the
+        one holding that boundary's state (a copy-on-write page, not necessarily
+        the one the allocation log recorded). Entries are accumulated across
+        steps -- a boundary handed off earlier stays valid while its page is
+        still in the request's block table -- and pruned against the same step's
+        snapshot, so a page the engine has freed can never be published.
+        """
+        if not self._state_group_idxs:
+            return
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if block_state is None:
+            return
+        offers = getattr(block_state, "boundary_state_offloads", None) or {}
+        snapshots = getattr(block_state, "block_ids", None) or {}
+        for req_id, entries in offers.items():
+            mine = self._state_pages.setdefault(req_id, {})
+            for gid, page, boundary in entries:
+                gid, page, boundary = int(gid), int(page), int(boundary)
+                if gid not in self._state_group_idxs or page == 0:
+                    continue
+                gbs = self._group_block_size(gid)
+                if boundary % gbs:
+                    continue
+                mine.setdefault(gid, {})[boundary] = page
+        for req_id, mine in list(self._state_pages.items()):
+            snapshot = snapshots.get(req_id)
+            if snapshot is None:
+                continue
+            for gid, pages in list(mine.items()):
+                live = {int(block) for block in snapshot[gid]}
+                kept = {b: p for b, p in pages.items() if p in live}
+                if kept:
+                    mine[gid] = kept
+                else:
+                    mine.pop(gid, None)
+
+    def _state_pages_for(self, req_id: str, gid: int) -> Dict[int, int]:
+        return self._state_pages.get(req_id, {}).get(gid, {})
+
+    def _tables_with_state_pages(
+        self, ledger: RequestLedger, num_blocks: int
+    ) -> List[List[int]]:
+        """The block tables the worker will translate through.
+
+        Attention groups keep the allocation log (their pages are the request's
+        own KV rows); a state group's entry for manager block mb is replaced by
+        the page the engine handed off for boundary (mb+1)*mbs, or 0 when no
+        hand-off exists -- which is exactly the block the mask marks incomplete.
+        """
+        tables = [list(group) for group in ledger.block_ids_per_group]
+        if not self._state_group_idxs:
+            return tables
+        mbs = self._manager_block_size
+        for gid in self._state_group_idxs:
+            pages = self._state_pages_for(ledger.vllm_request.request_id, gid)
+            table = tables[gid]
+            for mb in range(num_blocks):
+                page = pages.get((mb + 1) * mbs, 0)
+                if mb < len(table):
+                    table[mb] = page
+        return tables
+
     def _state_complete_mask(
         self, ledger: RequestLedger, manager_block_idxes: Sequence[int]
     ) -> List[bool]:
         """Per manager block: does *every* state group hold a real state?
 
-        vLLM's block table is the ground truth: in "align" mode a manager block
-        whose state block is the null block (id 0) has no materialized state.
-        Attention-only models return all True (nothing can be missing).
+        A manager block's key promises the prefix that ends at its last token,
+        so the state it needs is the one at ``boundary = (mb+1) * mbs`` -- the
+        engine's hand-off names exactly those boundaries. A boundary without an
+        offer (or whose page the engine has since freed) is *not* servable: an
+        attention-only block may still be published, but a reader is truncated
+        to the last block that carries every state group's page.
+
+        Two off-by-ones are possible here and both were shipped once: `mb`
+        publishes a state one block behind the key, and
+        `((mb+1)*mbs)//gbs` one block ahead; a reader then resumes from a state
+        that does not match its prefix.
         """
         if not self._state_group_idxs:
             return [True] * len(manager_block_idxes)
         mbs = self._manager_block_size
-        mask = []
-        for mb in manager_block_idxes:
-            complete = True
-            for group_idx in self._state_group_idxs:
-                table = ledger.block_ids_per_group[group_idx]
-                # State covers the prefix ending at the block's last token.
-                logical = ((mb + 1) * mbs - 1) // self._group_block_size(group_idx)
-                if logical >= len(table) or table[logical] == 0:
-                    complete = False
-                    break
-            mask.append(complete)
-        return mask
+        req_id = ledger.vllm_request.request_id
+        pages = {
+            gid: self._state_pages_for(req_id, gid) for gid in self._state_group_idxs
+        }
+        return [
+            all(pages[gid].get((mb + 1) * mbs, 0) for gid in self._state_group_idxs)
+            for mb in manager_block_idxes
+        ]
 
     def _num_allocated_blocks(self, ledger: RequestLedger) -> int:
         """Min allocated block-table length across the *transferred* groups.
@@ -450,6 +568,7 @@ class ConnectorScheduler:
         self._epoch += 1
 
         self._ingest_scheduled_reqs(scheduler_output)
+        self._record_state_offers(scheduler_output)
         self._dispatch_incremental_saves()
         self._collect_load_instructions(meta)
         self._collect_save_instructions(meta)
@@ -519,6 +638,19 @@ class ConnectorScheduler:
                 ):
                     group_ids.extend(new_ids)
 
+    def _clamp_save_window(self, ledger: RequestLedger, target_save_num: int) -> int:
+        """The upper bound, in manager blocks, of this step's save window.
+
+        Identity here: the stock scheduler saves every block the token stream
+        has reached. A cache child that publishes per-block recurrent state
+        overrides this to hold the window back while the window's last block
+        has no state to publish yet (a recurrent-state connector: the engine hands a
+        boundary over in the step *after* the one that filled its block, so an
+        unclamped window announces the last block of every prefill
+        attention-only and no reader can ever resume from it).
+        """
+        return target_save_num
+
     def _dispatch_incremental_saves(self) -> None:
         """Start async StartWriteCache calls for requests whose computed
         prefix crossed a manager-block boundary since the last step.
@@ -546,6 +678,7 @@ class ConnectorScheduler:
                 )
                 // self._manager_block_size
             )
+            target_save_num = self._clamp_save_window(ledger, target_save_num)
             if target_save_num > ledger.has_saved_block_num:
                 logger.info(
                     "req:%s incremental save: %d -> %d blocks "
@@ -557,9 +690,27 @@ class ConnectorScheduler:
                     self._num_allocated_blocks(ledger),
                 )
                 ledger.scheduled_saving_count += 1
-                # Per-block state completeness must be read here, in the
-                # scheduler loop: it comes from vLLM's block table, which the
-                # http_executor thread would race against later steps.
+                # Per-block state completeness and the state pages themselves
+                # must be read here, in the scheduler loop, from this step's
+                # hand-off: the http_executor thread would race against later
+                # steps, and the block table alone cannot name a boundary's
+                # current page (see _record_state_offers).
+                mask = self._state_complete_mask(ledger, range(target_save_num))
+                tables = self._tables_with_state_pages(
+                    ledger, target_save_num
+                )
+                # Off the scheduler thread on purpose: the HTTP call that
+                # acquires write locations resolves tens of ms later. The page
+                # a state block's key promises is a *cached*, ref-counted page
+                # (the engine's mamba manager offers it from the block cache,
+                # or from a private copy-on-write block for a partial tail), so
+                # it stays valid until the prefix cache evicts it -- measured:
+                # a save dispatched one step before its d2h produced pages that
+                # were bit-identical to the load, and a warm load that resumed
+                # at the same boundary. An earlier version of this comment
+                # claimed the copy had to happen inside the offering pass; the
+                # measured deltas (top-1 identical, tail logprobs within 1/16)
+                # are the cold-vs-warm forward's quantisation, not a stale page.
                 self._http_executor.submit(
                     self.start_save_kvcache_async,
                     ledger.vllm_request.request_id,
@@ -569,7 +720,8 @@ class ConnectorScheduler:
                         : target_save_num * self._manager_block_size
                     ],
                     target_save_num,
-                    self._state_complete_mask(ledger, range(target_save_num)),
+                    mask,
+                    tables,
                 )
             ledger.has_saved_block_num = target_save_num
 
@@ -601,10 +753,14 @@ class ConnectorScheduler:
                     "request %s is not tracked, skip saving", save_req.req_id
                 )
                 continue
-            # Snapshot the ledger for the worker: the gather translates
-            # manager blocks into physical slots through these tables, and
-            # the worker keeps no mirror of its own.
-            save_req.all_block_ids = [list(b) for b in ledger.block_ids_per_group]
+            # Snapshot the ledger for the worker unless the dispatch already
+            # snapshotted it together with the state mask (see
+            # _tables_with_state_pages): a later step's table would name pages
+            # the mask was not computed against.
+            if not save_req.all_block_ids:
+                save_req.all_block_ids = [
+                    list(b) for b in ledger.block_ids_per_group
+                ]
             meta.add_save_request(save_req)
             ledger.sent_saving_count += 1
             if (
@@ -627,6 +783,7 @@ class ConnectorScheduler:
         its bookkeeping and stop tracking the request ourselves."""
         self._waiting_to_finish_requests.append(FinishRequest(req_id))
         self._tracked.pop(req_id, None)
+        self._state_pages.pop(req_id, None)
         self._load_failed.discard(req_id)
         self._load_attempted.discard(req_id)
         self._location_query_manager.invalidate(req_id)
@@ -637,6 +794,7 @@ class ConnectorScheduler:
         token_ids: List[int],
         target_save_num: int,
         state_complete_mask: List[bool],
+        block_tables: Optional[List[List[int]]] = None,
     ) -> None:
         """Ask the manager for write locations for a request's first
         ``target_save_num`` manager blocks.
@@ -670,10 +828,29 @@ class ConnectorScheduler:
                     state_complete_mask.count(False),
                     target_save_num,
                 )
-        try:
-            response = self._manager_client.start_write_cache(request)
-        except Exception as e:
-            logger.warning("start_write_cache error, skip saving: %s", e)
+        response = None
+        last_error: Optional[Exception] = None
+        for attempt in range(_START_WRITE_ATTEMPTS):
+            try:
+                response = self._manager_client.start_write_cache(request)
+                break
+            except Exception as e:  # noqa: BLE001 - retried, then cancelled
+                last_error = e
+                if attempt + 1 < _START_WRITE_ATTEMPTS:
+                    logger.info(
+                        "req:%s start_write_cache attempt %d/%d failed, retrying: %s",
+                        req_id,
+                        attempt + 1,
+                        _START_WRITE_ATTEMPTS,
+                        e,
+                    )
+                    time.sleep(_START_WRITE_RETRY_S)
+        if response is None:
+            logger.warning(
+                "start_write_cache error after %d attempt(s), skip saving: %s",
+                _START_WRITE_ATTEMPTS,
+                last_error,
+            )
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
             return
@@ -739,9 +916,15 @@ class ConnectorScheduler:
         self._coordinator_client.send(CoordinateMsgSerializer.dumps(message))
 
         with self._waiting_to_save_requests_lock:
-            self._waiting_to_save_requests.append(
-                SaveRequest(req_id, locations, need_block_idx, write_session_id)
+            save_req = SaveRequest(
+                req_id, locations, need_block_idx, write_session_id
             )
+            if block_tables is not None:
+                # Snapshot at dispatch time, together with the mask it belongs
+                # to: the pages the worker copies must be the pages whose
+                # existence the manager was told about.
+                save_req.all_block_ids = [list(b) for b in block_tables]
+            self._waiting_to_save_requests.append(save_req)
 
     def handle_canceled_save_req(self) -> None:
         with self._canceled_save_request_ids_lock:
