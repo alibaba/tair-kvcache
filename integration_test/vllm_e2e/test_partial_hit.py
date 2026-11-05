@@ -23,9 +23,9 @@ import logging
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, assert_report_ok, compare_captures, make_base_prompts,
-    send_completions, shared_token_prefix_len, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    ScenarioEnv, assert_report_ok, capture_keys, compare_captures,
+    make_base_prompts, send_completions, shared_token_prefix_len, tokenize,
+    wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -62,7 +62,8 @@ class TestPartialHit(unittest.TestCase):
 
             # ---- Stage 1: save A.
             send_completions(vllm.base_url(), [prompt_a])
-            wait_for_captures(env.capture_dir, "ref", expected=blocks_a, timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * blocks_a, timeout=180)
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, toks_a,
                 min_blocks=blocks_a))
@@ -73,7 +74,8 @@ class TestPartialHit(unittest.TestCase):
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, toks_ab,
                 min_blocks=blocks_ab))
-            wait_for_captures(env.capture_dir, "ref", expected=blocks_ab, timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * blocks_ab, timeout=180)
 
             offsets = [int(g[0]) for g in env.scan_connector_logs(
                 r"get_kvcache_location request:.*'offset': (\d+)")]
@@ -84,10 +86,15 @@ class TestPartialHit(unittest.TestCase):
             vllm = env.restart_vllm(log_suffix="_s3")
             send_completions(vllm.base_url(), [prompt_abc])
             wait_for_captures(env.capture_dir, "loaded",
-                              expected=shared_abc, timeout=180)
+                              expected=env.tp_size * shared_abc, timeout=180)
 
-            report = compare_captures(env.capture_dir, tp_size=1)
-            assert_report_ok(report, min_matched=shared_abc)
+            report = compare_captures(env.capture_dir)
+            # The loaded blocks are exactly the shared prefix A+B, on every
+            # rank (each rank loads its own shard of the same blocks).
+            assert_report_ok(
+                report, min_matched=env.tp_size * shared_abc,
+                tp_size=env.tp_size,
+                expected_keys=capture_keys(toks_abc, mbs, env.tp_size, shared_abc))
         finally:
             env.stop()
 

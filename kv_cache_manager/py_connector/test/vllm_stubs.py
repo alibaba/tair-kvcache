@@ -176,12 +176,31 @@ def _install_stubs():
                 page_size_padded if page_size_padded is not None else page_size_bytes
             )
 
+    class MLAAttentionSpec(FullAttentionSpec):
+        """Mirrors the real spec's consumed contract: the MLA-only fields
+        parse_groups gates on (see vllm_common._check_mla_supported)."""
+
+        def __init__(
+            self,
+            block_size,
+            page_size_bytes,
+            page_size_padded=None,
+            cache_dtype_str=None,
+            compress_ratio=1,
+            kv_quant_mode=0,
+        ):
+            super().__init__(block_size, page_size_bytes, page_size_padded)
+            self.cache_dtype_str = cache_dtype_str
+            self.compress_ratio = compress_ratio
+            self.kv_quant_mode = kv_quant_mode
+
     class MambaSpec:
         def __init__(self, block_size, page_size_bytes):
             self.block_size = block_size
             self.page_size_bytes = page_size_bytes
 
     kv_cache_interface.FullAttentionSpec = FullAttentionSpec
+    kv_cache_interface.MLAAttentionSpec = MLAAttentionSpec
     kv_cache_interface.MambaSpec = MambaSpec
 
     _module("vllm.v1.core")
