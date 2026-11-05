@@ -1,6 +1,6 @@
 # Crash Stack Trace
 
-KVCacheManager 在 `CommandLine::RegisterSignal` 中默认安装了一个
+KVCacheManager 在 `CommandLine::InstallSignalPolicy` 中默认安装了一个
 async-signal-safe 的 crash handler，用于在进程被以下信号终止时，
 **在 coredump 之外额外**保留一份可读的堆栈：
 
