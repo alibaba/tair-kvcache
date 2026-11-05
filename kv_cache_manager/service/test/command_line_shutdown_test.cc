@@ -288,8 +288,15 @@ TEST_F(CommandLineShutdownTest, SecondExitSignalDuringShutdownForcesImmediateExi
         int exit_code = WEXITSTATUS(status);
         std::string log = ServiceLog();
         child_pid_ = -1;
-        if (exit_code == 0) {
-            missed_log = "attempt " + std::to_string(attempt) + ", log:\n" + log;
+        // 「窗口未命中」有两种形态，都要重试而不是判失败：
+        // 1) 退出码 0：主线程 DoStop 抢在控制线程消费第二个信号之前跑完；
+        // 2) 退出码为 128+sig 但日志已含 goodbye：主线程先完成优雅关闭，控制线程
+        //    随后才消费第二个信号。两种情况下「第二个信号落在关闭进行中」都没发生，
+        //    属时序未命中而非产品缺陷。
+        const bool missed = exit_code == 0 || log.find("kvcm server stopped, goodbye!") != std::string::npos;
+        if (missed) {
+            missed_log = "attempt " + std::to_string(attempt) + ", exit_code=" + std::to_string(exit_code)
+                         + ", log:\n" + log;
             continue;
         }
 

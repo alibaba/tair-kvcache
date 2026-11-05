@@ -147,10 +147,11 @@ int CommandLine::Finish(int exit_code) {
         server_->Stop();
         server_->Wait();
     }
+    // 控制线程要活到 manager 销毁之后：server_.reset() 里的析构会 join 各后台线程，
+    // 是关闭流程中最可能阻塞的一段，AC-3 的「再收一个退出信号就强退」兜底必须覆盖它。
+    server_.reset();
     // 不变量：控制线程必须在 logger 销毁之前完成 join，它在强制退出路径上还要打日志。
     controller_.Stop();
-    // service 与 manager 的依赖此时仍然有效，销毁放在最后。
-    server_.reset();
     LoggerBroker::DestroyLogger();
     return exit_code;
 }

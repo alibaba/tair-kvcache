@@ -73,7 +73,12 @@ void ShutdownController::Stop() {
     if (!started_.compare_exchange_strong(expected, false)) {
         return;
     }
-    stop_.store(true);
+    {
+        // stop_ 是 WaitForShutdownRequest() 等待谓词的一部分：必须在 mutex_ 内更新，
+        // 否则谓词判假后、进入 wait 前发出的 notify_all 会丢失，等待者永久睡死。
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_.store(true);
+    }
     cv_.notify_all();
     if (thread_.joinable()) {
         thread_.join();
