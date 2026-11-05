@@ -224,22 +224,6 @@ protected:
         return false;
     }
 
-    // 等到子进程确实进入关闭流程（DoStop 的第一条日志落盘）。关闭一旦开始就只剩十几毫秒，
-    // 所以这里用 1ms 粒度轮询，作为「第二个信号落在关闭进行中」的同步点。
-    bool WaitForShutdownStarted() {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kShutdownTimeoutMs);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (ServiceLog().find("server stopping...") != std::string::npos) {
-                return true;
-            }
-            if (!IsProcessAlive(child_pid_)) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        return false;
-    }
-
     std::string ServiceLog() { return ReadFile(work_dir_ + "/logs/kv_cache_manager.log"); }
 
 protected:
@@ -273,27 +257,49 @@ TEST_F(CommandLineShutdownTest, SingleSigtermShutsDownGracefullyWithExitCodeZero
     child_pid_ = -1;
 }
 
-// AC-3: 优雅关闭进行中再次收到 SIGTERM → 立即以 128+SIGTERM 结束。
-TEST_F(CommandLineShutdownTest, RepeatedSigtermForcesExitWithSignalCode) {
-    ASSERT_GE(StartServerChild(), 0);
-    ASSERT_TRUE(WaitForServerReady());
+// AC-3: 优雅关闭进行中再次收到退出信号 → 立即以 128+sig 结束。
+// memory backend 的关闭只需约 1ms，用日志轮询做「第二个信号落在关闭进行中」的同步点在负载下
+// 会退化成竞态。这里改为把子进程 SIGSTOP 冻结后一次性投递两个不同编号的退出信号（标准信号
+// 不排队，同编号会被合并；不同编号各有独立 pending 槽），再 SIGCONT 放行：控制线程必然背靠背
+// 取走两个信号，第二个必定落在 kRequested 上。哪个信号先被消费未指定，故退出码断言为集合。
+TEST_F(CommandLineShutdownTest, SecondExitSignalDuringShutdownForcesImmediateExit) {
+    // 兜住「主线程 DoStop 抢在控制线程消费第二个信号之前跑完」的极小概率窗口：
+    // 窗口未命中（退出码 0）时重启子进程重试，全部未命中才判失败。
+    constexpr int kMaxAttempts = 5;
+    std::string missed_log;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        // 重试前清空上一次的日志，否则关闭日志会跨 attempt 累积，断言就失去意义。
+        std::error_code ec;
+        std::filesystem::remove_all(work_dir_, ec);
+        std::filesystem::create_directories(work_dir_, ec);
+        ASSERT_TRUE(!ec);
 
-    ASSERT_EQ(0, kill(child_pid_, SIGTERM));
-    // 标准信号不排队：必须等控制线程取走第一个信号（表现为关闭日志落盘）再补第二个，
-    // 否则两个 SIGTERM 会合并成一个 pending 信号，只触发一次优雅关闭。
-    ASSERT_TRUE(WaitForShutdownStarted()) << "server never entered shutdown, log:\n" << ServiceLog();
-    // 子进程还没被回收，kill() 对僵尸进程同样返回 0，所以用 WNOHANG waitpid 判断是否仍在关闭中。
-    int status = 0;
-    ASSERT_EQ(0, waitpid(child_pid_, &status, WNOHANG)) << "graceful shutdown finished too fast, log:\n"
-                                                        << ServiceLog();
-    ASSERT_EQ(0, kill(child_pid_, SIGTERM));
+        ASSERT_GE(StartServerChild(), 0);
+        ASSERT_TRUE(WaitForServerReady());
 
-    ASSERT_TRUE(WaitChildWithTimeout(child_pid_, status, kShutdownTimeoutMs)) << "force exit hung";
-    ASSERT_TRUE(WIFEXITED(status));
-    EXPECT_EQ(128 + SIGTERM, WEXITSTATUS(status));
+        ASSERT_EQ(0, kill(child_pid_, SIGSTOP));
+        ASSERT_EQ(0, kill(child_pid_, SIGTERM));
+        ASSERT_EQ(0, kill(child_pid_, SIGUSR1));
+        ASSERT_EQ(0, kill(child_pid_, SIGCONT));
 
-    std::string log = ServiceLog();
-    EXPECT_NE(log.find("force exit"), std::string::npos) << log;
-    EXPECT_EQ(log.find("kvcm server stopped, goodbye!"), std::string::npos) << log;
-    child_pid_ = -1;
+        int status = 0;
+        ASSERT_TRUE(WaitChildWithTimeout(child_pid_, status, kShutdownTimeoutMs)) << "force exit hung";
+        ASSERT_TRUE(WIFEXITED(status));
+        int exit_code = WEXITSTATUS(status);
+        std::string log = ServiceLog();
+        child_pid_ = -1;
+        if (exit_code == 0) {
+            missed_log = "attempt " + std::to_string(attempt) + ", log:\n" + log;
+            continue;
+        }
+
+        EXPECT_TRUE(exit_code == 128 + SIGTERM || exit_code == 128 + SIGUSR1)
+            << "attempt " << attempt << ", unexpected exit code " << exit_code << ", log:\n"
+            << log;
+        EXPECT_NE(log.find("force exit"), std::string::npos) << log;
+        EXPECT_EQ(log.find("kvcm server stopped, goodbye!"), std::string::npos) << log;
+        return;
+    }
+    ADD_FAILURE() << "graceful shutdown finished before the second exit signal was consumed in all "
+                  << kMaxAttempts << " attempts, last: " << missed_log;
 }
