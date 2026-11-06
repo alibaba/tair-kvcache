@@ -1,10 +1,11 @@
 --- a/mooncake-store/src/real_client.cpp
 +++ b/mooncake-store/src/real_client.cpp
-@@ -28,5 +28,7 @@
- #include "shm_helper.h"
- #include "memory_location.h"
+@@ -54,6 +54,8 @@
+ #include "ascend_allocator.h"
+ #endif
  
 +#include <gflags/gflags.h>
 +
  DEFINE_bool(enable_http_server, false,
              "Enable embedded HTTP server for health check and metrics.");
+ DEFINE_int32(http_port, 9300,
