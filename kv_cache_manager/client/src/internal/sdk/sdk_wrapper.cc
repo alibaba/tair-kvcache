@@ -158,12 +158,12 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     std::vector<SdkGroup> groups;
     ec = GroupBySdk(remote_uris, local_buffers, groups);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
 
     // Build task vector for parallel dispatch
@@ -186,12 +186,12 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     std::vector<SdkGroup> groups;
     ec = GroupBySdk(remote_uris, local_buffers, groups);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     actual_remote_uris->resize(remote_uris.size());
 
@@ -227,7 +227,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
                           group_actual_uris->size(),
                           group.indices.size());
-            return ER_SDKWRITE_ERROR;
+            return ER_SDK_ERROR_BUFFER_SAFE;
         }
         for (size_t j = 0; j < group.indices.size(); ++j) {
             (*actual_remote_uris)[group.indices[j]] = (*group_actual_uris)[j];
@@ -290,7 +290,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     if (wait_task_thread_pool_->isFull()) {
         KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
                       getOpTypeString(op_type).c_str());
-        return ER_THREADPOOL_ERROR;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
 
     // Submit all tasks with shared stop flag

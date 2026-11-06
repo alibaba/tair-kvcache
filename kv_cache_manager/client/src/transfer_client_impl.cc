@@ -2,6 +2,8 @@
 
 #include <sstream>
 #if defined(USING_CUDA) || defined(USING_MUSA)
+#include <algorithm>
+#include <limits>
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 #include "kv_cache_manager/common/env_util.h"
 #endif
@@ -17,8 +19,8 @@
         return return_value;                                                                                           \
     }
 
-#define CHECK_SDK() CHECK_SDK_BASE(ER_INVALID_SDKWRAPPER_CONFIG)
-#define CHECK_SDK_WITH_TYPE() CHECK_SDK_BASE(DEFER({ER_INVALID_SDKWRAPPER_CONFIG, {}}))
+#define CHECK_SDK() CHECK_SDK_BASE(ER_SDK_ERROR_BUFFER_SAFE)
+#define CHECK_SDK_WITH_TYPE() CHECK_SDK_BASE(DEFER({ER_SDK_ERROR_BUFFER_SAFE, {}}))
 
 namespace kv_cache_manager {
 
@@ -118,10 +120,46 @@ ClientErrorCode TransferClientImpl::InitInternal(const std::string &client_confi
     }
 }
 
-void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
-                                              const UriStrVec &uri_str_vec,
-                                              const std::vector<int64_t> &block_hashs,
-                                              const std::shared_ptr<TransferTraceInfo> &trace_info) const {
+#if defined(USING_CUDA) || defined(USING_MUSA)
+ClientErrorCode TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
+                                                        const UriStrVec &uri_str_vec,
+                                                        const BlockBuffers &block_buffers,
+                                                        const std::shared_ptr<TransferTraceInfo> &trace_info) const {
+    if (!is_check_buffer_ || block_buffers.empty() || uri_str_vec.size() != block_buffers.size()) {
+        return ER_OK;
+    }
+    std::vector<int64_t> block_hashs;
+    if (!trace_info || trace_info->need_print) {
+        const size_t width = block_buffers.front().iovs.size();
+        if (width == 0 || width > max_check_iov_num_) {
+            return ER_OK;
+        }
+        const size_t sample = SdkBufferCheckUtil::CrcSampleBytes(block_buffers.front().iovs.front().size);
+        // The device kernel hashes the same number of head/tail bytes in each IOV.
+        // The diagnostic must never read ignored, host-only or out-of-bounds memory.
+        for (const auto &block : block_buffers) {
+            if (sample == 0 || block.iovs.size() != width ||
+                std::any_of(block.iovs.begin(), block.iovs.end(), [sample](const Iov &iov) {
+                    return iov.ignore || iov.type != MemoryType::GPU || !iov.base || iov.size < sample ||
+                           iov.size > std::numeric_limits<int>::max();
+                })) {
+                return ER_OK;
+            }
+        }
+        auto handle = sdk_buffer_check_pool_->GetCell();
+        bool caller_read_pending = false;
+        block_hashs = SdkBufferCheckUtil::GetBlocksHash(block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs,
+                                                        max_check_iov_num_, handle->gpu_stream, &caller_read_pending);
+        if (caller_read_pending) {
+#if defined(USING_CUDA)
+            CHECK_CUDA_ERROR_RETURN(cudaStreamSynchronize(handle->gpu_stream), ER_CUDA_STREAM_SYNCHRONIZE_ERROR,
+                                    "waiting for the SDK buffer check failed");
+#else
+            CHECK_MUSA_ERROR_RETURN(musaStreamSynchronize(handle->gpu_stream), ER_CUDA_STREAM_SYNCHRONIZE_ERROR,
+                                    "waiting for the SDK buffer check failed");
+#endif
+        }
+    }
     std::stringstream ss;
     ss << prefix << "; self_location_spec_name : " << init_params_.self_location_spec_name
        << "; uri size : " << uri_str_vec.size() << "; real size : " << block_hashs.size();
@@ -139,7 +177,9 @@ void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
     }
     ss << "}";
     KVCM_LOG_INFO("%s", ss.str().c_str());
+    return ER_OK;
 }
+#endif
 
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
@@ -154,18 +194,10 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
         return ec;
     }
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    if (is_check_buffer_) {
-        bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-        std::vector<int64_t> block_hashs;
-        if (need_print) {
-            auto handle = sdk_buffer_check_pool_->GetCell();
-            block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
-        }
-        PrintBlockHashAndUri("get_", uri_str_vec, block_hashs, trace_info);
-    }
+    return PrintBlockHashAndUri("get_", uri_str_vec, block_buffers, trace_info);
+#else
+    return ER_OK;
 #endif
-    return ec;
 }
 
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
@@ -176,15 +208,9 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    if (is_check_buffer_) {
-        bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-        std::vector<int64_t> block_hashs;
-        if (need_print) {
-            auto handle = sdk_buffer_check_pool_->GetCell();
-            block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
-        }
-        PrintBlockHashAndUri("put_", uri_str_vec, block_hashs, trace_info);
+    auto check_ec = PrintBlockHashAndUri("put_", uri_str_vec, block_buffers, trace_info);
+    if (check_ec != ER_OK) {
+        return {check_ec, {}};
     }
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);
