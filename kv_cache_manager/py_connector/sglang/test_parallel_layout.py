@@ -225,7 +225,7 @@ class TestTheStorageGroupIsJoinedLocally(unittest.TestCase):
 
         with (
             _patched_group_creation([2, 3], my_group_rank=1),
-            self.assertRaises(AssertionError) as caught,
+            self.assertRaises(RuntimeError) as caught,
         ):
             connector._init_parallel_context()
 

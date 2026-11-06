@@ -393,6 +393,17 @@ def _sidecars_are_written_by_every_rank() -> bool:
     return "backup_thread_func" in vars(HybridCacheController)
 
 
+def _require_one_uri_per_buffer(uris: List[str], buffers: List[Any], pool: Any) -> None:
+    """Refuse uri and buffer lists that do not cover the same pages.
+
+    ``LoadKvCaches``/``SaveKvCaches`` pair the two by position, so a mismatch
+    moves every page from the gap onward into another block's slot: the read
+    path reports a hit for another block's bytes, the write path commits them.
+    """
+    if len(uris) != len(buffers):
+        raise ValueError(f"pool {pool}: {len(uris)} uris for {len(buffers)} buffers")
+
+
 class _UnsupportedBackendError(RuntimeError):
     """The connector cannot serve the pools and configuration it has.
 
@@ -694,10 +705,11 @@ class HiCacheKVCM(HiCacheStorage):
             # not be a member, while the group's rank 0 is the rank the write
             # paths call ``tp_rank == 0`` -- asserted here.
             group_rank = torch.distributed.get_rank(group=self.storage_tp_group)
-            assert group_rank == self.tp_rank, (
-                f"this rank is group rank {group_rank} of {group_ranks} but the "
-                f"storage config reports tp_rank={self.tp_rank}"
-            )
+            if group_rank != self.tp_rank:
+                raise RuntimeError(
+                    f"this rank is group rank {group_rank} of {group_ranks} but "
+                    f"the storage config reports tp_rank={self.tp_rank}"
+                )
 
     def _raise_if_closed(self) -> None:
         """Refuse to serve once ``close()`` retired this backend."""
@@ -1842,7 +1854,7 @@ class HiCacheKVCM(HiCacheStorage):
         # Extract URIs and prepare buffers
         uris = self._extract_uris(locations)
         buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
-        assert len(uris) == len(buffers)
+        _require_one_uri_per_buffer(uris, buffers, self.location_spec_name)
         # Perform data transfer
         start_time = time.perf_counter()
         result = self.transfer_client.LoadKvCaches(uris, buffers)
@@ -1957,7 +1969,7 @@ class HiCacheKVCM(HiCacheStorage):
                 buffers = self._prepare_extra_pool_buffers(
                     ptr_list, size_list, components
                 )
-                assert len(uris) == len(buffers)
+                _require_one_uri_per_buffer(uris, buffers, transfer.name)
 
                 start_time = time.perf_counter()
                 load_result = self.transfer_client.LoadKvCaches(uris, buffers)
@@ -2082,7 +2094,7 @@ class HiCacheKVCM(HiCacheStorage):
         locations = result["locations"]
         write_session_id = result["write_session_id"]
         block_mask = result["block_mask"]
-        parsed = self._parse_block_mask(block_mask, len_prefix, len_new)
+        parsed = self._parse_block_mask(block_mask, len_prefix, len_new, len(locations))
 
         finish_trace_id = f"finish-{trace_id}"
 
@@ -2129,8 +2141,6 @@ class HiCacheKVCM(HiCacheStorage):
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
             return [False] * local_len_new if skip_transfer else [True] * local_len_new
-
-        assert unmatched + prefix_write_count == len(locations)
 
         # Data transfer preparation and execution.
         # Skip prefix locations — sglang cannot write prefix blocks.
@@ -2182,7 +2192,7 @@ class HiCacheKVCM(HiCacheStorage):
                     ]
                     uris = self._extract_uris(valid_locations)
                     buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
-                    assert len(uris) == len(buffers)
+                    _require_one_uri_per_buffer(uris, buffers, self.location_spec_name)
 
                     # Perform data transfer
                     start_time = time.perf_counter()
@@ -2446,7 +2456,9 @@ class HiCacheKVCM(HiCacheStorage):
                 block_mask = write_result["block_mask"]
                 finish_trace_id = f"finish-v2-{trace_id}"
 
-                parsed = self._parse_block_mask(block_mask, 0, len(keys))
+                parsed = self._parse_block_mask(
+                    block_mask, 0, len(keys), len(locations)
+                )
 
                 if parsed is None:
                     logger.warning(
@@ -2500,8 +2512,6 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [cached] * len(keys)
                     continue
 
-                assert len(save_indices) + _prefix_write_count == len(locations)
-
                 # Data transfer preparation and execution.
                 # Wrapped in try-except so that every rank always reaches the
                 # all_reduce below, preventing cross-rank NCCL/gloo hangs.
@@ -2529,7 +2539,7 @@ class HiCacheKVCM(HiCacheStorage):
                     buffers = self._prepare_extra_pool_buffers(
                         ptr_list, size_list, components
                     )
-                    assert len(uris) == len(buffers)
+                    _require_one_uri_per_buffer(uris, buffers, transfer.name)
                     start_time = time.perf_counter()
                     save_result = self.transfer_client.SaveKvCaches(uris, buffers)
                     end_time = time.perf_counter()
@@ -2789,7 +2799,7 @@ class HiCacheKVCM(HiCacheStorage):
         return buffers
 
     def _parse_block_mask(
-        self, block_mask: dict, len_prefix: int, len_new: int
+        self, block_mask: dict, len_prefix: int, len_new: int, location_count: int
     ) -> Optional[tuple[List[int], int]]:
         """Parse block_mask from manager to determine which new-block indices need writing.
 
@@ -2799,8 +2809,10 @@ class HiCacheKVCM(HiCacheStorage):
                   Empty list means all new blocks are already cached.
                 - prefix_write_count: number of prefix blocks the manager wants
                   written that we cannot fulfil (best-effort skip).
-            None: manager returned truly broken data (e.g. incomplete bool_masks);
-                  caller should treat as a total write failure.
+            None: manager returned truly broken data (e.g. incomplete bool_masks,
+                  or a block count that does not match the ``location_count``
+                  locations it handed out); caller should treat as a total write
+                  failure.
         """
         save_indices = []
         prefix_write_count = 0
@@ -2838,6 +2850,14 @@ class HiCacheKVCM(HiCacheStorage):
                 [i for i in range(len_prefix, max_index + 1) if not bool_masks[i]]
             )
         save_indices = [(i - len_prefix) for i in save_indices if i >= len_prefix]
+        if len(save_indices) + prefix_write_count != location_count:
+            # One location per block the manager wants written, prefix included.
+            logger.warning(
+                f"_parse_block_mask: {len(save_indices)} new blocks + "
+                f"{prefix_write_count} prefix blocks to write, but the manager "
+                f"returned {location_count} locations, treating as inconsistent state"
+            )
+            return None
         return save_indices, prefix_write_count
 
     def _extract_single_spec_uri(self, location: dict, spec_name: str) -> Optional[str]:
@@ -2862,18 +2882,20 @@ class HiCacheKVCM(HiCacheStorage):
         per conv buffer.  Each page must also match exactly one key: callers
         slice the flat IOV list by page position and map it back to key
         position, so both a wrong component count and a page/key mismatch would
-        silently shift every page's data.  Both are asserted here instead.
+        silently shift every page's data.  Both are refused here instead.
         """
         ptr_list, size_list = pool.get_page_buffer_meta(host_indices)
         num_pages = len(host_indices) // pool.page_size
-        assert num_pages == len(transfer.keys or []), (
-            f"pool transfer {transfer.name} carries {num_pages} host pages "
-            f"(page size {pool.page_size}) for {len(transfer.keys or [])} keys"
-        )
-        assert num_pages > 0 and len(ptr_list) % num_pages == 0, (
-            f"get_page_buffer_meta returned {len(ptr_list)} IOVs for "
-            f"{len(host_indices)} host indices (page size {pool.page_size})"
-        )
+        if num_pages != len(transfer.keys or []):
+            raise ValueError(
+                f"pool transfer {transfer.name} carries {num_pages} host pages "
+                f"(page size {pool.page_size}) for {len(transfer.keys or [])} keys"
+            )
+        if num_pages <= 0 or len(ptr_list) % num_pages:
+            raise ValueError(
+                f"get_page_buffer_meta returned {len(ptr_list)} IOVs for "
+                f"{len(host_indices)} host indices (page size {pool.page_size})"
+            )
         return ptr_list, size_list, len(ptr_list) // num_pages
 
     def _get_kv_spec_group(self) -> str:
