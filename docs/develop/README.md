@@ -70,6 +70,9 @@ bazelisk info --announce_rc repository_cache
     - 运行：```bazelisk test //integration_test/redis_coordination:redis_leader_recovery_test```。覆盖恢复期间外部删锁、反复删锁后恢复、连接中断、续约响应丢失/迟到和 Redis 重启，验证 Meta/Admin 门禁以及双节点切主。
     - 只跑外部删锁用例：```bazelisk test //integration_test/redis_coordination:redis_leader_recovery_test --test_arg=-k --test_arg=external_lock_deletion```。确定性恢复窗口由该目标自动编译并启动 C++ 测试驱动，无需单独配置共享 Redis。
 - 启用ASAN：上述命令后添加 ```--config=debug --config=asan --test_env ASAN_OPTIONS=detect_odr_violation=0```
+- 覆盖率：
+  - ```tools/coverage/run_coverage.sh --base-ref origin/main``` 默认运行单元测试和集成测试。需安装 ```genhtml```；没有时可加 ```--no-html```。
+  - 查看 ```coverage/coverage-summary.md``` 中的全量/增量结果，或打开 ```coverage/html/index.html``` 查看逐文件、逐行和分支覆盖率。CI 会在 PR 中更新摘要并上传完整报告。
 ### 测试资源清理
 
 测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。如果测试异常退出，可能需要手动清理：
@@ -183,4 +186,4 @@ githooks中已经添加了C++等语言的格式化脚本，请确保开发环境
 发起和参与 PR 时应遵守 [Pull Request 协作指南](pull_request_guidelines.md)，主动控制评审负担并为其他参与者准备所需的信息。
 
 ## CI
-可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。
+可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。```coverage``` 负责全量 LCOV、增量覆盖率和 HTML 报告。
