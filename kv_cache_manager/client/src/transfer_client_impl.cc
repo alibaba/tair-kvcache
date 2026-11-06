@@ -27,28 +27,13 @@ TransferClientImpl::TransferClientImpl() {}
 TransferClientImpl::~TransferClientImpl() {}
 
 ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const InitParams &init_params) {
-    return InitInternal(client_config, init_params, nullptr);
-}
-
-ClientErrorCode
-TransferClientImpl::InitWithSharedMemory(const std::string &client_config,
-                                         const InitParams &init_params,
-                                         const SharedMemoryRegistration &shared_memory_registration) {
-    ClientMemoryRegistrations registrations;
-    registrations.host = shared_memory_registration;
-    return InitInternal(client_config, init_params, &registrations);
-}
-
-ClientErrorCode TransferClientImpl::InitWithMemoryRegistrations(
-    const std::string &client_config,
-    const InitParams &init_params,
-    const ClientMemoryRegistrations &memory_registrations) {
-    return InitInternal(client_config, init_params, &memory_registrations);
+    return InitInternal(client_config, init_params, {}, {});
 }
 
 ClientErrorCode TransferClientImpl::InitInternal(const std::string &client_config,
                                                  const InitParams &init_params,
-                                                 const ClientMemoryRegistrations *memory_registrations) {
+                                                 const std::vector<SharedMemoryRegistration> &host_registrations,
+                                                 const std::vector<GpuMemorySpan> &gpu_registrations) {
     {
         std::shared_lock read_guard(config_mutex_);
         if (client_config_ != nullptr) {
@@ -92,7 +77,7 @@ ClientErrorCode TransferClientImpl::InitInternal(const std::string &client_confi
                       init_params_.regist_span,
                       init_params_.self_location_spec_name.c_str(),
                       init_params_.storage_configs.c_str());
-        ec = sdk_wrapper_->Init(client_config_, init_params_, memory_registrations);
+        ec = sdk_wrapper_->Init(client_config_, init_params_, host_registrations, gpu_registrations);
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("init sdk wrapper failed");
             client_config_.reset();
@@ -247,7 +232,9 @@ TransferClient::Create(const std::string &client_config,
                        const SharedMemoryRegistration &shared_memory_registration) {
     LoggerBroker::InitLoggerForClientOnce();
     auto client = std::make_unique<TransferClientImpl>();
-    auto ec = client->InitWithSharedMemory(client_config, init_params, shared_memory_registration);
+    // A default-constructed registration is the "register nothing" sentinel and
+    // is filtered out during preparation; a partially filled one is rejected there.
+    auto ec = client->InitInternal(client_config, init_params, {shared_memory_registration}, {});
     if (ec == ER_OK) {
         return client;
     }
@@ -261,11 +248,26 @@ TransferClient::Create(const std::string &client_config,
                        const ClientMemoryRegistrations &memory_registrations) {
     LoggerBroker::InitLoggerForClientOnce();
     auto client = std::make_unique<TransferClientImpl>();
-    auto ec = client->InitWithMemoryRegistrations(client_config, init_params, memory_registrations);
+    auto ec = client->InitInternal(client_config, init_params, {memory_registrations.host}, memory_registrations.gpu);
     if (ec == ER_OK) {
         return client;
     }
     KVCM_LOG_ERROR("create transfer client with memory registrations failed with errocode: %d", ec);
+    return nullptr;
+}
+
+std::unique_ptr<TransferClient>
+TransferClient::Create(const std::string &client_config,
+                       const InitParams &init_params,
+                       const std::vector<SharedMemoryRegistration> &host_registrations,
+                       const std::vector<GpuMemorySpan> &gpu_registrations) {
+    LoggerBroker::InitLoggerForClientOnce();
+    auto client = std::make_unique<TransferClientImpl>();
+    auto ec = client->InitInternal(client_config, init_params, host_registrations, gpu_registrations);
+    if (ec == ER_OK) {
+        return client;
+    }
+    KVCM_LOG_ERROR("create transfer client with host registration list failed with errocode: %d", ec);
     return nullptr;
 }
 
