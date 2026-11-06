@@ -1,9 +1,10 @@
 """Unit tests for the connector's manager-block -> physical-slot translation.
 
 Covers ``_attn_token_indices`` (attention groups: token-granular three-tier
-mapping) and ``_state_block_ids`` (mamba/state groups: manager block's last
-token selects the group block), verifying against an independent brute-force
-reference implementation, token by token.
+mapping) and ``_state_block_ids`` (mamba/state groups: a slot holds the state
+after exactly ``(idx + 1) * block_size`` tokens, so a manager block is served by
+the slot that ends at its boundary), verifying against an independent
+brute-force reference implementation, token by token.
 """
 
 import unittest
@@ -62,12 +63,25 @@ def _ref_attn_token_indices(
 
 
 def _ref_state_block_ids(manager_bs, group_bs, manager_block_idxes, block_table):
-    """Brute-force reference: the state covering a manager block is the state of
-    the group block containing the manager block's last token."""
+    """Brute-force reference: walk the table slot by slot.
+
+    The engine's invariant is "slot ``p`` holds the state after exactly
+    ``(p + 1) * group_bs`` tokens" and a manager block's key promises the prefix
+    ending at ``(mb + 1) * manager_bs`` tokens, so the serving slot is the last
+    one that does not run past that prefix. No such slot (the boundary precedes
+    the table) means the engine materialized no state there: the null block,
+    which the transfer task reads as "abstain".
+    """
     out = []
     for mb in manager_block_idxes:
-        last_token = (mb + 1) * manager_bs - 1
-        out.append(block_table[last_token // group_bs])
+        end = (mb + 1) * manager_bs
+        chosen = 0
+        for slot in range(len(block_table)):
+            if (slot + 1) * group_bs <= end:
+                chosen = block_table[slot]
+            else:
+                break
+        out.append(chosen)
     return out
 
 
@@ -115,8 +129,13 @@ class TestAttnTokenIndices(unittest.TestCase):
 
 
 class TestStateBlockIds(unittest.TestCase):
+    # (manager_bs, group_bs): state group equal to, finer than, and coarser
+    # than a manager block -- the last shape is where a manager-block boundary
+    # can fall *inside* a state slot and the two formulas disagree.
+    CASES = [(528, 528), (16, 16), (48, 16), (16, 32), (48, 32), (528, 128)]
+
     def test_against_reference(self):
-        for manager_bs, group_bs in [(528, 528), (16, 16), (16, 32), (48, 16)]:
+        for manager_bs, group_bs in self.CASES:
             with self.subTest(manager_bs=manager_bs, group_bs=group_bs):
                 conn = make_connector(manager_block_size=manager_bs)
                 group = _make_group(group_bs, is_attention=False)
@@ -128,18 +147,26 @@ class TestStateBlockIds(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_manual_example(self):
-        # manager_bs=4, group_bs=8: manager blocks 0 and 1 both end inside group
-        # block 0; manager block 2 ends in group block 1.
-        conn = make_connector(manager_block_size=4)
+        # manager_bs=16, group_bs=8: slot p holds the state after 8*(p+1)
+        # tokens, so manager block mb (prefix ending at 16*(mb+1) tokens) is
+        # served by slot 2*(mb+1)-1 = 1, 3, 5. Slot 5 was never allocated:
+        # the engine materialized no state at that boundary, so the null block.
+        conn = make_connector(manager_block_size=16)
         group = _make_group(group_bs=8, is_attention=False)
-        got = conn._state_block_ids(group, [0, 1, 2], [7, 3])
-        self.assertEqual(got, [7, 7, 3])
+        got = conn._state_block_ids(group, [0, 1, 2], [7, 3, 9, 4])
+        self.assertEqual(got, [3, 4, 0])
 
-    def test_out_of_range_asserts(self):
+    def test_missing_boundary_is_the_null_block(self):
+        # A boundary past the recorded table means the engine never
+        # materialized that state, which the transfer task understands as the
+        # null block id (0) -- "no state here", so the block abstains. The
+        # masked save path makes an assertion impossible here: the scheduler
+        # announces a boundary it has no hand-off for and still asks for its
+        # state ids (see _state_complete_mask / _tables_with_state_pages).
         conn = make_connector(manager_block_size=16)
         group = _make_group(group_bs=16, is_attention=False)
-        with self.assertRaises(AssertionError):
-            conn._state_block_ids(group, [2], [0, 1])
+        self.assertEqual(conn._state_block_ids(group, [0, 1], [7, 3]), [7, 3])
+        self.assertEqual(conn._state_block_ids(group, [2], [7, 3]), [0])
 
 
 if __name__ == "__main__":

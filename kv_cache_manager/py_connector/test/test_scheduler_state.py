@@ -76,10 +76,12 @@ def fake_scheduler_output(
     new_block_ids=(),
     resumed_req_ids=frozenset(),
     legacy_resumed=None,
+    block_state=None,
 ):
     """Build a fake SchedulerOutput. legacy_resumed switches the cached-reqs
     container to the pre-0.26 interface (resumed_from_preemption list, no
-    resumed_req_ids attribute)."""
+    resumed_req_ids attribute). block_state attaches the engine's state
+    hand-off; an engine that has none leaves the attribute off entirely."""
     if legacy_resumed is not None:
         cached = SimpleNamespace(
             req_ids=list(cached_req_ids),
@@ -92,10 +94,26 @@ def fake_scheduler_output(
             resumed_req_ids=set(resumed_req_ids),
             new_block_ids=list(new_block_ids),
         )
-    return SimpleNamespace(
+    out = SimpleNamespace(
         scheduled_new_reqs=list(new_reqs),
         scheduled_cached_reqs=cached,
         num_scheduled_tokens=dict(num_scheduled or {}),
+    )
+    if block_state is not None:
+        out.kv_connector_block_state = block_state
+    return out
+
+
+def block_state(offers=None, live=None):
+    """The engine's state hand-off for one step.
+
+    ``offers``: {req_id: [(group_idx, page, boundary)]} -- the boundaries the
+    scheduler is willing to have copied out and the page holding each one.
+    ``live``: {req_id: {group_idx: [page, ...]}} -- the request's block table
+    per group, i.e. the pages that are still the request's to read.
+    """
+    return SimpleNamespace(
+        boundary_state_offloads=dict(offers or {}), block_ids=dict(live or {})
     )
 
 
@@ -350,45 +368,92 @@ class TestSpecGroups(unittest.TestCase):
 
 
 class TestStateCompleteMask(unittest.TestCase):
-    """Which manager blocks have a materialized recurrent state is read from
-    vLLM's block table: a state group pointing at the null block (id 0) has
-    none. This mask is what start_write_cache announces per key."""
+    """Which manager blocks have a materialized recurrent state comes from the
+    engine's hand-off (``boundary_state_offloads``), not from the state group's
+    block table: that table is an allocation log, and the engine replaces a
+    boundary's page (copy-on-write) and frees the old ones while vLLM reports
+    only *newly allocated* blocks, so an append-only mirror keeps pages the
+    engine has already released. This mask is what start_write_cache announces
+    per key: a block without a hand-off at its boundary is announced
+    attention-only, so no reader resumes on a state nobody wrote."""
 
-    def _req(self, tables):
-        return RequestLedger(
+    MBS = 16
+
+    def _conn(self, num_groups=1, num_state_groups=1):
+        return make_connector_scheduler(
+            manager_block_size=self.MBS,
+            num_groups=num_groups,
+            num_state_groups=num_state_groups,
+        )
+
+    def _mask(self, conn, offers, live=None, num_blocks=3):
+        """Feed one step's hand-off, then read the mask the way the save path
+        does: per manager block, for blocks 0 .. num_blocks-1."""
+        conn._record_state_offers(
+            fake_scheduler_output(block_state=block_state(offers, live))
+        )
+        ledger = RequestLedger(
             vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
-            block_ids_per_group=tables,
+            block_ids_per_group=[[]],
             has_saved_block_num=0,
         )
+        return conn._state_complete_mask(ledger, range(num_blocks))
 
     def test_full_attention_is_always_complete(self):
-        conn = make_connector_scheduler(manager_block_size=16, num_groups=1)
-        req = self._req([[7, 0, 9]])
-        self.assertEqual(conn._state_complete_mask(req, range(3)), [True, True, True])
-
-    def test_null_state_blocks_are_incomplete(self):
-        conn = make_connector_scheduler(
-            manager_block_size=16, num_groups=1, num_state_groups=1
+        # No state group: nothing can be missing, whatever the hand-off says.
+        self.assertEqual(
+            self._mask(self._conn(num_state_groups=0), {}, num_blocks=3), [True] * 3
         )
-        # State table: blocks 0 and 2 are null (no state), block 1 is real.
-        req = self._req([[100, 101, 102], [0, 55, 0]])
-        self.assertEqual(conn._state_complete_mask(req, range(3)), [False, True, False])
 
-    def test_all_state_groups_must_have_state(self):
-        conn = make_connector_scheduler(
-            manager_block_size=16, num_groups=1, num_state_groups=2
-        )
-        # Block 1 has a state in group 1 but not in group 2 -> incomplete.
-        req = self._req([[100, 101], [7, 8], [7, 0]])
-        self.assertEqual(conn._state_complete_mask(req, range(2)), [True, False])
+    def test_only_handed_off_boundaries_are_complete(self):
+        # Boundary 16 (block 0's end) was handed off; 32 and 48 were not.
+        conn = self._conn()
+        mask = self._mask(conn, {"r0": [(1, 77, 16)]}, {"r0": {1: [77, 78, 79]}})
+        self.assertEqual(mask, [True, False, False])
 
-    def test_short_state_table_is_incomplete(self):
-        # A state table that does not reach the block cannot prove a state.
-        conn = make_connector_scheduler(
-            manager_block_size=16, num_groups=1, num_state_groups=1
+    def test_every_state_group_must_have_its_page(self):
+        # Group 1 has pages at both boundaries, group 2 only at the first: a
+        # reader would get no state for group 2 on block 1 -> incomplete.
+        conn = self._conn(num_state_groups=2)
+        mask = self._mask(
+            conn,
+            {"r0": [(1, 77, 16), (2, 88, 16), (1, 78, 32)]},
+            {"r0": {1: [77, 78], 2: [88, 89]}},
         )
-        req = self._req([[100, 101], [55]])
-        self.assertEqual(conn._state_complete_mask(req, range(2)), [True, False])
+        self.assertEqual(mask, [True, False, False])
+
+    def test_allocation_log_pages_are_not_a_hand_off(self):
+        # The state table holds three real pages, but a page sitting in the
+        # allocation log says nothing about the boundary the manager block
+        # promises: only an offer does. Offers that name a non-state group, a
+        # boundary that is not a state-slot end, or the null page are dropped.
+        conn = self._conn()
+        ledger = RequestLedger(
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
+            block_ids_per_group=[[100, 101], [55, 56, 57]],
+            has_saved_block_num=0,
+        )
+        conn._record_state_offers(
+            fake_scheduler_output(
+                block_state=block_state(
+                    # attention group, off-boundary, and null-page offers
+                    {"r0": [(0, 99, 16), (1, 58, 8), (1, 0, 16)]},
+                    {"r0": {1: [55, 56, 57]}},
+                )
+            )
+        )
+        self.assertEqual(conn._state_complete_mask(ledger, range(2)), [False, False])
+
+    def test_a_freed_page_stops_counting(self):
+        # The engine copies a boundary's state into a fresh page and frees the
+        # old one; the hand-off map is pruned against the same step's block
+        # table so a released page can never be published.
+        conn = self._conn()
+        self.assertEqual(
+            self._mask(conn, {"r0": [(1, 77, 16)]}, {"r0": {1: [77]}}),
+            [True, False, False],
+        )
+        self.assertEqual(self._mask(conn, {}, {"r0": {1: [90]}}), [False, False, False])
 
 
 class TestExternalHitTruncation(unittest.TestCase):
@@ -878,10 +943,15 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         self.assertEqual(args[3], [])
         self.assertFalse(kwargs["report_failures"])
 
-    def test_lone_state_group_refuses_to_report(self):
+    def test_lone_state_group_reports_nothing(self):
         # A single vLLM block table that is not attention (pure mamba): the
-        # token-granular recovery math upstream cannot consume state block
-        # ids; the worker must fail loudly instead of reporting nonsense.
+        # failure report speaks upstream's token-granular recovery, which
+        # divides by an *attention* group's block size, so state block ids must
+        # never reach it. With no attention group among the transferred ones
+        # there is nothing to express the report in, and the load proceeds
+        # unreported; parse_groups already refuses a pure-mamba model, so this
+        # shape is only a safety net, and a traceback in it would kill the
+        # engine for a model the connector never adopts.
         conn = make_connector(manager_block_size=self.MBS)
         conn._group_metas = [
             StateGroupMeta(
@@ -907,8 +977,10 @@ class TestSkippedGroupIndexing(unittest.TestCase):
                 all_block_ids=[[10]],
             )
         )
-        with self.assertRaises(AssertionError):
-            conn.start_load_kv(MagicMock(), meta)
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._backend.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
 
 
 # --------------------------------------------------------------------------- #
@@ -941,11 +1013,47 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
-        # The per-block state-completeness mask is computed here, in the
-        # scheduler loop, and handed to the http thread: it is read off vLLM's
-        # block table, which later steps mutate.
-        self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
+        # The per-block state-completeness mask *and* the block tables it was
+        # computed against are read here, in the scheduler loop, and handed to
+        # the http thread together: a later step's tables would name pages the
+        # mask was not computed against. Attention-only models keep their
+        # allocation log as the table.
+        self.assertEqual(
+            args[1:], ("r0", list(range(32)), 2, [True, True], [[100, 101, 102]])
+        )
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
+
+    def test_save_tables_name_the_hand_off_pages(self):
+        # Hybrid request: a state group's entry for a manager block is the page
+        # the engine handed off for that block's boundary, not the page the
+        # allocation log happens to hold there (the engine rewrites a boundary
+        # in a copy-on-write page and frees the old one), and the null block
+        # where no hand-off exists -- exactly the blocks the mask leaves out.
+        # Mask and tables are snapshotted in the same step so they agree.
+        conn = make_scheduler_connector(mbs=self.MBS, num_state_groups=1)
+        conn._location_query_manager.locations = []
+        conn._location_query_manager.in_flight = False
+        req = FakeRequest("r0", list(range(40)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        tables = [[100, 101, 102], [50, 51, 52]]
+        conn.update_state_after_alloc(
+            req,
+            SimpleNamespace(get_block_ids=lambda: [list(t) for t in tables]),
+            matched,
+        )
+        conn.build_connector_meta(
+            fake_scheduler_output(
+                new_reqs=[SimpleNamespace(req_id="r0", block_ids=tables)],
+                # Boundary 32 lives in page 77; boundary 16 has no hand-off.
+                block_state=block_state(
+                    {"r0": [(1, 77, 32)]}, {"r0": {1: [50, 77, 52]}}
+                ),
+            )
+        )
+        args = conn._http_executor.submit.call_args[0]
+        self.assertEqual(args[3], 2)  # target_save_num
+        self.assertEqual(args[4], [False, True])  # state completeness per block
+        self.assertEqual(args[5], [[100, 101, 102], [0, 77, 52]])  # worker tables
 
     def test_load_request_emitted_after_alloc(self):
         conn = make_scheduler_connector(mbs=self.MBS)
