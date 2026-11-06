@@ -7,6 +7,7 @@ class PrefixCacheDecorator(BaseDataset):
     Decorator for dataset classes to handle prefix_hit_rate functionality.
     Uses the Decorator design pattern to add prefix caching capabilities
     to any dataset implementation without modifying the original classes.
+    Random access generates earlier requests first and reuses cached results.
     """
 
     def __init__(self, dataset: BaseDataset):
@@ -25,15 +26,19 @@ class PrefixCacheDecorator(BaseDataset):
             start, stop, step = index.indices(len(self))
             return [self[i] for i in range(start, stop, step)]
 
-        if index >= len(self):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
             raise IndexError
 
         # If prefix_hit_rate is not set, delegate directly to the wrapped dataset
         if self.args.prefix_hit_rate is None:
             return self._dataset[index]
         else:
-            # Handle prefix cache logic
-            return self._get_item_with_prefix_cache(index)
+            # Generate missing requests in order so each uses the previous prefix.
+            while len(self.cached) <= index:
+                self._get_item_with_prefix_cache(len(self.cached))
+            return self.cached[index]
 
     def _get_item_with_prefix_cache(self, index: int) -> GenericRequest:
         if index == 0:
