@@ -366,3 +366,136 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchVsSequentialPerformance) {
     KVCM_LOG_INFO("Batch PrefixMatch duration for 100 runs: %ld ms for %ld", batch_duration.count() / 1000, num_keys);
     KVCM_LOG_INFO("Average per run: %.2f ms", batch_duration.count() / 100000.0);
 }
+
+class MetaSearcherDuplicateDeleteRedisTest : public MetaSearcherRealServiceTest,
+                                             public ::testing::WithParamInterface<std::string> {
+public:
+    void SetUp() override {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        if (GetParam() != "Redis") {
+            backend_config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+            const std::string persistent_type = GetParam() == "CachedAsyncRedis" ? "async_redis" : "redis";
+            backend_config->SetStorageUri(redis_test::Uri("test_user:test_password",
+                                                          redis_test::kMetaSearcherDb,
+                                                          "cache_type=local&persistent_type=" + persistent_type +
+                                                              "&capacity=16&num_shard_bits=2&async_queue_count=1"));
+        }
+
+        auto indexer_config = std::make_shared<MetaIndexerConfig>();
+        indexer_config->SetMetaStorageBackendConfig(backend_config);
+        indexer_config->SetMutexShardNum(32);
+        indexer_config->SetMaxKeyCount(10000);
+        auto cache_policy = std::make_shared<MetaCachePolicyConfig>();
+        cache_policy->SetCapacity(16);
+        indexer_config->SetMetaCachePolicyConfig(cache_policy);
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        // Isolate each mode and repeated test run without flushing the shared Redis database.
+        const std::string instance_id = GetCurrentTestName() + "_" + std::to_string(TimestampUtil::GetCurrentTimeUs());
+        ASSERT_EQ(EC_OK, meta_indexer_->Init(instance_id, indexer_config));
+        meta_searcher_ =
+            std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+        request_context_ = std::make_shared<RequestContext>("duplicate_delete_redis");
+    }
+
+    void CheckDuplicateDeleteAccounting(bool compare_status) {
+        constexpr KeyType healthy_key = 92001;
+        constexpr KeyType dead_key = 92002;
+        constexpr auto storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        const KeyVector seed_keys{healthy_key, dead_key};
+        CacheLocationVector locations{
+            std::make_shared<CacheLocation>(
+                storage_type, 1, std::vector<LocationSpec>{LocationSpec("healthy", "file:///tmp/healthy?size=101")}),
+            std::make_shared<CacheLocation>(
+                storage_type, 1, std::vector<LocationSpec>{LocationSpec("dead", "file:///tmp/dead?size=17")}),
+        };
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK,
+                  BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), seed_keys, locations, ids));
+        ASSERT_EQ(2u, ids.size());
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> status_tasks{{{ids[0], CLS_SERVING}},
+                                                                                {{ids[1], CLS_DELETING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), seed_keys, status_tasks, results));
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_OK}}), results);
+        ASSERT_TRUE(meta_indexer_->Sync(seed_keys));
+        ASSERT_EQ(2u, meta_indexer_->GetKeyCount());
+        ASSERT_EQ(118u, meta_indexer_->GetStorageUsage());
+        ASSERT_EQ(118u, meta_indexer_->GetStorageUsageByType(storage_type));
+
+        CacheLocationMapVector before;
+        const auto before_result = meta_indexer_->GetLocationsFromPrimary(request_context_.get(), seed_keys, before);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), before_result.error_codes);
+        ASSERT_EQ(2u, before.size());
+        ASSERT_EQ(1u, before[0].count(ids[0]));
+        ASSERT_EQ(1u, before[1].count(ids[1]));
+        const std::string healthy_snapshot = before[0].at(ids[0])->ToJsonString();
+        const std::string dead_snapshot = before[1].at(ids[1])->ToJsonString();
+
+        // Duplicate the target both within one row and across repeated keys.
+        const KeyVector keys{dead_key, dead_key, dead_key};
+        const LocationIdsPerKey location_ids{{ids[1], ids[1]}, {ids[1]}, {ids[1], ids[1]}};
+        const std::vector<std::vector<MetaSearcher::LocationCADTask>> cad_tasks{
+            {{ids[1], CLS_DELETING}, {ids[1], CLS_DELETING}},
+            {{ids[1], CLS_DELETING}},
+            {{ids[1], CLS_DELETING}, {ids[1], CLS_DELETING}},
+        };
+        const std::vector<std::vector<std::string>> expected_values{
+            {dead_snapshot, dead_snapshot}, {dead_snapshot}, {dead_snapshot, dead_snapshot}};
+
+        for (size_t attempt = 0; attempt < 2; ++attempt) {
+            SCOPED_TRACE(attempt);
+            if (compare_status) {
+                ASSERT_EQ(EC_OK,
+                          meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, cad_tasks, results));
+            } else {
+                ASSERT_EQ(EC_OK,
+                          meta_searcher_->BatchDeleteLocations(
+                              request_context_.get(), keys, location_ids, results, expected_values));
+            }
+            const ErrorCode expected_ec = attempt == 0 ? EC_OK : EC_NOENT;
+            const std::vector<std::vector<ErrorCode>> expected_results{
+                {expected_ec, expected_ec}, {expected_ec}, {expected_ec, expected_ec}};
+            EXPECT_EQ(expected_results, results);
+            ASSERT_TRUE(meta_indexer_->Sync(seed_keys));
+            EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+            EXPECT_EQ(101u, meta_indexer_->GetStorageUsage());
+            EXPECT_EQ(101u, meta_indexer_->GetStorageUsageByType(storage_type));
+
+            CacheLocationMapVector current;
+            const auto current_result = meta_indexer_->GetLocations(request_context_.get(), seed_keys, current);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), current_result.error_codes);
+            ASSERT_EQ(2u, current.size());
+            ASSERT_EQ(1u, current[0].size());
+            ASSERT_EQ(1u, current[0].count(ids[0]));
+            EXPECT_EQ(healthy_snapshot, current[0].at(ids[0])->ToJsonString());
+            EXPECT_TRUE(current[1].empty());
+
+            // A cache hit alone is insufficient: verify the real Redis state after the async barrier too.
+            CacheLocationMapVector persistent;
+            const auto persistent_result =
+                meta_indexer_->GetLocationsFromPrimary(request_context_.get(), seed_keys, persistent);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), persistent_result.error_codes);
+            ASSERT_EQ(2u, persistent.size());
+            ASSERT_EQ(1u, persistent[0].size());
+            ASSERT_EQ(1u, persistent[0].count(ids[0]));
+            EXPECT_EQ(healthy_snapshot, persistent[0].at(ids[0])->ToJsonString());
+            EXPECT_TRUE(persistent[1].empty());
+        }
+    }
+};
+
+TEST_P(MetaSearcherDuplicateDeleteRedisTest, BatchCADLocationStatusDuplicateTargetsAccountOnce) {
+    CheckDuplicateDeleteAccounting(true);
+}
+
+TEST_P(MetaSearcherDuplicateDeleteRedisTest, BatchDeleteLocationsDuplicateTargetsAccountOnce) {
+    CheckDuplicateDeleteAccounting(false);
+}
+
+INSTANTIATE_TEST_SUITE_P(RealRedisBackends,
+                         MetaSearcherDuplicateDeleteRedisTest,
+                         ::testing::Values(std::string("Redis"),
+                                           std::string("CachedRedis"),
+                                           std::string("CachedAsyncRedis")),
+                         [](const ::testing::TestParamInfo<std::string> &info) { return info.param; });
