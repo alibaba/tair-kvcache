@@ -324,6 +324,10 @@ def make_connector_scheduler(
     core._load_failed = set()
     core._load_attempted = set()
     core._waiting_to_load_requests = []
+    # The engine's per-request boundary -> page hand-off, filled by
+    # _record_state_offers from the scheduler output. Empty until a step hands
+    # one over, exactly as in __init__.
+    core._state_pages = {}
     import threading
 
     core._waiting_to_save_requests_lock = threading.Lock()
