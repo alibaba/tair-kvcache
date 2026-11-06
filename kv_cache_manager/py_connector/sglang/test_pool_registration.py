@@ -517,6 +517,10 @@ class TestPoolSpecTable(unittest.TestCase):
 # the iov size.  Literal on purpose: P2/P3/P4 add pools and change these
 # fields, and this is the table that makes "only added, nothing changed"
 # checkable without a GPU or a Manager.
+#
+# This table is the non-MLA layout: every pool registers one spec per TP rank.
+# An MLA model registers a replicated pool for rank 0 alone -- ``_MLA_COMBO_GOLDEN``
+# carries the differing fields of the same combinations.
 _COMBO_GOLDEN: dict[tuple, tuple] = {
     (): (
         [("tp_0", KV_SPEC_BYTES), ("tp_1", KV_SPEC_BYTES)],
@@ -580,6 +584,65 @@ _COMBO_GOLDEN: dict[tuple, tuple] = {
             ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
         ],
         BIG_INDEXER_SPEC_BYTES * 1024,
+    ),
+}
+
+# The same combinations on an MLA model: only (infos, groups) differ, so this
+# table carries just those two -- the iov size is sized from one block of the
+# table pools and does not depend on how many specs are registered.  A
+# replicated pool (KV, Indexer) registers rank 0's spec alone and its group
+# names that one; the sharded Mamba state keeps one spec per rank.
+_MLA_COMBO_GOLDEN: dict[tuple, tuple] = {
+    (): (
+        [("tp_0", KV_SPEC_BYTES)],
+        None,
+    ),
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+        ],
+    ),
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full"]),
+            ("Indexer", ["tp_0_indexer"]),
+        ],
+    ),
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+            ("Indexer", ["tp_0_indexer"]),
+        ],
+    ),
+    ((PoolName.INDEXER, BIG_INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", BIG_INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full"]),
+            ("Indexer", ["tp_0_indexer"]),
+        ],
     ),
 }
 
@@ -668,6 +731,19 @@ def _expected_client_config(spec_infos: dict) -> str:
     )
 
 
+def _golden_row(pools: tuple, is_mla: bool) -> tuple:
+    """(spec infos, spec groups, iov size) an instance of that combination sends.
+
+    A combination without an MLA row raises here on purpose: the two tables have
+    to cover the same combinations.
+    """
+    infos, groups, iov_size = _COMBO_GOLDEN[pools]
+    if not is_mla:
+        return infos, groups, iov_size
+    mla_infos, mla_groups = _MLA_COMBO_GOLDEN[pools]
+    return mla_infos, mla_groups, iov_size
+
+
 class TestControlPlaneGolden(unittest.TestCase):
     """The control plane of an instance, pinned for every pool combination.
 
@@ -714,8 +790,9 @@ class TestControlPlaneGolden(unittest.TestCase):
         }
 
     def test_control_plane_is_unchanged_per_pool_combination(self) -> None:
-        for pools, (infos, groups, iov_size) in _COMBO_GOLDEN.items():
+        for pools in _COMBO_GOLDEN:
             for is_mla in (False, True):
+                infos, groups, iov_size = _golden_row(pools, is_mla)
                 for tp_rank in (0, 1):
                     scenario = f"pools={pools} mla={is_mla} tp_rank={tp_rank}"
                     with self.subTest(scenario=scenario):
@@ -765,6 +842,48 @@ class TestControlPlaneGolden(unittest.TestCase):
                         self.assertEqual(
                             control_plane["kv_factor"], 1 if is_mla else 2, scenario
                         )
+
+    def test_the_spec_set_follows_the_rank_count(self) -> None:
+        """Only a replicated pool of an MLA model registers rank 0's spec alone.
+
+        A non-MLA model shards its KV state across the ranks, so a rank's spec
+        that went missing would leave that rank reading rank 0's shard.  Both
+        directions are pinned at tp=4, a rank count the golden table above does
+        not reach, and rank 3 is a rank neither table looks at either.
+        """
+        pools = ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),)
+        full = [f"tp_{rank}_full" for rank in range(4)]
+        linear = [f"tp_{rank}_linear" for rank in range(4)]
+
+        dense = self._control_plane(pools, is_mla=False, tp_rank=3, tp_size=4)
+        self.assertEqual(
+            [spec["name"] for spec in dense["location_spec_infos"]],
+            full + linear,
+            "a non-MLA model keeps one spec per rank",
+        )
+        self.assertEqual(
+            dense["location_spec_groups"],
+            [
+                {"name": "Full", "spec_names": full},
+                {"name": "Linear", "spec_names": linear},
+            ],
+        )
+        self.assertEqual(dense["location_spec_name"], "tp_3_full")
+
+        mla = self._control_plane(pools, is_mla=True, tp_rank=3, tp_size=4)
+        self.assertEqual(
+            [spec["name"] for spec in mla["location_spec_infos"]],
+            ["tp_0_full"] + linear,
+            "an MLA model registers rank 0's spec for a replicated pool only",
+        )
+        self.assertEqual(
+            mla["location_spec_groups"],
+            [
+                {"name": "Full", "spec_names": ["tp_0_full"]},
+                {"name": "Linear", "spec_names": linear},
+            ],
+        )
+        self.assertEqual(mla["location_spec_name"], "tp_0_full")
 
     def test_single_rank_flat_model_keeps_the_legacy_spec_name(self) -> None:
         control_plane = self._control_plane((), is_mla=False, tp_rank=0, tp_size=1)
