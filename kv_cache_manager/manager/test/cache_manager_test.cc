@@ -60,6 +60,46 @@ static const std::string default_storage_configs(
 namespace kv_cache_manager {
 
 namespace {
+// Locate semantic stage names without depending on compiler-specific __FILE__ paths.
+void CollectTraceStages(const rapidjson::Value &value,
+                        const std::string &stage,
+                        std::vector<const rapidjson::Value *> &matches) {
+    if (value.IsArray()) {
+        for (const auto &child : value.GetArray()) {
+            CollectTraceStages(child, stage, matches);
+        }
+    } else if (value.IsObject()) {
+        for (auto it = value.MemberBegin(); it != value.MemberEnd(); ++it) {
+            if (it->value.IsArray() && StringUtil::EndsWith(it->name.GetString(), ":" + stage)) {
+                matches.push_back(&value);
+            }
+            CollectTraceStages(it->value, stage, matches);
+        }
+    }
+}
+
+const rapidjson::Value *FindTraceStage(const rapidjson::Value &trace, const std::string &stage) {
+    std::vector<const rapidjson::Value *> matches;
+    CollectTraceStages(trace, stage, matches);
+    EXPECT_EQ(1u, matches.size()) << stage;
+    return matches.size() == 1 ? matches.front() : nullptr;
+}
+
+size_t CountTraceNodes(const rapidjson::Value &value) {
+    size_t count = 0;
+    if (value.IsObject()) {
+        count += value.HasMember("span_time_us");
+        for (auto it = value.MemberBegin(); it != value.MemberEnd(); ++it) {
+            count += CountTraceNodes(it->value);
+        }
+    } else if (value.IsArray()) {
+        for (const auto &child : value.GetArray()) {
+            count += CountTraceNodes(child);
+        }
+    }
+    return count;
+}
+
 ErrorCode BatchAddLocationForTest(const std::shared_ptr<MetaSearcher> &meta_searcher,
                                   RequestContext *request_context,
                                   const KeyVector &keys,
@@ -5845,6 +5885,138 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     EXPECT_EQ(replacement_token, ambiguous_response.committed_snapshot_version());
     EXPECT_EQ(visible, QueryEventReportUris({key}));
     EXPECT_TRUE(QueryRawEventReportUris(key + 1).empty());
+}
+
+TEST_F(CacheManagerTest, TestSnapshotTraceAggregatesBatchesAndCountsRebuiltLocations) {
+    const std::string host = "192.168.10.89:8080";
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    indexer->batch_key_size_ = 1;
+
+    size_t single_key_node_count = 0;
+    size_t previous_key_count = 0;
+    for (const size_t key_count : {1u, 64u, 64u}) {
+        std::vector<std::pair<int64_t, std::string>> keys;
+        for (size_t i = 0; i < key_count; ++i) {
+            keys.emplace_back(9600 + i, "unchanged");
+        }
+        const auto request = MakeSnapshotRequest(host, keys);
+        RequestContext context("snapshot_test__kvcm_need_span_tracer");
+        auto *root = context.parent_span_tracer();
+        proto::meta::ReportEventResponse response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(&context, &request, &response));
+        EXPECT_EQ(root, context.parent_span_tracer());
+        EXPECT_FALSE(response.committed_snapshot_version().empty());
+        rapidjson::Document trace;
+        trace.Parse(context.EndAndGetSpanTracerDebugStr().c_str());
+        ASSERT_FALSE(trace.HasParseError());
+        for (const auto *name : {"snapshot.validate",
+                                 "snapshot.group",
+                                 "snapshot.build_tasks",
+                                 "snapshot.admit_and_drain",
+                                 "snapshot.append_version",
+                                 "snapshot.release_validated",
+                                 "snapshot.replace_prepare",
+                                 "snapshot.account_results",
+                                 "snapshot.commit_or_abort",
+                                 "snapshot.response_and_release",
+                                 "rmw.make_batches",
+                                 "rmw.allocate_results",
+                                 "rmw.read_total",
+                                 "rmw.modify_and_bucket_total",
+                                 "rmw.upsert_total",
+                                 "rmw.lock_wait_total",
+                                 "rmw.lock_hold_total",
+                                 "rmw.async_enqueue_total"}) {
+            const auto *stage = FindTraceStage(trace, name);
+            ASSERT_NE(nullptr, stage) << name;
+            EXPECT_GE((*stage)["span_time_us"].GetInt64(), 0) << name;
+        }
+        const auto *prepare = FindTraceStage(trace, "snapshot.prepare");
+        ASSERT_NE(nullptr, prepare);
+        EXPECT_EQ(key_count, (*prepare)["counters"]["unique_keys"].GetUint64());
+        EXPECT_EQ(key_count, (*prepare)["counters"]["validated_specs"].GetUint64());
+        const auto *replace = FindTraceStage(trace, "snapshot.replace_specs");
+        ASSERT_NE(nullptr, replace);
+        EXPECT_EQ(previous_key_count, (*replace)["counters"]["rebuilt_existing_locations"].GetUint64());
+        EXPECT_EQ(key_count - previous_key_count, (*replace)["counters"]["rebuilt_missing_locations"].GetUint64());
+        const auto *rmw = FindTraceStage(trace, "rmw.total");
+        ASSERT_NE(nullptr, rmw);
+        EXPECT_EQ(key_count, (*rmw)["counters"]["keys"].GetUint64());
+        EXPECT_EQ(0, (*rmw)["counters"]["failed_keys"].GetInt64());
+        if (key_count == 1) {
+            single_key_node_count = CountTraceNodes(trace);
+        } else {
+            EXPECT_GT((*rmw)["counters"]["batches"].GetInt64(), 1);
+            // More keys/batches must not produce more trace nodes.
+            EXPECT_EQ(single_key_node_count, CountTraceNodes(trace));
+        }
+        previous_key_count = key_count;
+    }
+}
+
+TEST_F(CacheManagerTest, TestSnapshotTraceSurvivesInvalidEmptyAndRateLimitedRequests) {
+    const std::string host = "192.168.10.90:8080";
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    event_backend->SetSnapshotMinIntervalMsForTest(3'600'000);
+    auto invalid = MakeSnapshotRequest(host, {{9700, "invalid"}});
+    invalid.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->set_block_key("bad-key");
+    auto empty = MakeSnapshotRequest(host, {});
+    auto limited = MakeSnapshotRequest(host, {{9700, "limited"}});
+    for (const auto *request : {&invalid, &empty, &limited}) {
+        RequestContext context("snapshot_early_exit__kvcm_need_span_tracer");
+        auto *root = context.parent_span_tracer();
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(request == &empty ? EC_OK : EC_PARTIAL_OK, cache_manager_->ReportEvent(&context, request, &response));
+        EXPECT_EQ(root, context.parent_span_tracer());
+        rapidjson::Document trace;
+        trace.Parse(context.EndAndGetSpanTracerDebugStr().c_str());
+        ASSERT_FALSE(trace.HasParseError());
+        ASSERT_NE(nullptr, FindTraceStage(trace, "snapshot.validate"));
+        ASSERT_NE(nullptr, FindTraceStage(trace, "snapshot.response_and_release"));
+        std::vector<const rapidjson::Value *> rmw;
+        CollectTraceStages(trace, "rmw.total", rmw);
+        EXPECT_TRUE(rmw.empty());
+        if (request == &empty) {
+            EXPECT_FALSE(response.committed_snapshot_version().empty());
+            ASSERT_NE(nullptr, FindTraceStage(trace, "snapshot.commit_or_abort"));
+        } else if (request == &limited) {
+            EXPECT_GT(response.retry_after_ms(), 0u);
+            ASSERT_NE(nullptr, FindTraceStage(trace, "snapshot.admit_and_drain"));
+        }
+    }
+}
+
+TEST_F(CacheManagerTest, TestSnapshotTraceIncludesFailedWriteAndAbort) {
+    const std::string host = "192.168.10.91:8080";
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    meta_backend->FailKeyOnNextUpsert(9800);
+    const auto request = MakeSnapshotRequest(host, {{9800, "failure"}});
+    RequestContext context("snapshot_failed_write__kvcm_need_span_tracer");
+    auto *root = context.parent_span_tracer();
+    proto::meta::ReportEventResponse response;
+    EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(&context, &request, &response));
+    EXPECT_EQ(root, context.parent_span_tracer());
+    rapidjson::Document trace;
+    trace.Parse(context.EndAndGetSpanTracerDebugStr().c_str());
+    ASSERT_FALSE(trace.HasParseError());
+    const auto *rmw = FindTraceStage(trace, "rmw.total");
+    ASSERT_NE(nullptr, rmw);
+    EXPECT_EQ(1, (*rmw)["counters"]["failed_keys"].GetInt64());
+    const auto *batches = FindTraceStage(trace, "rmw.batches");
+    ASSERT_NE(nullptr, batches);
+    EXPECT_EQ(1, (*batches)["counters"]["upsert_attempted_keys"].GetInt64());
+    ASSERT_NE(nullptr, FindTraceStage(trace, "snapshot.commit_or_abort"));
+    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
 }
 
 TEST_F(CacheManagerTest, TestReportEventRateLimitedSnapshotDoesNotApplyPreparedTasks) {

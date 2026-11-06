@@ -2490,6 +2490,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                                                       LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
                                                       std::vector<ErrorCode> &out_per_key_ec,
                                                       AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+    ScopedTraceStage trace(request_context, __FILE__, "snapshot.replace_specs");
+    ScopedTraceStage stage(request_context, __FILE__, "snapshot.replace_prepare");
     if (!tasks.Valid(keys.size())) {
         return EC_BADARGS;
     }
@@ -2552,6 +2554,9 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
     bool write_lease_attempted = false;
     ErrorCode write_lease_ec = EC_OK;
     MetadataWriteLease write_lease;
+    const bool trace_enabled = request_context->need_span_tracer();
+    int64_t rebuilt_existing_locations = 0;
+    int64_t rebuilt_missing_locations = 0;
     auto modifier = [&keys,
                      &tasks,
                      &usage_offsets,
@@ -2560,6 +2565,9 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                      &write_lease_attempted,
                      &write_lease_ec,
                      &write_lease,
+                     trace_enabled,
+                     &rebuilt_existing_locations,
+                     &rebuilt_missing_locations,
                      batch_create_time](const std::vector<ErrorCode> &get_ecs,
                                         const LocationIdVector &location_ids,
                                         size_t key_index,
@@ -2620,6 +2628,9 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             // Old locations are consulted only for ownership and accounting.
             new_location->set_create_time(batch_create_time);
             new_location->set_validated_total_size(usage.new_size);
+            if (trace_enabled) {
+                (usage.has_old ? rebuilt_existing_locations : rebuilt_missing_locations)++;
+            }
             locations[location_index] = std::move(new_location);
             updated = true;
         }
@@ -2631,10 +2642,14 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    stage.Finish();
     auto result =
         meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, std::move(modifier));
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
+    trace.AddCounter("rebuilt_existing_locations", rebuilt_existing_locations);
+    trace.AddCounter("rebuilt_missing_locations", rebuilt_missing_locations);
+    stage.Next("snapshot.account_results");
     bool malformed_result = result.per_location_error_codes.size() != keys.size();
     if (malformed_result) {
         KVCM_LOG_ERROR("BatchReplaceLocationSpecs result size mismatch, keys[%zu], results[%zu]",

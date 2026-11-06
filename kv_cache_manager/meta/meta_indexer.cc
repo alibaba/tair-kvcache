@@ -713,6 +713,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      bool track_created_key_count,
                                                                      bool fill_missing_cache,
                                                                      bool maintenance_no_touch) noexcept {
+    ScopedTraceStage trace(request_context, __FILE__, "rmw.total");
+    ScopedTraceStage stage(request_context, __FILE__, "rmw.prepare");
+    const bool trace_enabled = request_context->need_span_tracer();
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -735,7 +738,11 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         track_created_key_count ? "read_modify_write_target_locations" : "read_modify_write_location",
         ephemeral_metrics_collector);
 
+    stage.Next("rmw.make_batches");
     std::vector<IndexBatch> batches = MakeBatches(keys);
+    trace.AddCounter("keys", keys.size());
+    trace.AddCounter("batches", batches.size());
+    stage.Next("rmw.allocate_results");
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     LocationResult location_result(location_ids);
@@ -750,6 +757,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     RmwStats stats;
     KeyVector batch_keys;
     LocationIdsPerKey batch_location_ids;
+    int64_t modifier_time_us = 0;
+    stage.Next("rmw.batches");
     for (const auto &batch : batches) {
         FillBatchKeys(batch.global_indices, keys, batch_keys);
         batch_location_ids.clear();
@@ -846,6 +855,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         }
 
         // 2. Per-key modifier dispatch -> bucket each key into the upsert sub-batch or the delete sub-batch.
+        const int64_t begin_modifier = trace_enabled ? TimestampUtil::GetSteadyTimeUs() : 0;
         BatchMetaData upsert_batch;
         BatchMetaData delete_batch;
         std::vector<int32_t> put_global_indexs;
@@ -980,6 +990,10 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             }
         }
 
+        if (trace_enabled) {
+            modifier_time_us += TimestampUtil::GetSteadyTimeUs() - begin_modifier;
+        }
+
         // 3. Dispatch upsert and delete sub-batches.
         const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(trace_id,
                                                                        ephemeral_request_context.get(),
@@ -1042,9 +1056,26 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));
     }
 
+    // Fixed-size request-local aggregates: no span allocation or timing per key.
+    // These are inclusive totals: lock_hold contains read/modify/write; upsert
+    // contains local cache writes and async enqueue. Do not sum all children.
+    stage.AddElapsed("rmw.read_total", stats.get_io_time_us);
+    stage.AddElapsed("rmw.modify_and_bucket_total", modifier_time_us);
+    stage.AddElapsed("rmw.upsert_total", stats.upsert_io_time_us);
+    stage.AddElapsed("rmw.delete_total", stats.delete_io_time_us);
+    stage.AddElapsed("rmw.lock_wait_total", stats.lock_wait_time_us);
+    stage.AddElapsed("rmw.lock_hold_total", stats.lock_hold_time_us);
+    stage.AddElapsed("rmw.async_enqueue_total", stats.async_enqueue_time_us);
+    stage.AddElapsed("rmw.cache_upsert_total", stats.cache_backend_upsert_time_us);
+    stage.AddElapsed("rmw.cache_delete_total", stats.cache_backend_delete_time_us);
+    stage.AddCounter("upsert_attempted_keys", stats.put_key_count + stats.update_key_count);
+    stage.AddCounter("delete_attempted_keys", stats.delete_key_count);
+    stage.AddCounter("async_enqueue_timeout_keys", stats.async_enqueue_timeout_key_count);
+    stage.Next("rmw.finish");
     EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
     const size_t failed_key_count =
         static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
+    trace.AddCounter("failed_keys", failed_key_count);
     if (failed_key_count == keys.size()) {
         location_result.ec = EC_ERROR;
         PREFIX_INDEXER_LOG(DEBUG, "all locations rmw failed, error count[%lu]", failed_key_count);

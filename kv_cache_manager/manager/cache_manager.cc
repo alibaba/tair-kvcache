@@ -2978,6 +2978,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                                     const proto::meta::ReportEventRequest *request,
                                     proto::meta::ReportEventResponse *response) {
     SPAN_TRACER(request_context);
+    // Declared before request-sized buffers so their destruction is included.
+    std::optional<ScopedTraceStage> snapshot_finish_trace;
     const std::string &trace_id = request_context->trace_id();
     const std::string &instance_id = request->instance_id();
     const std::string &host_ip_port = request->host_ip_port();
@@ -3641,11 +3643,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             break;
         }
         case proto::meta::EVENT_BLOCK_SNAPSHOT: {
+            ScopedTraceStage snapshot_trace(request_context, __FILE__, "snapshot.prepare");
+            ScopedTraceStage stage(request_context, __FILE__, "snapshot.validate");
             if (!item.has_block_snapshot()) {
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
             const auto &params = item.block_snapshot();
+            snapshot_trace.AddCounter("input_blocks", params.blocks_size());
             struct ValidatedBlock {
                 int64_t block_key;
                 const std::string *medium;
@@ -3655,6 +3660,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             std::vector<ValidatedBlock> validated_blocks;
             validated_blocks.reserve(params.blocks_size());
             std::uint64_t snapshot_total_size = 0;
+            int64_t validated_spec_count = 0;
             for (const auto &block : params.blocks()) {
                 int64_t block_key = 0;
                 const std::string &block_medium = block.medium().empty() ? params.medium() : block.medium();
@@ -3692,10 +3698,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 }
                 validated_blocks.push_back(
                     ValidatedBlock{block_key, &block_medium, std::move(specs), block_total_size});
+                validated_spec_count += block.specs_size();
             }
+            snapshot_trace.AddCounter("validated_specs", validated_spec_count);
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
+            stage.Next("snapshot.group");
             // Preserve the previous map's key order and each key's input
             // medium order, including which location error is returned first.
             const auto key_less = [](const auto &left, const auto &right) { return left.block_key < right.block_key; };
@@ -3735,6 +3744,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     snapshot_mediums.push_back(*block.medium);
                 }
             }
+            stage.Next("snapshot.ensure_node");
             const ErrorCode ensure_node_ec = ensure_node_mediums(snapshot_mediums);
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
@@ -3744,6 +3754,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             // Group and allocate the flat replacement tasks before closing
             // the reporter write gate. Only generation-dependent URI appends
             // and metadata mutation remain after BeginSnapshot.
+            stage.Next("snapshot.build_tasks");
             snapshot_keys.reserve(validated_blocks.size());
             snapshot_task_offsets.reserve(validated_blocks.size() + 1);
             snapshot_task_offsets.push_back(0);
@@ -3774,6 +3785,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 snapshot_task_offsets.push_back(snapshot_replace_tasks.size());
             }
 
+            snapshot_trace.AddCounter("unique_keys", snapshot_keys.size());
+            snapshot_trace.AddCounter("replacement_locations", snapshot_replace_tasks.size());
+            stage.Next("snapshot.admit_and_drain");
             uint64_t retry_after_ms = 0;
             const ErrorCode begin_ec = event_backend->BeginSnapshot(
                 reporter_key, request_snapshot_version, retry_after_ms, &mutation_lifecycle_generation);
@@ -3791,6 +3805,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
+            stage.Next("snapshot.append_version");
             for (size_t block_index = 0; block_index < validated_blocks.size(); ++block_index) {
                 auto &block = validated_blocks[block_index];
                 auto &task = snapshot_replace_tasks[block_index];
@@ -3813,6 +3828,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             snapshot_commit_task = SnapshotCommitTask{
                 reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i};
+            // The validated blocks die before stage, so their potentially
+            // large destructor work is measured rather than hidden in append.
+            stage.Next("snapshot.release_validated");
             break;
         }
         default:
@@ -4143,6 +4161,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (snapshot_commit_task && !snapshot_replace_tasks.empty()) {
+        ScopedTraceStage stage(request_context, __FILE__, "snapshot.replace");
         std::vector<ErrorCode> per_key_ec;
         meta_searcher->BatchReplaceLocationSpecsFlat(request_context,
                                                      snapshot_keys,
@@ -4160,6 +4179,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (snapshot_commit_task) {
+        ScopedTraceStage stage(request_context, __FILE__, "snapshot.commit_or_abort");
         const auto &task = *snapshot_commit_task;
         bool snapshot_failed = per_item_ec[task.event_index] != EC_OK;
         // Event-report metadata is a soft cache index. Like delta mutations,
@@ -4283,6 +4303,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                           instance_id.c_str(),
                           host_down_ec);
         }
+    }
+
+    if (has_snapshot_event) {
+        snapshot_finish_trace.emplace(request_context, __FILE__, "snapshot.response_and_release");
     }
 
     for (const auto &location : delta_locations) {

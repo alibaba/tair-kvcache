@@ -554,3 +554,82 @@ snapshot 分页或 exactly-once event delivery。
 ```
 
 Version 用于标记与回收，node liveness 控制硬可见性，snapshot 只负责可选的最终收敛。
+
+## 15. Snapshot 分阶段 trace
+
+排查单次大 snapshot 的服务端耗时时，在该 `ReportEventRequest` 的顶层 `trace_id`
+末尾加 `__kvcm_need_span_tracer`，例如：
+
+```json
+{"trace_id": "snapshot-5m-repeat-02__kvcm_need_span_tracer"}
+```
+
+其余请求字段与普通 snapshot 相同。复用已有追踪协议，无需修改服务配置或 protobuf。
+响应的 `header.tracer_result` 是 JSON 字符串（需再次 JSON decode），服务日志也会以
+`span_tracer_result` 输出同一棵树。节点名称是 `源文件路径:阶段名称`，耗时字段为
+`span_time_us`（微秒）；可选的 `counters` 记录该请求的计数。失败请求也输出已经执行的阶段，
+没有执行的阶段不出现。
+
+保存 HTTP JSON 响应后，可用 `jq '.header.tracer_result | fromjson' response.json` 展开追踪树。
+
+### 15.1 阶段含义
+
+| 阶段 | 测量范围 |
+| --- | --- |
+| `snapshot.prepare` | 从 snapshot item 校验到准备完替换任务，包含以下准备子阶段 |
+| `snapshot.validate` | key、medium、spec、URI 和 size 校验，以及 validated block 构造 |
+| `snapshot.group` | key 排序（需要时）、重复 medium 检查及 medium 收集 |
+| `snapshot.ensure_node` | reporter/medium 注册状态检查与补齐 |
+| `snapshot.build_tasks` | flat key/offset/task 分配与 spec name 准备 |
+| `snapshot.admit_and_drain` | `BeginSnapshot`：限流、写 gate 与已进入的 delta 排空 |
+| `snapshot.append_version` | 生成带 `s_v` 的 URI，移入替换任务 |
+| `snapshot.release_validated` | 成功准备后 validated block 等临时对象的释放 |
+| `snapshot.replace` | 批量替换及 ReportEvent 每 key 错误归并 |
+| `snapshot.replace_specs` | MetaSearcher 替换调用总耗时 |
+| `snapshot.replace_prepare` | 重复 key 检查，location ID、usage offset 等缓冲区构造与校验 |
+| `rmw.prepare` | RMW 参数检查和请求私有 metrics/context 创建 |
+| `rmw.make_batches` | 按 metadata mutex shard 分桶并构建批次 |
+| `rmw.allocate_results` | 分配每 key/per-location 结果与错误缓冲区 |
+| `rmw.batches` | 全部批次的同步读、改、写循环及批次临时对象释放 |
+| `snapshot.account_results` | 每 key 错误归并、storage usage 统计以及该调用尾部缓冲区释放 |
+| `snapshot.commit_or_abort` | 发布或放弃 snapshot version，必要时提交后台清理任务 |
+| `snapshot.response_and_release` | 填充最终响应和释放 ReportEvent 的请求级任务/缓冲区 |
+
+`rmw.total` 是 RMW 总耗时。`rmw.finish` 包括汇总结果、写 metrics 和 RMW 尾部缓冲区释放。
+准备失败时，临时对象析构计入最后一个执行中的阶段。
+
+`rmw.batches` 下面的以下节点是跨批次累加值，固定数量输出，不随 key 或批次数量增加节点：
+
+- `rmw.read_total`：backend 读取调用耗时。
+- `rmw.modify_and_bucket_total`：每批 key 结果检查、modifier 调用（含 CacheLocation 构造）及
+  upsert/delete 子批次构造；不是纯 `make_shared` 的计时。
+- `rmw.upsert_total` / `rmw.delete_total`：backend 写入/删除调用耗时。
+- `rmw.lock_wait_total` / `rmw.lock_hold_total`：metadata shard 锁的等待/持有时间。
+- `rmw.async_enqueue_total`：异步 backend 入队耗时。
+- `rmw.cache_upsert_total` / `rmw.cache_delete_total`：有 cache backend 时的本地写入/删除耗时；
+  单一 local backend 没有这个层次时，该值为 0，实际本地写耗时仍计入 upsert/delete。
+
+这些累计值复用本次同步 RMW 的私有统计，modifier 仅在 trace 开启时按批次增加计时。
+**累计节点存在包含关系，不能全部相加**：lock hold 包含读/改/写；upsert 又包含本地 cache
+写入和异步入队。`read + modify_and_bucket + upsert + delete` 可观察主要工作分布，和
+`rmw.batches` 的差额还包括锁等待、批次输入/结果映射、临时对象释放及统计开销。
+
+### 15.2 数量与读数边界
+
+- `snapshot.prepare.counters`：`input_blocks`、`validated_specs`、`unique_keys`、
+  `replacement_locations`。验证中途失败时只记录已到达的计数。
+- `snapshot.replace_specs.counters`：`rebuilt_existing_locations` 和 `rebuilt_missing_locations`。
+  它们记录已构造的替换对象数，后续写失败时仍会计数；不表示成功持久化数，也不做内容相等比较。
+  当前全量覆盖语义下，内容相同的已有 location 仍会重建，计入前者。
+- `rmw.total.counters`：`keys`、`batches`、`failed_keys`（结构/read/modifier/write 层面的 key 失败）。
+- `rmw.batches.counters`：`upsert_attempted_keys`、`delete_attempted_keys`、
+  `async_enqueue_timeout_keys`；attempted 不能当成成功写入数。
+
+推荐对同一 reporter 采集两次相同内容的完整 snapshot，遵守配置的 snapshot 最小间隔。
+第一次主要观察 missing，第二次主要观察 existing；对比 validate、append_version、
+modify_and_bucket、upsert 和对象释放耗时。不要仅用 existing 数推断“内容未变化”。
+
+此 trace 从服务方法内开始：不含客户端生成 JSON、上传、HTTP JSON 解码、请求进入服务方法前的
+排队，也不含返回后的 protobuf 请求销毁、网络发回或后台 Redis flush/cleanup 完成时间。
+因此 ACK 耗时和持久化完成时间需要分别测量。普通 trace ID 不开启这些节点，不做新增的批次
+计时或 trace 分配；建议只对待分析的请求启用。

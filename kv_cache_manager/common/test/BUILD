@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "trace_stage_test",
+    srcs = ["trace_stage_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:request_context",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "scoped_jemalloc_arena_rotation_test",
     srcs = ["scoped_jemalloc_arena_rotation_test.cc"],
     deps = [

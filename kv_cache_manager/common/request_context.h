@@ -129,4 +129,49 @@ private:
     SpanTracer *old_parent_tracer_;
 };
 
+// Request-local, synchronous stages. Disabled tracing performs no clock reads
+// or allocations. Next/Finish and destruction also cover early-return paths.
+// Names/files must outlive the request's trace serialization (use literals).
+class ScopedTraceStage {
+public:
+    ScopedTraceStage(RequestContext *context, std::string_view file, std::string_view name)
+        : context_(context && context->need_span_tracer() ? context : nullptr), file_(file) {
+        Next(name);
+    }
+    ~ScopedTraceStage() { Finish(); }
+    ScopedTraceStage(const ScopedTraceStage &) = delete;
+    ScopedTraceStage &operator=(const ScopedTraceStage &) = delete;
+
+    void Next(std::string_view name) {
+        Finish();
+        if (context_) {
+            parent_ = context_->parent_span_tracer();
+            span_.emplace(parent_, file_, name);
+            context_->set_parent_span_tracer(&*span_);
+        }
+    }
+    void Finish() {
+        if (span_) {
+            context_->set_parent_span_tracer(parent_);
+            span_.reset();
+        }
+    }
+    void AddElapsed(std::string_view name, int64_t elapsed_us) {
+        if (span_) {
+            span_->AddElapsed(file_, name, elapsed_us);
+        }
+    }
+    void AddCounter(std::string_view name, int64_t value) {
+        if (span_) {
+            span_->AddCounter(name, value);
+        }
+    }
+
+private:
+    RequestContext *context_;
+    std::string_view file_;
+    SpanTracer *parent_ = nullptr;
+    std::optional<SpanTracer> span_;
+};
+
 }; // namespace kv_cache_manager
