@@ -301,6 +301,57 @@ TEST_F(DataStorageSelectorTest, TestSelectTairMempoolSsdByExactType) {
     ASSERT_EQ(dram, selected);
 }
 
+TEST_F(DataStorageSelectorTest, TestExplicitTypeOverridesPreferenceWithoutFallback) {
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    auto legacy =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    ASSERT_EQ(EC_OK, legacy.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, legacy.type);
+    auto selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ("nfs_storage_00", selected.name);
+
+    auto missing = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    EXPECT_EQ(EC_NOENT, missing.ec);
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    auto excluded = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    EXPECT_EQ(EC_NOENT, excluded.ec);
+}
+
+TEST_F(DataStorageSelectorTest, TestExplicitTypeKeepsQuotaAndWritableChecks) {
+    const auto select = [this]() {
+        return data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    };
+    InstanceGroupQuota quota;
+    quota.set_capacity(1024);
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    quota.set_capacity(0);
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_ERROR, select().ec);
+    quota.set_capacity(1024);
+    quota.set_quota_config({});
+    instance_group_g->set_quota(quota);
+
+    class ReadOnlyNfs : public NfsBackend {
+    public:
+        using NfsBackend::NfsBackend;
+        bool Writable() override { return false; }
+    };
+    auto readonly = std::make_shared<ReadOnlyNfs>(metrics_registry_);
+    readonly->config_.set_global_unique_name("nfs_storage_00");
+    readonly->is_open_ = true;
+    readonly->is_available_ = true;
+    avail_backends_g[0] = readonly;
+    EXPECT_TRUE(readonly->Available());
+    EXPECT_EQ(EC_NOENT, select().ec);
+}
+
 TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendAbnormal00) {
     // should work with null data storage manager
     data_storage_manager_g.reset();
