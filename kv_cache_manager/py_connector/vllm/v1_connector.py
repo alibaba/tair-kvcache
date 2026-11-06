@@ -245,6 +245,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def shutdown(self) -> None:
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
         self._manager_client.close()
         return None
 
