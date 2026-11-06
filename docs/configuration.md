@@ -461,6 +461,11 @@ Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
 
 ## Logger Config
 
+服务端 `AccessLogWriter` 生成的 access log 仅保留 `request_begin_time`、`client_ip`、
+`trace_id`、`request_id`、`api_name`、`status_code` 和 `request_cost_time_us`，不再包含
+`request` / `response`。依赖完整请求和响应的日志回放工具无法使用这种精简日志。
+此调整仅精简日志构造和输出，上游请求 JSON 生成及响应序列化逻辑保持不变。
+
 ```TEXT
 alog.rootLogger=INFO, rootAppender
 alog.max_msg_len=20480

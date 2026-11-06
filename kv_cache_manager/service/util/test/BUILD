@@ -18,6 +18,7 @@ cc_test(
     srcs = ["access_log_writer_test.cc"],
     deps = [
         "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/service/util:access_log_writer",
         "@rapidjson",
