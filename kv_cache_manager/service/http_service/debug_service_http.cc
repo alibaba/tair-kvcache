@@ -13,6 +13,10 @@ DebugServiceHttp::DebugServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regi
     : metrics_registry_(std::move(metrics_registry)), debug_service_impl_(std::move(debug_service_impl)) {}
 
 void DebugServiceHttp::RegisterHandler() {
+    RegisterPostHandler(
+        "/api/getCacheMetaDetail",
+        GetHandler<DebugServiceHttp, proto::meta::GetCacheMetaDetailRequest, proto::meta::GetCacheMetaDetailResponse>(
+            &DebugServiceHttp::GetCacheMetaDetail));
     RegisterPostHandler("/api/injectFault",
                         GetHandler<DebugServiceHttp, proto::debug::InjectFaultRequest, proto::debug::CommonResponse>(
                             &DebugServiceHttp::InjectFault));
@@ -22,6 +26,12 @@ void DebugServiceHttp::RegisterHandler() {
     RegisterPostHandler("/api/clearFaults",
                         GetHandler<DebugServiceHttp, proto::debug::ClearFaultsRequest, proto::debug::CommonResponse>(
                             &DebugServiceHttp::ClearFaults));
+}
+
+void DebugServiceHttp::GetCacheMetaDetail(coro_http::coro_http_connection *http_conn,
+                                          const proto::meta::GetCacheMetaDetailRequest *request,
+                                          proto::meta::GetCacheMetaDetailResponse *response) {
+    debug_service_impl_->GetCacheMetaDetail(request, response);
 }
 
 void DebugServiceHttp::InjectFault(coro_http::coro_http_connection *http_conn,

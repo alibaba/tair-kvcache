@@ -20,6 +20,10 @@ public:
 
     void RegisterHandler() override;
 
+    void GetCacheMetaDetail(coro_http::coro_http_connection *http_conn,
+                            const proto::meta::GetCacheMetaDetailRequest *request,
+                            proto::meta::GetCacheMetaDetailResponse *response);
+
     void InjectFault(coro_http::coro_http_connection *http_conn,
                      const proto::debug::InjectFaultRequest *request,
                      proto::debug::CommonResponse *response);
