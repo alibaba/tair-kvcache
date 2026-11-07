@@ -1,3 +1,4 @@
+#include <chrono>
 #include <filesystem>
 #include <memory>
 
@@ -135,6 +136,60 @@ TEST_F(RegistryManagerRedisBackendTest, TestRedisDbIsolation) {
     EXPECT_EQ((std::map<std::string, std::string>{{"other", "preserved"}}), actual);
 
     EXPECT_EQ(EC_OK, backend_db1->Delete(key));
+}
+
+TEST_F(RegistryManagerRedisBackendTest, TwoLiveManagersShareRecoveredRegistryConfiguration) {
+    const std::string cluster_name =
+        "vlk01_shared_registry_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::string uri = redis_test::Uri("test_redis_user:test_redis_password",
+                                            redis_test::kRegistryManagerDb,
+                                            "timeout_ms=1000&retry_count=3&cluster_name=" + cluster_name);
+    const std::string storage_name = "shared_nfs";
+    const std::string group_name = "shared_group";
+
+    auto manager_a = std::make_shared<RegistryManager>(uri, std::make_shared<MetricsRegistry>());
+    auto manager_b = std::make_shared<RegistryManager>(uri, std::make_shared<MetricsRegistry>());
+    ASSERT_TRUE(manager_a->Init());
+    ASSERT_TRUE(manager_b->Init());
+
+    auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_key_count_per_file(7);
+    nfs_spec->set_root_path("/vlk01/shared/");
+    const StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, storage_name, nfs_spec);
+    ASSERT_EQ(EC_OK, manager_a->AddStorage(request_context_.get(), storage_config));
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    cache_config->meta_indexer_config_ = std::make_shared<MetaIndexerConfig>();
+    cache_config->cache_prefer_strategy_ = CachePreferStrategy::CPS_PREFER_3FS;
+    cache_config->set_reclaim_strategy(std::make_shared<CacheReclaimStrategy>());
+    InstanceGroup instance_group;
+    instance_group.set_cache_config(cache_config);
+    instance_group.set_name(group_name);
+    instance_group.set_version(3);
+    instance_group.set_user_data("written_by_manager_a");
+    ASSERT_EQ(EC_OK, manager_a->CreateInstanceGroup(request_context_.get(), instance_group));
+
+    ASSERT_EQ(EC_OK, manager_b->DoRecover());
+    auto recovered_storage = manager_b->data_storage_manager()->GetDataStorageBackend(storage_name);
+    ASSERT_NE(nullptr, recovered_storage);
+    const StorageConfig recovered_storage_config = recovered_storage->GetStorageConfig();
+    EXPECT_EQ(storage_name, recovered_storage_config.global_unique_name());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, recovered_storage_config.type());
+    EXPECT_TRUE(recovered_storage_config.is_available());
+    auto recovered_nfs_spec = std::dynamic_pointer_cast<NfsStorageSpec>(recovered_storage_config.storage_spec());
+    ASSERT_NE(nullptr, recovered_nfs_spec);
+    EXPECT_EQ("/vlk01/shared/", recovered_nfs_spec->root_path());
+    EXPECT_EQ(7, recovered_nfs_spec->key_count_per_file());
+
+    auto [group_ec, recovered_group] = manager_b->GetInstanceGroup(request_context_.get(), group_name);
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_NE(nullptr, recovered_group);
+    EXPECT_EQ(group_name, recovered_group->name());
+    EXPECT_EQ(3, recovered_group->version());
+    EXPECT_EQ("written_by_manager_a", recovered_group->user_data());
+
+    EXPECT_EQ(EC_OK, manager_a->RemoveInstanceGroup(request_context_.get(), group_name));
+    EXPECT_EQ(EC_OK, manager_a->RemoveStorage(request_context_.get(), storage_name));
 }
 
 TEST_F(RegistryManagerRedisBackendTest, TestRemovingInstanceKeepsIndexValueSmall) {
