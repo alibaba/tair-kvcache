@@ -91,6 +91,23 @@ py_test(
 )
 
 py_test(
+    name = "test_prefill_only",
+    timeout = "eternal",
+    srcs = ["test_prefill_only.py"],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    imports = ["."],
+    tags = [
+        "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
+    ],
+    deps = [":e2e_lib"],
+)
+
+py_test(
     name = "test_partial_hit",
     timeout = "eternal",
     srcs = ["test_partial_hit.py"],
