@@ -1,3 +1,4 @@
+#include <chrono>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -8,6 +9,28 @@
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 
 namespace kv_cache_manager {
+namespace {
+
+class MetaRedisBackendCleanup {
+public:
+    MetaRedisBackendCleanup(MetaRedisBackend &backend, MetaStorageBackend::KeyType key)
+        : backend_(backend), key_(key) {}
+
+    MetaRedisBackendCleanup(const MetaRedisBackendCleanup &) = delete;
+    MetaRedisBackendCleanup &operator=(const MetaRedisBackendCleanup &) = delete;
+
+    ~MetaRedisBackendCleanup() {
+        (void)backend_.Delete(nullptr, {key_});
+        (void)backend_.Close();
+    }
+
+private:
+    MetaRedisBackend &backend_;
+    MetaStorageBackend::KeyType key_;
+};
+
+} // namespace
+
 class MetaRedisBackendRealServiceTest : public TESTBASE {
 public:
     void SetUp() override;
@@ -70,6 +93,41 @@ TEST_F(MetaRedisBackendRealServiceTest, TestOpenAndClose) {
     }
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
     ASSERT_TRUE(meta_redis_backend_->client_pool_ == nullptr);
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestCacheLocationRoundTrip) {
+    const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string instance_id = "test_location_round_trip_" + std::to_string(unique_suffix);
+    const KeyType key = static_cast<KeyType>(unique_suffix);
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init(instance_id, meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+    MetaRedisBackendCleanup cleanup(*meta_redis_backend_, key);
+    (void)meta_redis_backend_->Delete(nullptr, {key});
+
+    auto expected_location = std::make_shared<CacheLocation>();
+    expected_location->set_id("round_trip_location");
+    expected_location->set_status(CacheLocationStatus::CLS_SERVING);
+    expected_location->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    expected_location->set_spec_size(2);
+    expected_location->set_create_time(1700000000123456);
+    expected_location->set_location_specs(
+        {LocationSpec("tensor_parallel_0", "nfs://cache-host/blocks/round-trip/tp0?size=4096"),
+         LocationSpec("tensor_parallel_1", "nfs://cache-host/blocks/round-trip/tp1?size=4096")});
+
+    CacheLocationMap expected_locations;
+    expected_locations.emplace(expected_location->id(), expected_location);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              meta_redis_backend_->Put(nullptr, {key}, {expected_locations}, FieldMapVec(1)));
+
+    CacheLocationMapVector actual_locations;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, meta_redis_backend_->GetLocations(nullptr, {key}, actual_locations));
+    ASSERT_EQ(1u, actual_locations.size());
+    ASSERT_EQ(1u, actual_locations.front().size());
+    const auto actual_location = actual_locations.front().find(expected_location->id());
+    ASSERT_NE(actual_locations.front().end(), actual_location);
+    ASSERT_NE(nullptr, actual_location->second);
+    EXPECT_EQ(expected_location->ToJsonString(), actual_location->second->ToJsonString());
 }
 
 TEST_F(MetaRedisBackendRealServiceTest, TestRedisDbIsolation) {
