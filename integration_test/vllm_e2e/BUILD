@@ -208,6 +208,7 @@ test_suite(
         ":test_multi_turn",
         ":test_mutation",
         ":test_partial_hit",
+        ":test_prefill_only",
         ":test_tp",
     ],
 )
