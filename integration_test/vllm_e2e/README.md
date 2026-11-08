@@ -64,6 +64,7 @@ Hybrid specifics verified:
 | `test_cross_request_prefix` | 1 | 2 | Request B is a strict token prefix of saved request A, ending inside one of A's blocks. Hybrid: B's match must be truncated to the last block whose recurrent state was really materialized, and B's output must be token-identical to a no-cache reference |
 | `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes |
 | `test_mutation` | 1 | 1 | Meta-test: injected off-by-one in the slot translation must make verification FAIL (proves the harness is not vacuous) |
+| `test_save_after_prefill` | 1 | 1 | CUDA graphs + async scheduling, one long prompt at a time; the reference is captured after each request finished (`KVCM_E2E_DEFER_REF=1`), so a save that gathers KV before the forward pass wrote it fails verification |
 
 ## Running
 
