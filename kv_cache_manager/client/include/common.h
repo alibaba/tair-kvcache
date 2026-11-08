@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -40,6 +41,14 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_SERVICE_DUPLICATE_ENTITY = 54,
     ER_SERVICE_INSTANCE_NOT_EXIST = 55,
     ER_SERVICE_NOT_LEADER = 56,
+    ER_SERVICE_NOT_READY = 57,
+    ER_SERVICE_REACH_MAX_ENTITY_CAPACITY = 58,
+    ER_SERVICE_RESOURCE_EXHAUSTED = 59,
+    ER_SERVICE_NOT_FOUND = 60,
+    ER_SERVICE_WRITE_IN_PROGRESS = 61,
+    ER_SERVICE_SESSION_NOT_FOUND = 62,
+    ER_SERVICE_SIZE_MISMATCH = 63,
+    ER_SERVICE_IO_ERROR = 64,
 
     // sdk
     ER_SDK_TIMEOUT = 100,
@@ -242,11 +251,28 @@ struct GpuMemorySpan {
     int device_id{-1};
 };
 
+// Failed deregistration is not proof that remote DMA stopped. Callers must
+// retain allocations if release_safe is false, even after client destruction.
+// No new GPU registrations are admitted after a failure: quarantine is bounded
+// by registrations already admitted, and recovery requires a process restart.
+struct GpuMemoryReleaseState {
+    std::atomic<bool> release_safe{true};
+    static std::atomic<bool> &RegistrationBlocked() {
+        static std::atomic<bool> blocked{false};
+        return blocked;
+    }
+    void MarkUnsafe() noexcept {
+        release_safe.store(false, std::memory_order_release);
+        RegistrationBlocked().store(true, std::memory_order_release);
+    }
+};
+
 struct ClientMemoryRegistrations {
     // A default-constructed host registration means that only GPU memory, or no
     // external memory, is registered.
     SharedMemoryRegistration host;
     std::vector<GpuMemorySpan> gpu;
+    std::shared_ptr<GpuMemoryReleaseState> gpu_release_state{std::make_shared<GpuMemoryReleaseState>()};
 };
 
 struct InitParams {

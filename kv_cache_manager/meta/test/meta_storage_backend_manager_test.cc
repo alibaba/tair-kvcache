@@ -490,9 +490,8 @@ class RecoverFailureLocal : public MetaLocalBackend {
 public:
     using MetaLocalBackend::Delete;
 
-    std::vector<ErrorCode> Delete(RequestContext *ctx,
-                                   const KeyTypeVec &keys,
-                                   const std::vector<ErrorCode> &gate) noexcept override {
+    std::vector<ErrorCode>
+    Delete(RequestContext *ctx, const KeyTypeVec &keys, const std::vector<ErrorCode> &gate) noexcept override {
         if (fail_delete) {
             return std::vector<ErrorCode>(keys.size(), EC_ERROR);
         }
@@ -500,9 +499,9 @@ public:
     }
 
     std::vector<ErrorCode> Get(RequestContext *ctx,
-                                const KeyTypeVec &keys,
-                                CacheLocationMapVector &locations,
-                                PropertyMapVector &properties) noexcept override {
+                               const KeyTypeVec &keys,
+                               CacheLocationMapVector &locations,
+                               PropertyMapVector &properties) noexcept override {
         if (fail_reads) {
             locations.assign(keys.size(), {});
             properties.assign(keys.size(), {});
@@ -817,9 +816,9 @@ TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
         BatchMetaData cache_batch = MakeBatch({12});
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
                   mgr.cache_backend_->Put(request_context_.get(),
-                                           cache_batch.batch_keys,
-                                           cache_batch.batch_locations,
-                                           cache_batch.batch_properties));
+                                          cache_batch.batch_keys,
+                                          cache_batch.batch_locations,
+                                          cache_batch.batch_properties));
         const size_t persistent_usage = mgr.persistent_backend_->GetMemUsage();
         const size_t cache_usage = mgr.cache_backend_->GetMemUsage();
         ASSERT_GT(persistent_usage, 0u);
@@ -1086,9 +1085,9 @@ TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryMaintenanceUsesLocalAndDo
         DeleteLocationsForMaintenance(_, KeyVector{11}, LocationIdsPerKey{{"loc_11"}}, std::vector<ErrorCode>{EC_OK}))
         .WillOnce(Return(std::vector<ErrorCode>{EC_ERROR}));
     int32_t reclaimed = 0;
-    EXPECT_EQ(std::vector<ErrorCode>{EC_OK},
-              mgr.DeleteLocationsForMaintenance(
-                  nullptr, {11}, {{"loc_11"}}, reclaimed, mgr.UseLocalPrimaryForMaintenance()));
+    EXPECT_EQ(
+        std::vector<ErrorCode>{EC_OK},
+        mgr.DeleteLocationsForMaintenance(nullptr, {11}, {{"loc_11"}}, reclaimed, mgr.UseLocalPrimaryForMaintenance()));
     EXPECT_EQ(0, reclaimed);
     EXPECT_EQ(oldest, mgr.GetOldestAccessTime());
     EXPECT_CALL(*backup, Delete(_, KeyVector{11}, std::vector<ErrorCode>{EC_OK}))
@@ -1306,6 +1305,14 @@ TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTim
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(1, cache_ptr->calls());
     EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+
+    ASSERT_EQ(EC_OK, mgr.SamplePersistentReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(999, candidates.front().last_access_time_us);
+    EXPECT_EQ(2, persistent_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->calls());
+    EXPECT_EQ(2, cache_ptr->timestamp_lookup_calls());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestGroupLruStrictReadModeReachesSelectedBackend) {
@@ -2147,6 +2154,13 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersist
     ASSERT_EQ(1u, scan_batch.locations.size());
     ASSERT_TRUE(scan_batch.locations[0].count("loc_888") > 0);
 
+    MaintenanceScanBatch recovery_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanPersistentLocationsForRecovery(nullptr, SCAN_BASE_CURSOR, 10, recovery_batch));
+    ASSERT_EQ((KeyVector{777}), recovery_batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), recovery_batch.location_results);
+    ASSERT_EQ(1u, recovery_batch.locations.size());
+    ASSERT_TRUE(recovery_batch.locations[0].count("loc_777") > 0);
+
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{false}), cache_exists);
@@ -2217,9 +2231,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteMirrorsPersistentAndH
     EXPECT_EQ(1u, hot_locations[0].count("loc_second"));
     EXPECT_EQ(1u, persistent_locations[0].count("loc_second"));
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {888}, {{"loc_second"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        mgr.DeleteLocationsForMaintenance(
+            request_context_.get(), {888}, {{"loc_second"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
     EXPECT_EQ(1, reclaimed_count);
     ASSERT_EQ(EC_OK, mgr.Close());
 }
@@ -2307,8 +2322,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverMaintenanceAllowsOnlineRecreate
                   mgr.GetLocations(nullptr, {889, 890}, {{"loc_889"}, {"loc_890"}}, values));
         std::vector<ErrorCode> key_ecs;
         EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}, {EC_OK}}),
-                  mgr.GetLocationsWithKeyStatus(
-                      nullptr, {889, 890}, {{"loc_889"}, {"loc_890"}}, values, key_ecs));
+                  mgr.GetLocationsWithKeyStatus(nullptr, {889, 890}, {{"loc_889"}, {"loc_890"}}, values, key_ecs));
         EXPECT_EQ(expected, key_ecs);
 
         auto replacement = MakeBatch({889});
@@ -2326,8 +2340,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverMaintenanceAllowsOnlineRecreate
         EXPECT_EQ(0u, properties[0].count("p0"));
         EXPECT_EQ("new_value", properties[0].at("new_property"));
         EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT, EC_OK}}),
-                  mgr.GetLocationsWithKeyStatus(
-                      nullptr, {889}, {{"loc_889", "new_location"}}, values, key_ecs));
+                  mgr.GetLocationsWithKeyStatus(nullptr, {889}, {{"loc_889", "new_location"}}, values, key_ecs));
         EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, key_ecs); // new hot key wins over its tombstone
         EXPECT_EQ(0, mgr.BackfillKeysToCache(old.batch_keys, old.batch_locations, old.batch_properties, {EC_OK}));
         EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.EnsureCacheForGc(nullptr, {889}));
@@ -2360,20 +2373,19 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverMaintenancePartialDeleteDefersO
         // has disappeared from hot between discovery and execution.
         ASSERT_EQ(2,
                   mgr.BackfillKeysToCache({892, 893},
-                                         {seed.batch_locations[1], seed.batch_locations[2]},
-                                         {seed.batch_properties[1], seed.batch_properties[2]},
-                                         {EC_OK, EC_OK}));
+                                          {seed.batch_locations[1], seed.batch_locations[2]},
+                                          {seed.batch_properties[1], seed.batch_properties[2]},
+                                          {EC_OK, EC_OK}));
         std::vector<int64_t> before;
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
                   mgr.cache_backend_->GetLastAccessTimesForMaintenance(nullptr, {892}, before));
         int32_t reclaimed = 0;
         EXPECT_EQ((std::vector<ErrorCode>{EC_OUT_OF_LIMIT, EC_OK, EC_OK}),
-                  mgr.DeleteLocationsForMaintenance(
-                      nullptr,
-                      {891, 892, 893},
-                      {{"loc_891"}, {"loc_892"}, {"loc_893"}},
-                      reclaimed,
-                      mgr.UseLocalPrimaryForMaintenance()));
+                  mgr.DeleteLocationsForMaintenance(nullptr,
+                                                    {891, 892, 893},
+                                                    {{"loc_891"}, {"loc_892"}, {"loc_893"}},
+                                                    reclaimed,
+                                                    mgr.UseLocalPrimaryForMaintenance()));
         EXPECT_EQ(1, reclaimed);
         EXPECT_EQ(0u, mgr.deleted_keys_.count(891));
         EXPECT_EQ(0u, mgr.deleted_keys_.count(892));
@@ -2388,8 +2400,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverMaintenancePartialDeleteDefersO
         EXPECT_EQ(2u, maps[0].size());
         EXPECT_EQ(1u, maps[1].size());
         EXPECT_EQ(1u, maps[1].count("sibling"));
-        EXPECT_EQ(0,
-                  mgr.BackfillKeysToCache({892}, {seed.batch_locations[1]}, {seed.batch_properties[1]}, {EC_OK}));
+        EXPECT_EQ(0, mgr.BackfillKeysToCache({892}, {seed.batch_locations[1]}, {seed.batch_properties[1]}, {EC_OK}));
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.cache_backend_->GetLocations(nullptr, {892}, maps));
         EXPECT_EQ(1u, maps[0].size());
         EXPECT_EQ(1u, maps[0].count("sibling"));
@@ -2511,8 +2522,7 @@ TEST_F(MetaStorageBackendManagerTest, TestGcFillsOnlyUnmarkedMissingKeysDuringRe
         // An empty hot key still exists and must not regain its old Location.
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.cache_backend_->Put(nullptr, {901}, {{}}, {{{"new", "value"}}}));
         mgr.deleted_keys_.insert(902);
-        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
-                  mgr.EnsureCacheForGc(nullptr, {901, 902, 903}));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), mgr.EnsureCacheForGc(nullptr, {901, 902, 903}));
         EXPECT_EQ((std::vector<KeyTypeVec>{{903}}), backup->full_get_keys);
         CacheLocationMapVector maps;
         PropertyMapVector properties;
@@ -2547,8 +2557,7 @@ TEST_F(MetaStorageBackendManagerTest, TestGcFillFailureDoesNotBlockOtherKeys) {
               backup->Put(nullptr, seed.batch_keys, seed.batch_locations, seed.batch_properties));
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
               mgr.cache_backend_->Put(nullptr, {904}, {seed.batch_locations[0]}, {seed.batch_properties[0]}));
-    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT, EC_OK}),
-              mgr.EnsureCacheForGc(nullptr, {904, 905, 906}));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT, EC_OK}), mgr.EnsureCacheForGc(nullptr, {904, 905, 906}));
     EXPECT_EQ((std::vector<KeyTypeVec>{{905, 906}}), backup->full_get_keys);
     CacheLocationMapVector maps;
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_OK}),
@@ -2625,9 +2634,9 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceReadUsesHotWithoutRedisFall
                           nullptr, current.batch_keys, current.batch_locations, current.batch_properties));
 
             LocationsPerKey values;
-            EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_NOENT}, {EC_NOENT}}),
-                      mgr.GetLocationsForMaintenance(
-                          nullptr, {1000, 1001}, {{"loc_1000", "removed"}, {"loc_1001"}}, values));
+            EXPECT_EQ(
+                (std::vector<std::vector<ErrorCode>>{{EC_OK, EC_NOENT}, {EC_NOENT}}),
+                mgr.GetLocationsForMaintenance(nullptr, {1000, 1001}, {{"loc_1000", "removed"}, {"loc_1001"}}, values));
             ASSERT_TRUE(values[0][0]);
             EXPECT_EQ(current.batch_locations[0].at("loc_1000")->ToJsonString(), values[0][0]->ToJsonString());
             EXPECT_FALSE(values[0][1]);
@@ -2663,10 +2672,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteUsesHotSiblingsAndSki
         int32_t reclaimed = 0;
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT, EC_OUT_OF_LIMIT}),
                   mgr.DeleteLocationsForMaintenance(nullptr,
-                                                     {1001, 1002, 1003, 1004},
-                                                     {{"loc_1001"}, {"loc_1002"}, {"loc_1003"}, {"loc_1004"}},
-                                                     reclaimed,
-                                                     mgr.UseLocalPrimaryForMaintenance()));
+                                                    {1001, 1002, 1003, 1004},
+                                                    {{"loc_1001"}, {"loc_1002"}, {"loc_1003"}, {"loc_1004"}},
+                                                    reclaimed,
+                                                    mgr.UseLocalPrimaryForMaintenance()));
         EXPECT_EQ(1, reclaimed);
         EXPECT_EQ(1u, mgr.deleted_keys_.count(1002));
         EXPECT_EQ(1u, mgr.deleted_keys_.size());
@@ -2682,8 +2691,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteUsesHotSiblingsAndSki
         ASSERT_EQ(1u, backup->writes.size());
         EXPECT_EQ((KeyTypeVec{1002}), backup->writes[0].keys);
         backup->Drain();
-        EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}),
-                  backup->GetLocations(nullptr, {1002, 1004}, maps));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}), backup->GetLocations(nullptr, {1002, 1004}, maps));
     }
 }
 
@@ -2707,9 +2715,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceWholeKeyDeleteFailureRemain
     failing_backend_ptr->FailNextDelete();
 
     int32_t reclaimed_count = 0;
-    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_ERROR}),
+        mgr.DeleteLocationsForMaintenance(
+            request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
     EXPECT_EQ(0, reclaimed_count);
     CacheLocationMapVector hot_locations;
     CacheLocationMapVector persistent_locations;
@@ -2719,9 +2728,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceWholeKeyDeleteFailureRemain
     EXPECT_EQ(1u, hot_locations[0].count("loc_1003"));
     EXPECT_EQ(1u, persistent_locations[0].count("loc_1003"));
 
-    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        mgr.DeleteLocationsForMaintenance(
+            request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count, mgr.UseLocalPrimaryForMaintenance()));
     EXPECT_EQ(1, reclaimed_count);
     std::vector<bool> exists;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {1003}, exists));

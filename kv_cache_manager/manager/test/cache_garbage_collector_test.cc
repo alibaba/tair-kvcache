@@ -18,6 +18,7 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
@@ -40,8 +41,7 @@ namespace {
 using InstanceGroups = std::vector<std::shared_ptr<const InstanceGroup>>;
 using InstanceInfos = std::vector<std::shared_ptr<const InstanceInfo>>;
 using SubmitAsyncLocation = AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const CacheLocationDelRequest &);
-using SubmitAsyncEventReport =
-    AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const EventReportMetadataDelRequest &);
+using SubmitAsyncEventReport = AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const EventReportMetadataDelRequest &);
 
 struct ScanResponse {
     ErrorCode ec{EC_OK};
@@ -425,6 +425,37 @@ public:
         instances_by_group[group_name].first = EC_OK;
         instances_by_group[group_name].second.push_back(instance);
         group_by_instance[instance_id] = group_name;
+    }
+
+    void AddKvMetaInstance(const std::string &group_name, const std::string &encoded_id) {
+        auto group_it = std::find_if(instance_groups.begin(), instance_groups.end(), [&](const auto &group) {
+            return group && group->name() == group_name;
+        });
+        if (group_it == instance_groups.end()) {
+            auto group = std::make_shared<InstanceGroup>();
+            group->set_name(group_name);
+            instance_groups.push_back(group);
+            group_configs[group_name] = group;
+        }
+        ModelDeployment deployment;
+        deployment.set_model_name(std::string(kKvMetaModelName));
+        deployment.set_dtype(std::string(kKvMetaDtype));
+        deployment.set_tp_size(1);
+        deployment.set_dp_size(1);
+        deployment.set_pp_size(1);
+        deployment.set_extra(std::string(kKvMetaDeploymentExtra));
+        auto instance = std::make_shared<InstanceInfo>(
+            "quota",
+            group_name,
+            std::string(kKvMetaInternalInstancePrefix) + encoded_id,
+            1,
+            std::vector<LocationSpecInfo>{LocationSpecInfo(std::string(kKvMetaValueSpecName), 1)},
+            deployment,
+            std::vector<LocationSpecGroup>{},
+            1);
+        instances_by_group[group_name].first = EC_OK;
+        instances_by_group[group_name].second.push_back(instance);
+        group_by_instance[instance->instance_id()] = group_name;
     }
 
     CacheGarbageCollector::Config DefaultConfig() const {
@@ -1158,8 +1189,7 @@ TEST_F(CacheGarbageCollectorTest, BackendRecoveryGraceDoesNotPauseOrdinaryGcCand
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"orphan"}}), submitted_requests.front().location_ids);
     EXPECT_TRUE(submitted_event_report_requests.empty());
     EXPECT_EQ(1,
-              metrics_registry_
-                  ->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "recovery_grace"}})
+              metrics_registry_->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "recovery_grace"}})
                   .Get());
     backend->Close();
 }
@@ -1625,10 +1655,8 @@ TEST_F(CacheGarbageCollectorTest, ReadOnlyStorageIsNotProbedAndNeverConfirmedMis
     might_exist_by_uri[healthy_missing_uri] = false;
 
     CacheLocationMap locations;
-    locations["on_read_only"] = MakeStoredLocation("on_read_only",
-                                                   CLS_SERVING,
-                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-                                                   {"dummy://read_only_storage/ga?size=1"});
+    locations["on_read_only"] = MakeStoredLocation(
+        "on_read_only", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://read_only_storage/ga?size=1"});
     locations["on_healthy"] =
         MakeStoredLocation("on_healthy", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {healthy_missing_uri});
 
@@ -1693,18 +1721,17 @@ TEST_F(CacheGarbageCollectorTest, AbandonedCopyTargetAndMissingSourceUseOrdinary
     const std::string source_uri = "dummy://pace_dram/source?size=1";
     might_exist_by_uri[source_uri] = false;
 
-    auto source = MakeStoredLocation(
-        "source_location", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {source_uri});
+    auto source =
+        MakeStoredLocation("source_location", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {source_uri});
     source->set_create_time(source_create_time);
-    auto target = MakeLocation(
-        "target_location", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
+    auto target =
+        MakeLocation("target_location", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
 
     CacheLocationMap locations;
     locations[source->id()] = source;
     locations[target->id()] = target;
     const auto request =
-        gc->BuildDeleteActions("instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), now_us)
-            .executor_request;
+        gc->BuildDeleteActions("instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), now_us).executor_request;
 
     ASSERT_EQ((KeyVector{10}), request.block_keys);
     ASSERT_EQ(1u, request.location_ids.size());
@@ -1792,6 +1819,25 @@ TEST_F(CacheGarbageCollectorTest, SubmittedLocationSummaryIncludesEveryReason) {
     EXPECT_EQ("future_reason=10,orphan_writing=90", reason_summary);
 }
 
+TEST_F(CacheGarbageCollectorTest, OnlyCompleteKvMetaInstancesAreExcludedFromTheKvCacheScanBudget) {
+    AddKvMetaInstance("group_a", "656d62");
+    const std::string ordinary_reserved_name = std::string(kKvMetaInternalInstancePrefix) + "future-format";
+    AddInstance("group_a", ordinary_reserved_name);
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
+    scan_responses[ordinary_reserved_name] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
+
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    gc->RunOneTick();
+    gc->RunOneTick();
+
+    ASSERT_EQ(2, scan_calls.size());
+    EXPECT_EQ((std::set<std::string>{"instance_a", ordinary_reserved_name}),
+              (std::set<std::string>{scan_calls[0].first, scan_calls[1].first}));
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
+}
+
 TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {
     scan_responses["instance_a"] = {
         {EC_ERROR, {}},
@@ -1851,8 +1897,7 @@ TEST_F(CacheGarbageCollectorTest, PersistentlyFailingInstanceIsSkippedAfterBound
     }
 
     ASSERT_GE(scan_calls.size(), 3u);
-    const std::vector<std::pair<std::string, std::string>> second_round_calls(
-        scan_calls.end() - 3, scan_calls.end());
+    const std::vector<std::pair<std::string, std::string>> second_round_calls(scan_calls.end() - 3, scan_calls.end());
     EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
                   {"instance_a", SCAN_BASE_CURSOR},
                   {"instance_b", SCAN_BASE_CURSOR},

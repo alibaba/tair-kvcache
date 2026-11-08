@@ -24,6 +24,7 @@ cc_library(
     ],
     hdrs = [
         "instance_info.h",
+        "kv_meta_instance.h",
         "model_deployment.h",
     ],
     deps = [
