@@ -468,7 +468,10 @@ class DataTransferManager:
         # the slot is needed only for the gather + SDK transfer, so holding
         # it while the model still runs only extends the pool occupancy and
         # queues concurrent loads behind a save that is not even staging.
-        ready_event.wait()
+        # Block this IO thread on the event: Event.wait() would only order
+        # the thread's current (default) stream, not _save_stream, so the
+        # gather below could read KV the forward has not written yet.
+        ready_event.synchronize()
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
         try:
