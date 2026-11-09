@@ -8,7 +8,7 @@
 > **本目录中的旧版 HiSim simulator 已停止维护。** 欢迎通过以下实现继续使用仿真能力并获取后续更新：
 >
 > - **SGLang：**[SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator)，已集成至 SGLang 官方仓库。
-> - **vLLM：**[vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator)，目前可使用 `simulator` 分支；上游集成正在进行中，进展见 [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747)。
+> - **vLLM：**[vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator)，上游合入前，请暂时使用 `simulator` 分支；集成进展及上游入口见 [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747)。
 >
 > 安装方式、支持版本和使用方法请以链接中的 README 为准。下方文档描述的是旧版实现，仅保留作历史参考。
 

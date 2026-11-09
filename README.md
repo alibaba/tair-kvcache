@@ -95,7 +95,7 @@ A unified transfer library supports KVCache transfer for multiple inference engi
 > **The legacy HiSim simulator under `hisim/` is no longer maintained.** For continued use and future updates, please use:
 >
 > - **SGLang:** [SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator), available in the official SGLang repository.
-> - **vLLM:** [vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator), available on the `simulator` branch. Upstream integration is in progress; follow [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747) for status.
+> - **vLLM:** [vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator), temporarily available on the `simulator` branch pending upstream integration. Follow [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747) for integration status and the upstream destination.
 >
 > See the linked READMEs for installation, supported versions, and usage.
 
