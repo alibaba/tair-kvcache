@@ -595,7 +595,9 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
         allocated_for_rollback.push_back(dst_uri);
         out_src_uris.push_back(src_uri);
         out_dst_uris.push_back(dst_uri);
-        dst_specs.emplace_back(src_spec.name_handle(), dst_uri.ToUriString());
+        LocationSpec dst_spec(src_spec.name_handle(), dst_uri.ToUriString());
+        dst_spec.set_checksum(src_spec.checksum());
+        dst_specs.push_back(std::move(dst_spec));
     }
 
     // 4. 建目标 location（BatchAddLocation 总是写 CLS_WRITING 并生成随机 location_id）。
@@ -1140,8 +1142,10 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             if (create_results[j].first == EC_OK) {
                 item.src_uris.push_back(e.src_uri);
                 item.dst_uris.push_back(create_results[j].second);
-                item.dst_specs.emplace_back(
-                    item.request.src_specs[e.spec_idx].name_handle(), create_results[j].second.ToUriString());
+                const auto &src_spec = item.request.src_specs[e.spec_idx];
+                LocationSpec dst_spec(src_spec.name_handle(), create_results[j].second.ToUriString());
+                dst_spec.set_checksum(src_spec.checksum());
+                item.dst_specs.push_back(std::move(dst_spec));
             } else {
                 item.MarkFailed(EC_ERROR);
             }

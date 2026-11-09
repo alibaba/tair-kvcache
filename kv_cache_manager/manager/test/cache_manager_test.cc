@@ -2647,8 +2647,14 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(2);
-            auto ec = cache_manager_->FinishWriteCache(
-                request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
+            auto ec = cache_manager_->FinishWriteCache(request_context_.get(),
+                                                       "test_instance",
+                                                       start_write_cache_info.write_session_id(),
+                                                       block_mask,
+                                                       CacheManager::FinishWriteCacheOptions::WithChecksumBatches({
+                                                           {"tp0", {"0x111", "0", "0x333"}},
+                                                           {"tp1", {"0xAAA", "", ""}},
+                                                       }));
             ASSERT_EQ(EC_OK, ec);
         }
 
@@ -2665,6 +2671,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
+            ASSERT_GE(cache_locations_view[0].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[0].has_checksum());
+            EXPECT_EQ("0x111", cache_locations_view[0].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[1].has_checksum());
+            EXPECT_EQ("0xAAA", cache_locations_view[0].location_specs()[1].checksum());
+            ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
+            EXPECT_EQ("0", cache_locations_view[1].location_specs()[0].checksum());
+            ASSERT_FALSE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ("", cache_locations_view[1].location_specs()[1].checksum());
         }
 
         {
@@ -2675,6 +2691,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             const auto &cache_locations_view = cache_metas.cache_locations_view();
             const auto &metas = cache_metas.metas();
             ASSERT_EQ(3, cache_locations_view.size());
+            ASSERT_GE(cache_locations_view[0].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[0].has_checksum());
+            EXPECT_EQ("0x111", cache_locations_view[0].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[1].has_checksum());
+            EXPECT_EQ("0xAAA", cache_locations_view[0].location_specs()[1].checksum());
+            ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
+            EXPECT_EQ("0", cache_locations_view[1].location_specs()[0].checksum());
+            ASSERT_FALSE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ("", cache_locations_view[1].location_specs()[1].checksum());
             std::map<std::string, std::string> meta;
             ASSERT_TRUE(Jsonizable::FromJsonString(metas[2], meta));
             ASSERT_TRUE(
@@ -5905,6 +5931,99 @@ TEST_F(CacheManagerTest, TestReportEventRateLimitedSnapshotDoesNotApplyPreparedT
     EXPECT_NE(std::string::npos,
               raw.front().find(std::string(SnapshotUriUtils::kSnapshotVersionParam) + "=" +
                                baseline.committed_snapshot_version()));
+}
+
+TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
+    const std::string host = "192.168.10.44:8080";
+    const int64_t key = 9444;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto get_tp0_checksum = [&]() -> std::optional<std::string> {
+        auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        if (meta_searcher == nullptr) {
+            return std::nullopt;
+        }
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask;
+        if (meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps) != EC_OK ||
+            location_maps.size() != 1) {
+            return std::nullopt;
+        }
+        for (const auto &[location_id, location] : location_maps[0]) {
+            (void)location_id;
+            if (location == nullptr || location->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+                continue;
+            }
+            const auto it = std::find_if(location->location_specs().begin(),
+                                         location->location_specs().end(),
+                                         [](const auto &spec) { return spec.name() == "tp0"; });
+            if (it != location->location_specs().end() && it->has_checksum()) {
+                return std::string(it->checksum());
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto add = MakeAddRequest(host, key, "checksum_delta");
+    auto *add_spec = add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
+    add_spec->set_checksum("");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_delta").first);
+    EXPECT_FALSE(get_tp0_checksum().has_value());
+
+    add_spec->set_checksum("0");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_nonempty").first);
+    ASSERT_EQ(std::optional<std::string>("0"), get_tp0_checksum());
+
+    // BLOCK_ADD is a patch. Omitting checksum while refreshing the same spec
+    // must keep the existing checksum.
+    auto add_without_checksum = MakeAddRequest(host, key, "checksum_delta_refresh");
+    ASSERT_EQ(EC_OK, CallReportEvent(add_without_checksum, "caller_checksum_delta_refresh").first);
+    const auto preserved_checksum = get_tp0_checksum();
+    ASSERT_TRUE(preserved_checksum.has_value());
+    EXPECT_EQ("0", *preserved_checksum);
+
+    add_spec->set_checksum("");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_empty_patch").first);
+    EXPECT_EQ(std::optional<std::string>("0"), get_tp0_checksum());
+
+    // The same patch rule also applies while repeated events are folded inside
+    // one RPC.  The second ADD updates the URI but must not discard the value
+    // supplied by the first ADD before either mutation reaches MetaSearcher.
+    auto batched_add = MakeAddRequest(host, key, "checksum_batch_first");
+    auto *batched_first_spec = batched_add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
+    batched_first_spec->set_checksum("crc64:0000deadbeef");
+    *batched_add.add_events() = MakeAddRequest(host, key, "checksum_batch_last").events(0);
+    auto *batched_last_spec = batched_add.mutable_events(1)->mutable_block_add()->mutable_specs(0);
+    batched_last_spec->set_checksum("");
+    ASSERT_EQ(EC_OK, CallReportEvent(batched_add, "caller_checksum_batched_patch").first);
+    const auto batched_checksum = get_tp0_checksum();
+    ASSERT_TRUE(batched_checksum.has_value());
+    EXPECT_EQ("crc64:0000deadbeef", *batched_checksum);
+    const auto visible_after_batched_patch = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_batched_patch.size());
+    EXPECT_NE(std::string::npos, visible_after_batched_patch.front().find("source=checksum_batch_last"));
+
+    auto snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot"}});
+    auto *snapshot_spec = snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
+    snapshot_spec->set_checksum("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+    ASSERT_EQ(EC_OK, CallReportEvent(snapshot, "caller_checksum_snapshot").first);
+    const auto snapshot_checksum = get_tp0_checksum();
+    ASSERT_TRUE(snapshot_checksum.has_value());
+    EXPECT_EQ("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", *snapshot_checksum);
+
+    // A full snapshot replaces the complete spec state. Empty checksum here
+    // is the explicit clearing mechanism, unlike the patch-style ADD above.
+    auto clearing_snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot_clear"}});
+    auto *empty_spec =
+        clearing_snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
+    empty_spec->set_checksum("");
+    ASSERT_EQ(EC_OK, CallReportEvent(clearing_snapshot, "caller_checksum_snapshot_clear").first);
+    const auto visible_after_clear = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_clear.size());
+    EXPECT_NE(std::string::npos, visible_after_clear.front().find("source=checksum_snapshot_clear"));
+    EXPECT_FALSE(get_tp0_checksum().has_value());
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWithoutStateChange) {
@@ -12449,8 +12568,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
     info->keys = {1};
     info->location_ids = {target_ids[0]};
     BlockMask success_mask = static_cast<BlockMaskOffset>(1); // 全部成功
-    auto ec = cache_manager_->FinishWriteCache(
-        request_context_.get(), "placeholder_id", "sess_p5", success_mask, std::move(info));
+    auto ec =
+        cache_manager_->FinishWriteCache(request_context_.get(),
+                                         "placeholder_id",
+                                         "sess_p5",
+                                         success_mask,
+                                         CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(info)));
     ASSERT_EQ(EC_OK, ec);
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
 
@@ -12613,11 +12736,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     partial_info->keys = {1};
     partial_info->location_ids = {partial_ids[0]};
     ASSERT_EQ(EC_OK,
-              cache_manager_->FinishWriteCache(request_context_.get(),
-                                               "full_policy_instance",
-                                               "sess_partial",
-                                               static_cast<BlockMaskOffset>(1),
-                                               std::move(partial_info)));
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(),
+                  "full_policy_instance",
+                  "sess_partial",
+                  static_cast<BlockMaskOffset>(1),
+                  CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(partial_info))));
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 
     auto remaining_cold_loc =
@@ -12635,11 +12759,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     remaining_info->keys = {1};
     remaining_info->location_ids = {remaining_ids[0]};
     ASSERT_EQ(EC_OK,
-              cache_manager_->FinishWriteCache(request_context_.get(),
-                                               "full_policy_instance",
-                                               "sess_remaining",
-                                               static_cast<BlockMaskOffset>(1),
-                                               std::move(remaining_info)));
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(),
+                  "full_policy_instance",
+                  "sess_remaining",
+                  static_cast<BlockMaskOffset>(1),
+                  CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(remaining_info))));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 }
 
@@ -12684,8 +12809,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheSkipsTieredMarkWhenMigrationDisable
     info->keys = {1};
     info->location_ids = {target_ids[0]};
     BlockMask success_mask = static_cast<BlockMaskOffset>(1);
-    auto ec = cache_manager_->FinishWriteCache(
-        request_context_.get(), "tiered_disabled_finish", "sess_disabled", success_mask, std::move(info));
+    auto ec =
+        cache_manager_->FinishWriteCache(request_context_.get(),
+                                         "tiered_disabled_finish",
+                                         "sess_disabled",
+                                         success_mask,
+                                         CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(info)));
     ASSERT_EQ(EC_OK, ec);
     // 关键断言：未启用 migration 的 group，finish 不清标。
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));
