@@ -3,6 +3,15 @@
 [English Version](README.md)
 
 ---
+
+> [!IMPORTANT]
+> **本目录中的旧版 HiSim simulator 已停止维护。** 欢迎通过以下实现继续使用仿真能力并获取后续更新：
+>
+> - **SGLang：**[SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator)，已集成至 SGLang 官方仓库。
+> - **vLLM：**[vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator)，目前可使用 `simulator` 分支；上游集成正在进行中，进展见 [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747)。
+>
+> 安装方式、支持版本和使用方法请以链接中的 README 为准。下方文档描述的是旧版实现，仅保留作历史参考。
+
 ## Background
 在大语言模型（LLM）推理服务快速落地与规模化部署的背景下，推理性能直接影响用户体验、服务成本与资源效率。首 Token 延迟（TTFT）、每输出 Token 延迟（TPOT）和系统吞吐量等关键指标，高度依赖于模型结构、硬件平台（如 A100/H100）、推理引擎（如 SGLang、vLLM、TensorRT-LLM）及其运行时配置（量化、批处理、并行策略等）的复杂耦合。
 

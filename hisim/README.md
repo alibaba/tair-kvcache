@@ -5,6 +5,14 @@
 
 ---
 
+> [!IMPORTANT]
+> **The legacy HiSim simulator in this directory is no longer maintained.** For continued use and future updates, please use:
+>
+> - **SGLang:** [SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator), available in the official SGLang repository.
+> - **vLLM:** [vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator), available on the `simulator` branch. Upstream integration is in progress; follow [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747) for status.
+>
+> See the linked READMEs for installation, supported versions, and usage. The documentation below describes the legacy implementation and is retained for historical reference.
+
 ## Background
 
 As large language models (LLMs) are rapidly deployed at scale for inference services, inference performance directly impacts user experience, service cost, and resource efficiency. Key metrics such as Time to First Token (TTFT), Time Per Output Token (TPOT), and system throughput are highly dependent on the complex interplay among model architecture, hardware platforms (e.g., A100/H100), inference engines (e.g., SGLang, vLLM, TensorRT-LLM), and runtime configurations (e.g., quantization, batching, parallelism strategies).
