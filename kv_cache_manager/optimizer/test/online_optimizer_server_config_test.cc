@@ -34,13 +34,13 @@ TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
         "io_thread_num": 8,
         "kvcm_event_subscriptions": [
             {
-                "service_discovery_url": "static://127.0.0.1:6490",
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:6490",
                 "consumer_id": "optimizer-a",
                 "discovery_refresh_interval_ms": 1234,
                 "capacity_gb": [10.0, 20.0, 40.0]
             },
             {
-                "service_discovery_url": "static://127.0.0.1:6491",
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:6491",
                 "consumer_id": "optimizer-b",
                 "discovery_refresh_interval_ms": 2345
             }
@@ -86,7 +86,7 @@ TEST_F(OnlineOptimizerServerConfigTest, ReparseWithoutSubscriptionRestoresDefaul
     OnlineOptimizerServerConfig config;
     ASSERT_TRUE(config.FromJsonString(R"({
         "kvcm_event_subscriptions": [{
-            "service_discovery_url": "static://127.0.0.1:6381"
+            "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:6381"
         }]
     })"));
     ASSERT_EQ(1, config.kvcm_event_subscriptions().size());
@@ -107,13 +107,13 @@ TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
         "io_thread_num": 16,
         "kvcm_event_subscriptions": [
             {
-                "service_discovery_url": "static://127.0.0.1:6490",
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:6490",
                 "consumer_id": "optimizer-a",
                 "discovery_refresh_interval_ms": 4321,
                 "capacity_gb": [12.0, 24.0]
             },
             {
-                "service_discovery_url": "static://127.0.0.1:6491",
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:6491",
                 "consumer_id": "optimizer-b",
                 "discovery_refresh_interval_ms": 5432
             }
@@ -156,7 +156,7 @@ TEST_F(OnlineOptimizerServerConfigTest, OverrideFromEnvironMap) {
         {"kvcm_optimizer.rpc_port", "60000"},
         {"kvcm_optimizer.io_thread_num", "16"},
         {"kvcm_optimizer.kvcm_event_subscriptions",
-         R"([{"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"optimizer-env-a","discovery_refresh_interval_ms":2500,"capacity_gb":[8.0,16.0]},{"service_discovery_url":"static://127.0.0.1:6382","consumer_id":"optimizer-env-b","discovery_refresh_interval_ms":3500}])"},
+         R"([{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"optimizer-env-a","discovery_refresh_interval_ms":2500,"capacity_gb":[8.0,16.0]},{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6382","consumer_id":"optimizer-env-b","discovery_refresh_interval_ms":3500}])"},
     };
     ASSERT_TRUE(config.OverrideFromEnviron(environ));
     EXPECT_EQ(60000, config.rpc_port());
@@ -175,17 +175,17 @@ TEST_F(OnlineOptimizerServerConfigTest, RejectsInvalidSubscriptions) {
     OnlineOptimizerServerConfig config;
     EXPECT_FALSE(config.FromJsonString(R"({"kvcm_event_subscriptions":[{}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"","discovery_refresh_interval_ms":5000}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"","discovery_refresh_interval_ms":5000}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"optimizer","discovery_refresh_interval_ms":0}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"optimizer","discovery_refresh_interval_ms":0}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[0.0]}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[0.0]}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[10.0,-1.0]}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[10.0,-1.0]}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[1e20]}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[1e20]}]})"));
     EXPECT_FALSE(config.FromJsonString(
-        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381"},{"service_discovery_url":"static://127.0.0.1:6381"}]})"));
+        R"({"kvcm_event_subscriptions":[{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381"},{"ttl_seconds_list":[86400],"service_discovery_url":"static://127.0.0.1:6381"}]})"));
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, OverrideFromSystemEnv) {
@@ -219,6 +219,26 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     std::unordered_map<std::string, std::string> empty_environ;
     ASSERT_TRUE(config.OverrideFromEnviron(empty_environ));
     EXPECT_EQ(8888, config.http_port());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, ValidatesAutoRegistrationTtls) {
+    KvcmEventSubscriptionConfig config;
+    EXPECT_FALSE(
+        config.FromJsonString(R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":false})"));
+    EXPECT_FALSE(config.auto_register_from_kvcm());
+    EXPECT_TRUE(config.FromJsonString(R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":true})"));
+    EXPECT_EQ((std::vector<int64_t>{86400}), config.ttl_seconds_list());
+    EXPECT_TRUE(config.FromJsonString(
+        R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":true,"ttl_seconds_list":[3600,86400]})"));
+    EXPECT_EQ((std::vector<int64_t>{3600, 86400}), config.ttl_seconds_list());
+    for (const auto &list : {"[]", "[-1]", "[1,1]", "[9223372036854775807]"}) {
+        EXPECT_FALSE(config.FromJsonString(
+            std::string(R"({"service_discovery_url":"static://host:1","ttl_seconds_list":)") + list + "}"));
+    }
+    EXPECT_TRUE(config.FromJsonString(
+        R"({"service_discovery_url":"static://host:1","ttl_seconds_list":[10,30],"capacity_gb":[]})"));
+    EXPECT_EQ((std::vector<int64_t>{10, 30}), config.ttl_seconds_list());
+    EXPECT_TRUE(config.capacity_gb().empty());
 }
 
 } // namespace kv_cache_manager

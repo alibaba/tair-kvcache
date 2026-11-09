@@ -35,10 +35,31 @@ bool OptimizerEventPublisher::Publish(const std::shared_ptr<BaseEvent> &event) {
     if (!event || !running_) {
         return false;
     }
+    const auto epoch = CaptureEpoch();
+    if (epoch == 0) {
+        return true;
+    }
+    const auto *query = dynamic_cast<const CacheGetEvent *>(event.get());
+    if (!query || !query->optimizer_observation()) {
+        skipped_.fetch_add(1);
+        return true;
+    }
     // Runs on a serving thread: enqueue and return, nothing else. A full queue
     // drops the event (counted by the base class) without surfacing an expected
     // best-effort drop as a publish failure and triggering a warning per request.
-    BasicEnqueue(event);
+    if (query->capture_epoch() != epoch) {
+        return true;
+    }
+    {
+        std::unique_lock<std::mutex> lock(basic_queue_->queue_mutex, std::try_to_lock);
+        if (!lock.owns_lock() || basic_queue_->queue_size.load() >= basic_queue_->max_queue_size) {
+            basic_queue_->dropped_counts.fetch_add(1);
+            return true;
+        }
+        basic_queue_->event_queue.push(event);
+        basic_queue_->queue_size.fetch_add(1);
+    }
+    basic_queue_->queue_cv.notify_one();
     return true;
 }
 
@@ -76,12 +97,17 @@ void OptimizerEventPublisher::WorkerThread() {
 
         std::shared_ptr<BaseEvent> event;
         while (BasicDequeue(event)) {
+            const auto *query = static_cast<const CacheGetEvent *>(event.get());
+            const auto epoch = query->capture_epoch();
+            if (epoch == 0 || epoch != CaptureEpoch()) {
+                continue;
+            }
             proto::optimizer::TraceQueryRequest request;
             if (!Convert(event, &request)) {
                 skipped_.fetch_add(1);
                 continue;
             }
-            if (sink_->Send(request)) {
+            if (sink_->Send(request, epoch)) {
                 forwarded_.fetch_add(1);
             }
         }

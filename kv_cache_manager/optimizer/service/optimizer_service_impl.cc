@@ -15,15 +15,12 @@
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
 
 namespace kv_cache_manager {
 
 namespace {
-
-constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
-constexpr int64_t kKvcmAutoGroupTtlSeconds = 24 * 60 * 60;
-constexpr const char *kKvcmSynthesizedFullSpecGroupName = "full";
 
 void SetPbResponseHeader(proto::optimizer::CommonResponseHeader *header, ErrorCode ec) {
     auto *status = header->mutable_status();
@@ -46,7 +43,7 @@ OptimizerInstanceGroup ConvertProtoToInstanceGroup(const proto::optimizer::Optim
     }
     group.set_shared_group_quota(pb.shared_group_quota());
     group.set_enable_theoretical_max_cache(pb.enable_theoretical_max_cache());
-    group.set_ttl_seconds(pb.ttl_seconds());
+    group.set_ttl_seconds_list({pb.ttl_seconds_list().begin(), pb.ttl_seconds_list().end()});
     group.set_enable_prefix_hash(pb.enable_prefix_hash());
     return group;
 }
@@ -58,7 +55,9 @@ void ConvertInstanceGroupToProto(const OptimizerInstanceGroup &group,
         pb->add_capacity_gb(cap);
     }
     pb->set_shared_group_quota(group.shared_group_quota());
-    pb->set_ttl_seconds(group.ttl_seconds());
+    for (auto ttl : group.ttl_seconds_list()) {
+        pb->add_ttl_seconds_list(ttl);
+    }
     pb->set_enable_theoretical_max_cache(group.enable_theoretical_max_cache());
     pb->set_enable_prefix_hash(group.enable_prefix_hash());
     if (group.eviction_policy() == "lru") {
@@ -305,135 +304,100 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 }
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                                       std::unordered_set<std::string> &unsupported_instance_ids,
-                                                       const std::vector<double> &capacity_gb_override) {
-    unsupported_instance_ids.clear();
-    if (!manager_) {
-        KVCM_LOG_ERROR("ApplyKvcmConfiguration: optimizer manager is null");
+                                                       const KvcmEventSubscriptionConfig &config) {
+    if (!manager_ || !manager_->registry_manager()) {
         return EC_ERROR;
+    }
+    if (!config.Validate()) {
+        return EC_BADARGS;
     }
     auto registry = manager_->registry_manager();
-    if (!registry) {
-        KVCM_LOG_ERROR("ApplyKvcmConfiguration: optimizer registry manager is null");
-        return EC_ERROR;
-    }
-
-    // TODO: Reconcile existing Optimizer groups and instances when KVCM configuration changes.
-    // The current synchronization only creates missing entries and does not update existing ones.
-    std::unordered_set<std::string> available_groups;
-    std::size_t created_groups = 0;
-    std::size_t registered_instances = 0;
     for (const auto &source : configuration.instance_groups()) {
-        if (source.name().empty() || source.capacity_bytes() <= 0) {
-            KVCM_LOG_ERROR("ApplyKvcmConfiguration: invalid KVCM instance group[%s], capacity_bytes=%ld",
-                           source.name().c_str(),
-                           source.capacity_bytes());
+        OptimizerInstanceGroup group;
+        group.set_name(source.name());
+        if (config.auto_register_from_kvcm()) {
+            group.set_capacity_gb({static_cast<double>(source.capacity_bytes()) / (1024.0 * 1024 * 1024)});
+        } else {
+            group.set_capacity_gb(config.capacity_gb());
+        }
+        group.set_ttl_seconds_list(config.ttl_seconds_list());
+        group.set_eviction_policy("lru");
+        group.set_enable_prefix_hash(true);
+        group.set_enable_theoretical_max_cache(true);
+        std::string invalid;
+        if (!group.ValidateRequiredFields(invalid)) {
             return EC_BADARGS;
         }
-        if (!registry->GetInstanceGroup(source.name())) {
-            OptimizerInstanceGroup group;
-            group.set_name(source.name());
-            if (capacity_gb_override.empty()) {
-                group.set_capacity_gb(
-                    {static_cast<double>(static_cast<long double>(source.capacity_bytes()) / kBytesPerGb)});
-            } else {
-                group.set_capacity_gb(capacity_gb_override);
-            }
-            group.set_eviction_policy("lru");
-            group.set_enable_prefix_hash(true);
-            group.set_enable_theoretical_max_cache(true);
-            group.set_ttl_seconds(kKvcmAutoGroupTtlSeconds);
-
-            std::string invalid_fields;
-            if (!group.ValidateRequiredFields(invalid_fields)) {
-                KVCM_LOG_ERROR("ApplyKvcmConfiguration: invalid mapped instance group[%s], invalid_fields[%s]",
-                               source.name().c_str(),
-                               invalid_fields.c_str());
-                return EC_BADARGS;
-            }
-
-            const ErrorCode ec = manager_->CreateInstanceGroup(group);
+        auto existing_group = registry->GetInstanceGroup(source.name());
+        if (!existing_group) {
+            const auto ec = manager_->CreateInstanceGroup(group);
             if (ec != EC_OK && ec != EC_DUPLICATE_ENTITY) {
-                KVCM_LOG_ERROR("ApplyKvcmConfiguration: create instance group[%s] failed, ec=%d",
-                               source.name().c_str(),
-                               static_cast<int>(ec));
                 return ec;
             }
-            if (ec == EC_OK) {
-                ++created_groups;
-            }
+            existing_group = registry->GetInstanceGroup(source.name());
         }
-        available_groups.insert(source.name());
-    }
-
-    for (const auto &source : configuration.instances()) {
-        if (source.instance_id().empty()) {
-            KVCM_LOG_ERROR("ApplyKvcmConfiguration: empty KVCM instance id");
+        if (!existing_group || existing_group->ToJsonString() != group.ToJsonString()) {
+            KVCM_LOG_ERROR("Conflicting auto-registration configuration for group[%s]", source.name().c_str());
             return EC_BADARGS;
         }
-        if (manager_->GetInstanceState(source.instance_id(), [](const InstanceState &) {}) == EC_OK) {
-            continue;
+    }
+    for (const auto &source : configuration.instances()) {
+        const auto block_size = source.block_size();
+        if (source.instance_id().empty() || block_size <= 0) {
+            return EC_BADARGS;
         }
-        if (source.location_spec_groups_size() > 1) {
-            KVCM_LOG_WARN("ApplyKvcmConfiguration: ignore unsupported multi-group instance[%s], groups=%d",
-                          source.instance_id().c_str(),
-                          source.location_spec_groups_size());
-            unsupported_instance_ids.insert(source.instance_id());
+        bool matches = true;
+        const auto exists = manager_->GetInstanceState(source.instance_id(), [&](const InstanceState &state) {
+            matches = state.instance_info->block_size() == block_size &&
+                      state.instance_info->instance_group_name() == source.instance_group_name() &&
+                      state.linear_step == 0 && (config.auto_register_from_kvcm() || state.size_full == 1);
+        });
+        if (exists == EC_OK) {
+            if (!matches) {
+                KVCM_LOG_ERROR("KVCM configuration differs for registered instance[%s]", source.instance_id().c_str());
+                return EC_BADARGS;
+            }
             continue;
-        }
-        if (available_groups.find(source.instance_group_name()) == available_groups.end()) {
-            KVCM_LOG_ERROR("ApplyKvcmConfiguration: instance[%s] group[%s] is unavailable",
-                           source.instance_id().c_str(),
-                           source.instance_group_name().c_str());
-            return EC_NOENT;
         }
         std::vector<LocationSpecInfo> spec_infos;
-        spec_infos.reserve(source.location_spec_infos_size());
-        for (const auto &spec : source.location_spec_infos()) {
-            spec_infos.emplace_back(spec.name(), spec.size());
-        }
-
         std::vector<LocationSpecGroup> spec_groups;
-        if (source.location_spec_groups().empty()) {
-            std::vector<std::string> spec_names;
-            spec_names.reserve(spec_infos.size());
-            for (const auto &spec : spec_infos) {
-                spec_names.push_back(spec.name());
+        if (config.auto_register_from_kvcm()) {
+            // Keep the original KVCM spec mapping: a single group is full-attention.
+            if (source.location_spec_groups_size() > 1) {
+                KVCM_LOG_WARN("Ignore unsupported multi-group instance[%s]", source.instance_id().c_str());
+                continue;
             }
-            spec_groups.emplace_back(kKvcmSynthesizedFullSpecGroupName, spec_names);
+            for (const auto &spec : source.location_spec_infos()) {
+                spec_infos.emplace_back(spec.name(), spec.size());
+            }
+            if (source.location_spec_groups().empty()) {
+                std::vector<std::string> names;
+                for (const auto &spec : spec_infos) {
+                    names.push_back(spec.name());
+                }
+                spec_groups.emplace_back("full", names);
+            } else {
+                const auto &group = source.location_spec_groups(0);
+                spec_groups.emplace_back(
+                    group.name(), std::vector<std::string>(group.spec_names().begin(), group.spec_names().end()));
+            }
         } else {
-            spec_groups.reserve(source.location_spec_groups_size());
-            for (const auto &source_group : source.location_spec_groups()) {
-                std::vector<std::string> spec_names(source_group.spec_names().begin(), source_group.spec_names().end());
-                spec_groups.emplace_back(source_group.name(), spec_names);
-            }
+            spec_infos.emplace_back("block", 1);
+            spec_groups.emplace_back("full", std::vector<std::string>{"block"});
         }
-
         OptimizerInstanceInfo instance(source.instance_group_name(),
                                        source.instance_id(),
-                                       source.block_size(),
+                                       block_size,
                                        spec_infos,
                                        spec_groups,
                                        0,
                                        OptimizerStateInfo());
         RegisterInstanceResult result;
-        const ErrorCode ec = manager_->RegisterInstance(instance, result);
+        auto ec = manager_->RegisterInstance(instance, result);
         if (ec != EC_OK) {
-            KVCM_LOG_ERROR("ApplyKvcmConfiguration: register instance[%s] failed, ec=%d",
-                           source.instance_id().c_str(),
-                           static_cast<int>(ec));
             return ec;
         }
-        ++registered_instances;
     }
-
-    KVCM_LOG_INFO("ApplyKvcmConfiguration: groups=%d instances=%d created_groups=%zu registered_instances=%zu "
-                  "unsupported_instances=%zu",
-                  configuration.instance_groups_size(),
-                  configuration.instances_size(),
-                  created_groups,
-                  registered_instances,
-                  unsupported_instance_ids.size());
     return EC_OK;
 }
 
@@ -454,17 +418,7 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
             collector->set_instance_id(request->instance_id());
             collector->set_total_blocks(response->total_blocks());
             collector->set_input_token_len(response->input_token_len());
-            std::vector<PerCapacityHitInfo> per_cap;
-            per_cap.reserve(response->capacity_results_size());
-            for (const auto &capacity_result : response->capacity_results()) {
-                per_cap.push_back(
-                    {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
-            }
-            collector->set_per_capacity_hits(std::move(per_cap));
-            collector->set_max_hit_count(response->theoretical_result().max_hit_count());
-            if (response->theoretical_result().max_hit_count() >= 0) {
-                collector->set_max_hit_rate(response->theoretical_result().hit_rate());
-            }
+            collector->SetTtlResults(*response);
         }
     } else {
         SetErrorOnCollector(request_context, ec);
@@ -488,38 +442,46 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
 
     response->set_total_blocks(result.total_blocks);
     response->set_input_token_len(result.input_token_len);
-    for (size_t i = 0; i < result.capacity_gb.size() && i < result.hit_count_per_capacity.size(); i++) {
-        auto *capacity_result = response->add_capacity_results();
-        capacity_result->set_capacity_gb(result.capacity_gb[i]);
-        capacity_result->set_cache_hit_count(result.hit_count_per_capacity[i]);
-        if (i < result.hit_rate_per_capacity.size()) {
-            capacity_result->set_hit_rate(result.hit_rate_per_capacity[i]);
+    response->clear_ttl_results();
+    for (const auto &ttl_result : result.ttl_results) {
+        const auto &result = ttl_result;
+        auto *ttl_response = response->add_ttl_results();
+        ttl_response->set_ttl_seconds(result.ttl_seconds);
+        for (size_t i = 0; i < result.capacity_gb.size() && i < result.hit_count_per_capacity.size(); i++) {
+            auto *capacity_result = ttl_response->add_capacity_results();
+            capacity_result->set_capacity_gb(result.capacity_gb[i]);
+            capacity_result->set_cache_hit_count(result.hit_count_per_capacity[i]);
+            if (i < result.hit_rate_per_capacity.size()) {
+                capacity_result->set_hit_rate(result.hit_rate_per_capacity[i]);
+            }
+            if (i < result.unique_keys_per_capacity.size()) {
+                capacity_result->set_current_unique_keys(result.unique_keys_per_capacity[i]);
+            }
         }
-        if (i < result.unique_keys_per_capacity.size()) {
-            capacity_result->set_current_unique_keys(result.unique_keys_per_capacity[i]);
-        }
-    }
-    response->mutable_theoretical_result()->set_max_hit_count(result.max_hit_count);
-    response->mutable_theoretical_result()->set_current_unique_keys(result.theoretical_unique_keys);
-    response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
+        ttl_response->mutable_theoretical_result()->set_max_hit_count(result.max_hit_count);
+        ttl_response->mutable_theoretical_result()->set_current_unique_keys(result.theoretical_unique_keys);
+        ttl_response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
 
-    if (event_manager_) {
-        auto event = std::make_shared<OptimizerQueryHitEvent>(request.instance_id());
-        event->SetEventTriggerTime();
-        event->SetAdditionalArgs(
-            request.trace_id(), request.timestamp_ns(), response->input_token_len(), response->total_blocks());
-        for (const auto &capacity_result : response->capacity_results()) {
-            event->AddCapacityResult(capacity_result.capacity_gb(),
-                                     capacity_result.cache_hit_count(),
-                                     capacity_result.hit_rate(),
-                                     capacity_result.current_unique_keys());
+        if (event_manager_) {
+            auto event = std::make_shared<OptimizerQueryHitEvent>(
+                TtlMetricsInstanceId(request.instance_id(), result.ttl_seconds));
+            event->SetEventTriggerTime();
+            event->SetAdditionalArgs(
+                request.trace_id(), request.timestamp_ns(), response->input_token_len(), response->total_blocks());
+            for (const auto &capacity_result : ttl_response->capacity_results()) {
+                event->AddCapacityResult(capacity_result.capacity_gb(),
+                                         capacity_result.cache_hit_count(),
+                                         capacity_result.hit_rate(),
+                                         capacity_result.current_unique_keys());
+            }
+            const auto &theoretical_result = ttl_response->theoretical_result();
+            event->SetTheoreticalResult(theoretical_result.max_hit_count(),
+                                        theoretical_result.hit_rate(),
+                                        theoretical_result.current_unique_keys());
+            event_manager_->Publish(event);
         }
-        const auto &theoretical_result = response->theoretical_result();
-        event->SetTheoreticalResult(theoretical_result.max_hit_count(),
-                                    theoretical_result.hit_rate(),
-                                    theoretical_result.current_unique_keys());
-        event_manager_->Publish(event);
     }
+
     return EC_OK;
 }
 
@@ -540,6 +502,7 @@ void OptimizerServiceImpl::ListInstances(RequestContext *request_context,
         for (const auto &s : summaries) {
             auto *pb = response->add_instances();
             pb->set_instance_id(s.instance_id);
+            pb->set_ttl_seconds(s.ttl_seconds);
             pb->set_instance_group(s.instance_group);
             pb->set_total_queries(s.total_queries);
             pb->set_total_blocks_queried(s.total_blocks_queried);

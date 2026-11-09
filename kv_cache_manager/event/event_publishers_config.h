@@ -24,13 +24,11 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
-    bool enable() const { return enable_; }
     std::size_t queue_size() const { return queue_size_; }
     std::size_t max_subscribers() const { return max_subscribers_; }
     std::size_t subscriber_queue_size() const { return subscriber_queue_size_; }
 
 private:
-    bool enable_ = false;
     std::size_t queue_size_ = 100000;
     std::size_t max_subscribers_ = 4;
     std::size_t subscriber_queue_size_ = 10000;
@@ -43,7 +41,6 @@ public:
 
     bool enable_log_event_publisher() const { return log_.enable(); }
     const LogEventPublisherConfig &log_event_publisher_config() const { return log_; }
-    bool enable_optimizer_event_publisher() const { return optimizer_.enable(); }
     const OptimizerEventPublisherConfig &optimizer_event_publisher_config() const { return optimizer_; }
 
 private:

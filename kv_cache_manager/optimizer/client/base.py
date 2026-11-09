@@ -120,25 +120,29 @@ class OptimizerClientBase(abc.ABC):
             raise OptimizerClientError(operation, code, header.status.message)
 
     @staticmethod
-    def parse_trace_query(response) -> Tuple[int, List[Tuple[float, int]], Optional[int]]:
+    def parse_trace_query(response, ttl_seconds: int) -> Tuple[int, List[Tuple[float, int]], Optional[int]]:
+        matches = [item for item in response.ttl_results if item.ttl_seconds == ttl_seconds]
+        if len(matches) != 1:
+            raise ValueError(f"Expected exactly one replay result for TTL {ttl_seconds}")
+        result = matches[0]
         total_blocks = int(response.total_blocks)
         per_capacity = [
             (float(item.capacity_gb), int(item.cache_hit_count))
-            for item in response.capacity_results
+            for item in result.capacity_results
         ]
         theoretical_hits = None
-        if response.HasField("theoretical_result"):
-            max_hit = int(response.theoretical_result.max_hit_count)
+        if result.HasField("theoretical_result"):
+            max_hit = int(result.theoretical_result.max_hit_count)
             if max_hit >= 0:
                 theoretical_hits = max_hit
         return total_blocks, per_capacity, theoretical_hits
 
-    def trace_query_for_stats(self, instance_id: str, block_keys: Iterable[int]):
+    def trace_query_for_stats(self, instance_id: str, block_keys: Iterable[int], ttl_seconds: int):
         import time
         start = time.monotonic()
         response = self.trace_query(instance_id, block_keys)
         latency_ms = (time.monotonic() - start) * 1000
-        total_blocks, per_capacity, theoretical_hits = self.parse_trace_query(response)
+        total_blocks, per_capacity, theoretical_hits = self.parse_trace_query(response, ttl_seconds)
         return latency_ms, total_blocks, per_capacity, theoretical_hits
 
     @staticmethod
@@ -165,8 +169,8 @@ class OptimizerClientBase(abc.ABC):
         self,
         name: str,
         capacity_gb,
+        ttl_seconds_list,
         eviction_policy=pb2.OPTIMIZER_EVICTION_POLICY_LRU,
-        ttl_seconds: int = 0,
         shared_group_quota: bool = False,
         enable_theoretical_max_cache: bool = False,
         allow_duplicate: bool = True,
@@ -179,8 +183,8 @@ class OptimizerClientBase(abc.ABC):
         self,
         name: str,
         capacity_gb,
+        ttl_seconds_list,
         eviction_policy=pb2.OPTIMIZER_EVICTION_POLICY_LRU,
-        ttl_seconds: int = 0,
         shared_group_quota: bool = False,
         enable_theoretical_max_cache: bool = False,
         trace_id: Optional[str] = None,

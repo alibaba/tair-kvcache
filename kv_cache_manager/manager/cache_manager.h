@@ -278,6 +278,7 @@ public:
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
+
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
 
@@ -380,8 +381,7 @@ private:
                                           const std::string &instance_id,
                                           size_t key_count,
                                           const std::vector<std::string> &location_spec_group_names);
-    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
-                                       CacheLocationVector &locations);
+    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info, CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
     void CleanupHostLocations(const std::string &instance_id,
@@ -465,6 +465,13 @@ private:
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态
     std::shared_ptr<EventManager> event_manager_;
+    bool EnqueueOptimizerEvent(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               int64_t input_token_len,
+                               int64_t timestamp_ns,
+                               const std::vector<std::string> &location_spec_names);
+
     // 无需清理
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
     // EventReportBackend owns a callback that cannot retain CacheManager.

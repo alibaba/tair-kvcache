@@ -60,7 +60,8 @@ public:
     void DisableSubscriptions();
     bool accepting_subscriptions() const { return accepting_subscriptions_.load(); }
 
-    bool Send(const proto::optimizer::TraceQueryRequest &event) override;
+    uint64_t CaptureEpoch() const override { return capture_epoch_.load(); }
+    bool Send(const proto::optimizer::TraceQueryRequest &event, uint64_t epoch) override;
     void Stop() override;
     std::size_t DroppedCount() const;
 
@@ -72,6 +73,8 @@ private:
     OptimizerEventPublisherConfig config_;
     mutable std::mutex subscriptions_mutex_;
     std::vector<std::shared_ptr<Subscription>> subscriptions_;
+    uint64_t next_epoch_ = 0; // Protected by subscriptions_mutex_.
+    std::atomic<uint64_t> capture_epoch_{0};
     std::atomic<bool> accepting_subscriptions_{true};
     std::atomic<bool> stopped_{false};
     std::atomic<std::size_t> dropped_{0};

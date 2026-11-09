@@ -28,6 +28,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
@@ -118,11 +119,7 @@ ErrorCode Fail(void * /*obj*/) { return EC_ERROR; }
 } // namespace remove_instance_retire_stub
 
 namespace remove_instance_trim_stub {
-ErrorCode Fail(void * /*obj*/,
-               RequestContext * /*request_context*/,
-               size_t /*scan_batch_size*/) {
-    return EC_ERROR;
-}
+ErrorCode Fail(void * /*obj*/, RequestContext * /*request_context*/, size_t /*scan_batch_size*/) { return EC_ERROR; }
 } // namespace remove_instance_trim_stub
 
 class FailFinalIndexDeleteRegistryBackend : public RegistryLocalBackend {
@@ -1496,13 +1493,15 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
 TEST_F(CacheManagerTest, TestRemoveInstanceKeepsRegistrationWhileCopyPrepareIsCancelling) {
     const std::string instance_id = "remove_active_copy";
     ASSERT_EQ(EC_OK,
-              cache_manager_->RegisterInstance(request_context_.get(),
-                                               "default",
-                                               instance_id,
-                                               64,
-                                               createLocationSpecInfos(),
-                                               createModelDeployment(),
-                                               {}).first);
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     instance_id,
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
     const auto original = registry_manager_->GetInstanceInfo(request_context_.get(), instance_id);
     auto manager = cache_manager_->migration_manager_;
     MigrationManager::CopyTaskContext task;
@@ -3655,8 +3654,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendF
     loc.set_id("kvs#event_report_l1p5#mem#192.168.1.100:8080");
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    loc.set_location_specs(
-        {LocationSpec("tp0", "event_report://cache-node/mem?s_v=01234567")});
+    loc.set_location_specs({LocationSpec("tp0", "event_report://cache-node/mem?s_v=01234567")});
 
     EXPECT_FALSE(func(loc));
 }
@@ -5889,9 +5887,8 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     for (const auto &location : snapshot_locations.cache_locations_view()) {
         for (const auto &spec : location.location_specs()) {
             const auto &spec_infos = instance_info->location_spec_infos();
-            const auto it = std::find_if(spec_infos.begin(), spec_infos.end(), [&](const auto &info) {
-                return info.name() == spec.name();
-            });
+            const auto it = std::find_if(
+                spec_infos.begin(), spec_infos.end(), [&](const auto &info) { return info.name() == spec.name(); });
             ASSERT_NE(spec_infos.end(), it);
             EXPECT_EQ(&it->name(), &spec.name());
         }
@@ -6810,12 +6807,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"version_without_equals", {"event_report://physical-cache:9600/mem?s_v"}, false},
         {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(7, 'a')}, false},
         {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(9, 'a')}, false},
-        {"non_hex_version",
-         {"event_report://physical-cache:9600/mem?s_v=0123456g"},
-         false},
-        {"duplicate_same_version",
-         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
-         false},
+        {"non_hex_version", {"event_report://physical-cache:9600/mem?s_v=0123456g"}, false},
+        {"duplicate_same_version", {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token}, false},
         {"duplicate_different_version",
          {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + upper_token},
          false},
@@ -6830,8 +6823,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
           "event_report://physical-cache:9600/mem?source=legacy"},
          true},
         {"mixed_valid_and_malformed",
-         {"event_report://physical-cache:9600/mem?s_v=" + token,
-          "event_report://physical-cache:9600/mem?s_v=bad"},
+         {"event_report://physical-cache:9600/mem?s_v=" + token, "event_report://physical-cache:9600/mem?s_v=bad"},
          false},
         {"mixed_valid_and_duplicate",
          {"event_report://physical-cache:9600/mem?s_v=" + token,
@@ -10437,6 +10429,54 @@ TEST_F(HostCacheStateWithoutP2PTest, TairCandidateRespectsReporterMediumAndReada
     auto [unreadable_ec, unreadable_matches] = query({"mem"});
     ASSERT_EQ(EC_OK, unreadable_ec);
     EXPECT_TRUE(unreadable_matches.empty());
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, OptimizerObservationDoesNotAffectQuery) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    class CapturePublisher : public EventPublisher {
+    public:
+        uint64_t CaptureEpoch() const override { return epoch; }
+        uint64_t epoch = 0;
+        bool Init(const std::string &) override { return true; }
+        bool Stop() override { return true; }
+        bool Publish(const std::shared_ptr<BaseEvent> &event) override {
+            events.push_back(event);
+            return accept;
+        }
+        bool accept = true;
+        std::vector<std::shared_ptr<BaseEvent>> events;
+    };
+    auto publisher = std::make_shared<CapturePublisher>();
+    auto query = [&] {
+        return cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH, {101, 102});
+    };
+    auto baseline = query();
+    ASSERT_EQ(EC_OK, baseline.first);
+    EXPECT_TRUE(publisher->events.empty());
+    ASSERT_TRUE(cache_manager_->event_manager()->RegisterPublisher("optimizer_event_publisher", publisher));
+    EXPECT_EQ(EC_OK, query().first);
+    EXPECT_TRUE(publisher->events.empty());
+    publisher->epoch = 1;
+    auto observed = query();
+    EXPECT_EQ(baseline.first, observed.first);
+    EXPECT_EQ(baseline.second.size(), observed.second.size());
+    ASSERT_EQ(1u, publisher->events.size());
+    auto event = std::dynamic_pointer_cast<CacheGetEvent>(publisher->events.front());
+    ASSERT_NE(nullptr, event);
+    EXPECT_TRUE(event->optimizer_observation());
+    EXPECT_EQ(request_context_->trace_id(), event->trace_id());
+    EXPECT_EQ(instance_id_, event->event_source());
+    EXPECT_EQ((CacheManager::KeyVector{101, 102}), event->get_keys());
+    EXPECT_GT(event->event_trigger_time_us(), 0);
+    publisher->epoch = 0;
+    EXPECT_EQ(EC_OK, query().first);
+    EXPECT_EQ(1u, publisher->events.size());
+    publisher->epoch = 1;
+    publisher->accept = false;
+    EXPECT_EQ(EC_OK, query().first);
+    ASSERT_TRUE(cache_manager_->event_manager()->RemovePublisher("optimizer_event_publisher"));
+    EXPECT_EQ(EC_OK, query().first);
 }
 
 TEST_F(HostCacheStateWithoutP2PTest, TairProjectsSharedVineyardReporterToRankedHosts) {

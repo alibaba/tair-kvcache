@@ -275,7 +275,9 @@ batch window = pipeline_worker_count * 256 entries
 
 **Fanout mode**: when `fanout_all_instances = true`, each request is broadcast to all lanes (each lane has independent LRU state and independent facts rows); combined with multiple instances of different `block_size`, a single replay can scan multiple analysis granities over the same trace; mutually exclusive with `override_instance_id`. The facts query summary is grouped by instance (one row per instance + one total row), and fanout results are directly readable.
 
-**TTL replay**: when the instance group config has `ttl_seconds != 0`, the `LiteHit` core of that group's lanes layers a fixed TTL on top (consistent with the online `TtlCacheIndexerWrapper` semantics: a block survives while strictly less than TTL since its last access; expired blocks are misses at any capacity and truncate the prefix like cold blocks; every access (hit or miss) refreshes last_access; time is taken from the trace timestamp, and replay is deterministic). Age is monotonic along the LRU stack, and expired blocks do not raise the reuse distance of surviving blocks, so a single replay remains exact for the joint metric of "fixed TTL × arbitrary capacity", and facts are still ordinary hit curve rows. TTL is a replay-time parameter, taken directly from the group's `ttl_seconds`; to scan multiple TTLs, configure multiple groups each with a different `ttl_seconds` (can be combined with fanout to complete in a single replay).
+**TTL replay**: for each configured TTL value, the `LiteHit` core of that group's lanes layers a fixed TTL on top (consistent with the online `TtlCacheIndexerWrapper` semantics: a block survives while strictly less than TTL since its last access; expired blocks are misses at any capacity and truncate the prefix like cold blocks; every access (hit or miss) refreshes last_access; time is taken from the trace timestamp, and replay is deterministic). Age is monotonic along the LRU stack, and expired blocks do not raise the reuse distance of surviving blocks, so a single replay remains exact for the joint metric of "fixed TTL × arbitrary capacity", and facts are still ordinary hit curve rows. TTL is a replay-time parameter, taken from the group's `ttl_seconds_list`; the offline facts runner requires one entry per group, so offline TTL sweeps use multiple groups (can be combined with fanout to complete in a single replay).
+
+Online replay maintains one independent state per TTL entry. The offline facts runner requires exactly one TTL per group; use multiple groups for an offline TTL sweep.
 
 **Fail-fast**: timestamp out of order, unknown instance, length validation failure, zero valid rows in the whole file — any of these fails the whole thing with a reason — facts are an all-or-nothing reconciliation ledger, and silent row loss is not allowed.
 
@@ -306,7 +308,7 @@ Memory is only O(number of instances × number of capacity slots) cumulative int
 
 ## 8. Online Integration
 
-The Online Optimizer's full-attention `InstanceState` directly holds a `LiteHit` (when the group config has `ttl_seconds != 0`, a fixed TTL is layered on with wall-clock time, with metrics consistent with the linear path's `TtlCacheIndexerWrapper`). Each TraceQuery:
+The Online Optimizer's full-attention `InstanceState` holds one independent LiteHit replay state per entry in `ttl_seconds_list`; 0 means no TTL limit. Each TraceQuery is normalized and prefix-hashed once before being replayed by all TTL states:
 
 ```text
 NormalizeRequest → ProcessRequest → obtain RequestFact

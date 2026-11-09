@@ -20,9 +20,8 @@ namespace kv_cache_manager {
 
 class OptimizerRegistryManager;
 
-struct InstanceState {
-    std::shared_ptr<const OptimizerInstanceInfo> instance_info;
-    std::shared_ptr<const OptimizerInstanceGroup> instance_group;
+struct TtlReplayState {
+    int64_t ttl_seconds = 0;
 
     // Exactly one analyzer is active. Full-attention uses LiteHit directly;
     // linear attention remains on the legacy CacheIndexer path.
@@ -31,11 +30,6 @@ struct InstanceState {
     // Static byte->block estimation of the configured capacities, kept for
     // the existing response contract and used as projection slots.
     std::vector<int64_t> lite_hit_capacity_blocks;
-
-    int64_t size_full = 0;
-    int64_t size_full_linear = 0;
-    int32_t linear_step = 0;
-    std::mutex mutex;
 
     // Minimal cumulative integers per the existing contract. LiteHit itself
     // no longer accumulates anything; the full-attention path updates these
@@ -53,9 +47,22 @@ struct InstanceState {
     MrcWindow mrc_window;
 };
 
-struct TraceQueryResult {
-    int64_t total_blocks = 0;
-    int64_t input_token_len = 0;
+struct InstanceState {
+    std::shared_ptr<const OptimizerInstanceInfo> instance_info;
+    std::shared_ptr<const OptimizerInstanceGroup> instance_group;
+    int64_t size_full = 0;
+    int64_t size_full_linear = 0;
+    int32_t linear_step = 0;
+    std::mutex mutex;
+    std::vector<std::unique_ptr<TtlReplayState>> replays;
+};
+
+inline std::string TtlMetricsInstanceId(const std::string &id, int64_t ttl) {
+    return id + "-ttl-" + std::to_string(ttl) + "s";
+}
+
+struct TtlTraceQueryResult {
+    int64_t ttl_seconds = 0;
     std::vector<int64_t> hit_count_per_capacity;
     std::vector<double> hit_rate_per_capacity;
     std::vector<double> capacity_gb;
@@ -63,6 +70,12 @@ struct TraceQueryResult {
     int64_t theoretical_unique_keys = 0;
     int64_t max_hit_count = -1;
     double max_hit_rate = 0.0;
+};
+
+struct TraceQueryResult {
+    int64_t total_blocks = 0;
+    int64_t input_token_len = 0;
+    std::vector<TtlTraceQueryResult> ttl_results;
 };
 
 struct RegisterInstanceResult {
@@ -101,6 +114,7 @@ struct IntervalMetricInfo {
 };
 
 struct InstanceSummary {
+    int64_t ttl_seconds = 0;
     std::string instance_id;
     std::string instance_group;
     int32_t block_size = 0;

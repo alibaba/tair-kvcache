@@ -92,7 +92,7 @@ class BenchmarkRunner:
                 start_ns = time.monotonic_ns()
                 try:
                     latency_ms, total_blocks, per_capacity, theoretical_hits = \
-                        self._client.trace_query_for_stats(config.instance_id, block_keys)
+                        self._client.trace_query_for_stats(config.instance_id, block_keys, config.ttl_seconds)
                     if not is_warmup:
                         self._stats.record_success(
                             latency_ms, total_blocks, per_capacity, theoretical_hits)

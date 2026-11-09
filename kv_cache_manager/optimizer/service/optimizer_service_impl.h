@@ -11,6 +11,7 @@
 namespace kv_cache_manager {
 
 class OnlineOptimizerManager;
+class KvcmEventSubscriptionConfig;
 class EventManager;
 class OptimizerMetricsReporter;
 class OptimizerRegistryManager;
@@ -62,8 +63,7 @@ public:
 
     // KVCM ingress
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                     std::unordered_set<std::string> &unsupported_instance_ids,
-                                     const std::vector<double> &capacity_gb_override = {});
+                                     const KvcmEventSubscriptionConfig &config);
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,

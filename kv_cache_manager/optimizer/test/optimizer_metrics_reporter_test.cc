@@ -26,10 +26,11 @@ protected:
                                    bool enable_theoretical_max_cache = false,
                                    int32_t linear_step = 0) {
         OptimizerInstanceGroup group;
+        group.set_ttl_seconds_list({0});
         group.set_name("grp1");
         group.set_capacity_gb(caps);
         group.set_enable_theoretical_max_cache(enable_theoretical_max_cache);
-        group.set_ttl_seconds(ttl_seconds);
+        group.set_ttl_seconds_list({ttl_seconds});
 
         // Register/update group in registry so RegisterInstance can look it up.
         if (opt_registry_->GetInstanceGroup("grp1")) {
@@ -58,7 +59,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportAfterRegistration) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge query_total = registry_->GetGauge("trace_query_total", tags);
     EXPECT_EQ(0.0, query_total.Get());
     EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
@@ -74,7 +75,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportAfterQueries) {
 
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge query_total = registry_->GetGauge("trace_query_total", tags);
     EXPECT_EQ(2.0, query_total.Get());
 
@@ -94,11 +95,11 @@ TEST_F(OptimizerMetricsReporterTest, ReportMultipleInstances) {
 
     reporter_->ReportInterval();
 
-    MetricsTags tags1 = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags1 = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge qt1 = registry_->GetGauge("trace_query_total", tags1);
     EXPECT_EQ(1.0, qt1.Get());
 
-    MetricsTags tags2 = {{"instance_group", "grp1"}, {"instance_id", "inst2"}};
+    MetricsTags tags2 = {{"instance_group", "grp1"}, {"instance_id", "inst2-ttl-0s"}};
     Gauge qt2 = registry_->GetGauge("trace_query_total", tags2);
     EXPECT_EQ(0.0, qt2.Get());
 }
@@ -113,13 +114,13 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalPerCapacityHitRate) {
     reporter_->ReportInterval();
 
     MetricsTags tags_cap1 = {
-        {"instance_group", "grp1"}, {"instance_id", "inst1"}, {"capacity_gb", std::to_string(1.0)}};
+        {"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"capacity_gb", std::to_string(1.0)}};
     Gauge rate1 = registry_->GetGauge("trace_query_hit_rate", tags_cap1);
     EXPECT_GE(rate1.Get(), 0.0);
     EXPECT_LE(rate1.Get(), 1.0);
 
     MetricsTags tags_cap5 = {
-        {"instance_group", "grp1"}, {"instance_id", "inst1"}, {"capacity_gb", std::to_string(5.0)}};
+        {"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"capacity_gb", std::to_string(5.0)}};
     Gauge rate5 = registry_->GetGauge("trace_query_hit_rate", tags_cap5);
     EXPECT_GE(rate5.Get(), 0.0);
     EXPECT_LE(rate5.Get(), 1.0);
@@ -134,15 +135,17 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryWritesToRegistry) {
     collector->set_client_ip("10.0.0.1");
     collector->set_total_blocks(10);
     collector->set_input_token_len(2048);
-    collector->set_per_capacity_hits({
-        {1.0, 7},
-        {0.5, 3},
-    });
-
+    collector->set_ttl_results({{0,
+                                 {
+                                     {1.0, 7},
+                                     {0.5, 3},
+                                 },
+                                 -1,
+                                 -1}});
     reporter_->ReportPerQuery(collector.get());
 
     MetricsTags tags1 = {{"instance_group", ""},
-                         {"instance_id", "inst1"},
+                         {"instance_id", "inst1-ttl-0s"},
                          {"client_ip", "10.0.0.1"},
                          {"capacity_gb", std::to_string(1.0)}};
     Gauge rate1 = registry_->GetGauge("query_hit_rate", tags1);
@@ -152,13 +155,13 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryWritesToRegistry) {
     EXPECT_DOUBLE_EQ(7.0, hit1.Get());
 
     MetricsTags tags2 = {{"instance_group", ""},
-                         {"instance_id", "inst1"},
+                         {"instance_id", "inst1-ttl-0s"},
                          {"client_ip", "10.0.0.1"},
                          {"capacity_gb", std::to_string(0.5)}};
     Gauge rate2 = registry_->GetGauge("query_hit_rate", tags2);
     EXPECT_NEAR(0.3, rate2.Get(), 1e-9);
 
-    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1"}, {"client_ip", "10.0.0.1"}};
+    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1-ttl-0s"}, {"client_ip", "10.0.0.1"}};
     Gauge blocks = registry_->GetGauge("query_total_blocks", base_tags);
     EXPECT_DOUBLE_EQ(10.0, blocks.Get());
 
@@ -173,13 +176,11 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryMaxHitMetrics) {
     collector->set_instance_id("inst1");
     collector->set_client_ip("10.0.0.2");
     collector->set_total_blocks(10);
-    collector->set_per_capacity_hits({{1.0, 7}});
-    collector->set_max_hit_count(8);
-    collector->set_max_hit_rate(0.8);
+    collector->set_ttl_results({{0, {{1.0, 7}}, 8, 0.8}});
 
     reporter_->ReportPerQuery(collector.get());
 
-    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1"}, {"client_ip", "10.0.0.2"}};
+    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1-ttl-0s"}, {"client_ip", "10.0.0.2"}};
     Gauge max_hit = registry_->GetGauge("query_max_hit_count", base_tags);
     EXPECT_DOUBLE_EQ(8.0, max_hit.Get());
 
@@ -193,18 +194,16 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryCapacityEfficiency) {
     collector->set_instance_id("inst1");
     collector->set_client_ip("10.0.0.3");
     collector->set_total_blocks(10);
-    collector->set_per_capacity_hits({{1.0, 6}, {5.0, 8}});
-    collector->set_max_hit_count(8);
-    collector->set_max_hit_rate(0.8);
+    collector->set_ttl_results({{0, {{1.0, 6}, {5.0, 8}}, 8, 0.8}});
 
     reporter_->ReportPerQuery(collector.get());
 
     MetricsTags tags1 = {{"instance_group", ""},
-                         {"instance_id", "inst1"},
+                         {"instance_id", "inst1-ttl-0s"},
                          {"client_ip", "10.0.0.3"},
                          {"capacity_gb", std::to_string(1.0)}};
     MetricsTags tags5 = {{"instance_group", ""},
-                         {"instance_id", "inst1"},
+                         {"instance_id", "inst1-ttl-0s"},
                          {"client_ip", "10.0.0.3"},
                          {"capacity_gb", std::to_string(5.0)}};
     EXPECT_NEAR(0.75, registry_->GetGauge("query_capacity_efficiency", tags1).Get(), 1e-9);
@@ -217,9 +216,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryCapacityEfficiency) {
     zero_hit_collector->set_instance_id("inst1");
     zero_hit_collector->set_client_ip("10.0.0.3");
     zero_hit_collector->set_total_blocks(10);
-    zero_hit_collector->set_per_capacity_hits({{1.0, 0}, {5.0, 0}});
-    zero_hit_collector->set_max_hit_count(0);
-    zero_hit_collector->set_max_hit_rate(0.0);
+    zero_hit_collector->set_ttl_results({{0, {{1.0, 0}, {5.0, 0}}, 0, 0.0}});
+
     reporter_->ReportPerQuery(zero_hit_collector.get());
 
     EXPECT_TRUE(std::isnan(registry_->GetGauge("query_capacity_efficiency", tags1).Get()));
@@ -231,11 +229,10 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryMaxHitNotApplicable) {
     ASSERT_TRUE(collector->Init());
     collector->set_instance_id("inst1");
     collector->set_total_blocks(10);
-    collector->set_per_capacity_hits({{1.0, 7}});
-
+    collector->set_ttl_results({{0, {{1.0, 7}}, -1, -1}});
     reporter_->ReportPerQuery(collector.get());
 
-    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1"}, {"client_ip", ""}};
+    MetricsTags base_tags = {{"instance_group", ""}, {"instance_id", "inst1-ttl-0s"}, {"client_ip", ""}};
     Gauge blocks = registry_->GetGauge("query_total_blocks", base_tags);
     EXPECT_DOUBLE_EQ(10.0, blocks.Get());
 }
@@ -310,7 +307,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalStaticMetrics) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
 
     Gauge bytes_per_block_gauge = registry_->GetGauge("trace_query_bytes_per_block", tags);
     EXPECT_DOUBLE_EQ(1024.0, bytes_per_block_gauge.Get());
@@ -340,7 +337,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMaxHitRate) {
 
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge max_rate = registry_->GetGauge("trace_query_max_hit_rate", tags);
     EXPECT_GT(max_rate.Get(), 0.0);
     EXPECT_LE(max_rate.Get(), 1.0);
@@ -362,7 +359,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
     const std::vector<std::pair<std::string, double>> expected = {
         {"60", 12.0}, {"80", 16.0}, {"90", 18.0}, {"95", 19.0}, {"99", 20.0}, {"99.5", 20.0}};
     for (const auto &[target, blocks] : expected) {
-        MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"target_hit_rate_percent", target}};
+        MetricsTags tags = {
+            {"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"target_hit_rate_percent", target}};
         EXPECT_DOUBLE_EQ(blocks * 1024.0, registry_->GetGauge("mrc", tags).Get());
     }
 
@@ -370,14 +368,14 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
     reporter_->ReportInterval();
     for (const auto &entry : expected) {
         MetricsTags tags = {
-            {"instance_group", "grp1"}, {"instance_id", "inst1"}, {"target_hit_rate_percent", entry.first}};
+            {"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"target_hit_rate_percent", entry.first}};
         EXPECT_DOUBLE_EQ(1.0 * 1024.0, registry_->GetGauge("mrc", tags).Get());
     }
 
     reporter_->ReportInterval();
     for (const auto &entry : expected) {
         MetricsTags tags = {
-            {"instance_group", "grp1"}, {"instance_id", "inst1"}, {"target_hit_rate_percent", entry.first}};
+            {"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"target_hit_rate_percent", entry.first}};
         EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("mrc", tags).Get());
     }
 }
@@ -392,20 +390,20 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiency) {
     reporter_->ReportInterval();
 
     // With theoretical max cache enabled, max_hit_rate should be > 0 after repeated queries.
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge max_rate = registry_->GetGauge("trace_query_max_hit_rate", tags);
     ASSERT_GT(max_rate.Get(), 0.0);
 
     // capacity_efficiency = cap_hit_rate / max_hit_rate, should be in [0, 1]
     std::string cap_str = std::to_string(1.0);
-    MetricsTags cap_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"capacity_gb", cap_str}};
+    MetricsTags cap_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"capacity_gb", cap_str}};
     Gauge efficiency = registry_->GetGauge("trace_query_capacity_efficiency", cap_tags);
     EXPECT_GE(efficiency.Get(), 0.0);
     EXPECT_LE(efficiency.Get(), 1.0);
 
     // The largest tier should have efficiency close to 1.0
     std::string cap_str5 = std::to_string(5.0);
-    MetricsTags cap_tags5 = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"capacity_gb", cap_str5}};
+    MetricsTags cap_tags5 = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"capacity_gb", cap_str5}};
     Gauge efficiency5 = registry_->GetGauge("trace_query_capacity_efficiency", cap_tags5);
     EXPECT_GE(efficiency5.Get(), efficiency.Get());
 }
@@ -416,12 +414,12 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiencyUndefinedWh
     reporter_->ReportInterval();
 
     // No queries → max_hit_rate=0 → capacity_efficiency is undefined.
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge max_rate = registry_->GetGauge("trace_query_max_hit_rate", tags);
     EXPECT_DOUBLE_EQ(0.0, max_rate.Get());
 
     std::string cap_str = std::to_string(1.0);
-    MetricsTags cap_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"capacity_gb", cap_str}};
+    MetricsTags cap_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}, {"capacity_gb", cap_str}};
     Gauge hit_rate = registry_->GetGauge("trace_query_hit_rate", cap_tags);
     EXPECT_DOUBLE_EQ(0.0, hit_rate.Get());
     Gauge efficiency = registry_->GetGauge("trace_query_capacity_efficiency", cap_tags);
@@ -436,7 +434,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMetrics) {
     ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result));
     reporter_->ReportInterval();
 
-    MetricsTags instance_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags instance_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     EXPECT_NEAR(0.5, registry_->GetGauge("interval.query_max_hit_rate", instance_tags).Get(), 1e-9);
 
     for (double capacity_gb : {1.0, 5.0}) {
@@ -473,7 +471,8 @@ TEST_F(OptimizerMetricsReporterTest, LegacyIndexerDoesNotReportReuseInterval) {
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p95_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p99_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_age_bucket_ratio"));
-        MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", instance_id}};
+        MetricsTags tags = {{"instance_group", "grp1"},
+                            {"instance_id", TtlMetricsInstanceId(instance_id, ttl_seconds)}};
         EXPECT_DOUBLE_EQ(2.0, registry_->GetGauge("trace_query_total", tags).Get());
     }
 }
@@ -487,7 +486,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
     ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 0, 140 * kSecond, result));
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
     EXPECT_DOUBLE_EQ(4.0, registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_max_seconds", tags).Get());
@@ -536,7 +535,7 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     reporter_->ReportInterval();
 
     // Verify metrics were written
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-0s"}};
     Gauge qt = registry_->GetGauge("trace_query_total", tags);
     EXPECT_EQ(2.0, qt.Get());
 
@@ -546,6 +545,27 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     // After removal, getting the gauge creates a fresh entry with default 0.0
     Gauge qt_after = registry_->GetGauge("trace_query_total", tags);
     EXPECT_DOUBLE_EQ(0.0, qt_after.Get());
+}
+
+TEST_F(OptimizerMetricsReporterTest, MultiTtlMetricsCountServiceRequestOnlyOnce) {
+    auto collector = std::make_shared<OptimizerServiceMetricsCollector>(registry_);
+    ASSERT_TRUE(collector->Init());
+    collector->set_instance_id("real");
+    collector->set_total_blocks(2);
+    collector->set_input_token_len(8);
+    collector->set_ttl_results({{10, {}, 0, 0.0}, {30, {}, 2, 1.0}});
+    reporter_->ReportPerQuery(collector.get());
+    EXPECT_EQ(1u, registry_->GetCounter("service.query_counter").Get());
+    EXPECT_EQ(8u, registry_->GetCounter("service.input_tokens_total").Get());
+    const MetricsTags service_tags = {{"instance_group", ""}, {"instance_id", "real"}};
+    EXPECT_EQ(1u, registry_->GetCounter("service.query_counter", service_tags).Get());
+    for (int64_t ttl : {10, 30}) {
+        const MetricsTags tags = {
+            {"instance_group", ""}, {"instance_id", TtlMetricsInstanceId("real", ttl)}, {"client_ip", ""}};
+        EXPECT_DOUBLE_EQ(ttl == 10 ? 0.0 : 1.0, registry_->GetGauge("query_max_hit_rate", tags).Get());
+    }
+    reporter_->RemoveInstanceMetrics("real");
+    EXPECT_TRUE(registry_->GetMetricsData("query_max_hit_rate")->GetMetricsValues().empty());
 }
 
 } // namespace kv_cache_manager

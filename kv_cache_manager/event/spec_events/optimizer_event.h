@@ -15,6 +15,10 @@ using TokenIdsVector = std::vector<TokenIds>;
 
 class CacheGetEvent : public BaseEvent {
 public:
+    uint64_t capture_epoch() const { return capture_epoch_; }
+    void set_capture_epoch(uint64_t epoch) { capture_epoch_ = epoch; }
+    bool optimizer_observation() const { return optimizer_observation_; }
+    void set_optimizer_observation(bool value) { optimizer_observation_ = value; }
     CacheGetEvent(const std::string &source) : BaseEvent(source, "cache_manager", "GetCacheLocation") {}
 
     // get and set
@@ -63,6 +67,8 @@ public:
     }
 
 private:
+    uint64_t capture_epoch_ = 0;
+    bool optimizer_observation_ = false;
     std::string trace_id_;
     std::string query_type_;
     optimizer_event::KeyVector keys_;

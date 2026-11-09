@@ -278,25 +278,29 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
         return;
     }
 
-    for (const auto &info : collector->per_capacity_hits()) {
-        const double hit_rate =
-            info.hit_rate >= 0.0 ? info.hit_rate
-                                 : static_cast<double>(info.hit_count) / static_cast<double>(collector->total_blocks());
-        MetricsTags capacity_tags = query_tags;
-        capacity_tags["capacity_gb"] = std::to_string(info.capacity_gb);
-        const auto tags = kmon_ctx_->GetKmonitorTags(capacity_tags);
-        kmon_ctx_->query_hit_rate_metrics->Report(&tags, hit_rate);
-        kmon_ctx_->query_hit_count_metrics->Report(&tags, static_cast<double>(info.hit_count));
-        if (collector->max_hit_rate() > 0) {
-            kmon_ctx_->query_capacity_efficiency_metrics->Report(&tags, hit_rate / collector->max_hit_rate());
+    for (const auto &ttl : collector->ttl_results()) {
+        MetricsTags ttl_tags = query_tags;
+        ttl_tags["instance_id"] = TtlMetricsInstanceId(collector->instance_id(), ttl.ttl_seconds);
+        for (const auto &info : ttl.per_capacity_hits) {
+            const double hit_rate = info.hit_rate >= 0.0 ? info.hit_rate
+                                                         : static_cast<double>(info.hit_count) /
+                                                               static_cast<double>(collector->total_blocks());
+            MetricsTags capacity_tags = ttl_tags;
+            capacity_tags["capacity_gb"] = std::to_string(info.capacity_gb);
+            const auto tags = kmon_ctx_->GetKmonitorTags(capacity_tags);
+            kmon_ctx_->query_hit_rate_metrics->Report(&tags, hit_rate);
+            kmon_ctx_->query_hit_count_metrics->Report(&tags, static_cast<double>(info.hit_count));
+            if (ttl.max_hit_rate > 0) {
+                kmon_ctx_->query_capacity_efficiency_metrics->Report(&tags, hit_rate / ttl.max_hit_rate);
+            }
         }
-    }
 
-    const auto tags = kmon_ctx_->GetKmonitorTags(query_tags);
-    kmon_ctx_->query_total_blocks_metrics->Report(&tags, static_cast<double>(collector->total_blocks()));
-    if (collector->max_hit_count() >= 0) {
-        kmon_ctx_->query_max_hit_count_metrics->Report(&tags, static_cast<double>(collector->max_hit_count()));
-        kmon_ctx_->query_max_hit_rate_metrics->Report(&tags, collector->max_hit_rate());
+        const auto tags = kmon_ctx_->GetKmonitorTags(ttl_tags);
+        kmon_ctx_->query_total_blocks_metrics->Report(&tags, static_cast<double>(collector->total_blocks()));
+        if (ttl.max_hit_count >= 0) {
+            kmon_ctx_->query_max_hit_count_metrics->Report(&tags, static_cast<double>(ttl.max_hit_count));
+            kmon_ctx_->query_max_hit_rate_metrics->Report(&tags, ttl.max_hit_rate);
+        }
     }
 }
 
@@ -309,7 +313,8 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
     }
 
     for (const auto &summary : summaries) {
-        MetricsTags base_tags = {{"instance_group", summary.instance_group}, {"instance_id", summary.instance_id}};
+        MetricsTags base_tags = {{"instance_group", summary.instance_group},
+                                 {"instance_id", TtlMetricsInstanceId(summary.instance_id, summary.ttl_seconds)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->trace_query_total_metrics->Report(&tags, static_cast<double>(summary.total_queries));
         kmon_ctx_->trace_query_blocks_total_metrics->Report(&tags, static_cast<double>(summary.total_blocks_queried));

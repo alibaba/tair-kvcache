@@ -221,7 +221,7 @@ class TraceReplayRunner:
         try:
             latency_ms, total_blocks, per_capacity, theoretical_hits = \
                 self._client.trace_query_for_stats(
-                    self._config.instance_id, record.block_keys)
+                    self._config.instance_id, record.block_keys, self._config.ttl_seconds)
             self._stats.record_success(
                 latency_ms, total_blocks, per_capacity, theoretical_hits)
         except Exception:

@@ -184,18 +184,10 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
         return false;
     }
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    const ErrorCode ec =
-        optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, config_.capacity_gb());
+    const auto ec = optimizer_service_->ApplyKvcmConfiguration(response, config_);
     if (ec != EC_OK) {
-        KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
-                      leader_endpoint.c_str(),
-                      static_cast<int>(ec));
+        KVCM_LOG_WARN("KvcmEventSubscriber: configuration sync failed, ec=%d", static_cast<int>(ec));
         return false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
-        unsupported_instance_ids_ = std::move(unsupported_instance_ids);
     }
     KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d",
                   leader_endpoint.c_str(),
@@ -332,29 +324,10 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
             if (collector) {
                 collector->set_total_blocks(response.total_blocks());
                 collector->set_input_token_len(response.input_token_len());
-                std::vector<PerCapacityHitInfo> per_capacity_hits;
-                per_capacity_hits.reserve(response.capacity_results_size());
-                for (const auto &capacity_result : response.capacity_results()) {
-                    per_capacity_hits.push_back(
-                        {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
-                }
-                collector->set_per_capacity_hits(std::move(per_capacity_hits));
-                collector->set_max_hit_count(response.theoretical_result().max_hit_count());
-                if (response.theoretical_result().max_hit_count() >= 0) {
-                    collector->set_max_hit_rate(response.theoretical_result().hit_rate());
-                }
+                collector->SetTtlResults(response);
             }
         } else if (collector) {
             collector->set_service_error_code_metrics(static_cast<double>(ec));
-        }
-    }
-    if (ec == EC_INSTANCE_NOT_EXIST) {
-        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
-        if (unsupported_instance_ids_.find(event.instance_id()) != unsupported_instance_ids_.end()) {
-            KVCM_LOG_DEBUG("KvcmEventSubscriber: ignore unsupported instance event, trace_id=%s instance_id=%s",
-                           event.trace_id().c_str(),
-                           event.instance_id().c_str());
-            return;
         }
     }
     if (ec != EC_OK) {

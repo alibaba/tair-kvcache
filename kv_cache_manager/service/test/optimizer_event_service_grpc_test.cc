@@ -48,6 +48,8 @@ bool WaitUntil(Predicate predicate, int timeout_ms = 2000) {
 
 std::shared_ptr<CacheGetEvent> MakeGetEvent() {
     auto event = std::make_shared<CacheGetEvent>("instance-a");
+    event->set_capture_epoch(1);
+    event->set_optimizer_observation(true);
     event->SetEventTriggerTime();
     event->set_trace_id("trace-grpc-e2e");
     event->SetAddtionalArgs(
@@ -69,6 +71,7 @@ std::string EncodeTokenIdsLe64(const std::vector<int64_t> &token_ids) {
 
 class CaptureEventPublisher : public EventPublisher {
 public:
+    uint64_t CaptureEpoch() const override { return 1; }
     bool Init(const std::string & /*config*/) override { return true; }
     bool Publish(const std::shared_ptr<BaseEvent> &event) override {
         events.push_back(event);
@@ -270,7 +273,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestDemotionClosesStreamAndReenableAccepts
     request.set_consumer_id("second-optimizer");
     auto second_reader = stub_->SubscribeEvents(&second_context, request);
     ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == 1; }));
-    ASSERT_TRUE(publisher_->Publish(MakeGetEvent()));
+    auto source = MakeGetEvent();
+    source->set_capture_epoch(sink_->CaptureEpoch());
+    ASSERT_TRUE(publisher_->Publish(source));
     EXPECT_TRUE(second_reader->Read(&event));
     second_context.TryCancel();
     EXPECT_FALSE(second_reader->Read(&event));
@@ -354,14 +359,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
               std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
     EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
-    ASSERT_EQ(1u, capture_publisher_->events.size());
-    auto broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.front());
-    ASSERT_NE(nullptr, broadcast_event);
-    EXPECT_EQ("reported-trace", broadcast_event->trace_id());
-    EXPECT_EQ("report-instance", broadcast_event->event_source());
-    EXPECT_EQ(5, broadcast_event->input_token_len());
-    EXPECT_EQ(123456789, broadcast_event->event_trigger_time_us());
-    EXPECT_EQ((std::vector<std::string>{"tp0"}), broadcast_event->location_spec_names());
+    EXPECT_TRUE(capture_publisher_->events.empty());
 
     grpc::ClientContext raw_report_context;
     proto::optimizer::TraceQueryRequest raw_request;
@@ -378,10 +376,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     EXPECT_EQ(std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()),
               std::vector<int64_t>(raw_received.block_keys().begin(), raw_received.block_keys().end()));
     EXPECT_EQ(5, raw_received.input_token_len());
-    ASSERT_EQ(2u, capture_publisher_->events.size());
-    auto raw_broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.back());
-    ASSERT_NE(nullptr, raw_broadcast_event);
-    EXPECT_EQ("reported-raw-trace", raw_broadcast_event->trace_id());
+    EXPECT_TRUE(capture_publisher_->events.empty());
 
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));

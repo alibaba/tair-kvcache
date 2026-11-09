@@ -141,13 +141,13 @@ TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscri
         "enable_prometheus": false,
         "kvcm_event_subscriptions": [
             {
-                "service_discovery_url": "static://127.0.0.1:)"
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:)"
            << event_port_a << R"(",
                 "consumer_id": "server-lifecycle-test-a",
                 "discovery_refresh_interval_ms": 50
             },
             {
-                "service_discovery_url": "static://127.0.0.1:)"
+                "ttl_seconds_list":[86400],"service_discovery_url": "static://127.0.0.1:)"
            << event_port_b << R"(",
                 "consumer_id": "server-lifecycle-test-b",
                 "discovery_refresh_interval_ms": 50

@@ -81,8 +81,6 @@ private:
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
     bool configuration_refresh_requested_ = false;
-    std::mutex unsupported_instances_mutex_;
-    std::unordered_set<std::string> unsupported_instance_ids_;
 };
 
 } // namespace kv_cache_manager

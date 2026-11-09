@@ -11,7 +11,10 @@
         {
             "service_discovery_url": "static://127.0.0.1:6381",
             "consumer_id": "online-optimizer",
-            "discovery_refresh_interval_ms": 5000
+            "discovery_refresh_interval_ms": 5000,
+            "auto_register_from_kvcm": false,
+            "capacity_gb": [],
+            "ttl_seconds_list": [86400]
         }
     ]
 }
