@@ -653,6 +653,29 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathPreservesPeerTimeout) {
     ASSERT_TRUE(timeout_ctrl->get_done.load());
 }
 
+TEST_F(SdkTimeoutContractTest, BufferSafeFailureCannotHideAnUnknownHost) {
+    auto a = std::make_shared<FakeSlowSdkControl>();
+    auto b = std::make_shared<FakeSlowSdkControl>();
+    a->gate_on_peer_calls = &b->get_call_count;
+    b->gate_on_peer_calls = &a->get_call_count;
+    RegisterFakeForTest("a", a);
+    RegisterFakeForTest("b", b);
+    SdkWrapper wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(wrapper, 2, 16, 2000, 2000, MakeDualFileStorageConfigs("a", "b")));
+    const std::vector<DataStorageUri> uris{MakeUri("a", "a/0", 0, 1024), MakeUri("b", "b/0", 0, 1024)};
+    auto buffers = TestBuffers::Make(2, 1024);
+
+    for (bool safe_first : {true, false}) {
+        a->get_call_count.store(0);
+        b->get_call_count.store(0);
+        a->get_result.store(safe_first ? ER_SDK_ERROR_BUFFER_SAFE : ER_SDKREAD_ERROR);
+        b->get_result.store(safe_first ? ER_SDKREAD_ERROR : ER_SDK_ERROR_BUFFER_SAFE);
+        EXPECT_EQ(ER_SDKREAD_ERROR, wrapper.Get(uris, buffers.buffers));
+        EXPECT_EQ(1, a->get_call_count.load());
+        EXPECT_EQ(1, b->get_call_count.load());
+    }
+}
+
 // 错误路径的 stop 标志：一个 group 报错后，仍在排队的 group 不得再发起 I/O。
 // 确定性设计（无 pop 竞态）：单线程 + 300ms 占位，三个任务全部排队，提交顺序 =
 // URI 首现顺序 = err → gap → tail（GroupBySdk 按输入顺序建组，FIFO 池按序拾起）。

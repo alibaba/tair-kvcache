@@ -44,10 +44,12 @@ private:
     ClientErrorCode IsValid(const std::unique_ptr<ClientConfig> &client_config) const;
     std::vector<DataStorageUri> ParseLocations(const UriStrVec &uri_str_vec);
     UriStrVec ConstructLocations(const std::vector<DataStorageUri> &uris);
-    void PrintBlockHashAndUri(const std::string &prefix,
-                              const UriStrVec &uri_str_vec,
-                              const std::vector<int64_t> &block_hashs,
-                              const std::shared_ptr<TransferTraceInfo> &trace_info) const;
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    ClientErrorCode PrintBlockHashAndUri(const std::string &prefix,
+                                        const UriStrVec &uri_str_vec,
+                                        const BlockBuffers &block_buffers,
+                                        const std::shared_ptr<TransferTraceInfo> &trace_info) const;
+#endif
 
 private:
     friend class TransferClient;

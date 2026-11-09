@@ -297,13 +297,11 @@ class TransferClientPyTest(unittest.TestCase):
         
         # 测试LoadKvCaches
         result_load = client.LoadKvCaches(empty_locations, empty_block_buffers)
-        self.assertEqual(result_load, kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
-                         "LoadKvCaches should return ER_INVALID_PARAMS for empty uri_str_vec")
+        self.assertEqual(result_load, kvcm_py_client.ClientErrorCode.ER_SDK_ERROR_BUFFER_SAFE)
         
         # 测试SaveKvCaches
         result_save = client.SaveKvCaches(empty_locations, empty_block_buffers)
-        self.assertEqual(result_save[0], kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
-                         "SaveKvCaches should return ER_INVALID_PARAMS for empty uri_str_vec")
+        self.assertEqual(result_save[0], kvcm_py_client.ClientErrorCode.ER_SDK_ERROR_BUFFER_SAFE)
         self.assertTrue(len(result_save[1]) == 0, 
                         "SaveKvCaches should return empty results for empty uri_str_vec")
 
@@ -346,8 +344,7 @@ class TransferClientPyTest(unittest.TestCase):
         block_buffers = [kvcm_py_client.BlockBuffer()]  # 只有一个缓冲区
         
         result = client.LoadKvCaches(self.uri_str_vec, block_buffers)
-        self.assertEqual(result, kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
-                         "LoadKvCaches should return ER_INVALID_PARAMS for mismatched uri_str_vec and buffers")
+        self.assertEqual(result, kvcm_py_client.ClientErrorCode.ER_SDK_ERROR_BUFFER_SAFE)
 
     def test_block_buffer_usage(self):
         """测试11: BlockBuffer使用测试"""

@@ -1,4 +1,6 @@
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #ifdef USING_CUDA
@@ -302,10 +304,37 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPool) {
     push_buffer();
     push_buffer();
     auto handle = pool.GetCell();
+    bool caller_read_pending = true;
     auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->gpu_stream);
+        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->gpu_stream,
+        &caller_read_pending);
     ASSERT_EQ(2, block_hashs.size());
     ASSERT_EQ(block_hashs[0], block_hashs[1]);
+    EXPECT_FALSE(caller_read_pending);
+
+    handle->h_iovs[0] = {nullptr, 0};
+
+    std::promise<void> release;
+    auto released = release.get_future();
+    ASSERT_EQ(cudaSuccess, cudaLaunchHostFunc(handle->gpu_stream, [](void *arg) {
+        static_cast<std::future<void> *>(arg)->wait_for(std::chrono::seconds(5));
+    }, &released));
+    caller_read_pending = true;
+    auto busy = SdkBufferCheckUtil::GetBlocksHash(block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs,
+                                                  max_check_iov_num, handle->gpu_stream, &caller_read_pending);
+    release.set_value();
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(handle->gpu_stream));
+    EXPECT_TRUE(busy.empty());
+    EXPECT_FALSE(caller_read_pending);
+    EXPECT_EQ(handle->h_iovs[0].base, nullptr);
+
+    caller_read_pending = true;
+    auto rejected = SdkBufferCheckUtil::GetBlocksHash(block_buffers, nullptr, handle->d_crcs, handle->h_iovs,
+                                                      max_check_iov_num, handle->gpu_stream, &caller_read_pending);
+    EXPECT_TRUE(rejected.empty());
+    EXPECT_FALSE(caller_read_pending);
+    EXPECT_EQ(handle->h_iovs[0].base, block_buffers.front().iovs.front().base);
+    (void)cudaGetLastError(); // clear the deliberately rejected upload
 #endif
 }
 
