@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -28,8 +29,8 @@ public:
 
     LocationSpec(const std::string &name, const std::string &uri) : name_(name), uri_(uri) {}
 
-    LocationSpec(const LocationSpec &) = default;
-    LocationSpec &operator=(const LocationSpec &) = default;
+    LocationSpec(const LocationSpec &other);
+    LocationSpec &operator=(const LocationSpec &other);
     LocationSpec(LocationSpec &&) noexcept = default;
     LocationSpec &operator=(LocationSpec &&) noexcept = default;
 
@@ -38,11 +39,24 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "name", name_);
         Put(writer, "uri", uri_);
+        if (has_checksum()) {
+            const auto value = checksum();
+            writer.Key("checksum");
+            writer.String(value.data(), value.size());
+        }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
+        clear_checksum();
+        const auto it = rapid_value.FindMember("checksum");
+        if (it != rapid_value.MemberEnd()) {
+            if (!it->value.IsString()) {
+                return false;
+            }
+            set_checksum(std::string_view(it->value.GetString(), it->value.GetStringLength()));
+        }
         return true;
     }
 
@@ -51,13 +65,29 @@ public:
     void set_name_view(std::string_view name) { name_.assign(name.data(), name.size()); }
     void set_uri(const std::string &uri) { uri_ = uri; }
     void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
+    void set_checksum(std::string_view checksum);
+    void clear_checksum() noexcept {
+        checksum_.reset();
+        checksum_size_ = 0;
+    }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
+    // The view remains valid until this spec is modified or destroyed.
+    [[nodiscard]] std::string_view checksum() const noexcept {
+        return checksum_ ? std::string_view(checksum_.get(), checksum_size_) : std::string_view("");
+    }
+    [[nodiscard]] bool has_checksum() const noexcept { return checksum_ != nullptr; }
 
 private:
     std::string name_; // 对应LocationSpecInfo中的name
     std::string uri_;  // URI
+    // A spec is an independently stored TP/PP/attention payload, so its
+    // checksum cannot be shared by the enclosing CacheLocation.
+    // Empty input is normalized to absent and never allocates a buffer.
+    // Keep the length so embedded NUL bytes survive copies and serialization.
+    std::unique_ptr<char[]> checksum_;
+    size_t checksum_size_ = 0;
 };
 
 enum CacheLocationStatus : int32_t {
@@ -176,6 +206,16 @@ public:
     [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
         return validated_total_size_ != kUnknownValidatedTotalSize;
     }
+    bool set_location_spec_checksum(std::string_view location_spec_name, std::string_view checksum) {
+        const auto it = std::find_if(location_specs_.begin(),
+                                     location_specs_.end(),
+                                     [location_spec_name](const auto &s) { return s.name() == location_spec_name; });
+        if (it == location_specs_.end()) {
+            return false;
+        }
+        it->set_checksum(checksum);
+        return true;
+    }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
@@ -201,6 +241,9 @@ public:
         size_t usage = sizeof(CacheLocation) + id().size();
         for (const auto &spec : location_specs_) {
             usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+            if (spec.has_checksum()) {
+                usage += spec.checksum().size() + 1;
+            }
         }
         return usage;
     }

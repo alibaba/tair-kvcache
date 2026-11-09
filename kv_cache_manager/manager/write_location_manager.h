@@ -7,9 +7,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "kv_cache_manager/manager/cache_location_view.h"
 
@@ -20,8 +22,18 @@ public:
     WriteLocationManager();
     ~WriteLocationManager();
     struct WriteLocationInfo {
+        std::string instance_id;
         std::vector<int64_t> keys;
         std::vector<std::string> location_ids;
+        std::unordered_set<std::string> location_spec_names;
+    };
+    enum class TakeResult {
+        SUCCESS,
+        NOT_FOUND,
+        INSTANCE_ID_MISMATCH,
+        BLOCK_MASK_MISMATCH,
+        KEY_COUNT_MISMATCH,
+        SPEC_NAME_MISMATCH,
     };
     using CallBack = std::function<void(std::unique_ptr<WriteLocationInfo>)>;
     void Start();
@@ -32,7 +44,28 @@ public:
              std::vector<std::string> &&location_ids,
              int64_t write_timeout_seconds,
              CallBack callback);
+    void Put(const std::string &write_session_id,
+             std::string instance_id,
+             std::vector<int64_t> &&keys,
+             std::vector<std::string> &&location_ids,
+             std::unordered_set<std::string> &&location_spec_names,
+             int64_t write_timeout_seconds,
+             CallBack callback);
+    void Put(const std::string &write_session_id,
+             std::vector<int64_t> &&keys,
+             std::vector<std::string> &&location_ids,
+             std::unordered_set<std::string> &&location_spec_names,
+             int64_t write_timeout_seconds,
+             CallBack callback);
     bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
+    // Validates every caller-controlled FinishWrite dimension under the same
+    // lock that consumes the session. Any mismatch remains retryable.
+    TakeResult GetAndDeleteForFinish(const std::string &write_session_id,
+                                     const std::string &instance_id,
+                                     const BlockMask &success_block_mask,
+                                     std::optional<size_t> expected_checksum_count,
+                                     const std::vector<std::string> &location_spec_names,
+                                     WriteLocationInfo &location_info);
     bool HasLocationId(const std::string &location_id) const;
     size_t ExpireSize() const { return session_id_map_.Size(); }
 
@@ -55,6 +88,12 @@ private:
         void DropAll();
         void Put(ExpireUnitPtr unit);
         bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
+        TakeResult GetAndDeleteForFinish(const std::string &write_session_id,
+                                         const std::string &instance_id,
+                                         const BlockMask &success_block_mask,
+                                         std::optional<size_t> expected_checksum_count,
+                                         const std::vector<std::string> &location_spec_names,
+                                         WriteLocationInfo &location_info);
         bool HasLocationId(const std::string &location_id) const;
 
     private:

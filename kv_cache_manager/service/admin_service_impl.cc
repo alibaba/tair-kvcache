@@ -513,7 +513,7 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
     } else {
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
-            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta, request->include_checksums());
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);
