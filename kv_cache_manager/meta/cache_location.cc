@@ -1,5 +1,8 @@
 #include "kv_cache_manager/meta/cache_location.h"
 
+#include <cstring>
+#include <stdexcept>
+
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/meta/common.h"
 namespace kv_cache_manager {
@@ -13,7 +16,23 @@ const SharedLocationSpecName &EmptySpecName() noexcept {
 } // namespace
 
 LocationSpec::LocationSpec() : name_(EmptySpecName()) {}
-LocationSpec::LocationSpec(LocationSpec &&other) noexcept : name_(std::move(other.name_)), uri_(std::move(other.uri_)) {
+LocationSpec::LocationSpec(const LocationSpec &other) : name_(other.name_), uri_(other.uri_) {
+    set_checksum(other.checksum());
+}
+
+LocationSpec &LocationSpec::operator=(const LocationSpec &other) {
+    if (this != &other) {
+        LocationSpec copy(other);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+LocationSpec::LocationSpec(LocationSpec &&other) noexcept
+    : name_(std::move(other.name_))
+    , uri_(std::move(other.uri_))
+    , checksum_(std::move(other.checksum_))
+    , checksum_size_(std::exchange(other.checksum_size_, 0)) {
     other.name_ = EmptySpecName();
 }
 
@@ -21,6 +40,8 @@ LocationSpec &LocationSpec::operator=(LocationSpec &&other) noexcept {
     if (this != &other) {
         name_ = std::move(other.name_);
         uri_ = std::move(other.uri_);
+        checksum_ = std::move(other.checksum_);
+        checksum_size_ = std::exchange(other.checksum_size_, 0);
         other.name_ = EmptySpecName();
     }
     return *this;
@@ -33,7 +54,7 @@ bool LocationSpec::FromRapidValueInterned(const rapidjson::Value &rapid_value, L
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name, std::string(""));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
     name_ = interner.Intern(name);
-    return true;
+    return ParseChecksum(rapid_value);
 }
 
 SharedLocationSpecName LocationSpecNameInterner::Intern(const std::string &name) {
@@ -61,6 +82,22 @@ SharedLocationSpecName LocationSpecNameInterner::Intern(const std::string &name)
     auto shared = std::make_shared<const std::string>(name);
     names_.emplace(*shared, shared);
     return shared;
+}
+
+void LocationSpec::set_checksum(std::string_view checksum) {
+    if (checksum.empty()) {
+        clear_checksum();
+        return;
+    }
+    if (checksum.size() == std::numeric_limits<size_t>::max()) {
+        throw std::length_error("checksum is too large");
+    }
+    auto buffer = std::make_unique<char[]>(checksum.size() + 1);
+    std::memcpy(buffer.get(), checksum.data(), checksum.size());
+    buffer[checksum.size()] = '\0';
+    // Allocate and copy first: checksum may refer to our existing buffer.
+    checksum_ = std::move(buffer);
+    checksum_size_ = checksum.size();
 }
 
 bool IsIndexInMaskRange(const BlockMask &mask, size_t index) {

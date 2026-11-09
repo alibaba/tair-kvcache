@@ -409,6 +409,8 @@ message GetCacheMetaRequest {
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
     int32 detail_level = 6;   // 返回数据的详细级别,越大获取的信息越多,暂定为数字
+    // Opt in to checksum fields on returned locations.
+    bool include_checksums = 7;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -419,6 +421,8 @@ message GetCacheMetaRequest {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Opaque checksum of this spec's independently stored payload; empty means absent.
+    string checksum = 3;
 }
 
 message CacheLocation {

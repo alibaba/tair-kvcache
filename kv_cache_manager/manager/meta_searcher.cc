@@ -274,7 +274,11 @@ void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs,
         if (existing == merged_specs.end()) {
             merged_specs.push_back(spec);
         } else {
-            *existing = spec;
+            LocationSpec replacement = spec;
+            if (existing->has_checksum() && !replacement.has_checksum()) {
+                replacement.set_checksum(existing->checksum());
+            }
+            *existing = std::move(replacement);
         }
     }
     std::sort(merged_specs.begin(), merged_specs.end(), [](const auto &lhs, const auto &rhs) {
@@ -2980,6 +2984,9 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_cont
                 std::vector<LocationSpec> specs;
                 specs.reserve(1);
                 specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, 0));
+                if (existing_location->location_specs().front().has_checksum() && !specs.front().has_checksum()) {
+                    specs.front().set_checksum(existing_location->location_specs().front().checksum());
+                }
                 new_location->set_location_specs(std::move(specs));
             } else {
                 new_location = std::make_shared<CacheLocation>(*existing_location);
@@ -3458,6 +3465,12 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
             // COW: copy the location, modify the copy, replace the pointer
             auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
             new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
+            for (const auto &spec_checksum : batch_tasks[key_index][loc_index].spec_checksums) {
+                // Empty batch entries are placeholders, not checksum updates.
+                if (!spec_checksum.checksum.empty()) {
+                    new_loc->set_location_spec_checksum(spec_checksum.location_spec_name, spec_checksum.checksum);
+                }
+            }
             locs[loc_index] = std::move(new_loc);
         }
         if (!updated) {
