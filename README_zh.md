@@ -89,7 +89,15 @@ KVCM 采用“中心化元数据管理 + 去中心化数据搬运”的设计：
 
 ## Tair KVCache HiSim
 
-[HiSim](hisim/README.md) 是一个高性能的基于CPU的LLM推理仿真系统。它能够在不依赖实际GPU资源的情况下，通过回放真实推理负载Trace，快速、低成本、高保真地预测不同模型、目标硬件、推理引擎和配置下的关键性能指标（如TTFT、TPOT、吞吐量等）。当前支持SGLang v0.5.6.post2，在H20 GPU上运行Qwen3 Dense系列模型，预测误差低于5%。
+> [!IMPORTANT]
+> **本仓库 `hisim/` 下的旧版 HiSim simulator 已停止维护。** 欢迎通过以下实现继续使用仿真能力并获取后续更新：
+>
+> - **SGLang：**[SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator)，已集成至 SGLang 官方仓库。
+> - **vLLM：**[vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator)，上游合入前，请暂时使用 `simulator` 分支；集成进展及上游入口见 [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747)。
+>
+> 安装方式、支持版本和使用方法请以链接中的 README 为准。
+
+[HiSim](hisim/README_zh.md) 是一个高性能的基于CPU的LLM推理仿真系统。它能够在不依赖实际GPU资源的情况下，通过回放真实推理负载Trace，快速、低成本、高保真地预测不同模型、目标硬件、推理引擎和配置下的关键性能指标（如TTFT、TPOT、吞吐量等）。旧版支持SGLang v0.5.6.post2，在H20 GPU上运行Qwen3 Dense系列模型，预测误差低于5%。
 
 # 联系我们
 - 如有本项目相关技术问题和功能需求，欢迎提交issue。

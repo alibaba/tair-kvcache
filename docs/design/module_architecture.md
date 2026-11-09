@@ -17,7 +17,7 @@
 | **KVCache Manager** | `kv_cache_manager/` | 核心系统：全局 KVCache 元数据管理服务。本文档的主体。 |
 | **Client & Connectors** | `kv_cache_manager/client/`、`kv_cache_manager/py_connector/`、`kv_cache_manager/client_java/`、`kv_cache_manager/manager_client/` | 推理引擎接入层：C++ SDK、vLLM/SGLang/TRT-LLM 连接器、Java 元数据客户端、轻量 Python HTTP 客户端。 |
 | **Optimizer** | `kv_cache_manager/optimizer/` | 缓存仿真与优化：既支持离线回放 KVCache 访问 trace，也提供在线 TraceQuery 服务。完整 optimizer 用于策略/容量分析；LiteHit 用最小状态精确计算多容量 full-attention LRU 命中率。 |
-| **HiSim** | `hisim/` | 独立的 LLM 推理仿真系统，通过回放 trace 预测 TTFT/TPOT/吞吐等指标，不依赖 Manager 运行时。 |
+| **HiSim（旧版，已停止维护）** | `hisim/` | 独立的 LLM 推理仿真系统，通过回放 trace 预测 TTFT/TPOT/吞吐等指标，不依赖 Manager 运行时。迁移入口见 [README](../../README_zh.md#tair-kvcache-hisim)。 |
 | **Tooling** | `package/`、`tools/`、`integration_test/` | 部署包、`kvcm_ops` 运维 CLI、Admin/Meta/Debug 客户端、配置检查/压测脚本与端到端集成测试。 |
 
 KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM 负责 KVCache 的全局元数据管理（查询、写入、容量管理），推理引擎通过 Client/Connector 接入；实际的 KVCache 数据由引擎经传输层直接读写存储后端，不经过 KVCM。
@@ -98,7 +98,7 @@ client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点
 | **optimizer（离线）** | `optimizer/` | Trace 回放与策略评估：支持 LRU/RandomLRU/LeafAwareLRU/TTL、RadixTree 索引、命中率/容量统计与可视化。 |
 | **LiteHit** | `optimizer/liteHit/` | 容量无关的 full-attention 命中率分析：一次回放产生 facts，事后投影任意 LRU 容量，支持 re-blocking 与多 block size。 |
 | **optimizer（在线）** | `optimizer/service/` | 在线 TraceQuery 服务：经服务发现定位 KVCM Leader，订阅 `SubscribeEvents` 事件流，输出命中率、MRC、reuse interval 等指标。 |
-| **hisim** | `hisim/` | 独立 LLM 推理仿真：CPU 回放真实负载，预测 TTFT/TPOT/吞吐，不依赖 KVCM 运行时。 |
+| **hisim（旧版，已停止维护）** | `hisim/` | 独立 LLM 推理仿真：CPU 回放真实负载，预测 TTFT/TPOT/吞吐，不依赖 KVCM 运行时。迁移入口见 [README](../../README_zh.md#tair-kvcache-hisim)。 |
 | **kvcm_ops / tools** | `package/kvcm_ops/`、`tools/` | 运维 CLI（Storage/Instance/Instance Group/配置管理）、Admin/Meta/Debug RPC 客户端、配置检查、压测与 Trace 转换。 |
 | **integration_test** | `integration_test/` | 多服务端到端测试：Admin/Meta/Debug/Reclaimer/GC/Redis 协调/optimizer/vLLM E2E。 |
 
