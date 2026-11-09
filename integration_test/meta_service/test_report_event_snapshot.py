@@ -508,7 +508,6 @@ class EventReportFunctionalTest(unittest.TestCase):
                             "storage_type": _meta_storage_type(META_STORAGE_URI),
                             "storage_uri": META_STORAGE_URI,
                         },
-                        "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                     },
                 },
                 "event_report_storage_candidates": [cls.EVENT_REPORT_STORAGE_NAME],
@@ -633,10 +632,6 @@ class EventReportFunctionalTest(unittest.TestCase):
                                     META_STORAGE_URI
                                 ),
                                 "storage_uri": META_STORAGE_URI,
-                            },
-                            "meta_cache_policy_config": {
-                                "type": "LRU",
-                                "capacity": 10000,
                             },
                         },
                     },

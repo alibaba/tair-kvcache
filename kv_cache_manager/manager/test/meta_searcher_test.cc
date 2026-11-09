@@ -220,8 +220,7 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
     owned.set_id("shared");
     CacheLocation shared;
     shared.set_id(std::make_shared<const std::string>("shared"));
-    EXPECT_EQ(sizeof(std::string) + sizeof(void *) * 2,
-              owned.EstimateMemUsage() - shared.EstimateMemUsage());
+    EXPECT_EQ(sizeof(std::string) + sizeof(void *) * 2, owned.EstimateMemUsage() - shared.EstimateMemUsage());
     CacheLocation long_shared;
     long_shared.set_id(std::make_shared<const std::string>(80, 'x'));
     EXPECT_EQ(80u - std::string("shared").size(), long_shared.EstimateMemUsage() - shared.EstimateMemUsage());
@@ -233,9 +232,10 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
     CacheLocationMap first;
     CacheLocationMap second;
     PropertyMap properties;
-    const FieldMap fields{{PROPERTY_LOCATION_PREFIX + std::string("shared"),
-                           CacheLocation("shared", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1, {})
-                               .ToJsonString()}};
+    const FieldMap fields{
+        {PROPERTY_LOCATION_PREFIX + std::string("shared"),
+         CacheLocation("shared", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1, {})
+             .ToJsonString()}};
     ASSERT_EQ(EC_OK, DeserializeLocations(fields, first, &interner));
     ASSERT_EQ(EC_OK, DeserializeFieldMap(fields, second, properties, &interner));
     ASSERT_EQ(1u, first.size());
@@ -244,9 +244,9 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
     EXPECT_EQ("shared", first.at("shared")->id());
     EXPECT_EQ(CLS_SERVING, second.at("shared")->status());
 
-    const FieldMap random_fields{{PROPERTY_LOCATION_PREFIX + std::string("random01"),
-                                  CacheLocation("random01", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {})
-                                      .ToJsonString()}};
+    const FieldMap random_fields{
+        {PROPERTY_LOCATION_PREFIX + std::string("random01"),
+         CacheLocation("random01", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {}).ToJsonString()}};
     CacheLocationMap random_first;
     CacheLocationMap random_second;
     ASSERT_EQ(EC_OK, DeserializeLocations(random_fields, random_first, &interner));
@@ -262,7 +262,7 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
     size_t inserted = 0;
     for (int i = 0; inserted < 4096 && i < 1000000; ++i) {
         const std::string candidate = "key" + std::to_string(i);
-        if ((std::hash<std::string>{}(candidate) & 15) == overflow_shard) {
+        if ((std::hash<std::string>{}(candidate)&15) == overflow_shard) {
             bounded.Intern(candidate);
             ++inserted;
         }
@@ -654,9 +654,6 @@ public:
         meta_indexer_config->SetMutexShardNum(32);
         meta_indexer_config->SetMaxKeyCount(max_key_count);
         auto indexer = std::make_shared<MetaIndexer>();
-        auto metaCachePolicyConfig = std::make_shared<MetaCachePolicyConfig>();
-        metaCachePolicyConfig->SetCapacity(0);
-        meta_indexer_config->SetMetaCachePolicyConfig(metaCachePolicyConfig);
         auto ec = indexer->Init(/*instance_id*/ "test", meta_indexer_config);
         if (ec != ErrorCode::EC_OK) {
             KVCM_LOG_ERROR("Init meta indexer failed");
@@ -2243,12 +2240,10 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("duplicate",
-                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b +
-                             "&s_v=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b + "&s_v=" + version_b),
         },
         {
-            LocationSpec("max_size",
-                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
+            LocationSpec("max_size", "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
             LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_v=" + version_b),
         },
     };
@@ -2404,8 +2399,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
         merge_futures.push_back(std::async(std::launch::async, [&, i] {
             merge_signal.wait();
             const std::string index = std::to_string(i);
-            const std::string uri =
-                "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_v=" + first_info.version;
+            const std::string uri = "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_v=" + first_info.version;
             std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
                 {location_id,
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
@@ -2506,14 +2500,14 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     // consume its URI while preserving replacement and usage semantics.
     std::vector<MetaSearcher::ReplaceLocationSpecsTask> flat_tasks{replace_tasks[0][0]};
     const auto shared_name = flat_tasks[0].specs[0].name_handle();
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchReplaceLocationSpecsFlat(
-                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchReplaceLocationSpecsFlat(request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
     EXPECT_EQ(replace_tasks[0][0].specs[0].uri(), flat_tasks[0].specs[0].uri());
     flat_tasks[0].prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(7);
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchReplaceLocationSpecsFlat(
-                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchReplaceLocationSpecsFlat(request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
     EXPECT_TRUE(flat_tasks[0].specs[0].uri().empty());
     EXPECT_EQ("linear_0", flat_tasks[0].specs[0].name());
     EXPECT_EQ(shared_name.get(), flat_tasks[0].specs[0].name_handle().get());
@@ -4025,9 +4019,9 @@ TEST_F(MetaSearcherTest, TestMemoryPrimaryFailedAddFollowsPhaseWriteOrder) {
     ASSERT_EQ(EC_NOSPC, added[0].ec);
     ASSERT_FALSE(added[0].location_id.empty());
     LocationsPerKey persistent;
-    // Recover retains the original persistent-first order. A local capacity
-    // failure here is a configuration error, not a supported degraded mode.
-    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+    // Capacity admission rejects the write before mutating the persistent
+    // backend in both Recover and Running phases.
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}),
               backup->GetLocations(nullptr, {42}, {{added[0].location_id}}, persistent));
     manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
     std::vector<MetaSearcher::AddLocationResult> running_added;
@@ -6037,7 +6031,9 @@ public:
                 location->set_create_time(times[index]);
                 locations.front() = std::move(location);
                 return LocationModifierResult{MA_OK, ecs};
-            });
+            },
+            true,
+            false);
         ASSERT_EQ(EC_OK, result.ec);
     }
 

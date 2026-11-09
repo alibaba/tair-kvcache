@@ -201,18 +201,12 @@ InstanceGroup StartupConfigLoaderTest::MakeInstanceGroup() {
     meta_storage_backend_config->SetStorageType(META_LOCAL_BACKEND_TYPE_STR);
     meta_storage_backend_config->SetStorageUri("file:///tmp/meta_storage");
 
-    // Create meta cache policy config
-    auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(10000);
-    meta_cache_policy_config->SetType("LRU");
-
     // Create meta indexer config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(1000000);
     meta_indexer_config->SetMutexShardNum(16);
     meta_indexer_config->SetBatchKeySize(16);
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
 
     // Create cache config
     auto cache_config = std::make_shared<CacheConfig>();

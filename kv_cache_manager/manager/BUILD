@@ -16,6 +16,7 @@ cc_library(
         "cache_manager.h",
     ],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         ":cache_garbage_collector",
         ":cache_location_view",
         ":cache_manager_metrics_recorder",
@@ -48,6 +49,7 @@ cc_library(
         "event_report_cleanup_util.h",
     ],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         ":meta_searcher",
         ":migration_manager",
         ":schedule_plan_executor",
@@ -97,6 +99,7 @@ cc_library(
     ],
     hdrs = ["cache_reclaimer.h"],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/config",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",
@@ -113,6 +116,7 @@ cc_library(
     srcs = ["data_storage_selector.cc"],
     hdrs = ["data_storage_selector.h"],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/meta:meta_indexer_manager",
@@ -130,6 +134,7 @@ cc_library(
         "meta_searcher_manager.h",
     ],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         ":select_location_policy",
         "//kv_cache_manager/common",
         "//kv_cache_manager/meta",
@@ -142,6 +147,7 @@ cc_library(
     srcs = ["schedule_plan_executor.cc"],
     hdrs = ["schedule_plan_executor.h"],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
@@ -156,6 +162,7 @@ cc_library(
     srcs = ["migration_manager.cc"],
     hdrs = ["migration_manager.h"],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         ":data_storage_selector",
         ":meta_searcher",
         ":schedule_plan_executor",
@@ -204,6 +211,7 @@ cc_library(
     srcs = ["cache_manager_metrics_recorder.cc"],
     hdrs = ["cache_manager_metrics_recorder.h"],
     deps = [
+        "//kv_cache_manager/meta:meta_indexer",
         ":write_location_manager",
         "//kv_cache_manager/config",
         "//kv_cache_manager/meta:meta_indexer_manager",

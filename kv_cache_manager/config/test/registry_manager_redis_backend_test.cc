@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/test/redis_test_environment.h"
@@ -78,7 +79,7 @@ void RegistryManagerRedisBackendTest::RegisterInstance(const std::string &instan
     LocationSpecInfo info;
     ModelDeployment model_deployment;
     auto ec = registry_manager_->RegisterInstance(
-        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment);
+        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment, {}, 0, std::nullopt);
     ASSERT_EQ(EC_OK, ec);
 }
 

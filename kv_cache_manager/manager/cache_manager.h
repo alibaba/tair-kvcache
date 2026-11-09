@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -129,7 +130,8 @@ public:
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
                                                        const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED);
+                                                       QueryType default_query_type,
+                                                       std::optional<bool> disable_write_session);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -354,8 +356,7 @@ private:
                                           const std::string &instance_id,
                                           size_t key_count,
                                           const std::vector<std::string> &location_spec_group_names);
-    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
-                                       CacheLocationVector &locations);
+    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info, CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
     void CleanupHostLocations(const std::string &instance_id,

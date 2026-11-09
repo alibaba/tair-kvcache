@@ -240,8 +240,6 @@ class EnvironmentParsingTest(unittest.TestCase):
             max_key_count=456,
             mutex_shard_num=8,
             batch_key_size=9,
-            search_cache_capacity=10,
-            search_cache_shard_bits=3,
             metadata_backend_mode=4,
             user_data="custom",
         )

@@ -12,6 +12,7 @@
 namespace kv_cache_manager {
 
 class MetaIndexerConfig;
+class InstanceInfo;
 class MetaIndexer;
 class MetricsRegistry;
 class QueryExecutor;
@@ -33,7 +34,8 @@ public:
 
     ErrorCode CreateMetaIndexer(const std::string &instance_id,
                                 const std::shared_ptr<MetaIndexerConfig> &config,
-                                const std::vector<double> &boundaries = {});
+                                const std::vector<double> &boundaries,
+                                std::shared_ptr<const InstanceInfo> instance_info);
 
     std::shared_ptr<MetaIndexer> GetMetaIndexer(const std::string &instance_id) const;
 

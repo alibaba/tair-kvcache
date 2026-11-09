@@ -605,10 +605,7 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
             const auto visit_logical_hosts = [&](std::string_view spec_name) {
                 if (location_info.logical_hosts && !location_info.logical_hosts->empty()) {
                     for (const auto &logical_host : *location_info.logical_hosts) {
-                        visitor(std::string_view(logical_host),
-                                spec_name,
-                                is_vineyard,
-                                location_info.reporter_host);
+                        visitor(std::string_view(logical_host), spec_name, is_vineyard, location_info.reporter_host);
                     }
                     return;
                 }
@@ -655,14 +652,13 @@ void BuildHostsForOneKey(const LocationRange &locations,
                          const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
                          const MediumViewSet &medium_set,
                          std::vector<std::string> &hosts) {
-    VisitHostSpecsForOneKey(locations,
-                            check_loc_data_exist,
-                            request_check_location,
-                            medium_set,
-                            false,
-                            [&hosts](std::string_view host, std::string_view, bool, std::string_view) {
-                                hosts.emplace_back(host);
-                            });
+    VisitHostSpecsForOneKey(
+        locations,
+        check_loc_data_exist,
+        request_check_location,
+        medium_set,
+        false,
+        [&hosts](std::string_view host, std::string_view, bool, std::string_view) { hosts.emplace_back(host); });
     std::sort(hosts.begin(), hosts.end());
     hosts.erase(std::unique(hosts.begin(), hosts.end()), hosts.end());
 }
@@ -674,25 +670,24 @@ void BuildCandidatePresenceForOneKey(const LocationRange &locations,
                                      const MediumViewSet &medium_set,
                                      const std::vector<std::string> &candidate_hosts,
                                      std::uint64_t *presence_words) {
-    VisitHostSpecsForOneKey(locations,
-                            check_loc_data_exist,
-                            request_check_location,
-                            medium_set,
-                            false,
-                            [&candidate_hosts, presence_words](
-                                std::string_view host, std::string_view, bool, std::string_view) {
-                                const auto it =
-                                    std::lower_bound(candidate_hosts.begin(),
-                                                     candidate_hosts.end(),
-                                                     host,
-                                                     [](const std::string &candidate, std::string_view value) {
-                                                         return std::string_view(candidate) < value;
-                                                     });
-                                if (it != candidate_hosts.end() && std::string_view(*it) == host) {
-                                    const size_t index = static_cast<size_t>(it - candidate_hosts.begin());
-                                    presence_words[index / 64] |= std::uint64_t{1} << (index % 64);
-                                }
-                            });
+    VisitHostSpecsForOneKey(
+        locations,
+        check_loc_data_exist,
+        request_check_location,
+        medium_set,
+        false,
+        [&candidate_hosts, presence_words](std::string_view host, std::string_view, bool, std::string_view) {
+            const auto it = std::lower_bound(candidate_hosts.begin(),
+                                             candidate_hosts.end(),
+                                             host,
+                                             [](const std::string &candidate, std::string_view value) {
+                                                 return std::string_view(candidate) < value;
+                                             });
+            if (it != candidate_hosts.end() && std::string_view(*it) == host) {
+                const size_t index = static_cast<size_t>(it - candidate_hosts.begin());
+                presence_words[index / 64] |= std::uint64_t{1} << (index % 64);
+            }
+        });
 }
 
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
@@ -2471,6 +2466,23 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsFlat(RequestContext *request_co
                                          std::move(acquire_write_lease));
 }
 
+std::vector<std::vector<int32_t>> MetaSearcher::GetWriteBatches(const KeyVector &keys) const {
+    return meta_indexer_->GetWriteBatches(keys);
+}
+
+ErrorCode MetaSearcher::ValidateReplaceLocationSpecsTask(const ReplaceLocationSpecsTask &task,
+                                                         std::uint64_t &out_total_size) {
+    out_total_size = 0;
+    if (task.ResolvedLocationId().empty() || task.SpecCount() == 0) {
+        return EC_BADARGS;
+    }
+    if (task.prevalidated_total_size.has_value()) {
+        out_total_size = task.prevalidated_total_size->value();
+        return EC_OK;
+    }
+    return ValidateConsistentSnapshotVersion(task.specs, &out_total_size);
+}
+
 ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
@@ -2519,15 +2531,10 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             const auto &task = tasks.At(key_index, task_index);
             const auto &location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
-            if (location_id.empty() || task.SpecCount() == 0 ||
-                (tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
-                (!task.prevalidated_total_size.has_value() &&
-                 ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK)) {
+            if ((tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
+                ValidateReplaceLocationSpecsTask(task, incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
-            }
-            if (task.prevalidated_total_size.has_value()) {
-                incoming_size = task.prevalidated_total_size->value();
             }
             location_ids.push_back(location_id);
             usage_changes[usage_offsets[key_index] + task_index].new_size = incoming_size;
@@ -2625,8 +2632,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result =
-        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, std::move(modifier));
+    MetaIndexer::LocationResult result =
+        meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
     bool malformed_result = result.per_location_error_codes.size() != keys.size();
@@ -2664,7 +2671,7 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
         out_per_key_ec[key_index] = key_ec;
     }
     if (result.ec != ErrorCode::EC_OK) {
-        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteTargetLocations failed, ec: %d", result.ec);
     }
     return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
 }
@@ -3267,7 +3274,8 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
     // ReadModifyWriteLocation 返回 flat 维度结果，这里映射回原始 key/task 维度。
@@ -3377,7 +3385,8 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_batch_results = std::move(result.per_location_error_codes);
 
@@ -3536,7 +3545,8 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_batch_results = std::move(result.per_location_error_codes);
 
@@ -3638,7 +3648,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
                       ? meta_indexer_->ReadModifyWriteLocationsForMaintenance(
                             request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count)
                       : meta_indexer_->ReadModifyWriteLocation(
-                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count);
+                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_per_location_ec = std::move(result.per_location_error_codes);
 

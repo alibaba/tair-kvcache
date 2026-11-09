@@ -3,12 +3,16 @@
 #include <memory>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -310,7 +314,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             const std::vector<LocationSpecInfo> &location_spec_infos,
                                             const ModelDeployment &model_deployment,
                                             const std::vector<LocationSpecGroup> &location_spec_groups,
-                                            int32_t default_query_type) {
+                                            int32_t default_query_type,
+                                            std::optional<bool> disable_write_session) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (removing_instance_infos_.count(instance_id) != 0) {
@@ -329,6 +334,9 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
         const auto &existing = it->second;
         auto mismatched = existing->MismatchFields(
             block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
+        if (disable_write_session.has_value() && existing->disable_write_session() != *disable_write_session) {
+            mismatched.emplace_back("disable_write_session");
+        }
         if (existing->instance_group_name() != instance_group) {
             mismatched.insert(mismatched.begin(), "instance_group_name");
         }
@@ -352,6 +360,44 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         model_deployment,
                                                         location_spec_groups,
                                                         default_query_type);
+    const bool simple = disable_write_session.value_or(
+        location_spec_infos.size() == 1 && EnvUtil::GetEnv<bool>("kvcm.disable_write_session_for_one_spec", false));
+    if (simple) {
+        const std::shared_ptr<const CacheConfig> cache_config = instance_group_iter->second->cache_config();
+        const std::shared_ptr<MetaIndexerConfig> meta_config =
+            cache_config ? cache_config->meta_indexer_config() : nullptr;
+        const std::shared_ptr<MetaStorageBackendConfig> backend_config =
+            meta_config ? meta_config->GetMetaStorageBackendConfig() : nullptr;
+        if (location_spec_infos.size() != 1 || location_spec_infos.front().name().empty() || !backend_config ||
+            backend_config->GetMemoryPrimary()) {
+            request_context->error_tracer()->AddErrorMsg(
+                "simple metadata requires one named spec and memory_primary=false");
+            return EC_BADARGS;
+        }
+        const std::string &storage_type = backend_config->GetStorageType();
+        if (storage_type != "local" && storage_type != "cached") {
+            request_context->error_tracer()->AddErrorMsg("simple metadata requires local or cached storage");
+            return EC_BADARGS;
+        }
+        const bool cached = storage_type == "cached";
+        const std::string &storage_uri = backend_config->GetStorageUri();
+        StandardUri uri;
+        if ((cached || !storage_uri.empty()) && (!uri.Parse(storage_uri) || !uri.Valid())) {
+            request_context->error_tracer()->AddErrorMsg("simple metadata has an invalid storage URI");
+            return EC_BADARGS;
+        }
+        if (cached) {
+            const std::string persistent_type = uri.GetParam("persistent_type");
+            const std::string cache_type = uri.GetParam("cache_type");
+            if ((!persistent_type.empty() && persistent_type != "redis" && persistent_type != "async_redis") ||
+                (!cache_type.empty() && cache_type != "local")) {
+                request_context->error_tracer()->AddErrorMsg(
+                    "simple cached metadata requires Redis/async Redis and local cache");
+                return EC_BADARGS;
+            }
+        }
+    }
+    instance_info->set_disable_write_session(simple);
     // Keep the full info out of the shared instance index.
     auto ec = UpsertRegistryField(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {
@@ -572,9 +618,8 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
-ErrorCode RegistryManager::UpsertRegistryField(const std::string &key,
-                                               const std::string &id,
-                                               const Jsonizable *jsonizable) {
+ErrorCode
+RegistryManager::UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
     const ErrorCode ec = storage_->UpsertField(key, id, jsonizable ? jsonizable->ToJsonString() : id);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Upsert %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);

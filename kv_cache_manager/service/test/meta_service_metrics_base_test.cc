@@ -110,7 +110,8 @@ TEST_F(MetaServiceMetricsBaseTest, ReportEventMetricsFallbackDoesNotGateRequestV
     request.clear_instance_id();
     request.set_storage_type(proto::meta::ST_UNSPECIFIED);
     auto invalid_request_collector = base_->ResolveReportEventMetricsCollector(request, metrics_type);
-    EXPECT_EQ(collector, invalid_request_collector);
+    EXPECT_NE(collector, invalid_request_collector);
+    EXPECT_EQ(collector->GetMetricsTags(), invalid_request_collector->GetMetricsTags());
     EXPECT_TRUE(metrics_type.empty());
 }
 
@@ -320,4 +321,30 @@ TEST_F(MetaServiceMetricsBaseTest, SlowPathCollectorCreationRacesWithRemoval) {
     // instance still seeded, so a final get should succeed
     auto final_collector = base->get_metrics_collector_from_map_for_GetCacheMeta("inst1");
     ASSERT_NE(nullptr, final_collector);
+}
+
+TEST_F(MetaServiceMetricsBaseTest, ReportEventsResolveFreshQueryKeyCountsWithoutRegisteringMoreSeries) {
+    SeedInstance("inst1", "grp1");
+    std::shared_ptr<ServiceMetricsCollector> shared = std::dynamic_pointer_cast<ServiceMetricsCollector>(
+        base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5"));
+    ASSERT_NE(nullptr, shared);
+    SET_METRICS_(shared, meta_indexer, query_key_count, 3600000.);
+    const size_t metric_count = metrics_registry_->GetSize();
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("inst1");
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+    std::string metrics_type;
+    std::shared_ptr<ServiceMetricsCollector> snapshot = std::dynamic_pointer_cast<ServiceMetricsCollector>(
+        base_->ResolveReportEventMetricsCollector(request, metrics_type));
+    std::shared_ptr<ServiceMetricsCollector> heartbeat = std::dynamic_pointer_cast<ServiceMetricsCollector>(
+        base_->ResolveReportEventMetricsCollector(request, metrics_type));
+    ASSERT_NE(nullptr, snapshot);
+    ASSERT_NE(nullptr, heartbeat);
+    EXPECT_NE(snapshot, heartbeat);
+    EXPECT_EQ("event_report_l1p5", metrics_type);
+    SET_METRICS_(snapshot, meta_indexer, query_key_count, 3600000.);
+    EXPECT_DOUBLE_EQ(0., heartbeat->get_meta_indexer_query_key_count_metrics());
+    EXPECT_DOUBLE_EQ(3600000., snapshot->get_meta_indexer_query_key_count_metrics());
+    EXPECT_EQ(shared->GetMetricsTags(), heartbeat->GetMetricsTags());
+    EXPECT_EQ(metric_count, metrics_registry_->GetSize());
 }

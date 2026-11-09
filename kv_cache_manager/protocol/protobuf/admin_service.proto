@@ -299,6 +299,7 @@ message MetaStorageBackendConfig {
     google.protobuf.BoolValue force_deleting_async_enqueue = 4;
 }
 
+// Obsolete search-cache configuration; retained for protocol compatibility only.
 message MetaCachePolicyConfig {
     int64 capacity = 1;
     string type = 2;
@@ -311,6 +312,7 @@ message MetaIndexerConfig {
     int64 mutex_shard_num = 2;
     int64 batch_key_size = 3;
     MetaStorageBackendConfig meta_storage_backend_config = 4;
+    // Obsolete search-cache setting; ignored by the server.
     MetaCachePolicyConfig meta_cache_policy_config = 5;
     // google.protobuf.Int64Value as a wrapper for tracking presence of
     // scalar fields in older proto3 versions (v3.12.0, before which
@@ -490,6 +492,7 @@ message InstanceInfo {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    bool disable_write_session = 9;
 }
 
 message RegisterInstanceRequest {
@@ -501,6 +504,7 @@ message RegisterInstanceRequest {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    oneof write_session_config { bool disable_write_session = 9; }
 }
 
 message RemoveInstanceRequest {

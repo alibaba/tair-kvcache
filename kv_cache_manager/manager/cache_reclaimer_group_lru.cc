@@ -91,7 +91,7 @@ bool CacheReclaimer::BuildGroupLruPlan(const RequestContext *request_context,
             continue;
         }
         const auto indexer = meta_indexer_manager_->GetMetaIndexer(info->instance_id());
-        if (!indexer) {
+        if (!indexer || !indexer->SupportsWriteSession()) {
             continue;
         }
         const auto key_count = static_cast<std::uint64_t>(indexer->GetKeyCount());
@@ -313,7 +313,7 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                 }
             }
             const auto indexer = meta_indexer_manager_->GetMetaIndexer(id);
-            if (!indexer) {
+            if (!indexer || !indexer->SupportsWriteSession()) {
                 state.failed = true;
                 continue;
             }

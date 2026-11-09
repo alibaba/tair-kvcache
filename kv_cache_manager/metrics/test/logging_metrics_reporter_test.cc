@@ -47,7 +47,8 @@ TEST_F(LoggingMetricsReporterTest, TestReportPerQuery) {
         DummyMetricsCollector collector;
         collector.Init();
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
-        EXPECT_EQ(3, metrics_registry_->GetSize());
+        EXPECT_EQ(4, metrics_registry_->GetSize());
+        EXPECT_NE(nullptr, metrics_registry_->GetMetricsData("meta_indexer.total_local_location_count"));
     }
 
     {

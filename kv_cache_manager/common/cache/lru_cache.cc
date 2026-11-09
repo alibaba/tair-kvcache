@@ -68,13 +68,14 @@ LRUHandleTable::~LRUHandleTable() {
         size_t{1} << length_bits_);
 }
 
-LRUHandle *LRUHandleTable::Lookup(const std::string_view &key, uint32_t hash) { return *FindPointer(key, hash); }
+LRUHandle *LRUHandleTable::Lookup(const std::string_view &key, uint32_t hash) const { return *FindPointer(key, hash); }
 
 LRUHandle *LRUHandleTable::Insert(LRUHandle *h) {
     LRUHandle **ptr = FindPointer(h->key(), h->hash);
     LRUHandle *old = *ptr;
     h->next_hash = (old == nullptr ? nullptr : old->next_hash);
     *ptr = h;
+    UpdateValueCount(old ? old->GetValueCount() : 0, h->GetValueCount());
     if (old == nullptr) {
         ++elems_;
         if ((elems_ >> length_bits_) > 0) { // elems_ >= length
@@ -91,17 +92,26 @@ LRUHandle *LRUHandleTable::Remove(const std::string_view &key, uint32_t hash) {
     LRUHandle *result = *ptr;
     if (result != nullptr) {
         *ptr = result->next_hash;
+        UpdateValueCount(result->GetValueCount(), 0);
         --elems_;
     }
     return result;
 }
 
-LRUHandle **LRUHandleTable::FindPointer(const std::string_view &key, uint32_t hash) {
+LRUHandle **LRUHandleTable::FindPointer(const std::string_view &key, uint32_t hash) const {
     LRUHandle **ptr = &list_[hash >> (32 - length_bits_)];
     while (*ptr != nullptr && ((*ptr)->hash != hash || key != (*ptr)->key())) {
         ptr = &(*ptr)->next_hash;
     }
     return ptr;
+}
+
+size_t LRUHandleTable::GetMemoryUsage(bool inserting) const {
+    int bits = length_bits_;
+    if (inserting && size_t{elems_} + 1 >= (size_t{1} << bits) && bits < max_length_bits_ && bits < 31) {
+        ++bits;
+    }
+    return EstimateAllocationSize((size_t{1} << bits) * sizeof(LRUHandle *));
 }
 
 void LRUHandleTable::Resize() {
@@ -356,8 +366,16 @@ void LRUCacheShard::MaintainPoolSize() {
     }
 }
 
-void LRUCacheShard::EvictFromLRU(size_t charge, autovector<LRUHandle *> *deleted) {
-    while ((usage_ + charge) > capacity_ && lru_.next != &lru_) {
+size_t LRUCacheShard::GetTableCharge(bool inserting) const {
+    return metadata_charge_policy_ == kFullChargeCacheMetadata ? table_.GetMemoryUsage(inserting) : 0;
+}
+
+bool LRUCacheShard::NeedsTableGrowth(const std::string_view &key, uint32_t hash) const {
+    return GetTableCharge(true) > GetTableCharge(false) && table_.Lookup(key, hash) == nullptr;
+}
+
+void LRUCacheShard::EvictFromLRU(size_t charge, bool inserting, autovector<LRUHandle *> *deleted) {
+    while ((usage_ + charge + GetTableCharge(inserting)) > capacity_ && lru_.next != &lru_) {
         LRUHandle *old = lru_.next;
         // LRU list contains only elements which can be evicted.
         assert(old->InCache() && !old->HasRefs());
@@ -391,7 +409,7 @@ void LRUCacheShard::SetCapacity(size_t capacity) {
         capacity_ = capacity;
         high_pri_pool_capacity_ = capacity_ * high_pri_pool_ratio_;
         low_pri_pool_capacity_ = capacity_ * low_pri_pool_ratio_;
-        EvictFromLRU(0, &last_reference_list);
+        EvictFromLRU(0, false, &last_reference_list);
     }
 
     NotifyEvicted(last_reference_list);
@@ -406,11 +424,13 @@ ErrorCode
 LRUCacheShard::DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list) {
     // Free the space following strict LRU policy until enough space
     // is freed or the lru list is empty.
+    const bool inserting = NeedsTableGrowth(e->key(), e->hash);
     if (!no_evict_on_insert_) {
-        EvictFromLRU(e->total_charge, last_reference_list);
+        EvictFromLRU(e->total_charge, inserting, last_reference_list);
     }
 
-    if ((usage_ + e->total_charge) > capacity_ && (strict_capacity_limit_ || handle == nullptr)) {
+    if ((usage_ + e->total_charge + GetTableCharge(inserting)) > capacity_ &&
+        (strict_capacity_limit_ || handle == nullptr)) {
         e->SetInCache(false);
         if (handle == nullptr) {
             // Don't insert the entry but still return ok, as if the entry inserted
@@ -539,9 +559,29 @@ bool LRUCacheShard::ApplyToEntryNoTouch(
     if (e == nullptr) {
         return false;
     }
+    ApplyToEntryUnsafe(e, callback);
+    return true;
+}
+
+bool LRUCacheShard::ApplyToHandleNoTouch(
+    LRUHandle *handle,
+    const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    assert(handle->HasRefs());
+    if (!handle->InCache()) {
+        return false;
+    }
+    ApplyToEntryUnsafe(handle, callback);
+    return true;
+}
+
+void LRUCacheShard::ApplyToEntryUnsafe(
+    LRUHandle *e, const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback) {
     assert(e->InCache());
     const bool in_lru = !e->HasRefs();
+    const size_t before = e->GetValueCount();
     const ssize_t delta = callback(e->value, e->total_charge, e->helper);
+    table_.UpdateValueCount(before, e->GetValueCount());
     if (delta > 0) {
         const size_t increase = static_cast<size_t>(delta);
         e->total_charge += increase;
@@ -573,7 +613,6 @@ bool LRUCacheShard::ApplyToEntryNoTouch(
             }
         }
     }
-    return true;
 }
 
 bool LRUCacheShard::Ref(LRUHandle *e) {
@@ -626,7 +665,7 @@ bool LRUCacheShard::Release(LRUHandle *e, bool /*useful*/, bool erase_if_last_re
         was_in_cache = e->InCache();
         if (must_free && was_in_cache) {
             // The item is still in cache, and nobody else holds a reference to it.
-            if (erase_if_last_ref || (!no_evict_on_insert_ && usage_ > capacity_)) {
+            if (erase_if_last_ref || (!no_evict_on_insert_ && usage_ + GetTableCharge(false) > capacity_)) {
                 // When no_evict_on_insert_ is false: usage > capacity means the
                 // LRU list must be empty (EvictFromLRU drained it on Insert).
                 // When no_evict_on_insert_ is true: skip opportunistic eviction
@@ -676,7 +715,7 @@ void LRUCacheShard::ReleaseBatch(Cache::Handle *const *handles, const size_t *or
             bool must_free = entry->Unref();
             const bool was_in_cache = entry->InCache();
             if (must_free && was_in_cache) {
-                if (!no_evict_on_insert_ && usage_ > capacity_) {
+                if (!no_evict_on_insert_ && usage_ + GetTableCharge(false) > capacity_) {
                     assert(lru_.next == &lru_);
                     table_.Remove(entry->key(), entry->hash);
                     entry->SetInCache(false);
@@ -767,10 +806,10 @@ LRUHandle *LRUCacheShard::CreateStandalone(const std::string_view &key,
         std::lock_guard<std::mutex> l(mutex_);
 
         if (!no_evict_on_insert_) {
-            EvictFromLRU(e->total_charge, &last_reference_list);
+            EvictFromLRU(e->total_charge, false, &last_reference_list);
         }
 
-        if (strict_capacity_limit_ && (usage_ + e->total_charge) > capacity_) {
+        if (strict_capacity_limit_ && (usage_ + e->total_charge + GetTableCharge(false)) > capacity_) {
             if (allow_uncharged) {
                 e->total_charge = 0;
             } else {
@@ -818,9 +857,15 @@ bool LRUCacheShard::Exists(const std::string_view &key, uint32_t hash) {
     return table_.Lookup(key, hash) != nullptr;
 }
 
+size_t LRUCacheShard::GetAvailableCapacity(const std::string_view &key, uint32_t hash) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t usage = usage_ + GetTableCharge(NeedsTableGrowth(key, hash));
+    return !strict_capacity_limit_ ? SIZE_MAX : (usage < capacity_ ? capacity_ - usage : 0);
+}
+
 size_t LRUCacheShard::GetUsage() const {
     std::lock_guard<std::mutex> l(mutex_);
-    return usage_;
+    return usage_ + GetTableCharge(false);
 }
 
 size_t LRUCacheShard::GetPinnedUsage() const {
@@ -832,6 +877,11 @@ size_t LRUCacheShard::GetPinnedUsage() const {
 size_t LRUCacheShard::GetOccupancyCount() const {
     std::lock_guard<std::mutex> l(mutex_);
     return table_.GetOccupancyCount();
+}
+
+size_t LRUCacheShard::GetValueCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return table_.GetValueCount();
 }
 
 size_t LRUCacheShard::GetTableAddressCount() const {

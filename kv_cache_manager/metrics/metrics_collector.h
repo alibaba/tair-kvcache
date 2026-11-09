@@ -300,12 +300,7 @@ class ServiceMetricsCollector final : public MetricsCollector {
 
     // meta indexer metrics
     KVCM_GAUGE_METRICS(meta_indexer, query_key_count)
-    KVCM_GAUGE_METRICS(meta_indexer, get_not_exist_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, query_batch_num)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_hit_count)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_miss_count)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_hit_ratio)
-    KVCM_GAUGE_METRICS(meta_indexer, io_data_size)
     KVCM_GAUGE_METRICS(meta_indexer, put_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, upsert_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, lock_wait_time_us)
@@ -331,6 +326,11 @@ public:
     ~ServiceMetricsCollector() override = default;
 
     bool Init() override;
+    std::shared_ptr<ServiceMetricsCollector> MakeRequestCollector() const;
+    void PublishQueryKeyCountSample();
+
+private:
+    Gauge registry_query_key_count_metrics_;
 };
 
 // Lightweight per-event observability for ReportEvent. It reuses service.*
@@ -483,6 +483,7 @@ public:
 
 class MetaIndexerAccumulativeMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, total_key_count)
+    KVCM_GAUGE_METRICS(meta_indexer, total_local_location_count)
     KVCM_GAUGE_METRICS(meta_indexer, total_cache_usage)
 
 public:
@@ -529,6 +530,8 @@ public:
 
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, local_key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, local_location_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, meta_cache_usage)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)

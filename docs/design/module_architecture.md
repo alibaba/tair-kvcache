@@ -43,7 +43,7 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
 | **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、Leader 请求门禁、调用守卫与访问日志。`OptimizerEventStreamService` 复用 Meta gRPC server 暴露订阅流，不新增端口。 |
 | **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、`ReportEvent`/`GetHostCacheState`、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcherManager`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`ReclaimerTaskSupervisor`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor`、`StartupConfigLoader` 等子组件，同时把生成的 `SelectLocationPolicy` 传给 `MetaSearcher`。 |
-| **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 隔离管理 `MetaIndexer` 并共享 `QueryExecutor`；`MetaIndexer` 维护 cache key → `CacheLocation` 的索引，提供 Get/Put/CAS/Sample、查询缓存与分片锁；`MetaStorageBackendManager` 组合 local、Redis、memory-primary + async Redis 等后端并负责恢复/备份。`CacheLocation` 是被广泛共享的核心类型。 |
+| **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 隔离管理 `MetaIndexer` 并共享 `QueryExecutor`；`MetaIndexer` 维护 cache key → `CacheLocation` 的索引，提供 Get/Put/CAS/Sample 与分片锁；`MetaStorageBackendManager` 组合 local、Redis、memory-primary + async Redis 等后端并负责恢复/备份。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义 Instance Group/Instance/Storage/Quota/回收/迁移等配置对象；`RegistryManager` 持久化实例注册信息（local/Redis registry backend）；`CoordinationBackend`（memory/file/redis）+ `LeaderElector` 提供一主多备的分布式选主。 |
 | **data_storage** | `data_storage/` | 可插拔的 KVCache 数据存储后端。`DataStorageManager` 管理后端集合、URI、健康探测与水位；`DataStorageBackend` 抽象物理存储；`EventReportBackend` 维护 EventReport 类型的 Reporter/Snapshot 状态与 GC 清理判定；`DataStorageUri` 统一位置描述。内置/可选后端：HF3FS、NFS、TairMemPool（DRAM/SSD）、Mooncake（构建开关）、VCNS HF3FS（构建开关）、EventReport（L1.5/L2）与 Dummy。 |
 
@@ -257,7 +257,7 @@ Recover 保留未回填 key 的回源、写前补齐与 tombstone；并发读允
 
 从完整视角看，读取由推理引擎驱动，client 的两条链路依次参与：
 
-1. **匹配**：引擎经 `ManagerClient::MatchLocation`（元数据面）调用 KVCM `CacheManager::GetCacheLocation(sByBackend)`。KVCM 内部由 `MetaSearcher` 经 `meta_search_cache` 与 `MetaIndexer` 查得 `CacheLocation`，`DataStorageSelector` 依据后端可用性/水位选出返回哪个存储位置，返回一组存储位置 URI（`Locations`）。支持前缀匹配、反向滚动滑动窗口匹配、混合注意力（Mamba/SWA）和按 block key 批量查询等类型。
+1. **匹配**：引擎经 `ManagerClient::MatchLocation`（元数据面）调用 KVCM `CacheManager::GetCacheLocation(sByBackend)`。KVCM 内部由 `MetaSearcher` 经 `MetaIndexer` 查得 `CacheLocation`，`DataStorageSelector` 依据后端可用性/水位选出返回哪个存储位置，返回一组存储位置 URI（`Locations`）。支持前缀匹配、反向滚动滑动窗口匹配、混合注意力（Mamba/SWA）和按 block key 批量查询等类型。
 2. **加载**：引擎拿到 URI 后，经 `ManagerClient::LoadKvCaches`（数据面 `TransferClient`）由对应 SDK 从存储后端把 KVCache 数据读入引擎显存/内存。此步**不经过 KVCM**。
 
 ### 4.4 两阶段写入（申请地址 → 写入 → 确认）

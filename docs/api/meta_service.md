@@ -1,6 +1,14 @@
 # KVCacheManager MetaService API curl Examples
 
 ## Register Instance
+
+`disable_write_session` is an optional boolean. Omitted on a new instance, it defaults to false.
+Set it to true for single-spec EventReport metadata with local storage or cached Redis/async Redis.
+Both modes require `memory_primary=false`. Ordinary write sessions and migration are unsupported.
+RemoveCache/TrimCache delete metadata only.
+The setting is persisted per instance: omission on re-registration preserves it, and an explicit different
+value is rejected. InstanceGroup configuration is unchanged.
+
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/registerInstance \
   -H "Content-Type: application/json" \

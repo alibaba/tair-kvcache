@@ -8,7 +8,6 @@
 
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -380,7 +379,8 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
         return {MA_OK, std::move(ecs)};
     };
     LocationIdsPerKey upsert_ids = {{"loc_a", "loc_new"}, {"loc_a", "loc_new"}};
-    auto loc_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, upsert_ids, upsert_modifier);
+    auto loc_result =
+        meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, upsert_ids, upsert_modifier, true, false);
     ASSERT_EQ(EC_OK, loc_result.ec);
     for (const auto &per_key : loc_result.per_location_error_codes) {
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key);
@@ -412,8 +412,8 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
     // Only operate on key 0 — location_ids must not be empty per key.
     KeyVector delete_keys = {keys[0]};
     LocationIdsPerKey delete_ids = {{"loc_b"}};
-    loc_result =
-        meta_indexer_->ReadModifyWriteLocation(request_context_.get(), delete_keys, delete_ids, delete_modifier);
+    loc_result = meta_indexer_->ReadModifyWriteLocation(
+        request_context_.get(), delete_keys, delete_ids, delete_modifier, true, false);
     ASSERT_EQ(EC_OK, loc_result.ec);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), loc_result.per_location_error_codes[0]);
     expect_locations[0].erase("loc_b");
@@ -433,13 +433,15 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
     };
     KeyVector miss_keys = {99};
     LocationIdsPerKey miss_ids = {{"loc_a"}};
-    loc_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), miss_keys, miss_ids, noent_modifier);
+    loc_result = meta_indexer_->ReadModifyWriteLocation(
+        request_context_.get(), miss_keys, miss_ids, noent_modifier, true, false);
     ASSERT_EQ(EC_OK, loc_result.ec);
     ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), loc_result.per_location_error_codes[0]);
 
     // 4. Bad args: keys/location_ids size mismatch.
     LocationIdsPerKey bad_ids = {{"loc_a"}};
-    auto bad_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, bad_ids, upsert_modifier);
+    auto bad_result =
+        meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, bad_ids, upsert_modifier, true, false);
     ASSERT_EQ(EC_BADARGS, bad_result.ec);
 
     // 5. Cleanup

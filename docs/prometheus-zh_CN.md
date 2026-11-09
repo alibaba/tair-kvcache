@@ -23,9 +23,6 @@ scrape_configs:
 # 服务 QPS（1 分钟速率）
 rate(kvcm_service_query_counter[1m])
 
-# 搜索缓存命中率
-kvcm_meta_indexer_search_cache_hit_ratio
-
 # GetCacheLocation Block 级命中率（5 分钟窗口）
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
   / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
@@ -173,7 +170,6 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_indexer.get_io_time_us` | gauge | metadata backend 调用区间的墙钟并集；local 模式包含 LRU/锁/复制，不包含并行 projection，也不表示 Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
-| `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
 | `cache_manager_instance.event_report_location_lifetime_min_us` | gauge | 最近有效 BLOCK_DELETE 批次中，成功删除的 Location 的最短存活时间（微秒） |
 | `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |

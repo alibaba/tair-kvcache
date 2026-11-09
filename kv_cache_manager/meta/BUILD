@@ -26,6 +26,7 @@ cc_library(
     ],
     deps = [
         ":meta_indexer",
+        "//kv_cache_manager/config",
         ":query_executor",
         "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
@@ -55,13 +56,14 @@ cc_library(
     hdrs = [
         "common.h",
         "meta_indexer.h",
-        "meta_search_cache.h",
         "meta_storage_backend_factory.h",
     ],
     deps = [
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/data_storage:snapshot_uri_utils",
+        "//kv_cache_manager/meta/simple:simple_kv_cache_backend",
         ":cache_location",
         ":common",
-        ":meta_search_cache",
         ":meta_storage_backend_manager",
         ":query_executor",
         ":storage_usage_data",
@@ -149,21 +151,6 @@ cc_library(
 )
 
 cc_library(
-    name = "meta_search_cache",
-    srcs = [
-        "meta_search_cache.cc",
-    ],
-    hdrs = [
-        "meta_search_cache.h",
-    ],
-    deps = [
-        "//kv_cache_manager/common",
-        "//kv_cache_manager/common:lru_cache",
-        "//kv_cache_manager/config",
-    ],
-)
-
-cc_library(
     name = "common",
     srcs = [
     ],
@@ -228,7 +215,6 @@ cc_library(
     deps = [
         ":common",
         ":meta_cache_base_backend",
-        ":meta_search_cache",
         ":utils",
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",

@@ -196,10 +196,6 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                     "meta_storage_backend_config": {
                         "storage_type": "local",
                         "storage_uri": "file:///tmp/meta_storage"
-                    },
-                    "meta_cache_policy_config": {
-                        "capacity": 1024 * 1024 * 1024,
-                        "type": "LRU"
                     }
                 }
             },

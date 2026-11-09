@@ -690,8 +690,7 @@ bootstrap_test_group() {
                         max_key_count: 10000000,
                         mutex_shard_num: 64,
                         batch_key_size: 128,
-                        meta_storage_backend_config: {storage_type: "local", storage_uri: ""},
-                        meta_cache_policy_config: {type: "LRU", capacity: 100000}
+                        meta_storage_backend_config: {storage_type: "local", storage_uri: ""}
                     }
                 },
                 version: 1

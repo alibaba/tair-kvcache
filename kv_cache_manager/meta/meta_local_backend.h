@@ -17,7 +17,6 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
 #include "kv_cache_manager/meta/utils.h"
@@ -90,9 +89,8 @@ private:
     // Both helpers return the usage delta they caused so Merge can accumulate
     // it locally without a full before/after EstimateUsage() rescan.
     ssize_t ErasePrevKeyFallback(LocalItemExtra *extra);
-    ssize_t UpsertExtraProperty(const std::string &name,
-                                const std::string &value,
-                                std::unique_ptr<LocalItemExtra> &extra);
+    ssize_t
+    UpsertExtraProperty(const std::string &name, const std::string &value, std::unique_ptr<LocalItemExtra> &extra);
     PropertyMap &EnsureExtraProperties(std::unique_ptr<LocalItemExtra> &extra);
 
     PrevKeyState prev_key_state_{PrevKeyState::kAbsent};
@@ -110,6 +108,9 @@ struct MetaMemCacheItem {
         }
         return total;
     }
+
+    size_t EstimateLocationGrowth(const LocationId &id, const CacheLocationConstPtr &location) const;
+    size_t EstimateMergeGrowth(const CacheLocationMap &locations, const PropertyMap &properties) const;
 
     ssize_t MergeLocations(const CacheLocationMap &locations) {
         return MutateExtra([&] { return locations_.Merge(locations, extra_); });
@@ -391,6 +392,12 @@ public:
 
     // LRU capacity charge, not process RSS or allocator allocated bytes.
     size_t GetMemUsage() const noexcept override;
+    ErrorCode CheckWriteCapacity(KeyType key,
+                                 const CacheLocationMap &locations,
+                                 const PropertyMap &properties,
+                                 bool replace) noexcept override;
+    size_t GetLocalKeyCount() const noexcept override;
+    size_t GetLocalLocationCount() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
     bool GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
@@ -412,13 +419,17 @@ private:
     ErrorCode UpdateHandleInPlace(KeyType key,
                                   Cache::Handle *handle,
                                   const CacheLocationMap &locations,
-                                  const PropertyMap &properties);
+                                  const PropertyMap &properties,
+                                  bool check_capacity);
     ErrorCode UpdateHandleInPlaceSingleLocation(KeyType key,
                                                 Cache::Handle *handle,
                                                 const LocationId &location_id,
                                                 CacheLocationConstPtr location,
                                                 CacheLocationVector *retired_locations = nullptr);
-    ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpdateInPlace(std::string_view key_sv,
+                            const CacheLocationMap &locations,
+                            const PropertyMap &properties,
+                            bool check_capacity);
     ErrorCode CreateAndInsertSingleLocation(std::string_view key_sv,
                                             const LocationId &location_id,
                                             CacheLocationConstPtr location);
@@ -433,7 +444,8 @@ private:
                                                  std::vector<ErrorCode> &out_results,
                                                  SingleLocationRmwScratch &scratch,
                                                  bool retain_handles) noexcept;
-    ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode
+    UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties, bool check_capacity);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);
     // Unified read helper. Fetches data from cache for a single key.

@@ -24,9 +24,6 @@ Then query metrics with PromQL:
 # Service QPS (rate over 1 minute)
 rate(kvcm_service_query_counter[1m])
 
-# Search cache hit ratio
-kvcm_meta_indexer_search_cache_hit_ratio
-
 # GetCacheLocation block-level hit rate (5-minute window)
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
   / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
@@ -187,7 +184,6 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.get_io_time_us` | gauge | Wall-time union of metadata-backend call intervals; local mode includes LRU/locks/copies, excludes parallel projection, and does not imply Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | Wall-time union of GetHostCacheState visibility and host/spec projection callback intervals (us) |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
-| `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
 
 `grpc.response_counter` counts the final gRPC status the server prepares to send, including framework

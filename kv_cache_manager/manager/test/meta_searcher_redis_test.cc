@@ -77,9 +77,6 @@ public:
         meta_indexer_config->SetMutexShardNum(32);
         meta_indexer_config->SetMaxKeyCount(10000);
         auto indexer = std::make_shared<MetaIndexer>();
-        auto metaCachePolicyConfig = std::make_shared<MetaCachePolicyConfig>();
-        metaCachePolicyConfig->SetCapacity(10000);
-        meta_indexer_config->SetMetaCachePolicyConfig(metaCachePolicyConfig);
         auto ec = indexer->Init(/*instance_id*/ "meta_searcher_real_service_test", meta_indexer_config);
         if (ec != ErrorCode::EC_OK) {
             KVCM_LOG_ERROR("Init meta indexer failed");

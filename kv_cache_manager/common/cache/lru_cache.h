@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 
+#include "kv_cache_manager/common/cache/allocation_size.h"
 #include "kv_cache_manager/common/cache/auto_vector.h"
 #include "kv_cache_manager/common/cache/sharded_cache.h"
 
@@ -104,6 +105,8 @@ struct LRUHandle : public Cache::Handle {
     // Return true if there are external refs, false otherwise.
     bool HasRefs() const { return refs > 0; }
 
+    size_t GetValueCount() const noexcept { return helper->value_count_cb ? helper->value_count_cb(value) : 0; }
+
     bool InCache() const { return m_flags & M_IN_CACHE; }
     bool IsHighPri() const { return im_flags & IM_IS_HIGH_PRI; }
     bool InHighPriPool() const { return m_flags & M_IN_HIGH_PRI_POOL; }
@@ -173,12 +176,7 @@ struct LRUHandle : public Cache::Handle {
         if (metadata_charge_policy != kFullChargeCacheMetadata) {
             return 0;
         } else {
-#ifdef ROCKSDB_MALLOC_USABLE_SIZE
-            return malloc_usable_size(const_cast<void *>(static_cast<const void *>(this)));
-#else
-            // This is the size that is used when a new handle is created.
-            return sizeof(LRUHandle) - 1 + key_length;
-#endif
+            return EstimateAllocationSize(sizeof(LRUHandle) - 1 + key_length);
         }
     }
 
@@ -204,7 +202,7 @@ public:
     explicit LRUHandleTable(int max_upper_hash_bits, MemoryAllocator *allocator);
     ~LRUHandleTable();
 
-    LRUHandle *Lookup(const std::string_view &key, uint32_t hash);
+    LRUHandle *Lookup(const std::string_view &key, uint32_t hash) const;
     LRUHandle *Insert(LRUHandle *h);
     LRUHandle *Remove(const std::string_view &key, uint32_t hash);
 
@@ -224,14 +222,20 @@ public:
     int GetLengthBits() const { return length_bits_; }
 
     size_t GetOccupancyCount() const { return elems_; }
+    size_t GetValueCount() const { return value_count_; }
+    void UpdateValueCount(size_t before, size_t after) {
+        assert(value_count_ >= before);
+        value_count_ = value_count_ - before + after;
+    }
 
     MemoryAllocator *GetAllocator() const { return allocator_; }
+    size_t GetMemoryUsage(bool inserting) const;
 
 private:
     // Return a pointer to slot that points to a cache entry that
     // matches key/hash.  If there is no such cache entry, return a
     // pointer to the trailing slot in the corresponding linked list.
-    LRUHandle **FindPointer(const std::string_view &key, uint32_t hash);
+    LRUHandle **FindPointer(const std::string_view &key, uint32_t hash) const;
 
     void Resize();
 
@@ -245,6 +249,7 @@ private:
 
     // Number of elements currently in the table.
     uint32_t elems_;
+    size_t value_count_ = 0;
 
     // Set from max_upper_hash_bits (see constructor).
     const int max_length_bits_;
@@ -339,6 +344,9 @@ public: // Function definitions expected as parameter to ShardedCache
 
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     void ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count);
+    bool ApplyToHandleNoTouch(
+        LRUHandle *handle,
+        const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback);
     bool Ref(LRUHandle *handle);
     bool Erase(const std::string_view &key, uint32_t hash);
     bool Exists(const std::string_view &key, uint32_t hash);
@@ -347,6 +355,7 @@ public: // Function definitions expected as parameter to ShardedCache
     // The caller must hold an external reference to `handle`.
     // Does NOT trigger eviction even if usage exceeds capacity.
     void AdjustCharge(LRUHandle *handle, ssize_t delta);
+    size_t GetAvailableCapacity(const std::string_view &key, uint32_t hash) const;
 
     // Although in some platforms the update of size_t is atomic, to make sure
     // GetUsage() and GetPinnedUsage() work correctly under any platform, we'll
@@ -355,6 +364,7 @@ public: // Function definitions expected as parameter to ShardedCache
     size_t GetUsage() const;
     size_t GetPinnedUsage() const;
     size_t GetOccupancyCount() const;
+    size_t GetValueCount() const;
     size_t GetTableAddressCount() const;
 
     void ApplyToSomeEntries(
@@ -417,6 +427,10 @@ private:
     // to last_reference_list for deferred cleanup outside the lock.
     ErrorCode DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list);
 
+    void ApplyToEntryUnsafe(
+        LRUHandle *entry,
+        const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback);
+
     void LRU_Remove(LRUHandle *e);
     void LRU_Insert(LRUHandle *e);
 
@@ -428,7 +442,9 @@ private:
     // to hold (usage_ + charge) is freed or the lru list is empty
     // This function is not thread safe - it needs to be executed while
     // holding the mutex_.
-    void EvictFromLRU(size_t charge, autovector<LRUHandle *> *deleted);
+    void EvictFromLRU(size_t charge, bool inserting, autovector<LRUHandle *> *deleted);
+    size_t GetTableCharge(bool inserting) const;
+    bool NeedsTableGrowth(const std::string_view &key, uint32_t hash) const;
 
     void NotifyEvicted(const autovector<LRUHandle *> &evicted_handles);
 

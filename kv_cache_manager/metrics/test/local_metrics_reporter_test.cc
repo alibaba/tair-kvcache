@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -89,15 +90,15 @@ TEST_F(LocalMetricsReporterTest, TestInitWithNull) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery00) {
-    EXPECT_EQ(3, metrics_registry_->GetSize());
+    EXPECT_EQ(4, metrics_registry_->GetSize());
     EXPECT_NO_THROW(reporter_->ReportPerQuery(nullptr));
-    EXPECT_EQ(3, metrics_registry_->GetSize());
+    EXPECT_EQ(4, metrics_registry_->GetSize());
 
     {
         DummyMetricsCollector collector;
         collector.Init();
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
-        EXPECT_EQ(3, metrics_registry_->GetSize());
+        EXPECT_EQ(4, metrics_registry_->GetSize());
     }
 
     {
@@ -144,8 +145,8 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery00) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
-    constexpr int kDataStorageMetricsCount = 10;
-    EXPECT_EQ(3, metrics_registry_->GetSize());
+    constexpr int kDataStorageMetricsCount = 11;
+    EXPECT_EQ(4, metrics_registry_->GetSize());
 
     DataStorageMetricsCollector collector(metrics_registry_);
     collector.Init();
@@ -198,8 +199,8 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
-    constexpr int kServiceMetricsCount = 3 + 5 + 14 + 6 + 26;
-    EXPECT_EQ(3, metrics_registry_->GetSize());
+    constexpr int kServiceMetricsCount = 4 + 5 + 14 + 6 + 21;
+    EXPECT_EQ(4, metrics_registry_->GetSize());
 
     ServiceMetricsCollector collector(metrics_registry_);
     collector.Init();
@@ -524,13 +525,22 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
     ASSERT_EQ(ErrorCode::EC_OK, registry_manager_->CreateInstanceGroup(&request_context, instance_group));
 
     ASSERT_EQ(ErrorCode::EC_OK,
-              registry_manager_->RegisterInstance(
-                  &request_context, "test_group", "test_instance_id", 8, {LocationSpecInfo("tp0", 1024)}, {}));
+              registry_manager_->RegisterInstance(&request_context,
+                                                  "test_group",
+                                                  "test_instance_id",
+                                                  8,
+                                                  {LocationSpecInfo("tp0", 1024)},
+                                                  {},
+                                                  {},
+                                                  0,
+                                                  std::nullopt));
 
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
-    ASSERT_EQ(ErrorCode::EC_OK,
-              cache_manager_->meta_indexer_manager_->CreateMetaIndexer("test_instance_id", meta_indexer_config));
-    auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance_id");
+    ASSERT_EQ(
+        ErrorCode::EC_OK,
+        cache_manager_->meta_indexer_manager_->CreateMetaIndexer("test_instance_id", meta_indexer_config, {}, nullptr));
+    std::shared_ptr<MetaIndexer> meta_indexer =
+        cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance_id");
     meta_indexer->key_count_.store(5);
     meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024 * 5);
     cache_manager_->metrics_recorder_->Start();
@@ -590,19 +600,30 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
     const std::map<std::string, std::string> instance_groups{
         {"small", "group_a"}, {"large", "group_b"}, {"empty", "group_a"}};
     for (const auto &[instance_id, group] : instance_groups) {
-        ASSERT_EQ(
-            EC_OK,
-            registry_manager_->RegisterInstance(&context, group, instance_id, 8, {LocationSpecInfo("tp0", 1024)}, {}));
         ASSERT_EQ(EC_OK,
-                  cache_manager_->meta_indexer_manager_->CreateMetaIndexer(instance_id,
-                                                                           std::make_shared<MetaIndexerConfig>()));
+                  registry_manager_->RegisterInstance(
+                      &context, group, instance_id, 8, {LocationSpecInfo("tp0", 1024)}, {}, {}, 0, std::nullopt));
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->meta_indexer_manager_->CreateMetaIndexer(
+                      instance_id, std::make_shared<MetaIndexerConfig>(), {}, nullptr));
     }
-    auto small = cache_manager_->meta_indexer_manager_->GetMetaIndexer("small");
-    auto large = cache_manager_->meta_indexer_manager_->GetMetaIndexer("large");
+    std::shared_ptr<MetaIndexer> small = cache_manager_->meta_indexer_manager_->GetMetaIndexer("small");
+    std::shared_ptr<MetaIndexer> large = cache_manager_->meta_indexer_manager_->GetMetaIndexer("large");
+    const size_t small_bucket_usage = small->GetMemUsage();
+    const size_t empty_usage = cache_manager_->meta_indexer_manager_->GetMetaIndexer("empty")->GetMemUsage();
     CacheLocationMapVector locations(1);
+    std::shared_ptr<CacheLocation> first_location = std::make_shared<CacheLocation>();
+    first_location->set_id("location_a");
+    first_location->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    first_location->push_location_spec(LocationSpec("tp0", "uri_a"));
+    locations[0].emplace("location_a", first_location);
     PropertyMapVector small_properties{{{"payload", std::string(128, 'a')}}};
     PropertyMapVector large_properties{{{"payload", std::string(4096, 'b')}}};
     ASSERT_EQ(EC_OK, small->Put(&context, {7}, locations, small_properties).ec);
+    std::shared_ptr<CacheLocation> second_location = std::make_shared<CacheLocation>(*first_location);
+    second_location->set_id("location_b");
+    locations[0].emplace("location_a", first_location);
+    locations[0].emplace("location_b", second_location);
     ASSERT_EQ(EC_OK, large->Put(&context, {7}, locations, large_properties).ec);
     const auto small_usage = small->GetMemUsage();
     const auto large_usage = large->GetMemUsage();
@@ -638,10 +659,24 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
         EXPECT_NE(output.find(series), std::string::npos) << output;
     };
     ASSERT_TRUE(sample());
+    EXPECT_EQ(1u, small->GetLocalLocationCount());
+    EXPECT_EQ(2u, large->GetLocalLocationCount());
+    EXPECT_DOUBLE_EQ(3, metrics_registry_->GetGauge("meta_indexer.total_local_location_count").Get());
+    EXPECT_DOUBLE_EQ(1,
+                     metrics_registry_
+                         ->GetGauge("cache_manager_instance.local_location_count",
+                                    {{"instance_group", "group_a"}, {"instance_id", "small"}})
+                         .Get());
+    EXPECT_DOUBLE_EQ(2,
+                     metrics_registry_
+                         ->GetGauge("cache_manager_instance.local_location_count",
+                                    {{"instance_group", "group_b"}, {"instance_id", "large"}})
+                         .Get());
     expect_usage("small", small_usage);
     expect_usage("large", large_usage);
-    expect_usage("empty", 0);
-    EXPECT_DOUBLE_EQ(small_usage + large_usage, metrics_registry_->GetGauge("meta_indexer.total_cache_usage").Get());
+    expect_usage("empty", empty_usage);
+    EXPECT_DOUBLE_EQ(small_usage + large_usage + empty_usage,
+                     metrics_registry_->GetGauge("meta_indexer.total_cache_usage").Get());
     // Metadata-only entries consume local memory without consuming data-storage quota.
     EXPECT_DOUBLE_EQ(
         0,
@@ -651,9 +686,15 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
 
     ASSERT_EQ(EC_OK, small->Delete(&context, {7}).ec);
     ASSERT_TRUE(sample());
-    expect_usage("small", 0);
+    EXPECT_DOUBLE_EQ(2, metrics_registry_->GetGauge("meta_indexer.total_local_location_count").Get());
+    EXPECT_DOUBLE_EQ(0,
+                     metrics_registry_
+                         ->GetGauge("cache_manager_instance.local_location_count",
+                                    {{"instance_group", "group_a"}, {"instance_id", "small"}})
+                         .Get());
+    expect_usage("small", small_bucket_usage);
     expect_usage("large", large_usage);
-    expect_usage("empty", 0);
+    expect_usage("empty", empty_usage);
 
     cache_manager_->InvalidateInstanceMetrics("small");
     reporter_->ReportInterval();
@@ -664,7 +705,12 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
         EXPECT_NE("small", tags.at("instance_id"));
     }
     expect_usage("large", large_usage);
-    expect_usage("empty", 0);
+    expect_usage("empty", empty_usage);
+    const std::string location_series =
+        "kvcm_cache_manager_instance_local_location_count{instance_group=\"group_b\",instance_id=\"large\"} 2\n";
+    EXPECT_NE(PrometheusExporter::Expose(*metrics_registry_).find(location_series), std::string::npos);
+    ASSERT_NE(nullptr, metrics_registry_->GetMetricsData("cache_manager_instance.local_location_count"));
+    EXPECT_EQ(2u, metrics_registry_->GetMetricsData("cache_manager_instance.local_location_count")->GetSize());
 }
 
 TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {
@@ -690,4 +736,23 @@ TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {
     expect_health(1.0);
     backend->SetOpen(false);
     expect_health(0.0);
+}
+
+TEST_F(LocalMetricsReporterTest, HeartbeatPublishesZeroAfterSnapshotWithoutChangingItsSample) {
+    auto shared =
+        std::make_shared<ServiceMetricsCollector>(metrics_registry_, MetricsTags{{"api_name", "ReportEvent"}});
+    ASSERT_TRUE(shared->Init());
+    std::shared_ptr<ServiceMetricsCollector> snapshot = shared->MakeRequestCollector();
+    std::shared_ptr<ServiceMetricsCollector> heartbeat = shared->MakeRequestCollector();
+    RequestContext snapshot_context("snapshot-key-count", snapshot);
+    snapshot_context.set_status_code(RequestContext::kOkStatusCode);
+    RequestContext heartbeat_context("heartbeat-key-count", heartbeat);
+    heartbeat_context.set_status_code(RequestContext::kOkStatusCode);
+    SET_METRICS_(snapshot, meta_indexer, query_key_count, 3600000.);
+    { ServiceCallGuard guard(cache_manager_.get(), &snapshot_context, reporter_.get()); }
+    EXPECT_DOUBLE_EQ(3600000., shared->get_meta_indexer_query_key_count_metrics());
+    { ServiceCallGuard guard(cache_manager_.get(), &heartbeat_context, reporter_.get()); }
+    EXPECT_DOUBLE_EQ(0., shared->get_meta_indexer_query_key_count_metrics());
+    EXPECT_DOUBLE_EQ(3600000., snapshot->get_meta_indexer_query_key_count_metrics());
+    EXPECT_EQ(2u, shared->get_service_query_counter_metrics());
 }

@@ -80,3 +80,15 @@ TEST_F(MetaIndexerConfigTest, TestMemoryPrimaryJsonRoundTripAndDefault) {
     EXPECT_FALSE(restored.FromJsonString(R"({"storage_type":"local","memory_primary":"true"})"));
     EXPECT_FALSE(restored.FromJsonString(R"({"storage_type":"local","force_deleting_async_enqueue":"false"})"));
 }
+
+TEST_F(MetaIndexerConfigTest, TestLegacySearchCacheConfigIsIgnored) {
+    ASSERT_TRUE(config_->FromJsonString(R"({
+        "meta_storage_backend_config": {"storage_type": "local"},
+        "meta_cache_policy_config": {"type": "removed", "capacity": 1024}
+    })"));
+    std::string invalid_fields;
+    EXPECT_TRUE(config_->ValidateRequiredFields(invalid_fields));
+    EXPECT_TRUE(invalid_fields.empty());
+    EXPECT_EQ("local", config_->GetMetaStorageBackendConfig()->GetStorageType());
+    EXPECT_EQ(std::string::npos, config_->ToJsonString().find("meta_cache_policy_config"));
+}

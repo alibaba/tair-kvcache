@@ -11,7 +11,6 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
@@ -39,14 +38,11 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     constexpr std::string_view kOtherHost = "other-host:8080";
 
     auto backend_config = std::make_shared<MetaStorageBackendConfig>("local");
-    auto cache_config = std::make_shared<MetaCachePolicyConfig>();
-    cache_config->SetCapacity(0);
     auto indexer_config = std::make_shared<MetaIndexerConfig>();
     indexer_config->SetMaxKeyCount(kMaxKeyCount + 16);
     indexer_config->SetMutexShardNum(256);
     indexer_config->SetBatchKeySize(kSetupBatchSize);
     indexer_config->SetMetaStorageBackendConfig(backend_config);
-    indexer_config->SetMetaCachePolicyConfig(cache_config);
 
     auto indexer = std::make_shared<MetaIndexer>();
     indexer->SetQueryExecutor(std::make_shared<QueryExecutor>(

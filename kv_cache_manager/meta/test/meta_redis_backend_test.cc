@@ -332,7 +332,7 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesReadsTimestampsWithoutWr
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(EC_OK, meta_redis_backend_->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->SampleReclaimCandidates(nullptr, 2, candidates, false));
     ASSERT_EQ(2, candidates.size());
     EXPECT_EQ(1, candidates[0].key);
     EXPECT_EQ(101, candidates[0].last_access_time_us);
@@ -373,7 +373,7 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegradesA
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(EC_OK, meta_redis_backend_->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->SampleReclaimCandidates(nullptr, 2, candidates, false));
     ASSERT_EQ(2, candidates.size());
     EXPECT_EQ(0, candidates[0].last_access_time_us);
     EXPECT_EQ(0, candidates[1].last_access_time_us);

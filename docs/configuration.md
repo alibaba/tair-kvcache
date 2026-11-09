@@ -352,12 +352,6 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
                     "storage_type": "local",
                     "storage_uri": "",
                     "memory_primary": false # 默认关闭；仅 cached + local + async_redis 可开启
-                },
-                "meta_cache_policy_config": { # 控制 meta indexer数据cache的配置
-                    "type": "LRU",
-                    "capacity": 10000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0
                 }
             }
         },

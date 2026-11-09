@@ -59,7 +59,6 @@ cc_library(
         "data_storage_strategy.cc",
         "instance_group.cc",
         "instance_group_quota.cc",
-        "meta_cache_policy_config.cc",
         "meta_indexer_config.cc",
         "meta_storage_backend_config.cc",
         "migration_strategy.cc",
@@ -74,7 +73,6 @@ cc_library(
         "data_storage_strategy.h",
         "instance_group.h",
         "instance_group_quota.h",
-        "meta_cache_policy_config.h",
         "meta_indexer_config.h",
         "meta_storage_backend_config.h",
         "migration_strategy.h",
@@ -90,15 +88,6 @@ cc_library(
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
-    ],
-)
-
-cc_library(
-    name = "meta_cache_policy_config",
-    srcs = ["meta_cache_policy_config.cc"],
-    hdrs = ["meta_cache_policy_config.h"],
-    deps = [
-        "//kv_cache_manager/common",
     ],
 )
 

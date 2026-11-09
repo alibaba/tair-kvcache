@@ -12,6 +12,88 @@
 
 namespace kv_cache_manager {
 
+class LRUCacheMetadataChargeTest : public TESTBASE {
+protected:
+    void SetUp() override { CreateCache(true); }
+
+    void CreateCache(bool no_evict) {
+        LRUCacheOptions options;
+        options.capacity = 1024 * 1024;
+        options.num_shard_bits = 0;
+        options.strict_capacity_limit = true;
+        options.no_evict_on_insert = no_evict;
+        options.metadata_charge_policy = kFullChargeCacheMetadata;
+        cache_ = std::make_shared<LRUCache>(options);
+    }
+
+    std::string Key(size_t index) const {
+        std::string key(8, 'k');
+        key[0] = static_cast<char>('a' + index);
+        return key;
+    }
+
+    void Insert(size_t index) {
+        Cache::Handle *handle = nullptr;
+        ASSERT_EQ(EC_OK, cache_->Insert(Key(index), nullptr, &kNoopCacheItemHelper, 5, &handle, Cache::Priority::LOW));
+        ASSERT_NE(nullptr, handle);
+        EXPECT_FALSE(cache_->Release(handle));
+    }
+
+    std::shared_ptr<LRUCache> cache_;
+};
+
+TEST_F(LRUCacheMetadataChargeTest, KeepsAllocatedBucketsAfterErase) {
+    EXPECT_EQ(EstimateAllocationSize(16 * sizeof(void *)), cache_->GetUsage());
+    for (size_t i = 0; i < 17; ++i) {
+        Insert(i);
+    }
+    EXPECT_EQ(32u, cache_->GetTableAddressCount());
+    for (size_t i = 0; i < 17; ++i) {
+        ASSERT_TRUE(cache_->Erase(Key(i)));
+    }
+    EXPECT_EQ(0u, cache_->GetOccupancyCount());
+    EXPECT_EQ(0u, cache_->GetPinnedUsage());
+    EXPECT_EQ(EstimateAllocationSize(32 * sizeof(void *)), cache_->GetUsage());
+}
+
+TEST_F(LRUCacheMetadataChargeTest, RejectsBeforeHashTableGrowthExceedsCapacity) {
+    const size_t initial_usage = cache_->GetUsage();
+    Insert(0);
+    const size_t entry_charge = cache_->GetUsage() - initial_usage;
+    ASSERT_TRUE(cache_->Erase(Key(0)));
+    const size_t full_usage = EstimateAllocationSize(32 * sizeof(void *)) + 16 * entry_charge;
+    cache_->SetCapacity(full_usage - 1);
+    for (size_t i = 0; i < 15; ++i) {
+        Insert(i);
+    }
+    EXPECT_EQ(entry_charge - 1, cache_->GetAvailableCapacity(Key(15)));
+    EXPECT_GT(cache_->GetAvailableCapacity(Key(0)), cache_->GetAvailableCapacity(Key(15)));
+    Cache::Handle *handle = nullptr;
+    EXPECT_EQ(EC_NOSPC, cache_->Insert(Key(15), nullptr, &kNoopCacheItemHelper, 5, &handle, Cache::Priority::LOW));
+    EXPECT_EQ(nullptr, handle);
+    EXPECT_EQ(15u, cache_->GetOccupancyCount());
+    EXPECT_EQ(16u, cache_->GetTableAddressCount());
+    cache_->SetCapacity(full_usage);
+    Insert(15);
+    EXPECT_EQ(full_usage, cache_->GetUsage());
+    EXPECT_EQ(32u, cache_->GetTableAddressCount());
+}
+
+TEST_F(LRUCacheMetadataChargeTest, EvictionCanAvoidHashTableGrowth) {
+    CreateCache(false);
+    const size_t initial_usage = cache_->GetUsage();
+    Insert(0);
+    const size_t entry_charge = cache_->GetUsage() - initial_usage;
+    ASSERT_TRUE(cache_->Erase(Key(0)));
+    cache_->SetCapacity(initial_usage + 16 * entry_charge);
+    for (size_t i = 0; i < 16; ++i) {
+        Insert(i);
+    }
+    EXPECT_EQ(15u, cache_->GetOccupancyCount());
+    EXPECT_EQ(16u, cache_->GetTableAddressCount());
+    EXPECT_EQ(initial_usage + 15 * entry_charge, cache_->GetUsage());
+}
+
 class LRUCacheTest : public TESTBASE {
 public:
     LRUCacheTest() = default;
@@ -353,7 +435,7 @@ TEST(LRUCacheBatchTest, ReleaseReusesLookupShardRuns) {
         EXPECT_EQ(lookup_order, scratch.ordered_indices);
         EXPECT_EQ(lookup_offsets, scratch.shard_offsets);
         cache->Erase("hit");
-        EXPECT_EQ(0u, cache->GetUsage());
+        EXPECT_EQ(cache->GetTableAddressCount() * sizeof(void *), cache->GetUsage());
     }
 }
 
@@ -383,7 +465,7 @@ TEST(LRUCacheBatchTest, ReleaseFallsBackWhenHandlesNoLongerMatchLookupShards) {
 
     cache->ReleaseBatchWithScratch(handles, 2, &scratch);
 
-    EXPECT_EQ(0u, cache->GetUsage());
+    EXPECT_EQ(cache->GetTableAddressCount() * sizeof(void *), cache->GetUsage());
 }
 
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
@@ -578,6 +660,94 @@ TEST_F(LRUCacheTest, EntriesWithPriority) {
     // Bottom-pri entries will be inserted to head of high-pri pool after lookup.
     ASSERT_TRUE(Lookup("m"));
     ValidateLRUList({"x", "y", "g", "z", "d", "m"}, 2, 2, 2);
+}
+
+class LRUCacheValueCountTest : public TESTBASE {
+protected:
+    void SetUp() override {
+        helper_.del_cb = [](Cache::ObjectPtr value, MemoryAllocator *) { delete static_cast<size_t *>(value); };
+        helper_.value_count_cb = [](Cache::ObjectPtr value) noexcept { return *static_cast<const size_t *>(value); };
+        CreateCache(true);
+    }
+    void CreateCache(bool no_evict) {
+        LRUCacheOptions options;
+        options.capacity = 1024 * 1024;
+        options.num_shard_bits = 1;
+        options.strict_capacity_limit = true;
+        options.no_evict_on_insert = no_evict;
+        cache_ = std::make_shared<LRUCache>(options);
+    }
+    void Insert(const std::string &key, size_t count) {
+        Cache::Handle *handle = nullptr;
+        size_t *value = new size_t(count);
+        const ErrorCode ec = cache_->Insert(key, value, &helper_, sizeof(size_t), &handle, Cache::Priority::LOW);
+        if (ec != EC_OK) {
+            delete value;
+        }
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_NE(nullptr, handle);
+        EXPECT_FALSE(cache_->Release(handle));
+    }
+    Cache::CacheItemHelper helper_;
+    std::shared_ptr<LRUCache> cache_;
+};
+
+TEST_F(LRUCacheValueCountTest, CountsCachedValuesAcrossMutationReplacementAndPinnedErase) {
+    EXPECT_EQ(0u, cache_->GetValueCount());
+    Insert("a", 3);
+    Insert("b", 5);
+    EXPECT_EQ(8u, cache_->GetValueCount());
+    Cache::Handle *retained = cache_->Lookup("a");
+    ASSERT_NE(nullptr, retained);
+    ASSERT_TRUE(cache_->ApplyToHandleNoTouch(
+        retained, [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+            *static_cast<size_t *>(value) = 7;
+            return 0;
+        }));
+    EXPECT_EQ(12u, cache_->GetValueCount());
+    Insert("a", 2);
+    EXPECT_EQ(7u, cache_->GetValueCount());
+    bool called = false;
+    EXPECT_FALSE(cache_->ApplyToHandleNoTouch(
+        retained, [&called](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+            called = true;
+            return 0;
+        }));
+    EXPECT_FALSE(called);
+    EXPECT_TRUE(cache_->Release(retained));
+    ASSERT_TRUE(
+        cache_->ApplyToEntryNoTouch("b", [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+            *static_cast<size_t *>(value) = 4;
+            return 0;
+        }));
+    EXPECT_EQ(6u, cache_->GetValueCount());
+    retained = cache_->Lookup("b");
+    ASSERT_NE(nullptr, retained);
+    ASSERT_TRUE(cache_->Erase("b"));
+    EXPECT_EQ(2u, cache_->GetValueCount());
+    EXPECT_TRUE(cache_->Release(retained));
+    ASSERT_TRUE(cache_->Erase("a"));
+    EXPECT_EQ(0u, cache_->GetValueCount());
+}
+
+TEST_F(LRUCacheValueCountTest, FailedInsertAndEvictionKeepValueCountExact) {
+    Insert("a", 3);
+    EXPECT_EQ(EC_EXIST,
+              cache_->InsertIfAbsent("a", new size_t(50), &helper_, sizeof(size_t), nullptr, Cache::Priority::LOW));
+    EXPECT_EQ(3u, cache_->GetValueCount());
+    cache_->SetCapacity(0);
+    size_t *rejected = new size_t(100);
+    Cache::Handle *handle = nullptr;
+    EXPECT_EQ(EC_NOSPC, cache_->Insert("b", rejected, &helper_, sizeof(size_t), &handle, Cache::Priority::LOW));
+    delete rejected;
+    EXPECT_EQ(nullptr, handle);
+    EXPECT_EQ(0u, cache_->GetValueCount());
+    CreateCache(false);
+    Insert("a", 3);
+    Insert("b", 7);
+    EXPECT_EQ(10u, cache_->GetValueCount());
+    cache_->SetCapacity(0);
+    EXPECT_EQ(0u, cache_->GetValueCount());
 }
 
 } // namespace kv_cache_manager

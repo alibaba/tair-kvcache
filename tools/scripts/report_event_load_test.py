@@ -88,7 +88,7 @@ class FakeBootstrapClient:
         if event_type == "EVENT_BLOCK_SNAPSHOT":
             return {
                 "header": {"status": {"code": "OK"}},
-                "committed_snapshot_version": "a" * 32,
+                "committed_snapshot_version": "a" * 8,
                 "snapshot_required": False,
             }
         raise AssertionError(f"unexpected payload: {payload}")
@@ -118,6 +118,11 @@ class ReportEventLoadTest(unittest.TestCase):
         self.assertEqual(
             calls[0][1]["instance_id"], "test_instance"
         )
+        self.assertEqual(
+            calls[0][1]["default_query_type"],
+            "QT_PREFIX_MATCH",
+        )
+        self.assertNotIn("query_type", calls[0][1])
         node_register_types = [
             payload["storage_type"]
             for api, payload in calls
@@ -136,7 +141,7 @@ class ReportEventLoadTest(unittest.TestCase):
             shadow.host(
                 "10.0.0.1:8080"
             ).committed_snapshot_version,
-            "a" * 32,
+            "a" * 8,
         )
 
     def test_bootstrap_rejects_reusing_committed_reporter(self):
@@ -192,6 +197,28 @@ class ReportEventLoadTest(unittest.TestCase):
         ):
             report_event_load.register_first_reporter(
                 MissingClient(), args, "10.0.0.1:8080"
+            )
+
+    def test_snapshot_version_matches_current_protocol(self):
+        response = {
+            "committed_snapshot_version": "a283bea6",
+            "snapshot_required": False,
+        }
+        self.assertEqual(
+            report_event_load.validate_new_snapshot_version(
+                response, "12345678", "SNAPSHOT"
+            ),
+            "a283bea6",
+        )
+        for token in ("a" * 32, "a283bea", "g283bea6", "12345678"):
+            with self.subTest(token=token), self.assertRaises(AssertionError):
+                report_event_load.validate_new_snapshot_version(
+                    dict(response, committed_snapshot_version=token),
+                    "12345678", "SNAPSHOT"
+                )
+        with self.assertRaises(AssertionError):
+            report_event_load.validate_new_snapshot_version(
+                dict(response, snapshot_required=True), "12345678", "SNAPSHOT"
             )
 
     def test_retry_after_ms_accepts_json_string(self):

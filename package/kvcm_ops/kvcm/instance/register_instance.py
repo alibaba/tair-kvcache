@@ -160,6 +160,9 @@ def parse_args():
         help="location spec infos"
     )
 
+    parser.add_argument("--disable_write_session", action="store_true", default=None,
+                        help="Use the single-spec EventReport metadata indexer")
+
     args = parser.parse_args()
     return args
 
@@ -183,6 +186,8 @@ def main():
         "block_size": args.block_size,
         "location_spec_infos": location_spec_infos_to_json_data(args.location_spec_infos)
     }
+    if args.disable_write_session is not None:
+        data["disable_write_session"] = args.disable_write_session
     result = http_post(args.host, "/api/registerInstance", data, args.verbose)
     pretty_print_json(result)
 

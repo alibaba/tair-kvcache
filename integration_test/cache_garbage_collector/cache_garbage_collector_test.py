@@ -404,10 +404,6 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
                                 "storage_type": meta_storage_type,
                                 "storage_uri": metadata_uri,
                             },
-                            "meta_cache_policy_config": {
-                                "capacity": 1024 * 1024,
-                                "type": "LRU",
-                            },
                             "persist_metadata_interval_time_ms": 0,
                         },
                     },

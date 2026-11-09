@@ -41,6 +41,10 @@ public:
     ~MetaStorageBackendManager();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept;
+    // Injected local serves as the sole backend for local, or the hot layer for cached.
+    ErrorCode Init(const std::string &instance_id,
+                   const std::shared_ptr<MetaStorageBackendConfig> &config,
+                   std::unique_ptr<MetaCacheBaseBackend> injected_local) noexcept;
 
     ErrorCode Open() noexcept;
     ErrorCode Close() noexcept;
@@ -212,6 +216,8 @@ public:
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     size_t GetMemUsage() const noexcept;
+    size_t GetLocalKeyCount() const noexcept;
+    size_t GetLocalLocationCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
@@ -237,6 +243,8 @@ private:
                 local_primary ? persistent_backend_.get() : cache_backend_.get(),
                 local_primary};
     }
+    std::vector<ErrorCode>
+    WritePrimary(RequestContext *request_context, BatchMetaData &batch, const WriteRoute &route, bool replace) noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,

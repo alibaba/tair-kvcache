@@ -413,8 +413,7 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriEmpty) {
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_CAPACITY * 1024 * 1024, backend->cache_->GetCapacity());
     uint32_t expected_shard_mask = (1 << META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS) - 1;
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
-    ASSERT_EQ((1u << META_LOCAL_BACKEND_DEFAULT_NUM_ITEM_MUTEX_SHARD_BITS) - 1,
-              backend->item_mutex_shard_mask_);
+    ASSERT_EQ((1u << META_LOCAL_BACKEND_DEFAULT_NUM_ITEM_MUTEX_SHARD_BITS) - 1, backend->item_mutex_shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES, backend->sample_times_);
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
@@ -535,22 +534,19 @@ TEST_F(MetaLocalBackendTest, TestUpsertPreservesRequestOrderForMixedCapacityBatc
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {2}, {{{PROPERTY_URI, "existing"}}}));
 
-    // UpdateInPlace historically does not reject charge growth. Therefore the
-    // request order below first admits key 1 while the cache has room, then
-    // expands existing key 2. Reordering all existing updates ahead of all
-    // missing inserts would incorrectly reject the earlier key 1.
+    // Each growth is admitted in request order: key 1 uses the remaining room,
+    // so the subsequent expansion of existing key 2 must leave its old value intact.
     const std::string large_insert(600 * 1024, 'i');
     const std::string large_update(600 * 1024, 'u');
-    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
               UpsertWithFieldMaps(
                   backend.get(), {1, 2}, {{{PROPERTY_URI, large_insert}}, {{PROPERTY_HIT_COUNT, large_update}}}));
 
-    AssertGetProperties(
-        backend.get(),
-        {1, 2},
-        {PROPERTY_URI, PROPERTY_HIT_COUNT},
-        {EC_OK, EC_OK},
-        {{{PROPERTY_URI, large_insert}}, {{PROPERTY_URI, "existing"}, {PROPERTY_HIT_COUNT, large_update}}});
+    AssertGetProperties(backend.get(),
+                        {1, 2},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, large_insert}}, {{PROPERTY_URI, "existing"}}});
     ASSERT_EQ(EC_OK, backend->Close());
 
     auto reverse_backend = std::make_shared<MetaLocalBackend>();
@@ -598,7 +594,8 @@ TEST_F(MetaLocalBackendTest, TestBatchedUpsertShapesMatchSequentialReference) {
         SplitFieldMaps(fields, reference_locations, reference_properties);
         std::vector<ErrorCode> reference_results(keys.size(), EC_OK);
         for (size_t i = 0; i < keys.size(); ++i) {
-            reference_results[i] = reference->UpsertForOneKey(keys[i], reference_locations[i], reference_properties[i]);
+            reference_results[i] =
+                reference->UpsertForOneKey(keys[i], reference_locations[i], reference_properties[i], true);
         }
         EXPECT_EQ(reference_results, UpsertWithFieldMaps(optimized.get(), keys, fields));
         observed_keys.insert(keys.begin(), keys.end());
@@ -1215,8 +1212,7 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTouchRefreshesSingletonShardColdness
     location->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->Put(nullptr, {1}, {{{"loc", location}}}, PropertyMapVector(1)));
     ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
-        MetaLocalBackend::KeyToView(1),
-        [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+        MetaLocalBackend::KeyToView(1), [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
             static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(100);
             return 0;
         }));
@@ -1323,7 +1319,7 @@ TEST_F(MetaLocalBackendTest, TestReclaimSampleReselectsColdShardsAndRespectsSamp
     const auto &coldest_keys = shards.at(cold_shards[0].second);
     for (int attempt = 0; attempt < 2; ++attempt) {
         ReclaimCandidateVector sample;
-        ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample));
+        ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample, false));
         ASSERT_EQ(2, sample.size());
         for (size_t i = 0; i < sample.size(); ++i) {
             EXPECT_EQ(coldest_keys[i], sample[i].key);
@@ -1335,7 +1331,7 @@ TEST_F(MetaLocalBackendTest, TestReclaimSampleReselectsColdShardsAndRespectsSamp
     // it does not globally merge the individual keys from every shard.
     backend->sample_times_ = 2;
     ReclaimCandidateVector sample;
-    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 4, sample));
+    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 4, sample, false));
     ASSERT_EQ(4, sample.size());
     EXPECT_EQ(coldest_keys[0], sample[0].key);
     EXPECT_EQ(coldest_keys[1], sample[1].key);
@@ -1349,7 +1345,7 @@ TEST_F(MetaLocalBackendTest, TestReclaimSampleReselectsColdShardsAndRespectsSamp
     PropertyMapVector properties;
     ASSERT_EQ(std::vector<ErrorCode>(coldest_keys.size(), EC_OK),
               backend->GetProperties(nullptr, coldest_keys, {PROPERTY_LRU_TIME}, properties));
-    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample));
+    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample, false));
     ASSERT_EQ(2, sample.size());
     EXPECT_EQ(next_coldest_keys[0], sample[0].key);
     EXPECT_EQ(next_coldest_keys[1], sample[1].key);
@@ -2591,6 +2587,42 @@ TEST_F(MetaLocalBackendTest, TestStrictCapacityInsertFails) {
     ASSERT_EQ(EC_OK, retry[0]);
 
     ASSERT_EQ(EC_OK, backend->Close());
+}
+
+TEST_F(MetaLocalBackendTest, LocalLocationCountTracksAllLocalMutationPaths) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("location_count", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    const auto location = [](const std::string &id) {
+        std::shared_ptr<CacheLocation> value = std::make_shared<CacheLocation>();
+        value->set_id(id);
+        value->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        value->set_status(CLS_SERVING);
+        value->push_location_spec(LocationSpec("spec", "uri"));
+        return value;
+    };
+    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        meta_storage_backend_->Put(nullptr, {1}, {{{"a", location("a")}, {"b", location("b")}}}, PropertyMapVector(1)));
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->Upsert(
+                  nullptr, {1}, {{{"a", location("a")}, {"c", location("c")}}}, PropertyMapVector(1)));
+    EXPECT_EQ(3u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->DeleteLocations(nullptr, {1}, {{"a", "missing"}}));
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalLocationCount());
+    const LocationId id = "d";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              GetLocalBackend()->UpsertSingleLocations(nullptr, {1}, {&id}, {location(id)}));
+    EXPECT_EQ(3u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1}, {{{"b", location("b")}}}, PropertyMapVector(1)));
+    EXPECT_EQ(1u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
+    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
 }
 
 } // namespace kv_cache_manager

@@ -45,6 +45,7 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::opti
         ++response_counter;
     } else if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<ServiceMetricsCollector *>(collector);
+        p->PublishQueryKeyCountSample();
 
         do {
             // service query_counter
@@ -159,15 +160,18 @@ void LocalMetricsReporter::ReportInterval() {
 
         const auto indexer_map = meta_indexer_manager->GetIndexers();
         std::size_t total_key_count_v = 0;
+        std::size_t total_local_location_count_v = 0;
         std::size_t total_cache_usage_v = 0;
         for (auto &[_, indexer] : indexer_map) {
             if (indexer) {
                 total_key_count_v += indexer->GetKeyCount();
+                total_local_location_count_v += indexer->GetLocalLocationCount();
                 total_cache_usage_v += indexer->GetMemUsage();
             }
         }
 
         SET_METRICS_(p, meta_indexer, total_key_count, static_cast<double>(total_key_count_v));
+        SET_METRICS_(p, meta_indexer, total_local_location_count, static_cast<double>(total_local_location_count_v));
         SET_METRICS_(p, meta_indexer, total_cache_usage, static_cast<double>(total_cache_usage_v));
     } while (false);
 
@@ -208,6 +212,14 @@ void LocalMetricsReporter::ReportInterval() {
                                 metrics_registry_,
                                 MetricsTags{{"instance_group", instance_group_name}, {"instance_id", instance_id}});
                     SET_METRICS_(p, cache_manager_instance, key_count, static_cast<double>(instance_metric.key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 local_key_count,
+                                 static_cast<double>(instance_metric.local_key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 local_location_count,
+                                 static_cast<double>(instance_metric.local_location_count));
                     SET_METRICS_(p, cache_manager_instance, byte_size, static_cast<double>(instance_metric.byte_size));
                     SET_METRICS_(p,
                                  cache_manager_instance,

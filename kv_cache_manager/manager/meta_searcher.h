@@ -212,6 +212,9 @@ public:
                                                                                    : nullptr;
         }
     };
+    std::vector<std::vector<int32_t>> GetWriteBatches(const KeyVector &keys) const;
+    static ErrorCode ValidateReplaceLocationSpecsTask(const ReplaceLocationSpecsTask &task,
+                                                      std::uint64_t &out_total_size);
     // Replaces existing specs or creates the stable location in one metadata
     // read-modify-write operation per batch. Keys and location ids within a
     // key must be unique. Every task requires non-empty, uniquely named specs

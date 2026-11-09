@@ -219,6 +219,13 @@ public:
         return GetShard(hash).ApplyToEntryNoTouch(key, hash, callback);
     }
 
+    bool
+    ApplyToHandleNoTouch(Handle *handle,
+                         const std::function<ssize_t(ObjectPtr, size_t, const CacheItemHelper *)> &callback) override {
+        HandleImpl *entry = static_cast<HandleImpl *>(handle);
+        return GetShard(entry->GetHash()).ApplyToHandleNoTouch(entry, callback);
+    }
+
     bool Exists(const std::string_view &key) override {
         HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
         return GetShard(hash).Exists(key, hash);
@@ -227,6 +234,11 @@ public:
     bool Erase(const std::string_view &key) override {
         HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
         return GetShard(hash).Erase(key, hash);
+    }
+
+    size_t GetAvailableCapacity(const std::string_view &key) const override {
+        const HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
+        return GetShard(hash).GetAvailableCapacity(key, hash);
     }
 
     void AdjustCharge(Handle *handle, ssize_t delta) override {
@@ -249,6 +261,7 @@ public:
     size_t GetUsage() const override { return SumOverShards2(&CacheShard::GetUsage); }
     size_t GetPinnedUsage() const override { return SumOverShards2(&CacheShard::GetPinnedUsage); }
     size_t GetOccupancyCount() const override { return SumOverShards2(&CacheShard::GetOccupancyCount); }
+    size_t GetValueCount() const override { return SumOverShards2(&CacheShard::GetValueCount); }
     size_t GetTableAddressCount() const override { return SumOverShards2(&CacheShard::GetTableAddressCount); }
     void ApplyToAllEntries(
         const std::function<

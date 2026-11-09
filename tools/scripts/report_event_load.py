@@ -292,7 +292,7 @@ def build_register_instance_payload(args: argparse.Namespace) -> Dict:
         "location_spec_infos": [
             {"name": args.spec_name, "size": args.spec_size}
         ],
-        "query_type": "QT_PREFIX_MATCH",
+        "default_query_type": "QT_PREFIX_MATCH",
     }
 
 
@@ -552,7 +552,7 @@ def validate_new_snapshot_version(
 ) -> str:
     actual = response.get("committed_snapshot_version", "")
     if (
-        len(actual) != 32
+        len(actual) != 8
         or any(char not in "0123456789abcdef" for char in actual)
         or actual == previous
     ):

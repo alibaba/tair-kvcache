@@ -66,12 +66,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
 
     // Test initial state
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_key_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, get_not_exist_key_count), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_batch_num), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_miss_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 0.);
@@ -86,12 +81,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
 
     // Test value setting
     SET_METRICS_(p, meta_indexer, query_key_count, 100.);
-    SET_METRICS_(p, meta_indexer, get_not_exist_key_count, 1.);
     SET_METRICS_(p, meta_indexer, query_batch_num, 10.);
-    SET_METRICS_(p, meta_indexer, search_cache_hit_count, 50.);
-    SET_METRICS_(p, meta_indexer, search_cache_miss_count, 50.);
-    SET_METRICS_(p, meta_indexer, search_cache_hit_ratio, 50.);
-    SET_METRICS_(p, meta_indexer, io_data_size, 2048.);
     SET_METRICS_(p, meta_indexer, put_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, upsert_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, lock_wait_time_us, 200.);
@@ -105,12 +95,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     SET_METRICS_(p, meta_indexer, read_modify_write_delete_key_count, 10.);
 
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_key_count), 100.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, get_not_exist_key_count), 1.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_batch_num), 10.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_count), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_miss_count), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 2048.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 200.);
@@ -501,4 +486,41 @@ TEST_F(MetricsCollectorTest, ChronoScopeAsymmetricConcurrentTest) {
         double val = GET(p, meta_searcher, indexer_get_time_us);
         EXPECT_GE(val, static_cast<double>(kLongSleepUs - 500));
     }
+}
+
+TEST_F(MetricsCollectorTest, RequestQueryKeyCountsRemainPrivateDuringConcurrentPublication) {
+    ServiceMetricsCollector shared(metrics_registry_);
+    ASSERT_TRUE(shared.Init());
+    SET_METRICS_(&shared, meta_indexer, query_key_count, 3600000.);
+    const size_t metric_count = metrics_registry_->GetSize();
+    constexpr int kWorkers = 4;
+    constexpr int kRequests = 100;
+    std::atomic<int> ready{0};
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < kWorkers; ++i) {
+        workers.emplace_back([&, i]() {
+            std::shared_ptr<ServiceMetricsCollector> request = shared.MakeRequestCollector();
+            if (request->get_meta_indexer_query_key_count_metrics() != 0.) {
+                ++mismatches;
+            }
+            ++ready;
+            while (ready.load() != kWorkers) {
+                std::this_thread::yield();
+            }
+            const double expected = i == 0 ? 0. : static_cast<double>(i * 100);
+            for (int j = 0; j < kRequests; ++j) {
+                SET_METRICS_(request, meta_indexer, query_key_count, expected);
+                request->PublishQueryKeyCountSample();
+                if (request->get_meta_indexer_query_key_count_metrics() != expected) {
+                    ++mismatches;
+                }
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    EXPECT_EQ(0, mismatches.load());
+    EXPECT_EQ(metric_count, metrics_registry_->GetSize());
 }

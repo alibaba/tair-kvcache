@@ -151,7 +151,6 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
                     "mutex_shard_num": 16,
                     "batch_key_size": 16,
                     "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
-                    "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                 },
             },
             "event_report_storage_candidates": [storage_name],

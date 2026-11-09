@@ -345,6 +345,10 @@ public:
 
 class MalformedCacheWriteBackend : public MetaLocalBackend {
 public:
+    ErrorCode CheckWriteCapacity(KeyType, const CacheLocationMap &, const PropertyMap &, bool) noexcept override {
+        return EC_OK;
+    }
+
     std::vector<ErrorCode> Put(RequestContext *,
                                const KeyTypeVec &,
                                const CacheLocationMapVector &,
@@ -757,7 +761,8 @@ TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_OK, mgr.Init("test", config));
         ASSERT_EQ(EC_OK, mgr.Open());
-        EXPECT_EQ(0u, mgr.GetMemUsage());
+        const size_t bucket_usage = mgr.GetMemUsage();
+        EXPECT_GT(bucket_usage, 0u);
         EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
 
         BatchMetaData batch = MakeBatch({11});
@@ -772,7 +777,7 @@ TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
         EXPECT_GT(mgr.GetMemUsage(), usage_after_put);
 
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Delete(request_context_.get(), {11}));
-        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(bucket_usage, mgr.GetMemUsage());
         EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
         EXPECT_EQ(EC_OK, mgr.Close());
         EXPECT_EQ(0u, mgr.GetMemUsage());
@@ -802,6 +807,7 @@ TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
         SCOPED_TRACE("sum both backends");
         MetaStorageBackendManager mgr;
         MemoryPrimaryBackup &backup = *InitMemoryPrimary(mgr);
+        const size_t cache_bucket_usage = mgr.cache_backend_->GetMemUsage();
         BatchMetaData persistent_batch = MakeBatch({11});
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
                   backup.MetaLocalBackend::Put(request_context_.get(),
@@ -828,7 +834,7 @@ TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
         EXPECT_EQ(std::min(backup.GetOldestAccessTime(), cache_oldest), mgr.GetOldestAccessTime());
 
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.cache_backend_->Delete(request_context_.get(), {12}));
-        EXPECT_EQ(persistent_usage, mgr.GetMemUsage());
+        EXPECT_EQ(persistent_usage + cache_bucket_usage, mgr.GetMemUsage());
         EXPECT_EQ(backup.GetOldestAccessTime(), mgr.GetOldestAccessTime());
         EXPECT_EQ(EC_OK, mgr.Close());
         EXPECT_EQ(0u, mgr.GetMemUsage());

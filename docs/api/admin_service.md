@@ -164,10 +164,6 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "local_path": "/tmp/meta"
-                },
-                "meta_cache_policy_config": {
-                    "capacity": 10000,
-                    "type": "lru"
                 }
             }
         },
@@ -216,12 +212,6 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "storage_uri": ""
-                },
-                "meta_cache_policy_config": {
-                    "type": "LRU",
-                    "capacity": 100000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0
                 }
             }
         },
@@ -273,10 +263,6 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "redis",
                     "storage_uri": "redis://xxxx:xxxx@r-xxxx.redis.zhangbei.rds.aliyuncs.com:6379"
-                },
-                "meta_cache_policy_config": {
-                    "capacity": 10000,
-                    "type": "lru"
                 }
             }
         },
@@ -353,6 +339,14 @@ curl -g -vvv -X POST http://localhost:6492/api/removeCache \
 ```
 
 ## Register Instance
+
+`disable_write_session` is an optional boolean. Omitted on a new instance, it defaults to false.
+Set it to true for single-spec EventReport metadata with local storage or cached Redis/async Redis.
+Both modes require `memory_primary=false`. Ordinary write sessions and migration are unsupported.
+RemoveCache/TrimCache delete metadata only.
+The setting is persisted per instance: omission on re-registration preserves it, and an explicit different
+value is rejected. InstanceGroup configuration is unchanged.
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/registerInstance \
   -H "Content-Type: application/json" \

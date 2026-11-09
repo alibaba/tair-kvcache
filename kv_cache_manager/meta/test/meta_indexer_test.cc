@@ -19,7 +19,6 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
-#include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/meta/query_executor.h"
@@ -158,9 +157,9 @@ public:
     }
 
     std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *context,
-                                                                  const KeyTypeVec &keys,
-                                                                  const LocationIdsPerKey &ids,
-                                                                  LocationsPerKey &locations) noexcept override {
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &ids,
+                                                                   LocationsPerKey &locations) noexcept override {
         ++maintenance_read_calls;
         return MetaLocalBackend::GetLocationsForMaintenance(context, keys, ids, locations);
     }
@@ -174,9 +173,9 @@ public:
     }
 
     std::vector<ErrorCode> Upsert(RequestContext *,
-                                const KeyTypeVec &keys,
-                                const CacheLocationMapVector &locations,
-                                const PropertyMapVector &properties) noexcept override {
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
         pending.emplace_back([this, keys, locations, properties] {
             (void)MetaLocalBackend::Upsert(nullptr, keys, locations, properties);
         });
@@ -184,10 +183,10 @@ public:
     }
 
     std::vector<ErrorCode> Upsert(RequestContext *context,
-                                 const KeyTypeVec &keys,
-                                 const CacheLocationMapVector &locations,
-                                 const PropertyMapVector &properties,
-                                 const std::vector<ErrorCode> &previous_error_codes) noexcept override {
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept override {
         if (previous_error_codes.size() != keys.size()) {
             return std::vector<ErrorCode>(keys.size(), EC_ERROR);
         }
@@ -253,8 +252,7 @@ TEST_F(MetaIndexerTest, TestInit) {
     // test success
     std::string configStr = R"({
         "max_key_count" : 100, "mutex_shard_num" : 8,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
@@ -269,29 +267,25 @@ TEST_F(MetaIndexerTest, TestInit) {
     ASSERT_EQ(EC_BADARGS, meta_indexer_->Init(/*instance_id*/ "test", meta_indexer_config));
 
     configStr = R"({
-        "meta_storage_backend_config" : { "storage_type" : "test" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "test" }
     })";
     ASSERT_EQ(EC_ERROR, InitIndexer(configStr));
 
     configStr = R"({
         "max_key_count" : 100, "mutex_shard_num" : 10,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
 
     configStr = R"({
         "max_key_count" : 100, "mutex_shard_num" : 0,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
 
     configStr = R"({
         "max_key_count" : 100, "mutex_shard_num" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
 }
@@ -301,8 +295,7 @@ TEST_F(MetaIndexerTest, TestIsRecoveringReflectsBackendState) {
     ASSERT_EQ(EC_OK, InitIndexer(R"({
         "max_key_count": 100,
         "mutex_shard_num": 8,
-        "meta_storage_backend_config": {"storage_type": "local"},
-        "meta_cache_policy_config": {}
+        "meta_storage_backend_config": {"storage_type": "local"}
     })"));
     EXPECT_FALSE(meta_indexer_->IsRecovering());
 
@@ -332,8 +325,7 @@ TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
 TEST_F(MetaIndexerTest, TestTrimResiduesContinuesAfterEmptyPersistentPage) {
     const std::string config = R"({
         "max_key_count" : 100, "mutex_shard_num" : 8,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config));
 
@@ -383,8 +375,7 @@ TEST_F(MetaIndexerTest, TestTrimResiduesContinuesAfterEmptyPersistentPage) {
 TEST_F(MetaIndexerTest, TestTrimResiduesSyncsOncePerPersistentPage) {
     const std::string config = R"({
         "max_key_count" : 100, "mutex_shard_num" : 8, "batch_key_size" : 1,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : {}
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config));
 
@@ -422,8 +413,7 @@ TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErr
         "max_key_count" : 2048,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -483,8 +473,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesStopsAtFirstMissingChunk)
         "max_key_count" : 32768,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -526,8 +515,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesHonorsVisitorStop) {
         "max_key_count" : 32768,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -558,8 +546,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesReturnsEveryAllHitKey) {
         "max_key_count" : 2048,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -598,8 +585,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesClampsOversizedConfigured
         "max_key_count" : 8192,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -630,8 +616,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixGetIoMetricExcludesPipelinedVisitorTime
         "max_key_count" : 8192,
         "mutex_shard_num" : 64,
         "batch_key_size" : 128,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -666,8 +651,7 @@ TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
         "batch_key_size" : 1,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -705,8 +689,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesRejectsMalformedShape) {
     const std::string config_str = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -735,8 +718,7 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationRejectsMalformedBackendResult
     const std::string config_str = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -759,21 +741,22 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationRejectsMalformedBackendResult
             return LocationModifierResult{ModifierAction::MA_SKIP, std::vector<ErrorCode>(ids.size(), EC_OK)};
         };
 
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier, true, false);
     EXPECT_EQ(EC_ERROR, result.ec);
     ASSERT_EQ(1u, result.per_location_error_codes.size());
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
     EXPECT_EQ(0u, modifier_calls);
 
     malformed_raw->SetShape(MalformedLocationReadBackend::Shape::kShortInner);
-    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier, true, false);
     EXPECT_EQ(EC_ERROR, result.ec);
     ASSERT_EQ(1u, result.per_location_error_codes.size());
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
     EXPECT_EQ(0u, modifier_calls);
 
     malformed_raw->SetShape(MalformedLocationReadBackend::Shape::kNullValueWithOk);
-    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier, true, false);
     EXPECT_EQ(EC_ERROR, result.ec);
     ASSERT_EQ(1u, result.per_location_error_codes.size());
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
@@ -810,8 +793,7 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationPreservesPartialModifierResul
     const std::string config_str = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
 
@@ -831,7 +813,8 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationPreservesPartialModifierResul
         return LocationModifierResult{MA_OK, {EC_OK, EC_BADARGS}};
     };
 
-    const auto result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    const auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier, true, false);
     // The RMW itself succeeded. A per-location validation failure is surfaced
     // in the aligned result without turning the whole batch into an
     // infrastructure failure.
@@ -855,8 +838,7 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
             meta_indexer_ = std::make_shared<MetaIndexer>();
             ASSERT_EQ(EC_OK, InitIndexer(R"({
                 "max_key_count":100, "mutex_shard_num":8,
-                "meta_storage_backend_config":{"storage_type":"local"},
-                "meta_cache_policy_config":{}
+                "meta_storage_backend_config":{"storage_type":"local"}
             })"));
             auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
             auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
@@ -887,8 +869,8 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
                 return {MA_DELETE, {EC_OK}};
             };
             ASSERT_EQ(EC_OK,
-                      meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-                                       request_context_.get(), keys, {{"L1"}}, remove)
+                      meta_indexer_
+                          ->ReadModifyWriteLocationsForMaintenance(request_context_.get(), keys, {{"L1"}}, remove, true)
                           .ec);
             ASSERT_EQ(0u, meta_indexer_->GetKeyCount());
             ASSERT_EQ(1u, queued->pending.size());
@@ -917,10 +899,9 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
                     locations[0] = MakeLocation("L2", "new_uri");
                     return {MA_OK, {EC_OK}};
                 };
-                ASSERT_EQ(EC_OK,
-                          meta_indexer_->ReadModifyWriteTargetLocations(
-                                           request_context_.get(), keys, {{"L2"}}, add)
-                              .ec);
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), keys, {{"L2"}}, add).ec);
             }
             EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
             EXPECT_EQ(0, queued->sync_calls);
@@ -947,7 +928,7 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
 TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishesRecovery) {
     ASSERT_EQ(EC_OK, InitIndexer(R"({
         "max_key_count":100, "mutex_shard_num":8,
-        "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+        "meta_storage_backend_config":{"storage_type":"local"}
     })"));
     auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
     auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
@@ -959,8 +940,7 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
     ASSERT_EQ(EC_OK, hot->Init("test", config));
     ASSERT_EQ(EC_OK, hot->Open());
     const auto target = MakeLocation("L1", "target_uri");
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, hot->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     auto &manager = *meta_indexer_->backend_manager_;
     manager.persistent_backend_ = std::move(persistent);
@@ -975,16 +955,16 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
         persistent_called_before_hot = exists.size() == 1 && exists[0];
     };
     const auto remove = [&manager](const std::vector<ErrorCode> &ecs,
-                                  const LocationIdVector &,
-                                  size_t,
-                                  CacheLocationVector &,
-                                  PropertyMap &) -> LocationModifierResult {
+                                   const LocationIdVector &,
+                                   size_t,
+                                   CacheLocationVector &,
+                                   PropertyMap &) -> LocationModifierResult {
         manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
         return {MA_DELETE, ecs};
     };
-    ASSERT_EQ(EC_OK,
-              meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {42}, {{"L1"}}, remove)
-                  .ec);
+    ASSERT_EQ(
+        EC_OK,
+        meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {42}, {{"L1"}}, remove, true).ec);
     EXPECT_TRUE(persistent_called_before_hot);
     EXPECT_EQ(0, backend->sync_calls);
     EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
@@ -998,13 +978,11 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
 TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedis) {
     for (const bool memory_primary : {false, true}) {
         for (const bool recovering : {false, true}) {
-            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary
-                                             << " recovering=" << recovering);
+            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary << " recovering=" << recovering);
             meta_indexer_ = std::make_shared<MetaIndexer>();
             ASSERT_EQ(EC_OK, InitIndexer(R"({
                 "max_key_count":100, "mutex_shard_num":8,
-                "meta_storage_backend_config":{"storage_type":"local"},
-                "meta_cache_policy_config":{}
+                "meta_storage_backend_config":{"storage_type":"local"}
             })"));
             auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
             auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
@@ -1026,7 +1004,7 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
             manager.cache_backend_ = std::move(hot);
             manager.memory_primary_ = memory_primary;
             manager.recover_state_.store(recovering ? MetaStorageBackendManager::RecoverState::kRecover
-                                                   : MetaStorageBackendManager::RecoverState::kRunning);
+                                                    : MetaStorageBackendManager::RecoverState::kRunning);
             meta_indexer_->key_count_.store(1);
 
             // A successful business RMW updates hot while its Redis write is
@@ -1038,11 +1016,12 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
             ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.Upsert(nullptr, update));
             ASSERT_EQ(1u, queued->pending.size());
             int modifier_calls = 0;
-            const auto remove = [&modifier_calls, &old_location, &replacement](const std::vector<ErrorCode> &ecs,
-                                                                             const LocationIdVector &,
-                                                                             size_t,
-                                                                             CacheLocationVector &locations,
-                                                                             PropertyMap &) -> LocationModifierResult {
+            const auto remove =
+                [&modifier_calls, &old_location, &replacement](const std::vector<ErrorCode> &ecs,
+                                                               const LocationIdVector &,
+                                                               size_t,
+                                                               CacheLocationVector &locations,
+                                                               PropertyMap &) -> LocationModifierResult {
                 ++modifier_calls;
                 EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
                 EXPECT_EQ(replacement->ToJsonString(), locations[0]->ToJsonString());
@@ -1050,7 +1029,7 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
                         {locations[0]->ToJsonString() == old_location->ToJsonString() ? EC_OK : EC_MISMATCH}};
             };
             const auto result = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-                request_context_.get(), keys, {{"L1"}}, remove);
+                request_context_.get(), keys, {{"L1"}}, remove, true);
             EXPECT_EQ(EC_OK, result.ec);
             ASSERT_EQ(1u, result.per_location_error_codes.size());
             EXPECT_EQ(std::vector<ErrorCode>{EC_MISMATCH}, result.per_location_error_codes[0]);
@@ -1073,7 +1052,7 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
 TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     ASSERT_EQ(EC_OK, InitIndexer(R"({
         "max_key_count":100, "mutex_shard_num":8,
-        "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+        "meta_storage_backend_config":{"storage_type":"local"}
     })"));
     auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
     auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
@@ -1081,8 +1060,7 @@ TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     ASSERT_EQ(EC_OK, persistent->Init("test", config));
     ASSERT_EQ(EC_OK, persistent->Open());
     const auto target = MakeLocation("L1", "target_uri");
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     auto &manager = *meta_indexer_->backend_manager_;
     manager.persistent_backend_ = std::move(persistent);
     manager.cache_backend_.reset();
@@ -1090,15 +1068,20 @@ TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     // Ordinary GC does not fill missing keys without a hot mirror. Keep
     // its original target read, including local access/LRU updates.
     const auto result = meta_indexer_->ReadModifyWriteLocation(
-        request_context_.get(), {42}, {{"L1"}}, [target](const std::vector<ErrorCode> &ecs,
-                                                        const LocationIdVector &,
-                                                        size_t,
-                                                        CacheLocationVector &locations,
-                                                        PropertyMap &) -> LocationModifierResult {
+        request_context_.get(),
+        {42},
+        {{"L1"}},
+        [target](const std::vector<ErrorCode> &ecs,
+                 const LocationIdVector &,
+                 size_t,
+                 CacheLocationVector &locations,
+                 PropertyMap &) -> LocationModifierResult {
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
             EXPECT_EQ(target->ToJsonString(), locations[0]->ToJsonString());
             return {MA_SKIP, ecs};
-        }, true, true);
+        },
+        true,
+        true);
     EXPECT_EQ(EC_OK, result.ec);
     EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, result.per_location_error_codes[0]);
     EXPECT_EQ(1, backend->target_read_calls);
@@ -1112,7 +1095,7 @@ TEST_F(MetaIndexerTest, TestSingleBackendMaintenancePreservesQueueBarriers) {
         meta_indexer_ = std::make_shared<MetaIndexer>();
         ASSERT_EQ(EC_OK, InitIndexer(R"({
             "max_key_count":100, "mutex_shard_num":8,
-            "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+            "meta_storage_backend_config":{"storage_type":"local"}
         })"));
         auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
         auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
@@ -1136,14 +1119,18 @@ TEST_F(MetaIndexerTest, TestSingleBackendMaintenancePreservesQueueBarriers) {
         }
         int modifier_calls = 0;
         const auto removed = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-            request_context_.get(), {42}, {{"L1"}}, [&modifier_calls](const std::vector<ErrorCode> &ecs,
-                                                                     const LocationIdVector &,
-                                                                     size_t,
-                                                                     CacheLocationVector &,
-                                                                     PropertyMap &) -> LocationModifierResult {
+            request_context_.get(),
+            {42},
+            {{"L1"}},
+            [&modifier_calls](const std::vector<ErrorCode> &ecs,
+                              const LocationIdVector &,
+                              size_t,
+                              CacheLocationVector &,
+                              PropertyMap &) -> LocationModifierResult {
                 ++modifier_calls;
                 return {MA_DELETE, ecs};
-            });
+            },
+            true);
         EXPECT_EQ(drain_writes ? EC_OK : EC_ERROR, removed.ec);
         EXPECT_EQ(std::vector<ErrorCode>{drain_writes ? EC_OK : EC_TIMEOUT}, removed.per_location_error_codes[0]);
         EXPECT_EQ(drain_writes ? 1 : 0, modifier_calls);
@@ -1159,8 +1146,7 @@ TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemant
         "max_key_count" : 2,
         "mutex_shard_num" : 2,
         "batch_key_size" : 100,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(config_str));
     ASSERT_TRUE(meta_indexer_->SupportsSingleLocationRmw());
@@ -1270,8 +1256,7 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
         "batch_key_size" : 2,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
@@ -1306,8 +1291,7 @@ TEST_F(MetaIndexerTest, TestPureLocalMutexShardsReuseLruHashSeed) {
         "max_key_count" : 100,
         "mutex_shard_num" : 16,
         "batch_key_size" : 4,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
 
@@ -1336,8 +1320,7 @@ TEST_F(MetaIndexerTest, TestMakeBatchesPreservesOrderWithinEachShard) {
         "max_key_count" : 100,
         "mutex_shard_num" : 16,
         "batch_key_size" : 3,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
@@ -1376,8 +1359,7 @@ TEST_F(MetaIndexerTest, TestLocalSimple) {
         "batch_key_size" : 2,
         "meta_storage_backend_config" : {
             "storage_type" : "local"
-        },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
@@ -1393,8 +1375,7 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
         "batch_key_size" : 4,
         "meta_storage_backend_config" : {
             "storage_type" : "local"
-        },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(10000, meta_indexer_->max_key_count_);
@@ -1409,8 +1390,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
         "persist_metadata_interval_time_ms" : 0,
-        "meta_storage_backend_config" : { "storage_type" : "dummy" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "dummy" }
     })";
     const auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->FromJsonString(configStr);
@@ -1483,8 +1463,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
         "persist_metadata_interval_time_ms" : 0,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "capacity" : 0 }
+        "meta_storage_backend_config" : { "storage_type" : "local" }
     })";
 
     ASSERT_EQ(EC_OK, InitIndexer(configStr));

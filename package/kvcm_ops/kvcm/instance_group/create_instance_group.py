@@ -54,12 +54,6 @@ curl -g -vvv -X POST http://localhost:56040/api/createInstanceGroup \
                     "storage_uri": "",
                     "memory_primary": False,
                     "force_deleting_async_enqueue": True
-                },
-                "meta_cache_policy_config": {
-                    "type": "LRU",
-                    "capacity": 100000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0
                 }
             }
         },
@@ -76,13 +70,10 @@ def create_instance_group(args) -> InstanceGroup:
                                        reclaim_policy=args.reclaim_policy,
                                        trigger_used_percentage=args.reclaim_used_percentage,
                                        instance_reclaim_budget_policy=args.instance_reclaim_budget_policy)
-    meta_cache_policy_config = MetaCachePolicyConfig(capacity=args.search_cache_capacity,
-                                                     cache_shard_bits=args.search_cache_shard_bits)
     meta_indexer_config = MetaIndexerConfig(max_key_count=args.max_key_count,
                                             mutex_shard_num=args.mutex_shard_num,
                                             batch_key_size=args.batch_key_size,
-                                            meta_storage_backend_config=args.meta_storage_backend_config,
-                                            meta_cache_policy_config=meta_cache_policy_config)
+                                            meta_storage_backend_config=args.meta_storage_backend_config)
     cache_config = CacheConfig(data_storage_strategy=args.data_storage_strategy,
                                reclaim_strategy=reclaim_strategy,
                                meta_indexer_config=meta_indexer_config)

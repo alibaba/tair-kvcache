@@ -409,7 +409,9 @@ void CacheReclaimer::RecordPendingLimitReject(const std::string &instance_group,
             MetricsTags{{"instance_group", instance_group}, {"storage_type", storage_type_scope}}) += 1;
     } catch (const std::exception &e) {
         KVCM_LOG_WARN("record tagged pending-limit metric failed: %s", e.what());
-    } catch (...) { KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception");
+    }
 }
 
 void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {
@@ -1207,8 +1209,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
     const std::string &ins_gr = instance_info->instance_group_name();
 
     const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-    if (meta_indexer == nullptr) {
-        LOG_WITH_ID(WARN, "meta indexer is nullptr");
+    if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
+        LOG_WITH_ID(WARN, "meta indexer is nullptr or does not support write sessions");
         return false;
     }
 
@@ -1229,7 +1231,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
         if (cancelled->load(std::memory_order_relaxed) || (bounded_waves && (!IsRunning() || IsPaused()))) {
             return ErrorCode::EC_ERROR;
         }
-        if (const auto ec = meta_indexer->SampleReclaimCandidates(request_context.get(), sampling_sz, candidates);
+        if (const auto ec =
+                meta_indexer->SampleReclaimCandidates(request_context.get(), sampling_sz, candidates, false);
             ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "reclaim candidate sampling failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
@@ -1821,7 +1824,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         }
         // Yield keys with no deletable locations so later samples can reach
         // other cold candidates, regardless of the rejected location types.
-        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
+            indexer && indexer->SupportsWriteSession() && !rejected_keys.empty()) {
             METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
         }
     }
@@ -1940,6 +1944,14 @@ void CacheReclaimer::TryMigrateOnGroup(
                     available_copy_slots);
 
         for (const auto &instance_info : instance_infos) {
+            if (!instance_info) {
+                continue;
+            }
+            const std::shared_ptr<MetaIndexer> eligible_indexer =
+                meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+            if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
+                continue;
+            }
             if (instance_info == nullptr) {
                 continue;
             }
@@ -2200,16 +2212,20 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept {
     const auto data = std::make_shared<GroupUsageData>();
     for (const auto &instance_info : instance_infos) {
-        if (instance_info == nullptr) {
-            LOG_WITH_TRACE(WARN, "instance is nullptr");
+        if (!instance_info) {
+            continue;
+        }
+        const std::shared_ptr<MetaIndexer> eligible_indexer =
+            meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+        if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
             continue;
         }
 
         const std::string &ins_id = instance_info->instance_id();
         const std::string &ins_gr = instance_info->instance_group_name();
         const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-        if (meta_indexer == nullptr) {
-            LOG_WITH_ID(WARN, "meta indexer is nullptr");
+        if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
+            LOG_WITH_ID(WARN, "meta indexer is nullptr or does not support write sessions");
             continue;
         }
 
@@ -2460,7 +2476,7 @@ bool CacheReclaimer::BuildFairReclaimPlan(const RequestContext *request_context,
         const std::string &ins_id = instance_info->instance_id();
         const std::string &ins_gr = instance_info->instance_group_name();
         const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-        if (meta_indexer == nullptr) {
+        if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
             LOG_WITH_ID(WARN, "skip instance without meta indexer when building fair reclaim plan");
             continue;
         }
@@ -2780,6 +2796,14 @@ CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
     const std::string &ins_gr = instance_group->name();
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
     for (const auto &instance_info : instance_infos) {
+        if (!instance_info) {
+            continue;
+        }
+        const std::shared_ptr<MetaIndexer> eligible_indexer =
+            meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+        if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
+            continue;
+        }
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
         const auto water_level_exceed = GetWaterLevelExceed(
             request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);

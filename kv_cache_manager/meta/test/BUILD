@@ -1,5 +1,14 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_test(
+    name = "SimpleKVCacheChargeTest",
+    srcs = ["simple_kv_cache_charge_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta/simple:simple_kv_cache_backend",
+    ],
+)
+
 cc_binary(
     name = "recovery_memory_probe",
     testonly = True,
@@ -74,19 +83,6 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/metrics:metrics_registry",
-    ],
-)
-
-cc_test(
-    name = "meta_search_cache_test",
-    srcs = [
-        "meta_search_cache_test.cc",
-    ],
-    copts = ["-fno-access-control"],
-    data = [],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/meta",
     ],
 )
 

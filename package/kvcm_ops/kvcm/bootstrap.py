@@ -12,7 +12,6 @@ from .instance_group.util import (
     CacheConfig,
     InstanceGroup,
     InstanceGroupQuota,
-    MetaCachePolicyConfig,
     MetaIndexerConfig,
     MetaStorageBackendConfig,
     ReclaimStrategy,
@@ -29,8 +28,6 @@ DEFAULT_QUOTA_CAPACITY = 1000000000
 DEFAULT_MAX_KEY_COUNT = 1000000000
 DEFAULT_MUTEX_SHARD_NUM = 131072
 DEFAULT_BATCH_KEY_SIZE = 1024
-DEFAULT_SEARCH_CACHE_CAPACITY = 10 * 1024
-DEFAULT_SEARCH_CACHE_SHARD_BITS = 6
 DEFAULT_RECLAIM_POLICY = "POLICY_LRU"
 DEFAULT_RECLAIM_USED_PERCENTAGE = 0.8
 CACHE_SHARD_BITS_UPPER_BOUND = 20
@@ -77,8 +74,6 @@ INSTANCE_GROUP_KEYS = {
     "max_key_count",
     "mutex_shard_num",
     "batch_key_size",
-    "search_cache_capacity",
-    "search_cache_shard_bits",
     "meta_storage_backend_config",
     "metadata_backend_mode",
 }
@@ -158,8 +153,6 @@ class BootstrapConfig:
         self.max_key_count = DEFAULT_MAX_KEY_COUNT
         self.mutex_shard_num = DEFAULT_MUTEX_SHARD_NUM
         self.batch_key_size = DEFAULT_BATCH_KEY_SIZE
-        self.search_cache_capacity = DEFAULT_SEARCH_CACHE_CAPACITY
-        self.search_cache_shard_bits = DEFAULT_SEARCH_CACHE_SHARD_BITS
         self.redis_host = ""
         self.redis_port = 0
 
@@ -462,18 +455,6 @@ def parse_environment(environ=None):
         raise BootstrapError("KVCM_INSTANCE_GROUP.mutex_shard_num must be a power of two")
     config.batch_key_size = _integer(
         value, "batch_key_size", DEFAULT_BATCH_KEY_SIZE, INSTANCE_GROUP_ENV)
-    config.search_cache_capacity = _integer(
-        value, "search_cache_capacity", DEFAULT_SEARCH_CACHE_CAPACITY, INSTANCE_GROUP_ENV)
-    config.search_cache_shard_bits = _integer(
-        value,
-        "search_cache_shard_bits",
-        DEFAULT_SEARCH_CACHE_SHARD_BITS,
-        INSTANCE_GROUP_ENV,
-        allow_zero=True,
-    )
-    if config.search_cache_shard_bits >= CACHE_SHARD_BITS_UPPER_BOUND:
-        raise BootstrapError("KVCM_INSTANCE_GROUP.search_cache_shard_bits must be less than 20")
-
     config.reclaim_policy = _optional_string(
         value, "reclaim_policy", DEFAULT_RECLAIM_POLICY, INSTANCE_GROUP_ENV).upper()
     if config.reclaim_policy not in ("POLICY_LRU", "POLICY_LFU", "POLICY_TTL"):
@@ -725,16 +706,11 @@ def _build_new_instance_group(config):
     meta_storage = MetaStorageBackendConfig(
         config.meta_storage_type, config.meta_storage_uri, config.memory_primary,
         config.force_deleting_async_enqueue)
-    meta_cache = MetaCachePolicyConfig(
-        capacity=config.search_cache_capacity,
-        cache_shard_bits=config.search_cache_shard_bits,
-    )
     meta_indexer = MetaIndexerConfig(
         max_key_count=config.max_key_count,
         mutex_shard_num=config.mutex_shard_num,
         batch_key_size=config.batch_key_size,
         meta_storage_backend_config=meta_storage,
-        meta_cache_policy_config=meta_cache,
     )
     cache_config = CacheConfig(
         data_storage_strategy=config.data_storage_strategy,
@@ -812,9 +788,6 @@ def _apply_managed_group_fields(current, config):
         "memory_primary": config.memory_primary,
         "force_deleting_async_enqueue": config.force_deleting_async_enqueue,
     }
-    meta_cache = meta_indexer.setdefault("meta_cache_policy_config", {})
-    meta_cache["capacity"] = config.search_cache_capacity
-    meta_cache["cache_shard_bits"] = config.search_cache_shard_bits
     extra_info = _extra_info_object(updated.get("extra_info", ""))
     if config.metadata_backend_mode is not None:
         extra_info["metadata_backend_mode"] = config.metadata_backend_mode
@@ -828,15 +801,12 @@ def _meta_indexer_view(group):
     cache_config = group.get("cache_config", {})
     meta_indexer = cache_config.get("meta_indexer_config", {})
     meta_storage = meta_indexer.get("meta_storage_backend_config", {})
-    meta_cache = meta_indexer.get("meta_cache_policy_config", {})
     return {
         "max_key_count": _as_int(meta_indexer.get("max_key_count")),
         "mutex_shard_num": _as_int(meta_indexer.get("mutex_shard_num")),
         "batch_key_size": _as_int(meta_indexer.get("batch_key_size")),
         "meta_storage_type": meta_storage.get("storage_type"),
         "meta_storage_uri": meta_storage.get("storage_uri"),
-        "search_cache_capacity": _as_int(meta_cache.get("capacity")),
-        "search_cache_shard_bits": _as_int(meta_cache.get("cache_shard_bits")),
     }
 
 

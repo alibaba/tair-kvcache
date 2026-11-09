@@ -104,12 +104,6 @@ class ManagerProcess:
                             "storage_type": "local",
                             "storage_uri": "",
                         },
-                        "meta_cache_policy_config": {
-                            "type": "LRU",
-                            "capacity": 10000,
-                            "cache_shard_bits": 0,
-                            "high_pri_pool_ratio": 0.0,
-                        },
                     },
                 },
                 "user_data": '{"description": "vllm e2e test instance group"}',

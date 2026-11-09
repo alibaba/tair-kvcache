@@ -3,16 +3,19 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "cache",
     srcs = [
+        "allocation_size.cc",
         "cache.cc",
         "sharded_cache.cc",
         "lru_cache.cc",
     ],
     hdrs = [
+        "allocation_size.h",
         "cache.h",
         "advanced_cache.h",
         "sharded_cache.h",
         "lru_cache.h",
     ],
+    linkopts = ["-ldl"],
     deps = [
         ":util",
         "//kv_cache_manager/common/hash:hash",

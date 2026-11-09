@@ -3,6 +3,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -318,7 +319,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
                                                   2,
                                                   {LocationSpecInfo("tp0", 128)},
                                                   ModelDeployment(),
-                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+                                                  {LocationSpecGroup("full_cache", {"tp0"})},
+                                                  0,
+                                                  std::nullopt));
     ASSERT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
     grpc::ClientContext subscription_context;
@@ -442,7 +445,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReturnsInstanceConfigurationSnapshot) 
                                                   16,
                                                   {LocationSpecInfo("tp0", 128)},
                                                   ModelDeployment(),
-                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+                                                  {LocationSpecGroup("full_cache", {"tp0"})},
+                                                  0,
+                                                  std::nullopt));
 
     grpc::ClientContext context;
     proto::optimizer::KvcmConfigurationRequest request;

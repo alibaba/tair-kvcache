@@ -23,6 +23,19 @@ thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
 thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
+thread_local Gauge interleaved_query_key_count;
+thread_local std::vector<double> reported_query_key_counts;
+
+void CaptureRequestQueryKeyCounts(kmonitor::MutableMetric *metric,
+                                  const kmonitor::MetricsTags * /*tags*/,
+                                  double value) {
+    if (metric->metric_name_.find("service.qps") != std::string::npos) {
+        interleaved_query_key_count = 123.;
+    }
+    if (metric->metric_name_.find("meta_indexer.query_key_count") != std::string::npos) {
+        reported_query_key_counts.push_back(value);
+    }
+}
 
 void CaptureMetaCacheUsage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
@@ -164,7 +177,7 @@ TEST_F(KmonitorMetricsReporterTest, TestReportPerQuery) {
         DummyMetricsCollector collector;
         collector.Init();
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
-        EXPECT_EQ(3, metrics_registry_->GetSize());
+        EXPECT_EQ(4, metrics_registry_->GetSize());
     }
 
     {
@@ -351,4 +364,24 @@ TEST_F(KmonitorMetricsReporterTest, LifetimeSamplesAreReportedPerRequestWithInst
     reporter_->ReportPerQuery(&zero);
     ASSERT_EQ(9u, reported_lifetimes.size());
     ExpectLifetime(reported_lifetimes, 6, lifetime_tags, {0, 0, 0});
+}
+
+TEST_F(KmonitorMetricsReporterTest, ReportsPrivateQueryKeyCountsDespiteInterleavedRegistryWrites) {
+    ServiceMetricsCollector shared(metrics_registry_, {{"api_name", "ReportEvent"}});
+    ASSERT_TRUE(shared.Init());
+    std::shared_ptr<ServiceMetricsCollector> snapshot = shared.MakeRequestCollector();
+    std::shared_ptr<ServiceMetricsCollector> heartbeat = shared.MakeRequestCollector();
+    std::shared_ptr<ServiceMetricsCollector> add = shared.MakeRequestCollector();
+    SET_METRICS_(snapshot, meta_indexer, query_key_count, 3600000.);
+    SET_METRICS_(add, meta_indexer, query_key_count, 17.);
+    COPY_METRICS_(&shared, meta_indexer, query_key_count, interleaved_query_key_count);
+    Stub stub;
+    void (kmonitor::MutableMetric::*report)(const kmonitor::MetricsTags *, double) = &kmonitor::MutableMetric::Report;
+    stub.set(report, CaptureRequestQueryKeyCounts);
+    reported_query_key_counts.clear();
+    reporter_->ReportPerQuery(snapshot.get(), false);
+    reporter_->ReportPerQuery(heartbeat.get(), false);
+    reporter_->ReportPerQuery(add.get(), false);
+    EXPECT_EQ((std::vector<double>{3600000., 0., 17.}), reported_query_key_counts);
+    interleaved_query_key_count = Gauge();
 }
