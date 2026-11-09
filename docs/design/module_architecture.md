@@ -392,10 +392,3 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 ## 5. 修改功能前的提示
 
 修改某个模块前，先对照第 3 节的依赖关系图与第 4 节的运行时流程，确认它的上游（谁依赖它、会被它影响）和下游（它依赖谁、受谁约束），不要遗漏被依赖方带来的约束。尤其注意 3.2 的两条反向边、`CacheLocation` 的生命周期与状态流转约束，以及改动 `protocol` proto 时需遵循 [proto 修改指南](../develop/proto_modification_guide.md)。涉及元数据面行为时，同时检查 C++ `MetaClient`、Python `KvCacheManagerClient`/`manager_client` 与 Java `client_java` 的语义一致性；涉及 EventReport 时，先确认 reporter lifecycle、snapshot generation 与 Leader-only 约束。
-
-### 选主阶段指标
-
-`service::Server` 使用独立轻量循环读取 `config::LeaderElector::GetRoleState()` 的原子状态，
-交由 `metrics::NodeStatusMetrics` 发布 `role_state{state="..."}` 的四条固定序列。
-采集不进入业务调用链、不持指标生命周期锁、不访问网络，因此普通指标采集或恢复/清理阻塞时
-仍可观察阶段；服务关闭时停止该采集线程。原有 `is_leader` 采集与业务门禁不变。
