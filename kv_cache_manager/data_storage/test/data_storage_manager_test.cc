@@ -44,6 +44,19 @@ public:
     std::vector<DataStorageCreateResult> scripted_results;
 };
 
+class CapacityBackend : public DummyBackend {
+public:
+    using DummyBackend::DummyBackend;
+    std::pair<ErrorCode, int64_t> GetStorageCapacity(const std::string &) const override {
+        if (on_query) {
+            on_query();
+        }
+        return result;
+    }
+    std::pair<ErrorCode, int64_t> result{EC_OK, 100};
+    std::function<void()> on_query;
+};
+
 class RecordingBatchBackend : public RecordingCreateBackend {
 public:
     using RecordingCreateBackend::RecordingCreateBackend;
@@ -133,6 +146,57 @@ public:
     void TearDown() override {}
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
+
+TEST_F(DataStorageManagerTest, CapacityRefreshRetainsLastGoodAndResetsOnRemoval) {
+    DataStorageManager manager(metrics_registry_);
+    auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
+    manager.storage_map_["pool"] = backend;
+    EXPECT_EQ(-1, manager.GetCapacitySnapshots().at("pool").capacity);
+    manager.RefreshCapacities();
+    auto snapshot = manager.GetCapacitySnapshots().at("pool");
+    EXPECT_EQ(100, snapshot.capacity);
+    EXPECT_GT(snapshot.last_success_time_s, 0);
+    backend->result = {EC_ERROR, 0};
+    manager.RefreshCapacities();
+    auto failed = manager.GetCapacitySnapshots().at("pool");
+    EXPECT_EQ(100, failed.capacity);
+    EXPECT_EQ(EC_ERROR, failed.refresh_code);
+    EXPECT_EQ(snapshot.last_success_steady_us, failed.last_success_steady_us);
+    backend->result = {EC_OK, -1};
+    manager.RefreshCapacities();
+    EXPECT_EQ(100, manager.GetCapacitySnapshots().at("pool").capacity);
+    EXPECT_EQ(EC_ERROR, manager.GetCapacitySnapshots().at("pool").refresh_code);
+    backend->result = {EC_OK, 0};
+    manager.RefreshCapacities();
+    EXPECT_EQ(0, manager.GetCapacitySnapshots().at("pool").capacity);
+    EXPECT_EQ(EC_OK, manager.UnRegisterStorage("pool"));
+    EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
+    manager.storage_map_["pool"] = std::make_shared<CapacityBackend>(metrics_registry_);
+    EXPECT_EQ(-1, manager.GetCapacitySnapshots().at("pool").capacity);
+    EXPECT_EQ(EC_OK, manager.DoCleanup());
+    EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
+}
+
+TEST_F(DataStorageManagerTest, CapacityQueryDoesNotBlockSnapshotReaders) {
+    DataStorageManager manager(metrics_registry_);
+    auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
+    std::promise<void> started;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    backend->on_query = [&]() {
+        started.set_value();
+        released.wait();
+    };
+    manager.storage_map_["pool"] = backend;
+    auto refresh = std::async(std::launch::async, [&]() { manager.RefreshCapacities(); });
+    started.get_future().wait();
+    auto read = std::async(std::launch::async, [&]() { return manager.GetCapacitySnapshots(); });
+    const auto state = read.wait_for(std::chrono::seconds(1));
+    release.set_value();
+    EXPECT_EQ(std::future_status::ready, state);
+    refresh.get();
+    EXPECT_TRUE(read.get().count("pool"));
+}
 
 TEST_F(DataStorageManagerTest, TestSimple) {
     DataStorageManager data_storage_manager(metrics_registry_);

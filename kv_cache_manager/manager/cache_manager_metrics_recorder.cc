@@ -79,6 +79,7 @@ void CacheManagerMetricsRecorder::RemoveInstance(const std::string &instance_id)
 void CacheManagerMetricsRecorder::RemoveGroup(const std::string &group_name) {
     std::scoped_lock guard(mutex_);
     group_usage_ratio_map_.erase(group_name);
+    group_quota_metric_map_.erase(group_name);
     group_instance_id_metric_map_.erase(group_name);
 }
 
@@ -103,6 +104,7 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
             continue;
         }
         GroupUsageRatioMap group_usage_ratio_map;
+        GroupQuotaMetricMap group_quota_metric_map;
         GroupInstanceIdMetricMap group_instance_id_metric_map;
         for (const auto &instance_group : instance_groups) {
             const std::string &instance_group_name = instance_group->name();
@@ -113,6 +115,8 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                 continue;
             }
             std::size_t group_byte_size = 0;
+            auto &quota_metric = group_quota_metric_map[instance_group_name];
+            quota_metric.quota = registry_manager_->ResolveQuota(*instance_group);
             for (const auto &instance_info : instance_infos) {
                 if (instance_info == nullptr) {
                     KVCM_LOG_WARN("instance is nullptr");
@@ -127,7 +131,12 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                 meta_indexer->PersistMetaData();
                 const std::size_t key_cnt = meta_indexer->GetKeyCount();
                 const std::size_t byte_size = meta_indexer->GetStorageUsage();
-                group_byte_size += byte_size;
+                group_byte_size = byte_size > SIZE_MAX - group_byte_size ? SIZE_MAX : group_byte_size + byte_size;
+                for (const auto &[type, value] : quota_metric.quota.types) {
+                    auto &usage = quota_metric.usage[type];
+                    const auto bytes = meta_indexer->GetStorageUsageByType(type);
+                    usage = bytes > UINT64_MAX - usage ? UINT64_MAX : usage + bytes;
+                }
                 const int64_t oldest_access_time = meta_indexer->GetOldestAccessTime();
                 int64_t max_lru_age_us = 0;
                 if (oldest_access_time < INT64_MAX) {
@@ -150,11 +159,13 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
             }
             int64_t capacity = instance_group->quota().capacity();
             group_usage_ratio_map[instance_group_name] =
-                capacity > 0 ? (static_cast<double>(group_byte_size) / capacity) : 0;
+                capacity == -1 ? QuotaUsageRatio(group_byte_size, quota_metric.quota.reference_capacity)
+                               : (capacity > 0 ? (static_cast<double>(group_byte_size) / capacity) : 0);
         }
         {
             std::scoped_lock write_guard(mutex_);
             group_usage_ratio_map_ = std::move(group_usage_ratio_map);
+            group_quota_metric_map_ = std::move(group_quota_metric_map);
             group_instance_id_metric_map_ = std::move(group_instance_id_metric_map);
         }
     }
@@ -165,6 +176,11 @@ size_t CacheManagerMetricsRecorder::write_location_expire_size() const { return 
 CacheManagerMetricsRecorder::GroupUsageRatioMap CacheManagerMetricsRecorder::group_usage_ratio_map() const {
     std::shared_lock read_guard(mutex_);
     return group_usage_ratio_map_;
+}
+
+CacheManagerMetricsRecorder::GroupQuotaMetricMap CacheManagerMetricsRecorder::group_quota_metric_map() const {
+    std::shared_lock read_guard(mutex_);
+    return group_quota_metric_map_;
 }
 
 CacheManagerMetricsRecorder::GroupInstanceIdMetricMap

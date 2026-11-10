@@ -1,5 +1,9 @@
 # KVCacheManager AdminService API curl Examples
 
+Instance Group quota supports `mode: "auto"` with `ratio` (default 1.0) and optional `storage_names` per storage type. Omitted mode keeps legacy fixed bytes. Total `quota.capacity=-1` means **unlimited total bytes**; `0` retains its existing meaning. New groups without quota default to unlimited total bytes and automatic per-type quotas.
+
+Get/List Instance Group responses include read-only `runtime_quota`: `total_bytes_limit_enabled`, `reference_capacity`, and `storage_types` (mode, ratio, effective/backend capacity, known, usable, refresh status, last successful Unix timestamp). **Reference capacity is a monitoring denominator, not a total limit.** Unknown capacity is `-1`; failed queries retain the last successful value and report their status. Runtime fields are never persisted or used as input configuration. See [dynamic quota](../design/dynamic_backend_quota.md) for backend scope, stale-data handling and examples.
+
 ## Basic Usage
 1. Add Account
 2. Add Storage

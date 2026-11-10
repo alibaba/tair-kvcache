@@ -30,7 +30,7 @@ public:
     void set_quota_config(const std::vector<QuotaConfig> &quota_config) { quota_config_ = quota_config; }
 
 private:
-    int64_t capacity_;
+    int64_t capacity_ = -1;
     std::vector<QuotaConfig> quota_config_;
 };
 

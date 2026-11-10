@@ -1,0 +1,70 @@
+# 动态分类型 quota 与无限 Group 总容量
+
+## 配置
+
+`quota.capacity > 0` 保留固定总字节上限，`0` 保留原有的禁止新分配及非空用量触发回收语义，`-1` 关闭总字节准入和总字节水位回收。key 数量、分类型水位和 Location 保护规则独立生效。参考容量不写回配置，不参与总量限制。
+
+持久化 JSON 示例（Admin API 的类型名称分别为 `ST_TAIRMEMPOOL`、`ST_TAIRMEMPOOL_SSD`）：
+
+```json
+{
+  "capacity": -1,
+  "quota_config": [
+    {"storage_type": "pace", "mode": "auto", "ratio": 0.5},
+    {"storage_type": "pace_ssd", "mode": "auto", "ratio": 0.8}
+  ]
+}
+```
+
+`mode` 省略为 `fixed`，`ratio` 省略为 `1.0`，必须在 `(0, 1]` 内。自动有效 quota 为后端总容量乘比例，向下取整到字节。固定 `capacity=0` 不解释为自动。每个基础类型只允许一个配置；VCNS 3FS 与 3FS 使用同一基础类型。
+
+自动容量默认关联本 Group 的 `storage_candidates`，以及 migration strategy 的 source、target，包含仅用于迁移的后端。独立的 EventReport 上报后端不自动加入普通存储的容量范围。可选 `storage_names` 替换该类型的默认关联范围。它仅选择容量来源，用量仍按整个 Group × 基础类型统计。
+
+独立池容量相加，重复 storage name 只计一次。同物理池的别名通过后端 capacity identity 去重；TairMempool 使用规范化的 domain 或 service discovery URL 加介质。相同物理池应使用相同发现标识；不同 URL 指向同一池时无法自动推断，应通过 `storage_names` 明确选择一次。不会累加多个 meta 副本的容量。共享后端的份额通过比例表达，不要求独占后端。
+
+新建 Group 省略整个 `quota` 时默认总量 `-1`；总量 `-1` 时，没有显式覆盖的关联类型默认自动 100%，因此只调整 DRAM 比例不会使 SSD 意外变成无类型限额。旧的显式固定总量和分类型配置保持不变。已有固定总量下，未配置的类型沿用不限制该类型的旧语义；自动默认模式下，未关联的显式写目标不能绕过类型 quota。
+
+## 容量口径与失败保护
+
+`DataStorageBackend::GetStorageCapacity` 返回指定介质可分配的**总字节数**和独立错误码，不返回剩余空闲容量。未实现时返回 `EC_UNIMPLEMENTED`，不能以成功零值代替。
+
+TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
+
+纯 DRAM 模式支持原有默认 AUTO 分配；有分层的部署，`pace` 自动 quota 需要配置 `media_type=2`，以保证其用量是 DRAM；`pace_ssd` 对应显式 SSD 分配。透明 AUTO 的一个 GA 可在两种介质间驻留，无法直接映射为这两个独立类型的预算，自动容量返回不支持，需使用固定 quota。不会把 DRAM 和 SSD 相加后重复用于两个类型，也不将 DRAM 指标冒充透明分层总容量。
+
+DataStorageManager 注册第一个后端后立即启动采集，以 10 秒为目标周期串行轮询；各查询受后端超时约束。变化到成功观察的时延上界约为 10 秒加排队及查询耗时。写入、回收、迁移和 Admin 查询只读内存快照，不发容量查询。监控另有最多约 5 秒的 recorder 采样延迟。
+
+| 状态 | 展示容量 | 新分配 | 按该类型容量水位回收/迁移 |
+| --- | --- | --- | --- |
+| `fixed` | 配置值 | 按配置检查 | 按配置检查 |
+| `fresh` | 最近成功值 × 比例 | 按有效值检查 | 按有效值检查 |
+| `refresh_error`，成功值未超过 30 秒 | 保留最近成功值 × 比例 | 按保留值检查，Writable 仍须通过 | 按保留值检查，后端原保护规则仍生效 |
+| `stale`，超过 30 秒未成功刷新 | 保留最近成功值，usable=false | 暂停该类型新分配 | 跳过该类型的容量触发 |
+| 首次未知、缺失、不支持或无效配置 | `-1`，known=false | 暂停该类型新分配 | 跳过该类型的容量触发 |
+| 确认的零容量 | `0`，known=true | 拒绝新分配 | 有用量时按该类型回收 |
+
+有效期用单调时钟判定，查询另提供最近成功的 Unix 秒时间。失败不覆盖容量和成功时间。多后端中任一个首次未知，则整个类型未知；已有成功值的失败后端保留其贡献。任一容量来源过期则整个类型过期。恢复成功后自动使用新容量。移除/替换后端或 Leader cleanup 清理对应快照，同名新后端不继承旧容量。关闭后端等待当前有界查询完成。重启/切主后的首次未知遵循同样策略，不猜测默认容量。
+
+`unsupported` 表示当前介质无法可靠计量；即使此前有成功值，也只保留展示，立即停止使用该类型容量作分配/回收判断。相同池的另一个别名查询成功不能掩盖这一介质配置问题。
+
+真实缩容后用量可以超过有效 quota：超配类型暂停分配并按自身水位回收。总量为 `-1` 时，Group 用量超过参考容量也不会阻止其他有余量类型的新分配。直接大比例缩容仍可能出现后端 alloc fail，缩容前排空编排不属于此功能。
+
+## 消费与观测
+
+`RegistryManager::ResolveQuota` 统一解析快照。普通写入和显式迁移目标使用 `ForAdmission()`；回收和迁移源水位使用 `ForReclaim()`。未知/过期容量在两条路径分别转换为拒绝分配、跳过容量回收，不修改展示值。沿用原有水位准入，不新增并发字节 reservation。
+
+每次解析使用调用方持有的同一份 InstanceGroup 配置快照，比例和后端范围不会分别读取不同配置版本，避免更新时拼接“旧比例 + 新后端”而制造一次不存在的缩容。
+
+Group 参考容量为各类型有效 quota 之和，包含固定与自动模式；任一类型未知或求和溢出时为未知 `-1`，不发布部分和。过期但已知的容量保留参考贡献，并标明陈旧性。DRAM 100 GiB × 50% 和 SSD 200 GiB × 80% 的参考容量为 210 GiB；用量 20、80 GiB 对应总使用率约 47.62%，分类型为 40%、50%。
+
+`getInstanceGroup` / `listInstanceGroup` 的只读 `runtime_quota` 与配置分开：
+
+- `quota.capacity=-1`、`total_bytes_limit_enabled=false` 表示“Group 总容量上限：无限”。
+- `reference_capacity` 表示“汇总参考容量”，只供观测。
+- `storage_types` 提供模式、比例、有效 quota、后端容量、known、usable、刷新状态及成功时间。
+
+`cache_manager_group.usage_ratio` 在固定正数总 quota 下沿用原分母，总量 `-1` 时使用参考容量。未知使用率为 NaN；确认零容量且有用量为 +Inf，空用量为 0，通过容量和 known 区分无容量状态。后端原有 `data_storage.storage_usage_ratio` 含义不变。
+
+CLI 新建默认总量 `-1`，支持 `--quota_configs 'ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8'`，显式范围格式为 `type,auto,ratio,backend1|backend2`。Bootstrap 新建采用相同默认；升级同步未显式配置 quota 时保留已有配置，显式 `quota_capacity=-1` 才改为默认自动模式。不支持容量查询的后端需要显式固定 quota。
+
+启用自动模式或总量 `-1` 后，回滚到不支持此功能的旧二进制前，应先恢复正数固定总 quota 和固定分类型 quota；旧版本无法正确解释这些新配置语义。

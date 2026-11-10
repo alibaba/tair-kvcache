@@ -1,5 +1,7 @@
 #include "kv_cache_manager/config/instance_group_quota.h"
 
+#include <set>
+
 namespace kv_cache_manager {
 
 InstanceGroupQuota::~InstanceGroupQuota() = default;
@@ -18,14 +20,18 @@ void InstanceGroupQuota::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer
 bool InstanceGroupQuota::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
-    // TODO quota_config_现在没有使用，后续做更改的时候再处理
-    // for (size_t i = 0; i < quota_config_.size(); ++i) {
-    //     if (!quota_config_[i].ValidateRequiredFields(invalid_fields)) {
-    //         // valid = false; 这里不设置false，允许部分quota_config不合法
-    //         valid = true;
-    //     }
-    // }
-    // invalid_fields += "}";
+    if (capacity_ < -1) {
+        valid = false;
+        local_invalid_fields += "{capacity}";
+    }
+    std::set<DataStorageType> types;
+    for (const auto &config : quota_config_) {
+        valid = config.ValidateRequiredFields(local_invalid_fields) && valid;
+        if (!types.insert(ToBaseType(config.storage_spec())).second) {
+            valid = false;
+            local_invalid_fields += "{duplicate storage_type}";
+        }
+    }
     if (!valid) {
         invalid_fields += "{InstanceGroupQuota: " + local_invalid_fields + "}";
     }

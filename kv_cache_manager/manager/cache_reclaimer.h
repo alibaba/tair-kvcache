@@ -561,12 +561,20 @@ private:
      * @brief Calculate the group's WaterLevelExceed data
      *
      * @param request_context The context of the request
-     * @param instance_group_name Name of the instance group to check
-     * @param instance_group_quota Quota info for the instance group
+     * @param instance_group Captured group configuration, including quota and backend associations
      * @param reclaim_strategy Strategy to use for reclamation decisions
      * @param instance_infos Vector of instance information
      * @return shared pointer to the result WaterLevelExceed data
      */
+    [[nodiscard]] std::shared_ptr<WaterLevelExceed>
+    GetWaterLevelExceed(const RequestContext *request_context,
+                        const InstanceGroup &instance_group,
+                        const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    // Standalone quota evaluation against the current registry associations.
+    // Production rounds pass their captured InstanceGroup to the overload above
+    // so a concurrent configuration update cannot mix old ratios with new pools.
     [[nodiscard]] std::shared_ptr<WaterLevelExceed>
     GetWaterLevelExceed(const RequestContext *request_context,
                         const std::string &instance_group_name,

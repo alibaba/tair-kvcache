@@ -1,5 +1,15 @@
 # Prometheus Metrics Endpoint
 
+## Dynamic quota metrics
+
+`cache_manager_group.usage_ratio` keeps the fixed total limit as denominator when positive. With total quota `-1`, it uses the sum of effective per-type quotas. This reference capacity is observational and never enforces a total byte limit.
+
+Group gauges (`instance_group` label): `cache_manager_group.reference_capacity` (-1 if unknown or overflowing) and `cache_manager_group.total_bytes_limit_enabled` (0 for unlimited).
+
+Per-type gauges use prefix `cache_manager_group_storage.` and labels `instance_group, storage_type`: `usage_bytes`, `effective_quota`, `usage_ratio`, `capacity_known`, `capacity_usable`, `refresh_success`, and `last_success_time_s`. Storage types use base names such as `pace` and `pace_ssd`. Failed queries retain the last good capacity; expired data stays visible with usable=0. Unknown capacity is -1 with NaN usage ratio. Confirmed zero capacity has +Inf ratio when occupied, or 0 when empty; inspect capacity and known status to distinguish these states. Timestamps are Unix seconds (0 if unknown). Prometheus replaces dots with underscores and prefixes names with `kvcm_`.
+
+Backend `data_storage.storage_usage_ratio` keeps its existing meaning. See [dynamic quota behavior](design/dynamic_backend_quota.md) for refresh timing and failure handling.
+
 KVCacheManager exposes a Prometheus-compatible metrics scrape endpoint
 at `GET /metrics` on the Admin HTTP service port (default 6492).
 
