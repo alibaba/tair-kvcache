@@ -7,21 +7,33 @@ from ..common.common_args import *
 class StorageQuota(JsonData):
     def __init__(self,
                  s_type: str,
-                 capacity: int):
+                 capacity: int = 0,
+                 mode: str = "fixed",
+                 ratio: float = 1.0,
+                 storage_names=None):
         self._type = s_type
         self._capacity = capacity
+        self._mode = mode
+        self._ratio = ratio
+        self._storage_names = list(storage_names or [])
         self.check()
 
     def to_json_data(self) -> dict:
         return {
             "storage_type": self._type,
-            "capacity": self._capacity
+            "capacity": self._capacity,
+            "mode": self._mode,
+            "ratio": self._ratio,
+            "storage_names": self._storage_names,
         }
 
     def check(self) -> bool:
         _type = self._type.upper()
         supported_types = [
             "ST_3FS",
+            "ST_VCNS_3FS",
+            "ST_MOONCAKE",
+            "ST_DUMMY",
             "ST_TAIRMEMPOOL",
             "ST_TAIRMEMPOOL_SSD",
             "ST_NFS",
@@ -32,17 +44,21 @@ class StorageQuota(JsonData):
             raise RuntimeError(
                 f"storage type {self._type} invalid, support {'|'.join(supported_types)}")
         self._type = _type
-        if self._capacity <= 0:
-            raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")
+        if self._mode not in ("fixed", "auto"):
+            raise RuntimeError("StorageQuota mode must be fixed or auto")
+        if type(self._ratio) not in (int, float) or not math.isfinite(self._ratio) or not 0 < self._ratio <= 1:
+            raise RuntimeError("StorageQuota ratio must be in (0, 1]")
+        if not all(isinstance(name, str) and name for name in self._storage_names):
+            raise RuntimeError("StorageQuota storage_names must contain non-empty strings")
         return True
 
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("storage_type", json_data, str):
             s_type = json_data["storage_type"]
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        return cls(s_type, capacity)
+        capacity = int(json_data.get("capacity", 0))
+        return cls(s_type, capacity, json_data.get("mode") or "fixed", json_data.get("ratio", 1.0),
+                   json_data.get("storage_names", []))
 
 
 def split_storage_quotas_value(value: str):
@@ -50,10 +66,17 @@ def split_storage_quotas_value(value: str):
     result = []
     for storage_quota_str in storage_quota_strs:
         storage_quota_str_split = split_strs(storage_quota_str)
-        if len(storage_quota_str_split) != 2:
+        if len(storage_quota_str_split) not in (2, 3, 4):
             raise argparse.ArgumentTypeError(f"Invalid storage_quota format: expected 'type,capacity', got '{value}'")
-        s_type, capacity_str = storage_quota_str_split
-        result.append(StorageQuota(s_type, int(capacity_str)))
+        s_type, capacity_str = storage_quota_str_split[:2]
+        if capacity_str == "auto":
+            ratio = float(storage_quota_str_split[2]) if len(storage_quota_str_split) >= 3 else 1.0
+            names = storage_quota_str_split[3].split('|') if len(storage_quota_str_split) == 4 else []
+            result.append(StorageQuota(s_type, mode="auto", ratio=ratio, storage_names=names))
+        else:
+            if len(storage_quota_str_split) != 2:
+                raise argparse.ArgumentTypeError("fixed quota expects type,capacity")
+            result.append(StorageQuota(s_type, int(capacity_str)))
     return result
 
 
@@ -75,21 +98,16 @@ class InstanceGroupQuota(JsonData):
         }
 
     def check(self) -> bool:
-        if self._capacity <= 0:
-            raise RuntimeError(f"InstanceGroupQuota capacity {self._capacity} <= 0")
+        if self._capacity < -1:
+            raise RuntimeError("InstanceGroupQuota capacity must be >= -1")
         for storage_qouta in self._storage_qoutas:
             storage_qouta.check()
         return True
 
     @classmethod
     def from_json_data(cls, json_data: dict):
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        if JsonData.expect_exist("quota_config", json_data, list):
-            storage_qouta_objs = json_data["quota_config"]
-            storage_qoutas = []
-            for storage_quota_obj in storage_qouta_objs:
-                storage_qoutas.append(StorageQuota.from_json_data(storage_quota_obj))
+        capacity = int(json_data.get("capacity", -1))
+        storage_qoutas = [StorageQuota.from_json_data(item) for item in json_data.get("quota_config", [])]
         return cls(capacity, storage_qoutas)
 
 
@@ -367,7 +385,7 @@ class CacheConfig(JsonData):
         ]
         if _data_storage_strategy not in valid_strategies:
             raise RuntimeError(
-                f"data_storage_strategy {_data_storage_strategy} invalid, support { '|'.join(valid_strategies) }")
+                f"data_storage_strategy {_data_storage_strategy} invalid, support {'|'.join(valid_strategies)}")
         self._data_storage_strategy = _data_storage_strategy
         self._reclaim_strategy.check()
         self._meta_indexer_config.check()
@@ -549,26 +567,19 @@ def parse_instance_group_args(is_create: bool):
         "--quota_capacity",
         "-q",
         type=int,
-        default=30000000000 if is_create else argparse.SUPPRESS,
-        help="quota_capacity(bytes), eg. 30000000000"
+        default=-1 if is_create else argparse.SUPPRESS,
+        help="Group byte limit; -1 disables the total byte limit (default)"
     )
 
     parser.add_argument(
         "--quota_configs",
         type=split_storage_quotas_value,
-        default=[
-            StorageQuota(
-                "ST_NFS",
-                10000000000),
-            StorageQuota(
-                "ST_3FS",
-                10000000000),
-            StorageQuota(
-                "ST_TAIRMEMPOOL",
-                10000000000)] if is_create else argparse.SUPPRESS,
+        default=[] if is_create else argparse.SUPPRESS,
         help=(
             "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
-            "ST_TAIRMEMPOOL,10000000000;ST_TAIRMEMPOOL_SSD,10000000000"))
+            "ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8. "
+            "Auto scope can be specified as type,auto,ratio,backend1|backend2; "
+            "with total=-1, associated types without an override use auto 100%."))
 
     parser.add_argument(
         "--reclaim_policy",

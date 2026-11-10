@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -7,7 +8,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstdint>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
@@ -15,12 +15,23 @@
 namespace kv_cache_manager {
 
 class MetricsRegistry;
+class LoopThread;
+
+struct StorageCapacitySnapshot {
+    // -1 is unknown; a successful zero is authoritative.
+    int64_t capacity = -1;
+    int64_t last_success_time_s = 0;
+    int64_t last_success_steady_us = 0;
+    ErrorCode refresh_code = EC_ERROR;
+    std::string identity;
+    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+};
 
 class DataStorageManager {
 public:
     DataStorageManager() = delete;
     explicit DataStorageManager(std::shared_ptr<MetricsRegistry> metrics_registry);
-    ~DataStorageManager() = default;
+    ~DataStorageManager();
 
     DataStorageManager(const DataStorageManager &) = delete;
     DataStorageManager &operator=(const DataStorageManager &) = delete;
@@ -30,6 +41,8 @@ public:
     std::vector<std::shared_ptr<DataStorageBackend>> GetAvailableStorages();
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
     std::vector<StorageConfig> ListStorageConfig();
+    std::map<std::string, StorageCapacitySnapshot> GetCapacitySnapshots() const;
+    void RefreshCapacities();
 
     ErrorCode EnableStorage(const std::string &name);
     ErrorCode DisableStorage(const std::string &name);
@@ -96,10 +109,12 @@ private:
 
 private:
     mutable std::shared_mutex rw_lock_;
-    std::thread heartbeat_thread_;
     // stroage unique name -> storage_backend
     std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_map_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+    // Runtime observations only; cleared with the corresponding backend on cleanup/removal.
+    std::map<std::string, StorageCapacitySnapshot> capacity_snapshots_;
+    std::shared_ptr<LoopThread> capacity_refresh_thread_;
 };
 
 } // namespace kv_cache_manager

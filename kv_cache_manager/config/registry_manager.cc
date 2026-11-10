@@ -6,6 +6,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -127,6 +128,12 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
     : registry_storage_uri_(registry_storage_uri), metrics_registry_(std::move(metrics_registry)) {}
 
 RegistryManager::~RegistryManager() { DoCleanup(); }
+
+EffectiveGroupQuota RegistryManager::ResolveQuota(const InstanceGroup &group) const {
+    const auto manager = data_storage_manager();
+    const auto snapshots = manager ? manager->GetCapacitySnapshots() : std::map<std::string, StorageCapacitySnapshot>{};
+    return ResolveEffectiveQuota(group, snapshots, TimestampUtil::GetSteadyTimeUs());
+}
 
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
@@ -572,9 +579,8 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
-ErrorCode RegistryManager::UpsertRegistryField(const std::string &key,
-                                               const std::string &id,
-                                               const Jsonizable *jsonizable) {
+ErrorCode
+RegistryManager::UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
     const ErrorCode ec = storage_->UpsertField(key, id, jsonizable ? jsonizable->ToJsonString() : id);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Upsert %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);

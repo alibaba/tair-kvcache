@@ -140,7 +140,7 @@ class EnvironmentParsingTest(unittest.TestCase):
             "KVCM_INSTANCE_GROUP": group_env(),
         })
 
-        self.assertEqual(1000000000, config.quota_capacity)
+        self.assertEqual(-1, config.quota_capacity)
         self.assertEqual(512, config.max_instance_count)
         self.assertEqual("POLICY_LRU", config.reclaim_policy)
         self.assertEqual(0.8, config.reclaim_used_percentage)
@@ -197,7 +197,7 @@ class EnvironmentParsingTest(unittest.TestCase):
                 "unique_name": L1P5_NAME, "heartbeat_timeout_ms": True}),
               "KVCM_INSTANCE_GROUP": group_env()}, "must be an integer"),
             ({"KVCM_L1P5_STORAGE": storage_env(L1P5_NAME),
-              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=0)}, "must be positive"),
+              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=-2)}, "must be non-negative"),
         )
         for environ, message in cases:
             with self.subTest(message=message):
@@ -417,7 +417,7 @@ class ErrorReportingTest(unittest.TestCase):
                 "cached,redis://user:{}@redis.example:6379/?cluster_name=test,true,invalid"
                 .format(secret)))
         with patch.dict("os.environ", environ, clear=True), \
-             self.assertLogs("kvcm_ops.bootstrap", level="ERROR") as logs:
+                self.assertLogs("kvcm_ops.bootstrap", level="ERROR") as logs:
             self.assertEqual(1, main([]))
         full_log = "\n".join(logs.output)
         self.assertIn("meta_storage_backend_config must use", full_log)
@@ -427,9 +427,9 @@ class ErrorReportingTest(unittest.TestCase):
     def test_bootstrap_command_uses_custom_admin_host(self):
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment",
                    return_value=parse_environment({})), \
-             patch("kvcm_ops.kvcm.bootstrap.AdminClient") as admin_client, \
-             patch("kvcm_ops.kvcm.bootstrap.bootstrap_once",
-                   return_value=BootstrapOutcome.COMPLETE):
+            patch("kvcm_ops.kvcm.bootstrap.AdminClient") as admin_client, \
+            patch("kvcm_ops.kvcm.bootstrap.bootstrap_once",
+                  return_value=BootstrapOutcome.COMPLETE):
             self.assertEqual(0, main(["--host", "http://127.0.0.1:6500"]))
         admin_client.assert_called_once_with("http://127.0.0.1:6500")
 
@@ -468,7 +468,8 @@ class DesiredConfigurationTest(unittest.TestCase):
 
         self.assertEqual([PACE_NAME], group["storage_candidates"])
         self.assertEqual([L1P5_NAME, L2_NAME], group["event_report_storage_candidates"])
-        self.assertEqual("ST_TAIRMEMPOOL", group["quota"]["quota_config"][0]["storage_type"])
+        self.assertEqual(-1, group["quota"]["capacity"])
+        self.assertEqual([], group["quota"]["quota_config"])
         self.assertEqual(PACE_NAME, group["cache_config"]["reclaim_strategy"]["storage_unique_name"])
         self.assertEqual("CPS_PREFER_TAIR_MEMPOOL", group["cache_config"]["data_storage_strategy"])
 
@@ -694,7 +695,7 @@ class BootstrapReconciliationTest(unittest.TestCase):
         config = parse_environment(environ)
 
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment", return_value=config), \
-             patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client):
+                patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client):
             status = main(["--reconcile"])
 
         self.assertEqual(3, status)
@@ -722,8 +723,8 @@ class BootstrapReconciliationTest(unittest.TestCase):
         config = parse_environment(environ)
 
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment", return_value=config), \
-             patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client), \
-             self.assertLogs("kvcm_ops.bootstrap", level="WARNING") as logs:
+                patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client), \
+                self.assertLogs("kvcm_ops.bootstrap", level="WARNING") as logs:
             status = main(["--reconcile"])
 
         self.assertEqual(3, status)

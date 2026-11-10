@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
@@ -1061,9 +1062,8 @@ public:
         return result;
     }
 
-    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
-                                                KeyType rejected_prefix = 0,
-                                                bool event_report_prefix = false) {
+    MetaLocalBackend *
+    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -2040,21 +2040,21 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         // instance 0 storage usage = 1024, key count = 0, max key count = 32
         // instance 1 storage usage = 1024, key count = 0, max key count = 32
         // group quota capacity set to -1
-        // A negative capacity has the same zero-capacity semantics.
+        // Unlimited total bytes does not trigger group byte reclamation.
 
         key_count = 0;
         max_key_count = 32;
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
+        ins_group->quota_.set_capacity(-1);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
-        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
     }
 }
 
@@ -2247,6 +2247,72 @@ TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevel
     EXPECT_FALSE(water_level->GetGeneralWaterLevelExceed());
     EXPECT_TRUE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
     EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+}
+
+TEST_F(CacheReclaimerTest, UnlimitedBytesStillEnforcesTypeAndKeyWaterLevels) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 2000);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, 10);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(-1);
+    group->quota_.set_quota_config({QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL),
+                                    QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)});
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+    auto water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                       group->name(),
+                                                       group->quota(),
+                                                       group->cache_config()->reclaim_strategy(),
+                                                       instance_infos);
+    ASSERT_NE(nullptr, water);
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(water->GetGroupKeysWaterLevelExceed());
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_FALSE(water->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    key_count = 100;
+    water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                  group->name(),
+                                                  group->quota(),
+                                                  group->cache_config()->reclaim_strategy(),
+                                                  instance_infos);
+    EXPECT_TRUE(water->GetGroupKeysWaterLevelExceed());
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+}
+
+TEST_F(CacheReclaimerTest, UnknownAndExpiredAutoQuotaNeverTriggerTypeEviction) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    dummy_meta_indexer->SetStorageUsageByType(type, 2000);
+    auto group = InstanceGroupFactory();
+    group->set_storage_candidates({"dram"});
+    QuotaConfig automatic(0, type);
+    automatic.set_mode("auto");
+    group->set_quota(InstanceGroupQuota(-1, {automatic}));
+    rm_->instance_group_configs_[group->name()] = group;
+    rm_->data_storage_manager_ = dsm_;
+    dsm_->storage_map_["dram"] = std::make_shared<TypedTestBackend>(mr_, type);
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+    auto check = [&]() {
+        return cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     group->name(),
+                                                     group->quota(),
+                                                     group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    };
+    auto water = check();
+    ASSERT_NE(nullptr, water);
+    EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water));
+    dsm_->capacity_snapshots_["dram"] = {100, 1000, TimestampUtil::GetSteadyTimeUs() - 31000000, EC_ERROR};
+    water = check();
+    EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water));
+    dsm_->capacity_snapshots_["dram"] = {100, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    water = check();
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+    dsm_->capacity_snapshots_["dram"].capacity = 0;
+    water = check();
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
 }
 
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
@@ -3511,7 +3577,9 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) { promise->set_exception(std::current_exception()); }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -6499,8 +6567,13 @@ TEST_F(CacheReclaimerTest, TestFairKeySamplingFailureClearsPartialWaveResults) {
     EXPECT_FALSE(
         cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, candidates));
     EXPECT_TRUE(candidates.empty());
-    EXPECT_EQ(4, SampleReclaimRequestsSnapshot().size());
-    EXPECT_EQ(0, cache_reclaimer_->in_flight_sampling_tasks_.load());
+    // The fourth task may observe cancellation before calling the backend.
+    // Failure returns before sibling tasks drain; neither scheduling outcome
+    // should allow a fifth sample or leave work behind after cancellation.
+    EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    const auto request_count = SampleReclaimRequestsSnapshot().size();
+    EXPECT_GE(request_count, 3u);
+    EXPECT_LE(request_count, 4u);
 }
 
 TEST_F(CacheReclaimerTest, TestFairKeySamplingTimeoutClearsPartialWaveResults) {
@@ -7313,12 +7386,12 @@ std::vector<ErrorCode> limited_copy_results;
 // This dispatch fixture stubs metadata and does not exercise actual backend
 // submission. Model the BatchSubmit group gate separately from its candidate
 // input; the real gate/byte-credit path is covered in MigrationManagerTest.
-std::vector<ErrorCode> MigrationManager_BatchSubmitWithGroupLimit_stub(
-    void *obj,
-    const std::string &trace_id,
-    std::vector<MigrationManager::MigrationRequest> requests,
-    MigrationManager::CopyConcurrencyLimit copy_limit,
-    bool lifecycle_lock_held) {
+std::vector<ErrorCode>
+MigrationManager_BatchSubmitWithGroupLimit_stub(void *obj,
+                                                const std::string &trace_id,
+                                                std::vector<MigrationManager::MigrationRequest> requests,
+                                                MigrationManager::CopyConcurrencyLimit copy_limit,
+                                                bool lifecycle_lock_held) {
     MigrationManager_BatchSubmit_stub(obj, trace_id, requests, copy_limit, lifecycle_lock_held);
     auto *manager = static_cast<MigrationManager *>(obj);
     const auto active = manager->ActiveTaskCountForGroup(copy_limit.instance_group_name);

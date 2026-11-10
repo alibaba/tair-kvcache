@@ -5,6 +5,8 @@
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/loop_thread.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
@@ -24,6 +26,53 @@ namespace kv_cache_manager {
 
 DataStorageManager::DataStorageManager(std::shared_ptr<MetricsRegistry> metrics_registry)
     : metrics_registry_(std::move(metrics_registry)) {}
+
+DataStorageManager::~DataStorageManager() {
+    if (capacity_refresh_thread_) {
+        capacity_refresh_thread_->Stop();
+    }
+}
+
+std::map<std::string, StorageCapacitySnapshot> DataStorageManager::GetCapacitySnapshots() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    auto snapshots = capacity_snapshots_;
+    for (const auto &[name, backend] : storage_map_) {
+        auto &snapshot = snapshots[name];
+        snapshot.type = backend->GetType();
+        snapshot.identity = backend->GetCapacityIdentity();
+    }
+    return snapshots;
+}
+
+void DataStorageManager::RefreshCapacities() {
+    for (const auto &name : GetAllStorageNames()) {
+        std::shared_ptr<DataStorageBackend> backend;
+        std::pair<ErrorCode, int64_t> result;
+        {
+            // Serialize the query with Close, but never perform backend I/O
+            // while holding the exclusive lock used by snapshot readers.
+            std::shared_lock<std::shared_mutex> lock(rw_lock_);
+            const auto it = storage_map_.find(name);
+            if (it == storage_map_.end()) {
+                continue;
+            }
+            backend = it->second;
+            result = backend->GetStorageCapacity("capacity_refresh");
+        }
+        std::unique_lock<std::shared_mutex> lock(rw_lock_);
+        const auto it = storage_map_.find(name);
+        if (it == storage_map_.end() || it->second != backend) {
+            continue; // Removed/replaced while the query was in flight.
+        }
+        auto &snapshot = capacity_snapshots_[name];
+        snapshot.refresh_code = result.first == EC_OK && result.second < 0 ? EC_ERROR : result.first;
+        if (snapshot.refresh_code == EC_OK) {
+            snapshot.capacity = result.second;
+            snapshot.last_success_time_s = TimestampUtil::GetCurrentTimeUs() / 1000000;
+            snapshot.last_success_steady_us = TimestampUtil::GetSteadyTimeUs();
+        }
+    }
+}
 
 std::vector<std::string> DataStorageManager::GetAllStorageNames() const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
@@ -119,6 +168,10 @@ ErrorCode DataStorageManager::RegisterStorage(RequestContext *request_context,
     }
     KVCM_LOG_INFO("RegisterStorage success, name: %s", name.c_str());
     storage_map_[name] = storage_backend;
+    if (!capacity_refresh_thread_) {
+        capacity_refresh_thread_ =
+            LoopThread::CreateLoopThread([this]() { RefreshCapacities(); }, 10000000, "capacity");
+    }
     return ec;
 }
 
@@ -141,6 +194,7 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
         metrics_registry_->RemoveByTagFilter({{"unique_name", name}});
     }
     storage_map_.erase(iter);
+    capacity_snapshots_.erase(name);
     return ec;
 }
 
@@ -166,14 +220,15 @@ ErrorCode DataStorageManager::DoCleanup() {
         }
     }
     storage_map_.clear();
+    capacity_snapshots_.clear();
 
     KVCM_LOG_INFO("data storage manager cleanup completed");
     return result;
 }
 
 bool DataStorageManager::PublishMetricsIfCurrent(const std::string &name,
-                                                const std::shared_ptr<DataStorageBackend> &backend,
-                                                const std::function<void()> &publish) const {
+                                                 const std::shared_ptr<DataStorageBackend> &backend,
+                                                 const std::function<void()> &publish) const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const auto it = storage_map_.find(name);
     if (!backend || it == storage_map_.end() || it->second != backend) {
@@ -395,16 +450,10 @@ AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_cont
     // local shared_ptr above only protects the submit call itself; without the
     // capture an unregister could destroy the coordinator while PACE is still
     // executing the operation.
-    auto completion_with_backend_lease =
-        [storage_backend, completion = std::move(completion)](AsyncCopyBatchResult result) mutable {
-            completion(std::move(result));
-        };
-    return storage_backend->CopyAsync(src_uris,
-                                      dst_uris,
-                                      operation_id,
-                                      trace_id,
-                                      options,
-                                      std::move(completion_with_backend_lease));
+    auto completion_with_backend_lease = [storage_backend, completion = std::move(completion)](
+                                             AsyncCopyBatchResult result) mutable { completion(std::move(result)); };
+    return storage_backend->CopyAsync(
+        src_uris, dst_uris, operation_id, trace_id, options, std::move(completion_with_backend_lease));
 }
 
 ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id) {
@@ -468,7 +517,8 @@ void DataStorageManager::RecordWriteBytes(const std::string &unique_name, std::u
     auto iter = storage_map_.find(unique_name); // iter->second 指向 DataStorageBackend 对象
     if (iter == storage_map_.end() || iter->second == nullptr) {
         KVCM_LOG_WARN("RecordWriteBytes: storage [%s] not found, drop %llu bytes",
-                      unique_name.c_str(), static_cast<unsigned long long>(bytes));
+                      unique_name.c_str(),
+                      static_cast<unsigned long long>(bytes));
         return;
     }
     const auto collector = iter->second->GetMetricsCollector(); // 指向 DataStorageMetricsCollector 对象

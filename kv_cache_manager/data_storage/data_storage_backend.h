@@ -103,6 +103,13 @@ public:
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
+    // Total allocatable bytes for GetType(), never free bytes. Failure and
+    // unsupported queries must not be represented as a successful zero.
+    virtual std::pair<ErrorCode, int64_t> GetStorageCapacity(const std::string &trace_id) const {
+        return {EC_UNIMPLEMENTED, 0};
+    }
+    // Aliases of the same physical pool and media must return the same identity.
+    virtual std::string GetCapacityIdentity() const { return config_.global_unique_name(); }
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
     virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }

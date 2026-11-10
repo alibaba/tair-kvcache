@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
@@ -34,6 +36,7 @@ protected:
     MetricsCollectors data_storage_interval_metrics_collectors_;
     KVCM_DECLARE_METRICS_COLLECTOR_(CacheManager);
     MetricsCollectors cache_manager_group_interval_metrics_collectors_;
+    std::set<MetricsTags> quota_storage_tags_;
     MetricsCollectors cache_manager_instance_interval_metrics_collectors_;
 };
 

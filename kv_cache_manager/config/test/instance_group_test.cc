@@ -14,6 +14,42 @@ public:
     void TearDown() override {}
 };
 
+TEST_F(InstanceGroupTest, DynamicQuotaProtoAndPersistenceRoundTrip) {
+    proto::admin::InstanceGroup wire;
+    InstanceGroup defaults;
+    ProtoConvert::InstanceGroupFromProto(&wire, defaults);
+    EXPECT_EQ(-1, defaults.quota().capacity());
+    wire.mutable_quota()->set_capacity(0);
+    InstanceGroup zero;
+    ProtoConvert::InstanceGroupFromProto(&wire, zero);
+    EXPECT_EQ(0, zero.quota().capacity());
+    wire.mutable_quota()->set_capacity(-1);
+    auto *config = wire.mutable_quota()->add_quota_config();
+    config->set_storage_type(proto::admin::ST_TAIRMEMPOOL);
+    config->set_mode("auto");
+    config->set_ratio(0.5);
+    config->add_storage_names("pool");
+    InstanceGroup group;
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    InstanceGroupQuota restored;
+    ASSERT_TRUE(restored.FromJsonString(group.quota().ToJsonString()));
+    group.set_quota(restored);
+    proto::admin::InstanceGroup result;
+    ProtoConvert::InstanceGroupToProto(group, &result);
+    EXPECT_EQ(-1, result.quota().capacity());
+    ASSERT_EQ(1, result.quota().quota_config_size());
+    EXPECT_EQ("auto", result.quota().quota_config(0).mode());
+    EXPECT_DOUBLE_EQ(0.5, result.quota().quota_config(0).ratio());
+    EXPECT_EQ("pool", result.quota().quota_config(0).storage_names(0));
+    config->clear_ratio_value();
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    EXPECT_DOUBLE_EQ(1.0, group.quota().quota_config().front().ratio());
+    config->set_ratio(0);
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    std::string invalid;
+    EXPECT_FALSE(group.quota().ValidateRequiredFields(invalid));
+}
+
 // --- InstanceGroup set_revisit_interval_buckets ---
 
 TEST_F(InstanceGroupTest, SetValidBuckets) {

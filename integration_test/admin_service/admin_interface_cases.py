@@ -295,6 +295,57 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         remove_resp = self._client.remove_instance_group(remove_req)
         self.assertEqual(remove_resp["header"]["status"]["code"], "OK")
 
+    def test_dynamic_quota_config_and_runtime_are_separate(self):
+        group = self.make_sample_instance_group()
+        group["quota"] = {
+            "capacity": -1,
+            "quota_config": [
+                {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 0.5,
+                 "storage_names": ["missing_pool"]},
+                {"storage_type": "ST_TAIRMEMPOOL_SSD", "capacity": 160},
+            ],
+        }
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        result = self._client.get_instance_group({"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(result["quota"]["capacity"]))
+        self.assertEqual("auto", result["quota"]["quota_config"][0]["mode"])
+        self.assertEqual(0.5, result["quota"]["quota_config"][0]["ratio"])
+        runtime = result["runtime_quota"]
+        self.assertFalse(runtime.get("total_bytes_limit_enabled", False))
+        self.assertEqual(-1, int(runtime["reference_capacity"]))
+        types = {item["storage_type"]: item for item in runtime["storage_types"]}
+        self.assertEqual("missing_backend", types["ST_TAIRMEMPOOL"]["refresh_status"])
+        self.assertFalse(types["ST_TAIRMEMPOOL"].get("known", False))
+        self.assertEqual(160, int(types["ST_TAIRMEMPOOL_SSD"]["effective_capacity"]))
+        # GET -> whole-object UPDATE must preserve auto configuration and
+        # ignore the read-only runtime object supplied by the client.
+        result["user_data"] = "updated"
+        result["runtime_quota"]["reference_capacity"] = 999999
+        current_version = int(result["version"])
+        result["version"] = current_version + 1
+        self._client.update_instance_group({"trace_id": self._trace_id, "instance_group": result,
+                                            "current_version": current_version})
+        restored = self._client.get_instance_group(
+            {"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(restored["runtime_quota"]["reference_capacity"]))
+        self.assertEqual(0.5, restored["quota"]["quota_config"][0]["ratio"])
+        listed = self._client.list_instance_group({"trace_id": self._trace_id})["instance_group"]
+        self.assertTrue(any(item["name"] == group["name"] and "runtime_quota" in item for item in listed))
+
+    def test_new_group_defaults_to_unlimited_auto_and_rejects_invalid_ratio(self):
+        group = self.make_sample_instance_group()
+        del group["quota"]
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        result = self._client.get_instance_group({"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(result["quota"]["capacity"]))
+        for ratio in (0, -0.1, 1.1):
+            group["name"] = "invalid_quota_group"
+            group["quota"] = {"capacity": -1, "quota_config": [
+                {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": ratio}]}
+            response = self._client.create_instance_group(
+                {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
+            self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+
     def test_register_get_list_remove_instance(self):
         ig = self.make_sample_instance_group()
         create_req = {"trace_id": self._trace_id, "instance_group": ig}
@@ -464,20 +515,21 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         get_resp = self._client.get_leader_elector_config(get_req)
         self.assertEqual(get_resp["header"]["status"]["code"], "OK")
         original_delay = int(get_resp["campaign_delay_time_ms"])
-        
+
         # 更新配置（增加1000ms）
         new_delay = original_delay + 1000
         update_req = {"trace_id": self._trace_id, "campaign_delay_time_ms": new_delay}
         update_resp = self._client.update_leader_elector_config(update_req)
         self.assertIn("header", update_resp)
         self.assertEqual(update_resp["header"]["status"]["code"], "OK")
-        
+
         # 再次获取配置验证是否更新（如果更新成功）
         get_resp2 = self._client.get_leader_elector_config(get_req)
         self.assertEqual(get_resp2["header"]["status"]["code"], "OK")
         # 如果更新成功，新的延迟应该生效；否则保持原样
         # 我们只是记录而不做硬性断言，因为更新可能需要特定权限
         logging.info(f"Original delay: {original_delay}, current delay: {get_resp2['campaign_delay_time_ms']}")
+
     def test_register_and_remove_instance_error_details(self):
         """Verify error details for various register/remove instance error scenarios."""
         # --- Part 1: invalid block_size ---
@@ -489,10 +541,16 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         reg_req["block_size"] = 0
         resp = self._client.register_instance(reg_req, check_response=False)
         status = resp["header"]["status"]
-        self.assertEqual(status["code"], "INVALID_ARGUMENT",
-                         f"Expected INVALID_ARGUMENT for block_size=0, got {status['code']}: {status.get('message', '')}")
+        self.assertEqual(
+            status["code"],
+            "INVALID_ARGUMENT",
+            f"Expected INVALID_ARGUMENT for block_size=0, got {
+                status['code']}: {
+                status.get(
+                    'message',
+                    '')}")
         self.assertIn("block_size", status.get("message", "").lower(),
-                       "Error message should mention block_size")
+                      "Error message should mention block_size")
 
         # --- Part 2: group not found ---
         non_existent_group = "totally_nonexistent_admin_group"
@@ -505,7 +563,7 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                             "Registering with non-existent group should fail")
         msg = status.get("message", "")
         self.assertIn(non_existent_group, msg,
-                       f"Error message should contain group name '{non_existent_group}', got: {msg}")
+                      f"Error message should contain group name '{non_existent_group}', got: {msg}")
 
         # --- Part 3: duplicate with different model_deployment ---
         reg_req = self.make_sample_register_instance_request()
@@ -519,9 +577,9 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                          f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
         msg = status.get("message", "")
         self.assertIn(reg_req["instance_id"], msg,
-                       f"Error message should contain instance_id, got: {msg}")
+                      f"Error message should contain instance_id, got: {msg}")
         self.assertIn("model_deployment", msg,
-                       f"Error message should mention mismatched field 'model_deployment', got: {msg}")
+                      f"Error message should mention mismatched field 'model_deployment', got: {msg}")
 
         # --- Part 4: duplicate with different block_size ---
         dup_req = self.make_sample_register_instance_request()
@@ -532,7 +590,7 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                          f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
         msg = status.get("message", "")
         self.assertIn("block_size", msg,
-                       f"Error message should mention mismatched field 'block_size', got: {msg}")
+                      f"Error message should mention mismatched field 'block_size', got: {msg}")
 
         # --- Part 5: remove non-existent instance ---
         remove_req = {
@@ -543,11 +601,13 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         status = resp["header"]["status"]
         self.assertNotEqual(status["code"], "OK",
                             "Removing non-existent instance should fail")
-        self.assertNotEqual(status["code"], "INTERNAL_ERROR",
-                            f"Expected a specific error code (not INTERNAL_ERROR) for non-existent instance, got: {status}")
+        self.assertNotEqual(
+            status["code"],
+            "INTERNAL_ERROR",
+            f"Expected a specific error code (not INTERNAL_ERROR) for non-existent instance, got: {status}")
         msg = status.get("message", "")
         self.assertIn("nonexistent_instance_for_remove", msg,
-                       f"Error message should contain the instance_id, got: {msg}")
+                      f"Error message should contain the instance_id, got: {msg}")
 
     def test_leader_demote(self):
         """测试 LeaderDemote 接口"""
@@ -639,7 +699,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             try:
                 req = {"trace_id": f"trace_wait_{worker_id}_{int(time.time())}"}
                 resp = client.check_health(req, check_response=False)
-                if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_health") == True:
+                if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_health"):
                     return True
             except Exception as e:
                 logging.warning(f"Worker {worker_id} check health failed: {e}")
@@ -653,7 +713,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             try:
                 req = {"trace_id": f"trace_wait_{worker_id}_{int(time.time())}"}
                 resp = client.check_health(req, check_response=False)
-                if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_leader") == True:
+                if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_leader"):
                     return True
             except Exception as e:
                 logging.warning(f"Worker {worker_id} check health failed: {e}")
@@ -668,7 +728,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
                 try:
                     req = {"trace_id": f"trace_any_{i}_{int(time.time())}"}
                     resp = client.check_health(req, check_response=False)
-                    if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_leader") == True:
+                    if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_leader"):
                         return i, resp
                 except Exception as e:
                     logging.warning(f"Worker {i} check health failed: {e}")
@@ -740,7 +800,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
 
             demote_req = {"trace_id": "trace_demote_test"}
             demote_resp = original_leader_client.leader_demote(demote_req)
-            self.assertEqual(demote_resp["header"]["status"]["code"],"OK", f"Leader降级失败: {demote_resp}")
+            self.assertEqual(demote_resp["header"]["status"]["code"], "OK", f"Leader降级失败: {demote_resp}")
 
             # 原来的leader不再是leader
             check_req = {"trace_id": f"trace_check_original_leader_{int(time.time())}"}
@@ -780,7 +840,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             # 确定非leader的worker
             non_leader_id = 1 if leader_id == 0 else 0
             non_leader_client = client0 if non_leader_id == 0 else client1
-            
+
             # 检查非leader的状态
             non_leader_req = {"trace_id": "trace_non_leader_before_stop"}
             non_leader_resp = non_leader_client.check_health(non_leader_req)
@@ -788,7 +848,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
 
             # kill掉当前的leader worker
             self.worker_manager.stop_worker(leader_id, True)
-            
+
             # 等待一段时间，让分布式锁检测到leader失效
             time.sleep(1)  # 等待足够时间让租约过期
 
@@ -808,7 +868,7 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             # 验证新的leader状态
             new_leader_req = {"trace_id": "trace_new_leader_health"}
             new_leader_resp = non_leader_client.check_health(new_leader_req)
-            
+
             self.assertTrue(new_leader_resp.get("is_leader"), f"Worker {non_leader_id} 应该成为新的leader")
             self.assertTrue(new_leader_resp.get("is_health"), f"新的leader应该健康")
 
@@ -816,13 +876,16 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             new_cluster_req = {"trace_id": "trace_new_leader_cluster"}
             new_cluster_resp = non_leader_client.get_manager_cluster_info(new_cluster_req)
             leader_node_id = new_cluster_resp["leader_node_id"]
-            
+
             self.assertEqual(new_cluster_resp["header"]["status"]["code"], "OK", "获取新的leader集群信息应该成功")
-            self.assertEqual(new_cluster_resp["leader_node_id"], new_cluster_resp["self_node_id"], "leader节点ID和leader自身应该一致")
+            self.assertEqual(
+                new_cluster_resp["leader_node_id"],
+                new_cluster_resp["self_node_id"],
+                "leader节点ID和leader自身应该一致")
 
             # 重新启动之前停止的worker
             self.start_worker_by_id(leader_id)
-            
+
             # 等待重新启动的worker完成初始化
             time.sleep(2)
             restarted_client = self._get_manager_client(leader_id)
@@ -852,14 +915,14 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             # 系统应该仍然有leader（可能是Worker 0或Worker 1）
             leader_count = 0
             if worker0_resp["is_leader"]:
-                leader_count+=1
+                leader_count += 1
             if worker1_resp["is_leader"]:
-                leader_count+=1
+                leader_count += 1
             self.assertEqual(leader_count, 1, "系统应该有且只有1个leader")
 
             worker0_client.close()
             worker1_client.close()
-            
+
             logging.info("worker挂掉后的leader自动切换测试完成")
 
         finally:

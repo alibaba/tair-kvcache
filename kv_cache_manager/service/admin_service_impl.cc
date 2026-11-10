@@ -111,6 +111,26 @@ bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::Re
 
 namespace kv_cache_manager {
 
+namespace {
+void FillRuntimeQuota(const EffectiveGroupQuota &quota, proto::admin::InstanceGroup *group) {
+    auto *runtime = group->mutable_runtime_quota();
+    runtime->set_total_bytes_limit_enabled(quota.configured_capacity != -1);
+    runtime->set_reference_capacity(quota.reference_capacity);
+    for (const auto &[type, value] : quota.types) {
+        auto *status = runtime->add_storage_types();
+        status->set_storage_type(static_cast<proto::admin::StorageType>(type));
+        status->set_mode(value.config.mode());
+        status->set_ratio(value.config.ratio());
+        status->set_effective_capacity(value.capacity);
+        status->set_backend_capacity(value.backend_capacity);
+        status->set_known(value.known);
+        status->set_usable(value.usable);
+        status->set_refresh_status(value.status);
+        status->set_last_success_time_s(value.last_success_time_s);
+    }
+}
+} // namespace
+
 AdminServiceImpl::AdminServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                    std::shared_ptr<MetricsReporter> metrics_reporter,
                                    std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -439,6 +459,7 @@ void AdminServiceImpl::GetInstanceGroup(RequestContext *request_context,
     } else {
         auto *instance_group_config = response->mutable_instance_group();
         ProtoConvert::InstanceGroupToProto(*instance_group_res, instance_group_config);
+        FillRuntimeQuota(registry_manager_->ResolveQuota(*instance_group_res), instance_group_config);
         status->set_code(proto::admin::OK);
         request_context->set_status_code(status->code());
         status->set_message("Instance group retrieved successfully");
@@ -467,6 +488,7 @@ void AdminServiceImpl::ListInstanceGroup(RequestContext *request_context,
     for (const auto &instance_group : instance_groups) {
         auto *instance_group_config = response->add_instance_group();
         ProtoConvert::InstanceGroupToProto(*instance_group, instance_group_config);
+        FillRuntimeQuota(registry_manager_->ResolveQuota(*instance_group), instance_group_config);
     }
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());
@@ -586,10 +608,8 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
     }
 
-    const bool do_copy =
-        method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
-    const bool do_mark =
-        method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_copy = method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_mark = method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
 
     // 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
     // 显式 block_keys 优先，否则由 facade 按 rule.sample_count 采样（<=0 用默认）。
@@ -664,15 +684,15 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
     }
     std::vector<LocationSpecGroup> location_spec_groups;
     ProtoConvert::LocationSpecGroupsFromProto(request->location_spec_groups(), location_spec_groups);
-    auto [ec_info, _] = cache_manager_->RegisterInstance(request_context,
-                                                         request->instance_group(),
-                                                         request->instance_id(),
-                                                         request->block_size(),
-                                                         location_spec_infos,
-                                                         model_deployment_req,
-                                                         location_spec_groups,
-                                                         static_cast<CacheManager::QueryType>(
-                                                             request->default_query_type()));
+    auto [ec_info, _] =
+        cache_manager_->RegisterInstance(request_context,
+                                         request->instance_group(),
+                                         request->instance_id(),
+                                         request->block_size(),
+                                         location_spec_infos,
+                                         model_deployment_req,
+                                         location_spec_groups,
+                                         static_cast<CacheManager::QueryType>(request->default_query_type()));
     if (ec_info != EC_OK) {
         status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());

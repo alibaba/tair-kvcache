@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <future>
 #include <map>
@@ -479,7 +480,6 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
     }
 }
 
-
 namespace {
 // NfsBackend with a controllable usage ratio, used to verify how
 // ReportInterval handles valid readings, default zero and negative values.
@@ -500,7 +500,6 @@ private:
     bool writable_ = true;
 };
 } // namespace
-
 
 TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeValues) {
     auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
@@ -536,9 +535,11 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeV
     be->SetAvailable(false);
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.0, published_ratio());
-    EXPECT_DOUBLE_EQ(0.0,
-                     metrics_registry_->GetGauge("data_storage.healthy_status",
-                                                 MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}}).Get());
+    EXPECT_DOUBLE_EQ(
+        0.0,
+        metrics_registry_
+            ->GetGauge("data_storage.healthy_status", MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}})
+            .Get());
     be->SetUsageRatio(0.75);
     be->SetAvailable(true);
     reporter_->ReportInterval();
@@ -640,8 +641,8 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
             backend->SetAvailable(available);
             backend->SetWritable(writable);
             for (double ratio : {-1.0, 0.0, 0.75, 1.0}) {
-                SCOPED_TRACE(::testing::Message() << "available=" << available << " writable=" << writable
-                                                 << " ratio=" << ratio);
+                SCOPED_TRACE(::testing::Message()
+                             << "available=" << available << " writable=" << writable << " ratio=" << ratio);
                 // A real full reading must remain visible on the leader.
                 leader = true;
                 backend->SetUsageRatio(1.0);
@@ -804,6 +805,67 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         EXPECT_DOUBLE_EQ(0., flush_time_v);
         EXPECT_DOUBLE_EQ(0., pipeline_err_v);
     }
+}
+
+TEST_F(LocalMetricsReporterTest, UnlimitedQuotaMetricsUseReferenceAndExposeUnknownCapacity) {
+    cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
+    cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>();
+    registry_manager_->storage_ = std::make_unique<RegistryLocalBackend>();
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Init({}));
+    RequestContext context("quota_metrics");
+    InstanceGroup group;
+    group.set_name("quota_group");
+    const auto dram = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const auto ssd = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+    group.set_quota(InstanceGroupQuota(-1, {QuotaConfig(50, dram), QuotaConfig(160, ssd)}));
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&context, group));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(
+                  &context, group.name(), "instance", 8, {LocationSpecInfo("tp0", 1024)}, {}));
+    ASSERT_EQ(
+        EC_OK,
+        cache_manager_->meta_indexer_manager_->CreateMetaIndexer("instance", std::make_shared<MetaIndexerConfig>()));
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("instance");
+    indexer->SetStorageUsageByType(dram, 20);
+    indexer->SetStorageUsageByType(ssd, 80);
+    const auto sample = [&]() {
+        auto recorder = std::make_shared<CacheManagerMetricsRecorder>(cache_manager_->meta_indexer_manager_,
+                                                                      cache_manager_->write_location_manager_,
+                                                                      registry_manager_,
+                                                                      cache_manager_->metrics_lifecycle());
+        cache_manager_->metrics_recorder_ = recorder;
+        recorder->Start();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (recorder->group_quota_metric_map().empty() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        recorder->Stop();
+        reporter_->ReportInterval();
+        return !recorder->group_quota_metric_map().empty();
+    };
+    ASSERT_TRUE(sample());
+    const MetricsTags tags{{"instance_group", group.name()}};
+    const MetricsTags dram_tags{{"instance_group", group.name()}, {"storage_type", "pace"}};
+    const MetricsTags ssd_tags{{"instance_group", group.name()}, {"storage_type", "pace_ssd"}};
+    EXPECT_DOUBLE_EQ(210, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
+    EXPECT_NEAR(100.0 / 210, metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get(), 1e-10);
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group.total_bytes_limit_enabled", tags).Get());
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("cache_manager_group_storage.usage_bytes", dram_tags).Get());
+    EXPECT_DOUBLE_EQ(0.4, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", dram_tags).Get());
+    EXPECT_DOUBLE_EQ(0.5, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get());
+    QuotaConfig unknown(0, ssd);
+    unknown.set_mode("auto");
+    registry_manager_->instance_group_configs_[group.name()]->set_quota(
+        InstanceGroupQuota(-1, {QuotaConfig(50, dram), unknown}));
+    ASSERT_TRUE(sample());
+    EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
+    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get()));
+    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get()));
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.capacity_known", ssd_tags).Get());
+    registry_manager_->instance_group_configs_[group.name()]->set_quota(
+        InstanceGroupQuota(-1, {QuotaConfig(50, dram)}));
+    ASSERT_TRUE(sample());
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("storage_type=\"pace_ssd\""));
 }
 
 TEST_F(LocalMetricsReporterTest, InstanceLocalMetadataMetricsTrackEntriesAndLifecycle) {

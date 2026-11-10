@@ -15,8 +15,8 @@ flowchart TD
     main["main.cpp"] --> service["service（接入层/装配入口/请求门禁）"]
     service --> manager["manager（CacheManager）"]
     manager --> meta["meta（索引/CacheLocation）"]
-    meta --> config["config（注册表/选主）"]
-    config --> data_storage["data_storage（存储后端）"]
+    meta --> config["config（注册表/选主/有效 quota）"]
+    config --> data_storage["data_storage（存储后端/容量快照）"]
     data_storage --> common["common"]
 
     manager --> event["event"]
