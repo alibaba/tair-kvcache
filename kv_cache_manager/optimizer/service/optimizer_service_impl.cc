@@ -304,7 +304,9 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 }
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                                       const KvcmEventSubscriptionConfig &config) {
+                                                       const KvcmEventSubscriptionConfig &config,
+                                                       std::unordered_set<std::string> *unsupported_instance_ids) {
+    std::unordered_set<std::string> unsupported;
     if (!manager_ || !manager_->registry_manager()) {
         return EC_ERROR;
     }
@@ -365,6 +367,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
             // Keep the original KVCM spec mapping: a single group is full-attention.
             if (source.location_spec_groups_size() > 1) {
                 KVCM_LOG_WARN("Ignore unsupported multi-group instance[%s]", source.instance_id().c_str());
+                unsupported.insert(source.instance_id());
                 continue;
             }
             for (const auto &spec : source.location_spec_infos()) {
@@ -397,6 +400,9 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (ec != EC_OK) {
             return ec;
         }
+    }
+    if (unsupported_instance_ids) {
+        *unsupported_instance_ids = std::move(unsupported);
     }
     return EC_OK;
 }

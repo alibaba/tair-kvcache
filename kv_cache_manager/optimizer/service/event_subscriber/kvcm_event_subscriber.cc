@@ -184,10 +184,15 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
         return false;
     }
 
-    const auto ec = optimizer_service_->ApplyKvcmConfiguration(response, config_);
+    std::unordered_set<std::string> unsupported_instance_ids;
+    const auto ec = optimizer_service_->ApplyKvcmConfiguration(response, config_, &unsupported_instance_ids);
     if (ec != EC_OK) {
         KVCM_LOG_WARN("KvcmEventSubscriber: configuration sync failed, ec=%d", static_cast<int>(ec));
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
+        unsupported_instance_ids_ = std::move(unsupported_instance_ids);
     }
     KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d",
                   leader_endpoint.c_str(),
@@ -328,6 +333,12 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
             }
         } else if (collector) {
             collector->set_service_error_code_metrics(static_cast<double>(ec));
+        }
+    }
+    if (ec == EC_INSTANCE_NOT_EXIST) {
+        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
+        if (unsupported_instance_ids_.count(event.instance_id()) != 0) {
+            return;
         }
     }
     if (ec != EC_OK) {

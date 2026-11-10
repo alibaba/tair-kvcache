@@ -63,7 +63,8 @@ public:
 
     // KVCM ingress
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                     const KvcmEventSubscriptionConfig &config);
+                                     const KvcmEventSubscriptionConfig &config,
+                                     std::unordered_set<std::string> *unsupported_instance_ids = nullptr);
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,

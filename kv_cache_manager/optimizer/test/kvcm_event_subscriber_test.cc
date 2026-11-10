@@ -461,6 +461,50 @@ TEST_F(KvcmEventSubscriberTest, AutoRegistersWithoutSpecInterpretation) {
     subscriber.Stop();
 }
 
+TEST_F(KvcmEventSubscriberTest, UnsupportedInstancesDoNotRequestRefreshAndRecoverAfterConfigurationChange) {
+    TestKvcmServer leader;
+    auto configuration = MakeConfiguration({"ambiguous"});
+    auto *extra_group = configuration.mutable_instances(0)->add_location_spec_groups();
+    extra_group->set_name("linear");
+    extra_group->add_spec_names("tp0");
+    leader.event_service_.SetConfiguration(configuration);
+
+    KvcmEventSubscriptionConfig config;
+    ASSERT_TRUE(
+        config.FromJsonString(std::string(R"({"auto_register_from_kvcm":true,"service_discovery_url":"static://)") +
+                              leader.endpoint() + R"(","discovery_refresh_interval_ms":5000})"));
+    KvcmEventSubscriber subscriber(config, optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    // Drive sync and event consumption synchronously so the supervisor cannot
+    // clear the refresh flag before the assertion.
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    EXPECT_FALSE(IsRegistered("ambiguous"));
+    for (int i = 0; i < 100; ++i) {
+        subscriber.ProcessEvent(MakeEvent("ambiguous", "unsupported", i), "127.0.0.1");
+        EXPECT_FALSE(subscriber.configuration_refresh_requested_);
+    }
+    EXPECT_EQ(1, leader.event_service_.configuration_count_.load());
+
+    // A failed sync must not discard the last successful unsupported set.
+    leader.event_service_.SetConfigurationAvailable(false);
+    EXPECT_FALSE(subscriber.SyncConfiguration(leader.endpoint()));
+    subscriber.ProcessEvent(MakeEvent("ambiguous", "failed-sync", 1), "127.0.0.1");
+    EXPECT_FALSE(subscriber.configuration_refresh_requested_);
+    leader.event_service_.SetConfigurationAvailable(true);
+
+    // A successful replacement snapshot removes stale exclusions.
+    leader.event_service_.SetConfiguration(MakeConfiguration({}));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    subscriber.ProcessEvent(MakeEvent("ambiguous", "now-unknown", 1), "127.0.0.1");
+    EXPECT_TRUE(subscriber.configuration_refresh_requested_);
+
+    leader.event_service_.SetConfiguration(MakeConfiguration({"ambiguous"}));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(IsRegistered("ambiguous"));
+    subscriber.ProcessEvent(MakeEvent("ambiguous", "now-supported", 1), "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("ambiguous"));
+}
+
 TEST_F(KvcmEventSubscriberTest, ReconnectsClosedLeaderStream) {
     TestKvcmServer leader(false);
     leader.event_service_.SetConfiguration(MakeConfiguration({}));

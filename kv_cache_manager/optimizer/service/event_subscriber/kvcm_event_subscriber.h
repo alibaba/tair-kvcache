@@ -78,6 +78,8 @@ private:
     std::thread supervisor_thread_;
     std::mutex worker_mutex_;
     std::unique_ptr<EndpointWorker> worker_;
+    std::mutex unsupported_instances_mutex_;
+    std::unordered_set<std::string> unsupported_instance_ids_;
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
     bool configuration_refresh_requested_ = false;
