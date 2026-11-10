@@ -188,6 +188,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
+| `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
+| `role_state` | gauge | 选主生命周期阶段，导出为 `kvcm_role_state`；`state` 标签为 `follower`、`promoting`、`leader`、`demoting`，当前采样阶段为 1，其余为 0 |
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
 | `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
@@ -212,6 +214,41 @@ cached 模式统计本地部分，纯 Redis 模式为 0。该口径与 `meta_ind
 local 和 cached 模式均统计当前本地索引；恢复期间只反映已经加载到 local 的条目，没有 local 后端时为 0。
 各 shard 分别读取，属于并发采样值。原有 `cache_manager_instance.key_count` 和 `meta_indexer.total_key_count`
 继续使用 `MetaIndexer::GetKeyCount()` 的逻辑计数，含义和行为不变；新指标不参与配额或回收决策。
+
+`is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
+不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。
+
+`role_state` 由独立轻量线程读取 `LeaderElector::GetRoleState()`，周期为
+`kvcm.metrics.report_interval_ms`（默认 20 秒）。不访问网络、不持业务或生命周期锁，
+恢复、清理或普通指标采集阻塞时仍可采样。每轮刷新固定的四条序列，旧阶段归零。
+短于上报/抓取周期的阶段可能采不到；这是当前状态的周期采样，不是状态切换事件记录。
+`is_leader` 保留原有采集路径，两者是独立采样，不是事务性的服务就绪快照。
+`role_state` 直接写入指标注册表，使用 dummy reporter 时也会发布。
+
+晋升期间的输出示例：
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+检测晋升或降级耗时过长，可使用以下表达式，并设置例如 `for: 5m`，按预期恢复/清理耗时调整：
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+筛选同时报告持有租约且处于稳定主节点阶段的节点：
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+该组合不保证请求入口已就绪、所有实例恢复完成或依赖均健康；指标只暴露现有状态机，
+不改变请求准入及选主、恢复、降级行为。
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
 

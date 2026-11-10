@@ -23,6 +23,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/command_line.h"
 #include "kv_cache_manager/service/debug_service_impl.h"
@@ -423,6 +424,15 @@ void Server::CreateMetricsReporter() {
     auto reporter_config = config_.metrics_reporter_config();
     metrics_reporter_ =
         metrics_reporter_factory_->Create(reporter_type, reporter_config, config_.metrics_common_tags());
+    if (metrics_reporter_ && leader_elector_) {
+        // Hold the elector weakly: the metrics loop thread can still run one
+        // last ReportInterval() while the server tears its members down.
+        std::weak_ptr<LeaderElector> weak_leader_elector = leader_elector_;
+        metrics_reporter_->SetLeaderStateProvider([weak_leader_elector]() {
+            auto leader_elector = weak_leader_elector.lock();
+            return leader_elector != nullptr && leader_elector->IsLeader();
+        });
+    }
     KVCM_LOG_INFO("create metrics reporter OK");
 }
 
@@ -529,6 +539,18 @@ bool Server::StartMetricsReportThread() {
         KVCM_LOG_ERROR("do not have metrics reporter, start report thread failed.");
         return false;
     }
+    std::weak_ptr<LeaderElector> weak_role_elector = leader_elector_;
+    // Phase reporting must remain live while recovery, cleanup or capacity
+    // collection is waiting. GetRoleState only loads an existing atomic.
+    role_state_metrics_thread_ = LoopThread::CreateLoopThread(
+        [registry = metrics_registry_, weak_role_elector]() {
+            if (const auto elector = weak_role_elector.lock()) {
+                NodeStatusMetrics::PublishRoleState(registry, elector->GetRoleState());
+            }
+        },
+        config_.metrics_report_interval_ms() * 1000,
+        "role_state",
+        true);
     if (leader_elector_) {
         std::weak_ptr<LeaderElector> weak_storage_elector = leader_elector_;
         metrics_reporter_->SetStorageUsageProvider([weak_storage_elector]() {
@@ -572,6 +594,9 @@ void Server::Stop() {
     if (debug_http_service_) {
         debug_http_service_->Stop();
         KVCM_LOG_INFO("debug http server stopped.");
+    }
+    if (role_state_metrics_thread_) {
+        role_state_metrics_thread_->Stop();
     }
     if (metrics_report_thread_) {
         metrics_report_thread_->Stop();

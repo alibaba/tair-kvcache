@@ -156,6 +156,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:node_status_metrics",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/service/util:common",

@@ -22,6 +22,7 @@
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
 #include "stub.h"
@@ -953,6 +954,47 @@ TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {
     expect_health(0.0);
 }
 
+TEST_F(LocalMetricsReporterTest, TestReportIntervalNodeStatus) {
+    auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("node_status", backend);
+
+    const auto is_leader_gauge = [&]() { return metrics_registry_->GetGauge(NodeStatusMetrics::kIsLeaderName).Get(); };
+    // no provider installed: the node-level gauges stay unregistered
+    reporter_->ReportInterval();
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData(NodeStatusMetrics::kIsLeaderName));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
+
+    bool leader = false;
+    reporter_->SetLeaderStateProvider([&leader]() { return leader; });
+
+    // a follower serves no data plane request even with a healthy backend
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, is_leader_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
+
+    leader = true;
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0, is_leader_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
+
+    backend->SetAvailable(false);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0, is_leader_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
+
+    leader = false;
+    backend->SetAvailable(true);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, is_leader_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
+
+    const auto output = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_NE(std::string::npos, output.find("kvcm_is_leader 0"));
+    EXPECT_EQ(std::string::npos, output.find("kvcm_access_mode"));
+}
 
 TEST_F(LocalMetricsReporterTest, DemotionCleanupClearsRemovedBackendHealth) {
     auto backend = std::make_shared<NfsBackend>(metrics_registry_);
