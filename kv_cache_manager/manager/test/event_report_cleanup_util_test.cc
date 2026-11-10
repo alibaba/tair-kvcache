@@ -69,8 +69,28 @@ TEST_F(EventReportCleanupUtilTest, MalformedSpecNeverAuthorizesLocationDeletion)
     EXPECT_TRUE(
         IsSnapshotLocationStaleForCleanup(&backend, reporter.instance_id, old_only, /*preserve_in_flight=*/true));
 
+    const std::string legacy_uri = "event_report://physical-cache:9600/mem?s_version=0123456789abcdef0123456789abcdef";
+    CacheLocation legacy_only(
+        location_id, CLS_SERVING, backend.GetStorageType(), 1, {LocationSpec("legacy", legacy_uri)});
+    EXPECT_TRUE(
+        IsSnapshotLocationStaleForCleanup(&backend, reporter.instance_id, legacy_only, /*preserve_in_flight=*/true));
+    legacy_only.set_location_specs({LocationSpec("legacy", legacy_uri), LocationSpec("current", committed_uri)});
+    EXPECT_FALSE(
+        IsSnapshotLocationStaleForCleanup(&backend, reporter.instance_id, legacy_only, /*preserve_in_flight=*/true));
+    for (const auto &uri : {legacy_uri + "&s_version=0123456789abcdef0123456789abcdef",
+                            legacy_uri + "&s_v=" + committed_version,
+                            std::string("event_report://physical-cache:9600/mem?s_version=bad")}) {
+        legacy_only.set_location_specs({LocationSpec("legacy", uri)});
+        EXPECT_FALSE(IsSnapshotLocationStaleForCleanup(
+            &backend, reporter.instance_id, legacy_only, /*preserve_in_flight=*/true));
+    }
+
     std::string in_flight_version;
     ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter, in_flight_version, retry_after_ms));
+    legacy_only.set_location_specs(
+        {LocationSpec("legacy", legacy_uri), LocationSpec("in_flight", VersionedUri(in_flight_version))});
+    EXPECT_FALSE(
+        IsSnapshotLocationStaleForCleanup(&backend, reporter.instance_id, legacy_only, /*preserve_in_flight=*/true));
     CacheLocation malformed_then_in_flight(
         location_id,
         CLS_SERVING,

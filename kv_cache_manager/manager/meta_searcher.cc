@@ -204,7 +204,8 @@ ValidateConsistentSnapshotVersion(size_t spec_count, SpecAccessor spec_at, std::
         }
         total_size += spec_size;
         const size_t version_param_count =
-            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam) +
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kLegacySnapshotVersionParam);
         if (version_param_count == 0) {
             if (has_snapshot_version) {
                 return EC_BADARGS;

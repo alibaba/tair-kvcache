@@ -66,6 +66,15 @@ KVCM 在 reporter 提供的 URI 上只追加：
 s_v=<opaque-version>
 ```
 
+新写入使用 `s_v=<8 位 ASCII 十六进制>`。为兼容原地升级，持久化 metadata 的读取、查询和
+两条 GC 路径也接受 `s_version=<32 位 ASCII 十六进制>`，保留并比较完整 token，不截断或
+转换为新 token。同一个 URI 只能含一个版本字段；重复字段、两种字段同时出现或长度非法均
+按 malformed 处理。Reporter 原始上报 URI 仍禁止携带任一内部版本字段。
+
+兼容格式不改变查询、liveness、snapshot、cleanup lease 和条件删除规则。成功 snapshot 后，
+完全属于旧版本的 location 可由 GC 回收；混有当前或受保护 in-flight spec 的 location 仍保留。
+只发实时增量且节点一直存活的 reporter，未触碰的旧 metadata 仍可能长期存在。
+
 Version 的用途：
 
 - 标记本进程内一段增量或一次 snapshot generation；
@@ -307,12 +316,12 @@ abort，committed generation 和已有 metadata 都不变。
 3. reporter 必须已注册且 available；
 4. location 至少包含一个 spec；
 5. 每个 URI 必须合法；
-6. URI 如果有 `s_v`，该值必须唯一且格式合法；
+6. URI 如果有 `s_v` 或 `s_version`，只允许其中一个字段出现一次，且值的格式合法；
 7. strict 模式下，location 至少包含一个 committed version。
 
 soft 模式接受：
 
-- 无 `s_v` 的历史 URI；
+- 无版本字段的历史 URI；
 - 旧 generation；
 - 当前 generation；
 - snapshot in-flight generation；

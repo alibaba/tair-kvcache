@@ -5768,6 +5768,64 @@ TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDel
     }));
 }
 
+TEST_F(CacheManagerTest, TestReportEventReadsLegacyVersionAndPreservesUntouchedSpecsOnDelta) {
+    const std::string host = "192.168.10.49:8080";
+    const int64_t key = 94'435;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    const std::string legacy_uri = "event_report://physical-cache:9600/mem?s_version=00112233445566778899aabbccddeeff";
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<ErrorCode> merge_results;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher->BatchMergeLocationSpecs(request_context_.get(),
+                                               {key},
+                                               {{{event_backend->BuildLocationId("mem", host),
+                                                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                                  CacheLocationStatus::CLS_SERVING,
+                                                  {LocationSpec("tp0", legacy_uri), LocationSpec("tp1", legacy_uri)}}}},
+                                               merge_results));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), merge_results);
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+
+    proto::meta::ReportEventRequest heartbeat;
+    heartbeat.set_instance_id("test_instance");
+    heartbeat.set_host_ip_port(host);
+    heartbeat.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *event = heartbeat.add_events();
+    event->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    event->mutable_heartbeat();
+    const auto [heartbeat_ec, heartbeat_response] = CallReportEvent(heartbeat, "legacy_version_recovery");
+    ASSERT_EQ(EC_OK, heartbeat_ec);
+    EXPECT_TRUE(heartbeat_response.snapshot_required());
+    EXPECT_EQ(2u, QueryEventReportUris({key}).size());
+
+    const auto [delta_ec, delta] = CallReportEvent(MakeAddRequest(host, key, "new_delta"), "legacy_version_delta");
+    ASSERT_EQ(EC_OK, delta_ec);
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(delta.committed_snapshot_version()));
+    const auto raw = QueryRawEventReportUris(key);
+    ASSERT_EQ(2u, raw.size());
+    EXPECT_EQ(1, std::count(raw.begin(), raw.end(), legacy_uri));
+    EXPECT_EQ(1, std::count_if(raw.begin(), raw.end(), [&](const auto &uri) {
+                  return uri.find("s_v=" + delta.committed_snapshot_version()) != std::string::npos &&
+                         uri.find("s_version=") == std::string::npos;
+              }));
+    EXPECT_EQ(2u, QueryEventReportUris({key}).size());
+
+    // A caller cannot inject either internal field through the newly accepted
+    // persisted-metadata format.
+    auto forged = MakeAddRequest(host, key, "forged");
+    forged.mutable_events(0)->mutable_block_add()->mutable_specs(0)->set_uri(legacy_uri);
+    const auto [forged_ec, forged_response] = CallReportEvent(forged, "legacy_version_forged_input");
+    EXPECT_EQ(EC_PARTIAL_OK, forged_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, forged_response.header().status().code());
+    EXPECT_EQ(raw, QueryRawEventReportUris(key));
+
+    event_backend->SetNodeUnavailable("test_instance", host);
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+}
+
 TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysButAllowsDifferentMedia) {
     const std::string host = "192.168.10.33:8080";
     const int64_t key = 9428;
@@ -6687,6 +6745,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
 
     const std::string unknown_token = "ffffffff";
     const std::string legacy_uri = "event_report://physical-cache:9600/mem?source=legacy";
+    const std::string legacy_version_uri =
+        "event_report://physical-cache:9600/mem?s_version=0123456789abcdef0123456789abcdef";
     std::string unknown_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
         "event_report://physical-cache:9600/mem?source=unknown", unknown_token, unknown_uri));
@@ -6703,6 +6763,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     EXPECT_TRUE(check(location));
     location.set_location_specs({LocationSpec("tp0", unknown_uri)});
     EXPECT_TRUE(check(location));
+    location.set_location_specs({LocationSpec("tp0", legacy_version_uri)});
+    EXPECT_TRUE(check(location));
 
     const auto [snapshot_ec, snapshot_response] =
         CallReportEvent(MakeSnapshotRequest(host, {}), "query_filter_baseline");
@@ -6718,6 +6780,10 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     EXPECT_TRUE(check(location));
     location.set_location_specs({LocationSpec("tp0", current_uri), LocationSpec("tp1", legacy_uri)});
     EXPECT_TRUE(check(location));
+    location.set_location_specs({LocationSpec("tp0", current_uri), LocationSpec("tp1", legacy_version_uri)});
+    EXPECT_TRUE(check(location));
+    location.set_location_specs({LocationSpec("tp0", legacy_version_uri)});
+    EXPECT_FALSE(check(location));
     location.set_location_specs({LocationSpec("tp0", legacy_uri)});
     EXPECT_FALSE(check(location));
     location.set_location_specs({LocationSpec("tp0", unknown_uri)});
@@ -6750,6 +6816,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     // An admitted snapshot failure falls back to soft visibility because
     // candidate writes may already have replaced committed metadata in place.
     event_backend->AbortSnapshotVersion(reporter_key, candidate);
+    location.set_location_specs({LocationSpec("tp0", legacy_version_uri)});
+    EXPECT_TRUE(check(location));
     location.set_location_specs({LocationSpec("tp0", unknown_uri)});
     EXPECT_TRUE(check(location));
     location.set_location_specs({LocationSpec("tp0", legacy_uri)});
@@ -6784,6 +6852,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
     const std::string host = "192.168.10.37:8080";
     const std::string token = "01234567";
     const std::string upper_token = "ABCDEF01";
+    const std::string legacy_token = "0123456789abcdef0123456789ABCDEF";
     auto event_backend = InstallEventReportBackend();
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode(instance_id, host, {"mem"}));
@@ -6805,17 +6874,21 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"legacy_with_other_params", {"event_report://physical-cache:9600/mem?size=4096&offset=0"}, true},
         {"valid_lowercase_version", {"event_report://physical-cache:9600/mem?s_v=" + token}, true},
         {"valid_uppercase_version", {"event_report://physical-cache:9600/mem?s_v=" + upper_token}, true},
+        {"valid_legacy_version", {"event_report://physical-cache:9600/mem?s_version=" + legacy_token}, true},
+        {"invalid_legacy_version", {"event_report://physical-cache:9600/mem?s_version=01234567"}, false},
+        {"duplicate_legacy_version",
+         {"event_report://physical-cache:9600/mem?s_version=" + legacy_token + "&s_version=" + legacy_token},
+         false},
+        {"both_version_fields",
+         {"event_report://physical-cache:9600/mem?s_version=" + legacy_token + "&s_v=" + token},
+         false},
         {"near_match_param", {"event_report://physical-cache:9600/mem?xs_v=bad&s_v_suffix=bad"}, true},
         {"empty_version", {"event_report://physical-cache:9600/mem?s_v="}, false},
         {"version_without_equals", {"event_report://physical-cache:9600/mem?s_v"}, false},
         {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(7, 'a')}, false},
         {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(9, 'a')}, false},
-        {"non_hex_version",
-         {"event_report://physical-cache:9600/mem?s_v=0123456g"},
-         false},
-        {"duplicate_same_version",
-         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
-         false},
+        {"non_hex_version", {"event_report://physical-cache:9600/mem?s_v=0123456g"}, false},
+        {"duplicate_same_version", {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token}, false},
         {"duplicate_different_version",
          {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + upper_token},
          false},
@@ -6830,8 +6903,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
           "event_report://physical-cache:9600/mem?source=legacy"},
          true},
         {"mixed_valid_and_malformed",
-         {"event_report://physical-cache:9600/mem?s_v=" + token,
-          "event_report://physical-cache:9600/mem?s_v=bad"},
+         {"event_report://physical-cache:9600/mem?s_v=" + token, "event_report://physical-cache:9600/mem?s_v=bad"},
          false},
         {"mixed_valid_and_duplicate",
          {"event_report://physical-cache:9600/mem?s_v=" + token,
