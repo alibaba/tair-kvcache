@@ -185,7 +185,11 @@ jobs:
           set -x
           set +e
           rm -f bazel-out.tar
-          find bazel-out/*-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';' 2>/dev/null
+          # Integration tests keep worker and Redis logs in TEST_TMPDIR, outside bazel-out.
+          bazel_test_tmpdir="$(bazelisk info execution_root)/_tmp"
+          find bazel-out/*-opt/bin/ "${bazel_test_tmpdir}/" -type f \
+            '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' \
+            -exec tar -r -f bazel-out.tar '{}' ';' 2>/dev/null
           # Collect core dump files and their corresponding executables for offline debugging
           for core in /tmp/corefile/core.*; do
             if [ -f "$core" ]; then
