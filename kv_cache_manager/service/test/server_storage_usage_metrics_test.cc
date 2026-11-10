@@ -36,11 +36,20 @@ class ServerStorageUsageMetricsTest : public TESTBASE {};
 
 TEST_F(ServerStorageUsageMetricsTest, CapacityEligibilityFollowsLeaseWithoutChangingIt) {
     Server server;
+    // Match Server::Init wiring: default-enabled Redis probes also read the
+    // managers while this test exercises leader/follower capacity sampling.
+    server.metrics_registry_ = std::make_shared<MetricsRegistry>();
+    server.metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
+    server.registry_manager_ = std::make_shared<RegistryManager>("", server.metrics_registry_);
+    server.cache_manager_ =
+        std::make_shared<CacheManager>(server.metrics_registry_, server.registry_manager_, server.metrics_lifecycle_);
     auto reporter = std::make_shared<CapacityObserver>();
     server.metrics_reporter_ = reporter;
     server.leader_elector_ = std::make_shared<LeaderElector>(nullptr, "key", "node");
     server.config_.metrics_report_interval_ms_ = 10;
     ASSERT_TRUE(server.StartMetricsReportThread());
+    EXPECT_TRUE(server.redis_health_metrics_);
+    EXPECT_TRUE(server.redis_health_thread_);
     for (bool leader : {false, true, false, true, false}) {
         server.leader_elector_->lock_acquired_.store(leader);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);

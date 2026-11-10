@@ -64,6 +64,7 @@ cc_test(
     ],
 )
 
+
 cc_test(
     name = "NodeStatusMetricsTest",
     srcs = [
@@ -161,5 +162,22 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:revisit_interval_histogram",
+    ],
+)
+
+cc_test(
+    name = "RedisHealthMetricsTest",
+    copts = ["-fno-access-control"],
+    srcs = ["redis_health_metrics_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/meta:meta_indexer",
+        "//kv_cache_manager/meta:meta_indexer_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/metrics:redis_health_metrics",
+        "@hiredis",
     ],
 )

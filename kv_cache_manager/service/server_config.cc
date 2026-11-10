@@ -310,6 +310,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->metrics_env_tag_mappings_ = value;
          return true;
      }},
+    {"kvcm.metrics.redis_health_probe_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->redis_health_probe_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
     {"kvcm.metrics.report_interval_ms",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_report_interval_ms_ = std::stol(value);
@@ -418,6 +423,7 @@ void ServerConfig::UpdateDefaultConfig() {
     metrics_common_tags_.clear();
     prometheus_common_tags_.clear();
     metrics_report_interval_ms_ = 20000;
+    redis_health_probe_enabled_ = true;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
     schedule_plan_executor_thread_count_ = 2;

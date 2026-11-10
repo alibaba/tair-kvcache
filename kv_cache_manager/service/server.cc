@@ -1,8 +1,10 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
+#include <system_error>
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -24,6 +26,7 @@
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
 #include "kv_cache_manager/metrics/node_status_metrics.h"
+#include "kv_cache_manager/metrics/redis_health_metrics.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/command_line.h"
 #include "kv_cache_manager/service/debug_service_impl.h"
@@ -560,6 +563,35 @@ bool Server::StartMetricsReportThread() {
     }
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
+    if (config_.redis_health_probe_enabled()) {
+        std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
+        redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
+            metrics_registry_, metrics_lifecycle_, registry_manager_, cache_manager_->meta_indexer_manager(),
+            [weak_elector]() {
+                const auto elector = weak_elector.lock();
+                return elector && elector->IsLeader();
+            });
+        redis_health_thread_ = LoopThread::CreateLoopThread([metrics = redis_health_metrics_]() { metrics->Report(); },
+                                                            config_.metrics_report_interval_ms() * 1000,
+                                                            "redis_health",
+                                                            true);
+        coordination_redis_health_metrics_ =
+            std::make_shared<CoordinationRedisHealthMetrics>(metrics_registry_, config_.GetCoordinationUri());
+        if (coordination_redis_health_metrics_->IsEnabled()) {
+            // Neither slow metadata probes nor loss of leadership may suppress this
+            // observation. A minimum interval also bounds load for fast metrics configurations.
+            try {
+                coordination_redis_health_thread_ =
+                    LoopThread::CreateLoopThread([metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
+                                                 std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
+                                                 "coord_redis_health",
+                                                 true);
+            } catch (const std::system_error &error) {
+                // Observability must not prevent the existing service from starting.
+                KVCM_LOG_WARN("cannot start coordination Redis health probe thread: %s", error.what());
+            }
+        }
+    }
     KVCM_LOG_INFO("start metrics reporter success.");
     return true;
 }
@@ -570,6 +602,12 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (redis_health_thread_) {
+        redis_health_metrics_->RequestStop();
+    }
+    if (coordination_redis_health_metrics_) {
+        coordination_redis_health_metrics_->RequestStop();
+    }
     // Lifecycle callbacks need the service gates and managers to remain alive.
     if (leader_elector_) {
         leader_elector_->Stop();
@@ -601,6 +639,12 @@ void Server::Stop() {
     if (metrics_report_thread_) {
         metrics_report_thread_->Stop();
         KVCM_LOG_INFO("metrics reporter stopped.");
+    }
+    if (redis_health_thread_) {
+        redis_health_thread_->Stop();
+    }
+    if (coordination_redis_health_thread_) {
+        coordination_redis_health_thread_->Stop();
     }
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
