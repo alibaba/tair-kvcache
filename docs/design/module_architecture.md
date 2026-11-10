@@ -31,7 +31,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 | 模块 | 目录 | 职责 |
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
-| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。 |
+| **service** | `service/` | 接入层。`Server` 创建并装配组件；`ServiceRequestExecutor` 以共享有界 FIFO 将 Meta HTTP/gRPC Request 分发至工作线程；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。 |
 | **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 管理 `MetaIndexer`，维护 cache key → `CacheLocation` 的索引；元数据后端可插拔；`meta_search_cache` 做查询缓存。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义各类配置对象；`RegistryManager` 持久化实例注册信息；`CoordinationBackend` + `LeaderElector` 提供一主多备的分布式选主。 |
@@ -106,7 +106,7 @@ flowchart TD
     main["main.cpp（入口）"]
 
     subgraph access["接入层"]
-        service["service<br/>Server / *ServiceImpl · 请求门禁<br/>grpc · http · util"]
+        service["service<br/>Server / ServiceRequestExecutor / *ServiceImpl<br/>grpc · http · util · 请求门禁"]
     end
 
     subgraph core["编排与业务核心"]
@@ -192,9 +192,14 @@ flowchart TD
 一次元数据面请求进入 KVCM 后：
 
 ```
-client（MetaClient/gRPC）→ service（grpc 适配 → *ServiceImpl）
+client（gRPC / HTTP）→ service（协议适配 → Request / ServiceRequestExecutor → MetaServiceImpl）
     → manager（CacheManager）→ meta（索引）/ data_storage（存储状态）→ common
 ```
+
+Meta gRPC 由独立 CompletionQueue 接收，HTTP 通过协程挂起释放 IO 线程；全部 Meta 业务共享默认容量 2048 的可配置队列与工作池。
+collector 查找、业务日志和 ServiceImpl 在 worker 执行，Leader 门禁仍在执行时校验。
+Admin、Debug、健康检查和 Optimizer 保持原路径；模块依赖方向不变。
+指标与停机顺序见 [MetaService Reactor 请求分发](service_request_dispatch.md)。
 
 ### 4.2 实例注册
 

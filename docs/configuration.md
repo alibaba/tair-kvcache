@@ -93,8 +93,10 @@ kvcm.service.io_thread_num=2
 # 为长期订阅预留线程；独立 Admin Server 不增加。显式设置正数时仍作为总上限，不额外增加。
 # -1 沿用 gRPC 框架默认，不额外设限；显式上限必须 >= 2。
 # Meta/Admin 分端口时各有独立配额，都使用这个值；共用端口时只有一套配额。
-# 不限制 HTTP、后台任务及 gRPC 其他内部线程。同步流式 RPC 也会占用工作线程。
-# 配额耗尽时新 RPC 可能返回 RESOURCE_EXHAUSTED；修改后需要重启。
+# 不限制 HTTP、Meta 共享业务 worker、独立 CQ 轮询线程、后台任务及 gRPC 其他内部线程。
+# Admin/Debug 等同步 RPC 和 Optimizer 同步流式 RPC 仍占用该配额。
+# 同步 RPC 的线程配额耗尽时可能返回 RESOURCE_EXHAUSTED；异步 Meta 不再因该线程配额被拒绝。
+# Meta 默认使用最多 2048 个等待请求的业务队列；修改后需要重启。
 # 环境变量形式：kvcm_service_grpc_max_threads。
 kvcm.service.grpc_max_threads=0
 
@@ -102,6 +104,28 @@ kvcm.service.grpc_max_threads=0
 # 仅约束 gRPC 纳入配额管理的内存，不是进程 RSS 上限；Meta/Admin 分端口时配额各自独立。
 # 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
 kvcm.service.grpc_memory_quota_bytes=0
+
+# Meta gRPC 使用同一个 CQ，默认 2 个轮询线程；必须是正整数。
+# 承担网络推进、protobuf 请求解析和完成事件处理；不执行业务，不计入 grpc_max_threads。
+# 独立 Admin Server 保留同步框架，不创建这些轮询线程。修改后需要重启。
+# 环境变量形式：kvcm_service_grpc_cq_thread_num。
+kvcm.service.grpc_cq_thread_num=2
+
+# Meta HTTP/gRPC 共享业务池。Admin、健康检查、Debug、Optimizer 保留原执行路径。
+# 0 = 2 * max(1, hardware_concurrency())；正数为显式 worker 数。
+# 环境变量形式：kvcm_service_worker_thread_num。
+kvcm.service.worker_thread_num=0
+
+# 默认最多 2048 个等待请求，不包括正在执行的任务。0 显式不限制，正数满时快速返回 SERVICE_NOT_READY。
+# gRPC 拒绝仍是 transport OK + 业务 SERVICE_NOT_READY，不等价于原 RESOURCE_EXHAUSTED。
+# 环境变量形式：kvcm_service_worker_queue_capacity。
+kvcm.service.worker_queue_capacity=2048
+
+# discard_pending（默认）：停止提交，丢弃尚未被 worker 取出的任务并返回 SERVICE_NOT_READY。
+# drain：停止提交，继续准备并检查已接收任务的业务门禁。两者都等待已领取任务及协议收尾。
+# 关闭队列前先停止 LeaderElector；其后 Leader-only 请求通常返回 SERVER_NOT_LEADER，不执行写入。
+# 环境变量形式：kvcm_service_worker_shutdown_mode。
+kvcm.service.worker_shutdown_mode=discard_pending
 
 # 是否开启DebugService服务，可以通过DebugService直接操作集群内部状态
 kvcm.service.enable_debug_service=false

@@ -1,4 +1,5 @@
 #include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -20,6 +21,14 @@ namespace {
 thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
+thread_local std::map<std::string, double> reported_executor_metrics;
+
+void CaptureExecutorMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    const auto offset = metric->metric_name_.find("service.request_");
+    if (offset != std::string::npos) {
+        reported_executor_metrics[metric->metric_name_.substr(offset)] = value;
+    }
+}
 
 struct ReportedLifetime {
     std::string name;
@@ -176,6 +185,43 @@ TEST_F(KmonitorMetricsReporterTest, TestReportPerQuery) {
         DataStorageMetricsCollector collector2{metrics_registry_};
         collector2.Init();
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
+    }
+}
+
+TEST_F(KmonitorMetricsReporterTest, ExecutorWindowMetricsAndCumulativeCountersReachKmonitor) {
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureExecutorMetrics);
+    const std::map<std::string, double> gauges{{"service.request_queue_length", 3},
+                                               {"service.request_queue_length_max", 7},
+                                               {"service.request_queue_length_avg", 2.5},
+                                               {"service.request_queue_capacity", 2048},
+                                               {"service.request_running", 2},
+                                               {"service.request_wait_time_us_max", 12500},
+                                               {"service.request_wait_time_us_avg", 3400},
+                                               {"service.request_execution_time_us_max", 8000},
+                                               {"service.request_execution_time_us_avg", 4200}};
+    for (const auto &[name, value] : gauges) {
+        metrics_registry_->GetGauge(name) = value;
+    }
+    metrics_registry_->GetCounter("service.request_rejected") += 11;
+    metrics_registry_->GetCounter("service.request_discarded") += 5;
+    metrics_registry_->GetCounter("service.request_completed") += 19;
+    metrics_registry_->GetCounter("service.request_queue_wait_seconds_sum") += 1500000;
+    metrics_registry_->GetCounter("service.request_queue_wait_seconds_count") += 23;
+    for (int i = 0; i < 2; ++i) {
+        reported_executor_metrics.clear();
+        reporter_->ReportInterval();
+        for (const auto &[name, value] : gauges) {
+            ASSERT_EQ(1u, reported_executor_metrics.count(name)) << name;
+            EXPECT_DOUBLE_EQ(value, reported_executor_metrics.at(name)) << name;
+        }
+        EXPECT_DOUBLE_EQ(11, reported_executor_metrics.at("service.request_rejected"));
+        EXPECT_DOUBLE_EQ(5, reported_executor_metrics.at("service.request_discarded"));
+        EXPECT_DOUBLE_EQ(19, reported_executor_metrics.at("service.request_completed"));
+        EXPECT_DOUBLE_EQ(1.5, reported_executor_metrics.at("service.request_queue_wait_seconds_sum"));
+        EXPECT_DOUBLE_EQ(23, reported_executor_metrics.at("service.request_queue_wait_seconds_count"));
     }
 }
 

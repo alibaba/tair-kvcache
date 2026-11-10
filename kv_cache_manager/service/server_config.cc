@@ -109,6 +109,27 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_grpc_memory_quota_bytes_ = parsed;
          return true;
      }},
+    {"kvcm.service.grpc_cq_thread_num",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_grpc_cq_thread_num_) &&
+                config->service_grpc_cq_thread_num_ > 0;
+     }},
+    {"kvcm.service.worker_thread_num",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_worker_thread_num_);
+     }},
+    {"kvcm.service.worker_queue_capacity",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_worker_queue_capacity_);
+     }},
+    {"kvcm.service.worker_shutdown_mode",
+     [](const std::string &value, ServerConfig *config) {
+         config->service_worker_shutdown_mode_ = value;
+         return value == "discard_pending" || value == "drain";
+     }},
     {"kvcm.service.rpc_port",
      [](const std::string &value, ServerConfig *config) {
          config->service_rpc_port_ = std::stoi(value);
@@ -408,6 +429,10 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 void ServerConfig::UpdateDefaultConfig() {
     service_grpc_max_threads_ = 0;
     service_grpc_memory_quota_bytes_ = 0;
+    service_grpc_cq_thread_num_ = 2;
+    service_worker_thread_num_ = 0;
+    service_worker_queue_capacity_ = 2048;
+    service_worker_shutdown_mode_ = "discard_pending";
     metrics_reporter_type_ = "local";
     metrics_env_tag_mappings_.clear();
     metrics_common_tags_.clear();

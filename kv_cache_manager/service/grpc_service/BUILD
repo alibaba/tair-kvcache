@@ -35,6 +35,7 @@ cc_library(
         "//kv_cache_manager/service:debug_service_impl",
         "//kv_cache_manager/service:meta_service_impl",
         "//kv_cache_manager/service:meta_service_metrics_base",
+        "//kv_cache_manager/service:service_request_executor",
     ],
 )
 

@@ -110,7 +110,10 @@ def git_deps():
             "https://codeload.github.com/grpc/grpc/tar.gz/109c570727c3089fef655edcdd0dd02cc5958010",
             "https://github.com/grpc/grpc/archive/109c570727c3089fef655edcdd0dd02cc5958010.tar.gz",
         ],
-        patches = ["//patches/grpc:0001-Rename-gettid-functions.patch"],
+        patches = [
+            "//patches/grpc:0001-Rename-gettid-functions.patch",
+            "//patches/grpc:0002-shutdown-server-on-first-bind-failure.patch",
+        ],
     )
 
     http_archive(
