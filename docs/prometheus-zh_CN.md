@@ -182,6 +182,14 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 ### 周期性指标
 
+Meta 工作池另提供 `service.request_queue_capacity`、`request_queue_length`、
+`request_queue_length_max`、`request_queue_length_avg`、`request_running`，以及
+`service.request_wait_time_us_max/avg`、`service.request_execution_time_us_max/avg`。
+MAX/AVG 按上报窗口计算，队列平均值按时间加权；无样本窗口为 0。
+`service.request_completed`、`request_rejected`、`request_discarded` 是累计计数；
+`service.request_queue_wait_seconds` 是累计 histogram。详见[请求分发指标口径](design/service_request_dispatch.md)。
+Prometheus 指标名将点替换为下划线，并添加配置的前缀。
+
 | 指标 | 类型 | 说明 |
 |---|---|---|
 | `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |

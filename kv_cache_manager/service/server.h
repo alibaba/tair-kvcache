@@ -1,11 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <thread>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/service/server_config.h"
+#include "kv_cache_manager/service/service_request_executor.h"
 
 namespace grpc {
 class Server;
@@ -49,6 +51,7 @@ private:
     bool StartHttpServer();
     void CreateMetricsReporter();
     bool StartMetricsReportThread();
+    void ReportMetrics(bool final_snapshot = false);
     void CreateAndRegisterEventPublisher();
     void RegisterEventPublishers(const std::shared_ptr<EventManager> &event_manager);
     bool CreateLeaderElector();
@@ -62,6 +65,7 @@ private:
     std::atomic<bool> stop_{false};
     bool is_startup_loaded_ = false;
     ServerConfig config_;
+    std::shared_ptr<ServiceRequestExecutor> request_executor_;
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
     std::shared_ptr<DebugServiceImpl> debug_impl_;
@@ -94,5 +98,9 @@ private:
     std::shared_ptr<LoopThread> redis_health_thread_;
     std::shared_ptr<CoordinationRedisHealthMetrics> coordination_redis_health_metrics_;
     std::shared_ptr<LoopThread> coordination_redis_health_thread_;
+    // Accessed by the report thread, then by Stop after that thread is joined.
+    uint64_t last_request_rejected_ = 0;
+    uint64_t last_request_discarded_ = 0;
+    ServiceRequestExecutor::QueueWaitStats last_queue_wait_;
 };
 } // namespace kv_cache_manager

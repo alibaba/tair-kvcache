@@ -5,6 +5,7 @@
 - [Checksum 元数据存储](design/checksum_metadata.md) - 接收调用方计算的 checksum，按 block/spec 持久化与查询，支持 v6d 自有 CRC
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+- [HTTP/gRPC 业务线程池设计](design/service_request_dispatch.md) - 仅 Meta 入池，Admin/健康检查保留；含 gRPC 异步适配、配置与停机设计
 - [分层存储设计](design/tiered_storage.md) - 多层缓存读写、Copy / Mark 迁移、回收协同，以及完整配置与 Admin 操作示例
 - [StartWriteCache 按存储类型补写副本](design/start_write_storage_replica.md) - 请求级副本目标、与 min-replica/Mark 的关系、实现范围及验证记录
 - [Client SDK I/O 契约](design/client_sdk_io_contract.md) - deadline 语义、buffer 生命周期、各后端取消能力矩阵
