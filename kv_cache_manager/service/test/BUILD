@@ -175,6 +175,8 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    # Let cpp_stub patch the function entry used by the code under test.
+    linkstatic = True,
     deps = [
         "@cpp_stub",
         "//kv_cache_manager/common:unittest",
