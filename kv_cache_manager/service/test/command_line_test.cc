@@ -1,3 +1,5 @@
+#include <thread>
+
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/service/command_line.h"
 
@@ -51,4 +53,21 @@ TEST_F(CommandLineTest, TestParseCmdLine) {
     ASSERT_EQ("value2", environ["key_b"]);
     ASSERT_EQ("6381", environ["kvcm.service.rpc_port"]);
     ASSERT_EQ("6382", environ["kvcm.service.http_port"]);
+}
+
+TEST_F(CommandLineTest, TerminationSignalOnWorkerOnlyNotifiesMainThread) {
+    // RegisterSignal also installs crash handlers and alternate signal-stack
+    // state. Keep all of those process-wide side effects in the child.
+    ASSERT_EXIT(
+        {
+            CommandLine command;
+            command.RegisterSignal();
+            // No Server is installed: stopping inside the handler would fail.
+            std::thread worker([] { std::raise(SIGTERM); });
+            command.WaitForTerminationSignal();
+            worker.join();
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0),
+        "");
 }

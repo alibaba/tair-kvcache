@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -54,6 +55,13 @@ public:
     ~RequestContext() = default;
 
 public:
+    // An adapter may capture request timing before enqueueing, then bind the
+    // collector on its worker. Call once, on one thread, before any business
+    // code or ServiceCallGuard uses this context.
+    void InitMetricsCollector(std::shared_ptr<MetricsCollector> metrics_collector) {
+        assert(!metrics_collector_);
+        metrics_collector_ = std::move(metrics_collector);
+    }
     MetricsCollector *metrics_collector() { return metrics_collector_.get(); }
     const MetricsCollectors &GetMetricsCollectorsVehicle() const { return metrics_collectors_vehicle_; }
     const std::string &trace_id() const { return trace_id_; }
@@ -106,9 +114,9 @@ private:
     int status_code_{0};
     JsonFragment request_debug_json_;
     LazyResponseJsonCache response_debug_json_;
-    const std::shared_ptr<MetricsCollector> metrics_collector_; // the master metrics collector for this request context
-    MetricsCollectors metrics_collectors_vehicle_;              // for carrying other metrics collectors for reporting
-    std::shared_ptr<QueryTracer> query_tracer_;                 // 和LOG结合，可以把LOG输出给用户
+    std::shared_ptr<MetricsCollector> metrics_collector_; // the master metrics collector for this request context
+    MetricsCollectors metrics_collectors_vehicle_;        // for carrying other metrics collectors for reporting
+    std::shared_ptr<QueryTracer> query_tracer_;           // 和LOG结合，可以把LOG输出给用户
     std::unique_ptr<ErrorTracer> error_tracer_;
     std::shared_ptr<SpanTracer> root_span_tracer_;
     mutable SpanTracer *parent_span_tracer_ = nullptr;

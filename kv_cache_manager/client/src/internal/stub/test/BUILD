@@ -18,5 +18,6 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
         "//kv_cache_manager/service/grpc_service",
+        "//kv_cache_manager/service:service_request_executor",
     ],
 )

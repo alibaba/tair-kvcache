@@ -36,10 +36,30 @@ cc_library(
         "//kv_cache_manager/service:debug_service_impl",
         "//kv_cache_manager/service:meta_service_impl",
         "//kv_cache_manager/service:meta_service_metrics_base",
+        "//kv_cache_manager/service:service_request_executor",
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:report_event_json_parser",
         "@com_google_protobuf//:protobuf",
         "@com_google_protobuf//:protobuf_headers",
+        "@yalantinglibs//:ylt",
+    ],
+)
+
+cc_test(
+    name = "CoroHttpDispatchTest",
+    srcs = ["coro_http_dispatch_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fcoroutines",
+    ],
+    deps = [
+        ":http_service",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:service_request_executor",
+        "@com_google_protobuf//:protobuf",
         "@yalantinglibs//:ylt",
     ],
 )
