@@ -206,10 +206,11 @@ errors in response bodies remain in `service.error_counter`.
 | `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
-| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
+| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers omit this metric and remove previously published series on the next reporting interval after demotion. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
+| `cache_manager_instance.local_key_count` | gauge | Resident keys in the instance's local metadata index, labeled by `instance_group` and `instance_id` |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
 | `cache_manager_instance.meta_cache_usage` | gauge | Estimated per-instance local metadata memory (LRU charge, bytes), labeled by `instance_group` and `instance_id` |
 
@@ -219,6 +220,15 @@ Local mode reports the instance's LRU charge, cached mode reports the local port
 It uses the same accounting as `meta_indexer.total_cache_usage`, but sampling times differ, so concurrent writes
 can prevent an exact instantaneous sum. Charge is not RSS or actual container memory and does not fully account
 for fixed lock arrays, allocator overhead, and similar costs. `byte_size` measures KVCache data quota usage.
+
+`cache_manager_instance.local_key_count` is sampled by the same recorder approximately every five seconds and
+exported as `kvcm_cache_manager_instance_local_key_count` in Prometheus. It reads counters already maintained by
+the local LRU shards without scanning keys, accessing Redis, or updating LRU access order. Each resident key is
+counted once, regardless of its Location count or state. Local and cached modes report the current local index;
+during recovery this includes only entries already loaded locally. Backends without a local index report zero.
+Shards are read individually, so this is a concurrent sample. The existing `cache_manager_instance.key_count`
+and `meta_indexer.total_key_count` retain their logical counts from `MetaIndexer::GetKeyCount()` and their existing
+behavior. The new metric does not participate in quota or reclaim decisions.
 
 `is_leader` is a node-level metric without storage labels. It reports ownership
 of the leader lease (1/0), including promotion/recovery, and does not imply that
@@ -260,6 +270,12 @@ and ignoring(state) (kvcm_role_state{state="leader"} == 1)
 This combination does not guarantee request readiness, complete instance recovery or healthy
 dependencies. The metric only exposes the existing state machine; it changes neither admission
 nor election/recovery behavior.
+
+For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
+
+Storage unload removes all metric series tagged with its unique name, including health, writability and capacity. Local sampling checks backend identity before publishing so unloaded backends cannot re-register old series. Unloaded backends are removed from the local registry rather than reporting artificial zero values. While a follower still has loaded backends, health and writability remain actual observations and capacity is omitted.
+
+Known KMonitor limitation: demotion, unload or same-name replacement between Local sampling and KMonitor submission may still allow the current round to push old samples, including capacity. The next Local interval refreshes collectors and capacity eligibility. Stopping pushes does not retract data already sent; downstream expiry and alert windows determine how long old values can affect alerts.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.

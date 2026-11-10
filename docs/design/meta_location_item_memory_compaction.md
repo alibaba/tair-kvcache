@@ -45,7 +45,7 @@ charge 不是物理分配或 RSS：短字符串可能重复计字符，共享文
 
 ## 验证与边界
 
-代码回归覆盖对象布局、JSON 往返、共享 ID/name 与移动后的生命周期、字典并发/上限、item map 与属性的创建/释放及 charge delta、同 key/同分段锁的维护并发。相关测试位于 `MetaSearcherTest`、`meta_local_backend_test`、Redis backend、`MigrationManagerTest` 和 `CacheManagerTest`；布局测试限制 `sizeof(CacheLocation) <= 80`、`sizeof(LocationSpec) <= 56`、`sizeof(MetaMemCacheItem) <= 48`，但这些断言不代表实际分配档位或集群内存。
+代码回归覆盖对象布局、JSON 往返、共享 ID/name 与移动后的生命周期、字典并发/上限、item map 与属性的创建/释放及 charge delta、同 key/同分段锁的维护并发。相关测试位于 `MetaSearcherTest`、`meta_local_backend_test`、Redis backend、`MigrationManagerTest` 和 `CacheManagerTest`；布局测试限制 `sizeof(CacheLocation) <= 80`、`sizeof(LocationSpec) <= 72`、`sizeof(MetaMemCacheItem) <= 48`。其中 LocationSpec 在共享名称的 56B 基线上增加 16B 可选 checksum 所有权；未设置 checksum 时不分配字符缓冲。这些断言不代表实际分配档位或集群内存。
 
 合入与容量验收还需在相同镜像、配置和 key 分布下对照 **cgroup 净增/key、jemalloc allocated/active、LRU charge、恢复峰值、成功率、QPS、p95/p99 和锁等待**。至少覆盖 EventReport 大批量共享 ID/name、高基数随机 StartWriteCache、多 spec、多 location、非规范属性、更新/删除及 Redis 恢复。固定锁数组、独立 ID 分配、共享指针引用计数与 Redis 字典锁都可能使某些形态回退；没有这些 A/B 数据，不能宣称达到 20 亿 key / 800 GB 或完全没有性能劣化。
 

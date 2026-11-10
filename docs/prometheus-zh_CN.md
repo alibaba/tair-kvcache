@@ -194,10 +194,11 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
-| `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
+| `data_storage.storage_usage_ratio` | gauge | 存储使用率。follower 不输出该指标，降级后的下一次上报周期移除之前发布的序列。leader（或未配置角色信息的调用方）沿用后端返回值，包括默认值 0；若后端返回负值则跳过更新。健康状态及可写状态独立上报，连接异常仍可告警 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
+| `cache_manager_instance.local_key_count` | gauge | 单实例 local 元数据索引的驻留 key 数量，标签为 `instance_group`、`instance_id` |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 | `cache_manager_instance.meta_cache_usage` | gauge | 单实例本地元数据估算内存（LRU charge，字节），标签为 `instance_group`、`instance_id` |
 
@@ -206,6 +207,13 @@ Prometheus 名称为 `kvcm_cache_manager_instance_meta_cache_usage`。local 模�
 cached 模式统计本地部分，纯 Redis 模式为 0。该口径与 `meta_indexer.total_cache_usage` 一致，
 但两者采样时刻不同，并发写入时不保证瞬时加总相等。charge 不代表 RSS 或容器实际内存，
 不包含完整的固定锁数组、分配器等开销；`byte_size` 则是 KVCache 数据的配额用量。
+
+`cache_manager_instance.local_key_count` 由同一 Recorder 约每 5 秒采集一次，Prometheus 名称为
+`kvcm_cache_manager_instance_local_key_count`。它读取 local LRU 各 shard 已维护的条目计数，不扫描 key，
+不访问 Redis，也不更新 LRU 访问顺序。每个驻留 key 只计一次，与其 Location 数量和状态无关。
+local 和 cached 模式均统计当前本地索引；恢复期间只反映已经加载到 local 的条目，没有 local 后端时为 0。
+各 shard 分别读取，属于并发采样值。原有 `cache_manager_instance.key_count` 和 `meta_indexer.total_key_count`
+继续使用 `MetaIndexer::GetKeyCount()` 的逻辑计数，含义和行为不变；新指标不参与配额或回收决策。
 
 `is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
 不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。
@@ -242,7 +250,11 @@ and ignoring(state) (kvcm_role_state{state="leader"} == 1)
 该组合不保证请求入口已就绪、所有实例恢复完成或依赖均健康；指标只暴露现有状态机，
 不改变请求准入及选主、恢复、降级行为。
 
-对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
+对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
+
+存储卸载时同步移除带有其 unique_name 的所有指标序列，包括健康、可写和容量指标。Local 在途采样发布前校验后端身份，防止卸载后重新注册旧指标；已卸载后端的指标从本地注册表移除，不再用零值占位。follower 尚保留后端时，健康及可写指标继续反映实际状态，容量指标不输出。
+
+KMonitor 已知限制：Local 完成采样后、KMonitor 提交前发生降级、卸载或同名重建时，本轮仍可能提交旧样本（包括旧容量值）。下一轮 Local 采样刷新 collector 和容量输出控制；停止推送不撤回已经发送的数据，下游旧值何时不再影响告警取决于其过期策略和告警窗口。
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。

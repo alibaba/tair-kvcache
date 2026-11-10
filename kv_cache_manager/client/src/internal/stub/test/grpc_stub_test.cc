@@ -503,8 +503,13 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheFail) {
     }
     {
         BlockMask success_block = static_cast<size_t>(6);
-        ASSERT_EQ(ER_SERVICE_INTERNAL_ERROR,
+        ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT,
                   stub_->FinishWriteCache("trace5", "instance1", write_session_id, success_block, {}));
+    }
+    {
+        // Invalid masks leave the session available for a corrected retry.
+        BlockMask success_block = static_cast<size_t>(4);
+        ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace6", "instance1", write_session_id, success_block, {}));
     }
 }
 

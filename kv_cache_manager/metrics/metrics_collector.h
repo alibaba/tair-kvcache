@@ -472,6 +472,8 @@ public:
     ~DataStorageIntervalMetricsCollector() override = default;
 
     bool Init() override;
+    // Followers retain health/writability without registering a capacity series.
+    bool Init(bool report_storage_usage);
 };
 
 /* ------------ MetaIndexerAccumulativeMetricsCollector ------------- */
@@ -529,6 +531,7 @@ public:
 
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, local_key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, meta_cache_usage)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)

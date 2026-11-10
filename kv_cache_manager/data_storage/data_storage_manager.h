@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -37,6 +38,13 @@ public:
     ErrorCode UnRegisterStorage(const std::string &name);
     ErrorCode DoCleanup();
 
+    // Publish only while this exact backend is still registered. The callback
+    // must be short, perform no backend/network I/O and not reenter this manager.
+    // Unregister/cleanup use the same storage lock to detach metric series.
+    bool PublishMetricsIfCurrent(const std::string &name,
+                                 const std::shared_ptr<DataStorageBackend> &backend,
+                                 const std::function<void()> &publish) const;
+
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
                                                              const std::string &unique_name,
                                                              const std::vector<std::string> &keys,
@@ -60,6 +68,15 @@ public:
                                 const std::string &unique_name,
                                 const std::vector<DataStorageUri> &src_uris,
                                 const std::vector<DataStorageUri> &dst_uris);
+    bool SupportsAsyncCopy(const std::string &unique_name) const;
+    AsyncCopySubmitResult CopyAsync(RequestContext *request_context,
+                                    const std::string &unique_name,
+                                    const std::vector<DataStorageUri> &src_uris,
+                                    const std::vector<DataStorageUri> &dst_uris,
+                                    const std::string &operation_id,
+                                    const AsyncCopyOptions &options,
+                                    AsyncCopyCompletion completion);
+    ErrorCode RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id);
     std::vector<bool>
     Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);

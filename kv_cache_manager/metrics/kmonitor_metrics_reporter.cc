@@ -220,6 +220,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
+    DECLARE_METRICS(cache_manager_instance, local_key_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
     DECLARE_METRICS(cache_manager_instance, meta_cache_usage);
     DECLARE_METRICS(cache_manager_instance, async_queue_max_size);
@@ -540,6 +541,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, local_key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_queue_max_size);
@@ -733,22 +735,24 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // for data storage metrics
-        // these metrics are already updated by local metrics reporter
-        // so report them directly to kmonitor
+        // Report the Local snapshot without taking storage lifecycle locks.
+        // Known limitation: unload/replacement after sampling can leave one
+        // round of old samples to push. The next Local interval refreshes it.
         const auto &vec = data_storage_interval_metrics_collectors_.GetMetricsCollectors();
         for (const auto &mc : vec) {
             if (const auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc); p != nullptr) {
                 const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
                 double healthy_status_v;
                 double writable_status_v;
-                double storage_usage_ratio_v;
                 GET_METRICS_(p, data_storage, healthy_status, healthy_status_v);
                 REPORT_METRICS(data_storage, healthy_status, healthy_status_v);
                 GET_METRICS_(p, data_storage, writable_status, writable_status_v);
                 REPORT_METRICS(data_storage, writable_status, writable_status_v);
-                GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
-                REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                if (report_storage_usage_) {
+                    double storage_usage_ratio_v;
+                    GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                    REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                }
             }
         }
     } while (false);
@@ -1145,6 +1149,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     double key_count_v, byte_size_v, max_lru_age_us_v;
                     GET_METRICS_(p, cache_manager_instance, key_count, key_count_v);
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
+                    double local_key_count_v;
+                    GET_METRICS_(p, cache_manager_instance, local_key_count, local_key_count_v);
+                    REPORT_METRICS(cache_manager_instance, local_key_count, local_key_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
                     double meta_cache_usage_v;

@@ -145,7 +145,8 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                                    max_lru_age_us,
                                    write_stats.dropped_key_count,
                                    write_stats.dropped_metadata_count,
-                                   meta_indexer->GetMemUsage()};
+                                   meta_indexer->GetMemUsage(),
+                                   meta_indexer->GetLocalKeyCount()};
             }
             int64_t capacity = instance_group->quota().capacity();
             group_usage_ratio_map[instance_group_name] =

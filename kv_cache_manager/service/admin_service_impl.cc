@@ -215,9 +215,9 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
     if (request->storage_unique_name().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveStorage", "storage_unique_name", true);
     }
-    // hold the lifecycle lock as a writer so metric-registration sites
-    // (reporter interval loop) cannot re-create storage-tagged entries
-    // concurrently with the purge below
+    // Coordinate with instance removal and interval metric registration.
+    // DataStorageManager owns storage-tagged metric cleanup under its storage
+    // lock; do not purge again here after a same-name backend can register.
     const auto metrics_lifecycle = cache_manager_->metrics_lifecycle();
     std::unique_lock<std::shared_mutex> removal_guard(metrics_lifecycle->removal_mut_);
     std::unique_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle->mut_);
@@ -234,11 +234,6 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Storage removed successfully");
         KVCM_LOG_INFO("[traceId: %s] RemoveStorage succeeded", request->trace_id().c_str());
-
-        // purge storage-tagged metrics from the registry
-        if (metrics_registry_) {
-            metrics_registry_->RemoveByTagFilter({{"unique_name", request->storage_unique_name()}});
-        }
     }
 };
 
@@ -517,7 +512,7 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
     } else {
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
-            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta, request->include_checksums());
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);

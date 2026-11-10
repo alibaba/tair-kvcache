@@ -34,7 +34,7 @@ static_assert(std::is_nothrow_move_constructible_v<LocationSpec>);
 static_assert(std::is_nothrow_move_assignable_v<LocationSpec>);
 static_assert(std::is_nothrow_move_constructible_v<CacheLocation>);
 static_assert(std::is_nothrow_move_assignable_v<CacheLocation>);
-static_assert(sizeof(LocationSpec) <= 56, "shared spec names must shrink the single-spec vector allocation");
+static_assert(sizeof(LocationSpec) <= 72, "shared spec names plus optional checksum ownership must stay compact");
 
 TEST(CacheLocationMoveTest, SharedSpecNameSurvivesConfigAndLocationMoves) {
     auto mutable_info = std::make_shared<InstanceInfo>();
@@ -487,6 +487,7 @@ public:
     }
 
     void FailSyncCall(size_t call_index) { fail_sync_call_ = call_index; }
+    void SetFailLocationDelete(bool fail) { fail_location_delete_ = fail; }
 
     const std::vector<std::string> &Events() const { return events_; }
 
@@ -512,6 +513,15 @@ public:
         return MetaLocalBackend::GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
     }
 
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids) noexcept override {
+        if (fail_location_delete_) {
+            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+        }
+        return MetaLocalBackend::DeleteLocations(request_context, keys, location_ids);
+    }
+
     std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
                                                          const KeyTypeVec &keys,
                                                          const LocationIdsPerKey &location_ids) noexcept override {
@@ -530,6 +540,7 @@ private:
     std::vector<std::string> events_;
     size_t sync_call_count_{0};
     size_t fail_sync_call_{0};
+    bool fail_location_delete_{false};
 };
 
 class RecordingGetLocationsBackend : public MetaLocalBackend {
@@ -962,6 +973,14 @@ TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotal
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(17), per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> checksum_tasks{
+        {{location_id, CLS_SERVING, {{"tp0", "0"}}}},
+    };
+    std::vector<std::vector<ErrorCode>> checksum_results;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, checksum_tasks, checksum_results));
+    ASSERT_TRUE(meta_indexer_->Sync({key}));
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(23), per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
@@ -974,6 +993,8 @@ TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotal
     ASSERT_NE(location_maps[0].end(), location_it);
     ASSERT_TRUE(location_it->second);
     ASSERT_EQ(1u, location_it->second->location_specs().size());
+    EXPECT_TRUE(location_it->second->location_specs()[0].has_checksum());
+    EXPECT_EQ("0", location_it->second->location_specs()[0].checksum());
     EXPECT_EQ("event_report://size-hint:8080/mem?size=23", location_it->second->location_specs()[0].uri());
     std::uint64_t total_size = 0;
     ASSERT_TRUE(location_it->second->GetValidatedTotalSize(total_size));
@@ -2495,6 +2516,7 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=7")}},
     }};
+    replace_tasks[0][0].specs[0].set_checksum("0");
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
@@ -2538,6 +2560,8 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     ASSERT_EQ(1u, replaced_location->location_specs().size());
     EXPECT_EQ(replace_tasks[0][0].specs[0].name_handle().get(),
               replaced_location->location_specs()[0].name_handle().get());
+    EXPECT_TRUE(replaced_location->location_specs()[0].has_checksum());
+    EXPECT_EQ("0", replaced_location->location_specs()[0].checksum());
     std::uint64_t validated_size = 0;
     ASSERT_TRUE(replaced_location->GetValidatedTotalSize(validated_size));
     EXPECT_EQ(7u, validated_size);
@@ -2885,6 +2909,9 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
           LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem"),
           LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
     }};
+    merge_tasks[0][0].specs[0].set_checksum("101");
+    merge_tasks[0][0].specs[1].set_checksum("102");
+    merge_tasks[0][0].specs[2].set_checksum("103");
     std::vector<ErrorCode> per_key_ec;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
 
@@ -2903,13 +2930,17 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(1u, location_maps.size());
     ASSERT_EQ(1u, location_maps[0].size());
     auto spec_names = std::set<std::string>();
+    auto spec_checksums = std::map<std::string, std::string>();
     for (const auto &spec : location_maps[0].at(location_id)->location_specs()) {
         spec_names.insert(spec.name());
         if (spec.name() == "linear_1") {
             EXPECT_EQ(merge_tasks[0][0].specs[1].name_handle().get(), spec.name_handle().get());
         }
+        ASSERT_TRUE(spec.has_checksum());
+        spec_checksums.emplace(spec.name(), spec.checksum());
     }
     ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
+    EXPECT_EQ((std::map<std::string, std::string>{{"linear_1", "102"}, {"full_3", "103"}}), spec_checksums);
     EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
     EXPECT_TRUE(location_maps[0].at(location_id)->HasValidatedLocationSpecs());
 
@@ -3693,6 +3724,122 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
 }
 
+// LocationUpdateTask 的 checksum 必须落到对应 LocationSpec，而不是整个 CacheLocation。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsPerSpecChecksum) {
+    MetaSearcher::KeyVector keys = {7001, 7002};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+    ASSERT_EQ(out_location_ids.size(), keys.size());
+
+    const std::string kChecksumA = "0x1234567890ABCDEF";
+    const std::string kChecksumB = "-42";
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", kChecksumA}}}},
+        {MetaSearcher::LocationUpdateTask{out_location_ids[1], CLS_SERVING, {{"tp0", kChecksumB}}}},
+    };
+    std::vector<std::vector<ErrorCode>> out_batch_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    ASSERT_EQ(out_location_maps.size(), 2u);
+    const auto &first_spec = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    const auto &second_spec = out_location_maps[1].at(out_location_ids[1])->location_specs()[0];
+    EXPECT_EQ(first_spec.checksum(), kChecksumA);
+    EXPECT_EQ(second_spec.checksum(), kChecksumB);
+    EXPECT_TRUE(first_spec.has_checksum());
+    EXPECT_TRUE(second_spec.has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusWithoutChecksumPreservesExisting) {
+    MetaSearcher::KeyVector keys = {7100};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+    // Make the initial add visible before exercising the two update RMWs below.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    // 先写入一个 checksum
+    const std::string kInitial = "0xDEADBEEF";
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> first_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", kInitial}}}},
+    };
+    std::vector<std::vector<ErrorCode>> first_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, first_tasks, first_results));
+    // The test backend queues writes asynchronously. Drain the first update so
+    // the second RMW reads the checksum-bearing value whose preservation is
+    // under test.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    // 再用 has_checksum=false 调用，原 checksum 应保留。
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> second_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING}},
+    };
+    std::vector<std::vector<ErrorCode>> second_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, second_tasks, second_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &stored_spec = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    EXPECT_EQ(stored_spec.checksum(), kInitial);
+    EXPECT_TRUE(stored_spec.has_checksum());
+
+    // Empty batch placeholders are omitted updates, even for existing values.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+    second_tasks[0][0].spec_checksums = {{"tp0", ""}};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, second_tasks, second_results));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+    out_location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &after_empty = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    EXPECT_TRUE(after_empty.has_checksum());
+    EXPECT_EQ(kInitial, after_empty.checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsZeroChecksum) {
+    MetaSearcher::KeyVector keys = {7101};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", "0"}}}},
+    };
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &location = out_location_maps[0].at(out_location_ids[0]);
+    ASSERT_EQ(location->location_specs().size(), 1u);
+    EXPECT_TRUE(location->location_specs()[0].has_checksum());
+    EXPECT_EQ(location->location_specs()[0].checksum(), "0");
+}
+
 TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     // 准备测试数据 - 使用相同的key添加多个location
     MetaSearcher::KeyVector keys = {12345}; // 只使用一个key
@@ -3899,6 +4046,336 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationsTracksStorageUsage) {
     EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
     EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+}
+
+class DuplicateLocationDeletesTest : public MetaSearcherTest {
+public:
+    static constexpr DataStorageType kStorageType = DataStorageType::DATA_STORAGE_TYPE_NFS;
+
+    void SeedLocation(KeyType key,
+                      const std::string &location_id,
+                      uint64_t size,
+                      CacheLocationStatus status = CLS_DELETING) {
+        CacheLocationMapVector existing_locations;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, existing_locations));
+        ASSERT_EQ(1u, existing_locations.size());
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        const bool creates_key = existing_locations[0].empty();
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+            {location_id,
+             kStorageType,
+             status,
+             {LocationSpec("tp0", "file:///tmp/duplicate-location-delete?size=" + std::to_string(size))}},
+        }};
+        std::vector<ErrorCode> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, tasks, results));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+        ASSERT_EQ(initial_key_count + (creates_key ? 1 : 0), meta_indexer_->GetKeyCount());
+    }
+
+    ErrorCode Delete(bool use_cad,
+                     const KeyVector &keys,
+                     const LocationIdsPerKey &ids,
+                     std::vector<std::vector<ErrorCode>> &results) {
+        if (!use_cad) {
+            return meta_searcher_->BatchDeleteLocations(request_context_.get(), keys, ids, results);
+        }
+        std::vector<std::vector<MetaSearcher::LocationCADTask>> tasks(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            for (const auto &id : ids[i]) {
+                tasks[i].push_back({id, CLS_DELETING});
+            }
+        }
+        return meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, tasks, results);
+    }
+};
+
+TEST_F(DuplicateLocationDeletesTest, RepeatedTargetsAccountOnceAndPreserveResultShape) {
+    KeyType next_key = 91000;
+    for (const bool use_cad : {false, true}) {
+        for (size_t shape = 0; shape < 3; ++shape) {
+            SCOPED_TRACE(::testing::Message() << "cad=" << use_cad << " shape=" << shape);
+            const KeyType deleted_key = next_key++;
+            const KeyType retained_key = next_key++;
+            const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+            const auto initial_key_count = meta_indexer_->GetKeyCount();
+            SeedLocation(deleted_key, "deleted", 17);
+            SeedLocation(retained_key, "retained", 101, CLS_SERVING);
+            ASSERT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+
+            const std::vector<KeyVector> keys = {
+                {deleted_key, deleted_key, deleted_key}, {deleted_key}, {deleted_key, deleted_key}};
+            const std::vector<LocationIdsPerKey> ids = {
+                {{"deleted"}, {"deleted"}, {"deleted"}},
+                {{"deleted", "deleted", "deleted"}},
+                {{"deleted", "deleted"}, {"deleted"}},
+            };
+            std::vector<std::vector<ErrorCode>> expected;
+            for (const auto &row : ids[shape]) {
+                expected.emplace_back(row.size(), EC_OK);
+            }
+            std::vector<std::vector<ErrorCode>> results;
+            ASSERT_EQ(EC_OK, Delete(use_cad, keys[shape], ids[shape], results));
+            EXPECT_EQ(expected, results);
+            // A surviving location of the same type prevents saturating subtraction
+            // from hiding repeated charges: 118 - 17 is 101, not 118 - 3 * 17.
+            EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+
+            CacheLocationMapVector maps;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, retained_key}, {}, maps));
+            ASSERT_EQ(2u, maps.size());
+            EXPECT_TRUE(maps[0].empty());
+            EXPECT_EQ(1u, maps[1].count("retained"));
+
+            for (auto &row : expected) {
+                std::fill(row.begin(), row.end(), EC_NOENT);
+            }
+            ASSERT_EQ(EC_OK, Delete(use_cad, keys[shape], ids[shape], results));
+            EXPECT_EQ(expected, results);
+            EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, DistinguishesKeysAndPreservesPerLocationMismatches) {
+    KeyType next_key = 92000;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType first_key = next_key++;
+        const KeyType second_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(first_key, "shared_id", 17);
+        SeedLocation(second_key, "shared_id", 23);
+        SeedLocation(first_key, "mismatch", 5, CLS_SERVING);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+
+        CacheLocationMapVector before;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {first_key, second_key}, {}, before));
+        ASSERT_EQ(2u, before.size());
+        const std::string first_value = before[0].at("shared_id")->ToJsonString();
+        const std::string second_value = before[1].at("shared_id")->ToJsonString();
+        const KeyVector keys{first_key, second_key, first_key, first_key};
+        const LocationIdsPerKey ids{{"shared_id"}, {"shared_id"}, {"mismatch", "shared_id"}, {"mismatch"}};
+        std::vector<std::vector<ErrorCode>> results;
+        if (use_cad) {
+            ASSERT_EQ(EC_OK, Delete(true, keys, ids, results));
+        } else {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchDeleteLocations(
+                          request_context_.get(),
+                          keys,
+                          ids,
+                          results,
+                          {{first_value}, {second_value}, {"stale", first_value}, {"stale"}}));
+        }
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_OK}, {EC_MISMATCH, EC_OK}, {EC_MISMATCH}}),
+                  results);
+        EXPECT_EQ(initial_usage + 106, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+
+        CacheLocationMapVector after;
+        ASSERT_EQ(
+            EC_OK,
+            meta_searcher_->BatchGetLocation(request_context_.get(), {first_key, second_key, healthy_key}, {}, after));
+        ASSERT_EQ(3u, after.size());
+        ASSERT_EQ(1u, after[0].size());
+        EXPECT_EQ(1u, after[0].count("mismatch"));
+        EXPECT_TRUE(after[1].empty());
+        EXPECT_EQ(1u, after[2].count("healthy"));
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, ConflictingConditionsRejectTheEntireBatchBeforeWriting) {
+    KeyType next_key = 93000;
+    for (const bool use_cad : {false, true}) {
+        for (const bool across_rows : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "cad=" << use_cad << " across_rows=" << across_rows);
+            const KeyType duplicate_key = next_key++;
+            const KeyType other_key = next_key++;
+            const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+            const auto initial_key_count = meta_indexer_->GetKeyCount();
+            SeedLocation(duplicate_key, "duplicate", 17);
+            SeedLocation(other_key, "other", 101);
+            CacheLocationMapVector before;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {duplicate_key, other_key}, {}, before));
+            ASSERT_EQ(2u, before.size());
+            const std::string duplicate_value = before[0].at("duplicate")->ToJsonString();
+            const std::string other_value = before[1].at("other")->ToJsonString();
+
+            const KeyVector keys =
+                across_rows ? KeyVector{duplicate_key, duplicate_key, other_key} : KeyVector{duplicate_key, other_key};
+            const LocationIdsPerKey ids = across_rows ? LocationIdsPerKey{{"duplicate"}, {"duplicate"}, {"other"}}
+                                                      : LocationIdsPerKey{{"duplicate", "duplicate"}, {"other"}};
+            std::vector<std::vector<MetaSearcher::LocationCADTask>> tasks(ids.size());
+            std::vector<std::vector<std::string>> expected_values(ids.size());
+            std::vector<std::vector<ErrorCode>> expected_results;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                expected_results.emplace_back(ids[i].size(), EC_BADARGS);
+                for (size_t j = 0; j < ids[i].size(); ++j) {
+                    const bool conflicting_slot = across_rows ? i == 1 : i == 0 && j == 1;
+                    tasks[i].push_back({ids[i][j], conflicting_slot ? CLS_SERVING : CLS_DELETING});
+                    expected_values[i].push_back(conflicting_slot
+                                                     ? (across_rows ? "" : "different-generation")
+                                                     : (keys[i] == duplicate_key ? duplicate_value : other_value));
+                }
+            }
+            std::vector<std::vector<ErrorCode>> results;
+            if (use_cad) {
+                EXPECT_EQ(EC_BADARGS,
+                          meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, tasks, results));
+            } else {
+                EXPECT_EQ(
+                    EC_BADARGS,
+                    meta_searcher_->BatchDeleteLocations(request_context_.get(), keys, ids, results, expected_values));
+            }
+            EXPECT_EQ(expected_results, results);
+            EXPECT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+            CacheLocationMapVector after;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {duplicate_key, other_key}, {}, after));
+            ASSERT_EQ(2u, after.size());
+            ASSERT_EQ(1u, after[0].count("duplicate"));
+            ASSERT_EQ(1u, after[1].count("other"));
+            EXPECT_EQ(duplicate_value, after[0].at("duplicate")->ToJsonString());
+            EXPECT_EQ(other_value, after[1].at("other")->ToJsonString());
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, DeleteFlagsAndMaintenanceReclaimFinalLocationsOnce) {
+    KeyType next_key = 94000;
+    for (const bool maintenance : {false, true}) {
+        for (const bool adjust_usage : {false, true}) {
+            for (const bool adjust_key_count : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "maintenance=" << maintenance << " usage=" << adjust_usage
+                                                  << " key_count=" << adjust_key_count);
+                const KeyType deleted_key = next_key++;
+                const KeyType healthy_key = next_key++;
+                const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+                const auto initial_key_count = meta_indexer_->GetKeyCount();
+                SeedLocation(deleted_key, "first", 17);
+                SeedLocation(deleted_key, "second", 19);
+                SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+                CacheLocationMapVector before;
+                ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key}, {}, before));
+                ASSERT_EQ(1u, before.size());
+                const std::string first_value = before[0].at("first")->ToJsonString();
+                const std::string second_value = before[0].at("second")->ToJsonString();
+
+                std::vector<std::vector<ErrorCode>> results;
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                         {deleted_key, deleted_key, deleted_key},
+                                                         {{"first", "second"}, {"first"}, {"second"}},
+                                                         results,
+                                                         {{first_value, second_value}, {first_value}, {second_value}},
+                                                         adjust_usage,
+                                                         adjust_key_count,
+                                                         maintenance));
+                EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}, {EC_OK}, {EC_OK}}), results);
+                EXPECT_EQ(initial_usage + (adjust_usage ? 101 : 137),
+                          meta_indexer_->GetStorageUsageByType(kStorageType));
+                EXPECT_EQ(initial_key_count + (adjust_key_count ? 1 : 2), meta_indexer_->GetKeyCount());
+                CacheLocationMapVector after;
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, after));
+                ASSERT_EQ(2u, after.size());
+                EXPECT_TRUE(after[0].empty());
+                EXPECT_EQ(1u, after[1].count("healthy"));
+            }
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, FailedBackendDeleteKeepsUsageUntilSuccessfulRetry) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+    KeyType next_key = 94500;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType deleted_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(deleted_key, "deleted", 17);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+        const KeyVector keys{deleted_key, deleted_key};
+        const LocationIdsPerKey ids{{"deleted", "deleted"}, {"deleted"}};
+
+        backend->SetFailLocationDelete(true);
+        std::vector<std::vector<ErrorCode>> results;
+        EXPECT_EQ(EC_ERROR, Delete(use_cad, keys, ids, results));
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_ERROR, EC_ERROR}, {EC_ERROR}}), results);
+        EXPECT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+        CacheLocationMapVector maps;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, maps));
+        ASSERT_EQ(2u, maps.size());
+        EXPECT_EQ(1u, maps[0].count("deleted"));
+        EXPECT_EQ(1u, maps[1].count("healthy"));
+
+        backend->SetFailLocationDelete(false);
+        ASSERT_EQ(EC_OK, Delete(use_cad, keys, ids, results));
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}, {EC_OK}}), results);
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, maps));
+        ASSERT_EQ(2u, maps.size());
+        EXPECT_TRUE(maps[0].empty());
+        EXPECT_EQ(1u, maps[1].count("healthy"));
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, EmptyIdsAndRowsKeepTheirExistingResults) {
+    KeyType next_key = 95000;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType deleted_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(deleted_key, "deleted", 17);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+        CacheLocationMapVector before;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key}, {}, before));
+        ASSERT_EQ(1u, before.size());
+        const std::string expected_value = before[0].at("deleted")->ToJsonString();
+        const KeyVector keys{deleted_key, deleted_key, deleted_key};
+        const LocationIdsPerKey ids{{}, {"", "deleted"}, {""}};
+        std::vector<std::vector<ErrorCode>> results;
+        if (use_cad) {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchCADLocationStatus(
+                          request_context_.get(),
+                          keys,
+                          {{}, {{"", CLS_SERVING}, {"deleted", CLS_DELETING}}, {{"", CLS_WRITING}}},
+                          results));
+        } else {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchDeleteLocations(
+                          request_context_.get(), keys, ids, results, {{}, {"first", expected_value}, {"second"}}));
+        }
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{}, {EC_NOENT, EC_OK}, {EC_NOENT}}), results);
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+
+        results = {{EC_ERROR}};
+        EXPECT_EQ(EC_OK, Delete(use_cad, {}, {}, results));
+        EXPECT_TRUE(results.empty());
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+    }
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationsCanPreserveKeyCountForUncertainAddRollback) {
@@ -4867,6 +5344,90 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         EXPECT_EQ(loc->location_specs()[0].name(), "tp0");
         EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
+}
+
+// Specs merged from distinct locations keep their own independent checksum.
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationPreservesPerSpecChecksums) {
+    MetaSearcher::KeyVector keys = {61000};
+    std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
+    CacheLocationConstPtr loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
+    CacheLocationConstPtr loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
+
+    const std::string kTp0Checksum = "0x0123456789ABCDEF";
+    const std::string kTp1Checksum = "-17";
+
+    std::vector<std::string> out_ids_a;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {loc_a}, out_ids_a));
+    std::vector<std::string> out_ids_b;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {loc_b}, out_ids_b));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{
+        {{out_ids_a[0], CLS_SERVING, {{"tp0", kTp0Checksum}}}, {out_ids_b[0], CLS_SERVING, {{"tp1", kTp1Checksum}}}},
+    };
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results));
+
+    CacheLocationVector out_locations;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_));
+    ASSERT_EQ(out_locations.size(), 1u);
+    ASSERT_EQ(out_locations[0]->location_specs().size(), 2u); // both merged
+    EXPECT_EQ(out_locations[0]->location_specs()[0].name(), "tp0");
+    EXPECT_EQ(out_locations[0]->location_specs()[0].checksum(), kTp0Checksum);
+    EXPECT_TRUE(out_locations[0]->location_specs()[0].has_checksum());
+    EXPECT_EQ(out_locations[0]->location_specs()[1].name(), "tp1");
+    EXPECT_EQ(out_locations[0]->location_specs()[1].checksum(), kTp1Checksum);
+    EXPECT_TRUE(out_locations[0]->location_specs()[1].has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationByBackendPreservesPerSpecChecksums) {
+    MetaSearcher::KeyVector keys = {61100};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {
+                 LocationSpec("tp0", "event_report://peer_a:8080/tp0"),
+                 LocationSpec("tp1", "event_report://peer_a:8080/tp1"),
+             }},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, upserts, per_key_ec));
+
+    // Attach distinct checksums to both specs via the update path.
+    std::vector<CacheLocationMap> loc_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, loc_maps));
+    ASSERT_EQ(loc_maps.size(), 1u);
+    ASSERT_EQ(loc_maps[0].size(), 1u);
+    const std::string kTp0Checksum = "0x77AA55BB11CC33DD";
+    const std::string kTp1Checksum = "-99";
+    std::vector<MetaSearcher::LocationUpdateTask> per_key_tasks;
+    for (const auto &[id, _loc] : loc_maps[0]) {
+        per_key_tasks.push_back({id, CLS_SERVING, {{"tp0", kTp0Checksum}, {"tp1", kTp1Checksum}}});
+    }
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> update_tasks{per_key_tasks};
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, update_tasks, update_results));
+
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+    ASSERT_EQ(out.size(), 1u);
+    ASSERT_FALSE(out[0].empty());
+    ASSERT_EQ(out[0].front()->location_specs().size(), 2u);
+    EXPECT_EQ(out[0].front()->location_specs()[0].checksum(), kTp0Checksum);
+    EXPECT_TRUE(out[0].front()->location_specs()[0].has_checksum());
+    EXPECT_EQ(out[0].front()->location_specs()[1].checksum(), kTp1Checksum);
+    EXPECT_TRUE(out[0].front()->location_specs()[1].has_checksum());
 }
 
 // ============================================================

@@ -1,4 +1,5 @@
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -23,10 +24,16 @@ thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
 thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
+thread_local std::map<MetricsTags, double> reported_local_key_count;
+thread_local std::map<MetricsTags, double> reported_key_count;
 
-void CaptureMetaCacheUsage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+void CaptureInstanceMetadataMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
         reported_meta_cache_usage[tags->GetTagsMap()] = value;
+    } else if (metric->metric_name_.find("cache_manager_instance.local_key_count") != std::string::npos) {
+        reported_local_key_count[tags->GetTagsMap()] = value;
+    } else if (metric->metric_name_.find("cache_manager_instance.key_count") != std::string::npos) {
+        reported_key_count[tags->GetTagsMap()] = value;
     }
 }
 
@@ -41,6 +48,31 @@ void CaptureEventAges(kmonitor::MutableMetric *metric, const kmonitor::MetricsTa
     const auto pos = metric->metric_name_.find("cache_manager_instance.event_report_location_lifetime_");
     if (pos != std::string::npos) {
         reported_lifetimes.push_back({metric->metric_name_.substr(pos), tags->GetTagsMap(), value});
+    }
+}
+
+class FixedUsageNfsBackend : public NfsBackend {
+public:
+    FixedUsageNfsBackend(std::shared_ptr<MetricsRegistry> registry, double usage)
+        : NfsBackend(std::move(registry)), usage_(usage) {}
+    double GetStorageUsageRatio(const std::string &) const override { return usage_; }
+
+private:
+    const double usage_;
+};
+
+thread_local std::vector<ReportedLifetime> reported_storage;
+thread_local std::function<void()> before_storage_report;
+
+void CaptureStorage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    if (before_storage_report && metric->metric_name_.find("meta_indexer.total_key_count") != std::string::npos) {
+        auto callback = std::move(before_storage_report);
+        before_storage_report = {};
+        callback();
+    }
+    const auto pos = metric->metric_name_.find("data_storage.");
+    if (pos != std::string::npos) {
+        reported_storage.push_back({metric->metric_name_.substr(pos), tags->GetTagsMap(), value});
     }
 }
 
@@ -90,36 +122,63 @@ protected:
 
 TEST_F(KmonitorMetricsReporterTest, TestConstructorAndDestructor) { EXPECT_NE(reporter_, nullptr); }
 
-TEST_F(KmonitorMetricsReporterTest, InstanceMetaCacheUsagePreservesTagsAndReportsZero) {
+TEST_F(KmonitorMetricsReporterTest, InstanceMetadataMetricsPreserveTagsAndReportZero) {
     auto recorder = std::make_shared<CacheManagerMetricsRecorder>(
         nullptr, std::make_shared<WriteLocationManager>(), registry_manager_, cache_manager_->metrics_lifecycle());
     cache_manager_->metrics_recorder_ = recorder;
     recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 2048;
     recorder->group_instance_id_metric_map_["group_b"]["instance_b"].meta_cache_usage = 4096;
+    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].local_key_count = 2;
+    recorder->group_instance_id_metric_map_["group_b"]["instance_b"].local_key_count = 3;
+    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].key_count = 100;
+    recorder->group_instance_id_metric_map_["group_b"]["instance_b"].key_count = 200;
     const MetricsTags tags_a{{"instance_group", "group_a"}, {"instance_id", "instance_a"}};
     const MetricsTags tags_b{{"instance_group", "group_b"}, {"instance_id", "instance_b"}};
     Stub stub;
     auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
         &kmonitor::MutableMetric::Report);
-    stub.set(report, CaptureMetaCacheUsage);
+    stub.set(report, CaptureInstanceMetadataMetrics);
     reported_meta_cache_usage.clear();
+    reported_local_key_count.clear();
+    reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(2u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(2048, reported_meta_cache_usage.at(tags_a));
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+    ASSERT_EQ(2u, reported_local_key_count.size());
+    ASSERT_EQ(2u, reported_key_count.size());
+    EXPECT_DOUBLE_EQ(2, reported_local_key_count.at(tags_a));
+    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
+    EXPECT_DOUBLE_EQ(100, reported_key_count.at(tags_a));
+    EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 
     recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 0;
+    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].local_key_count = 0;
     reported_meta_cache_usage.clear();
+    reported_local_key_count.clear();
+    reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(2u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(0, reported_meta_cache_usage.at(tags_a));
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+    ASSERT_EQ(2u, reported_local_key_count.size());
+    ASSERT_EQ(2u, reported_key_count.size());
+    EXPECT_DOUBLE_EQ(0, reported_local_key_count.at(tags_a));
+    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
+    EXPECT_DOUBLE_EQ(100, reported_key_count.at(tags_a));
+    EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 
     cache_manager_->InvalidateInstanceMetrics("instance_a");
     reported_meta_cache_usage.clear();
+    reported_local_key_count.clear();
+    reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(1u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+    ASSERT_EQ(1u, reported_local_key_count.size());
+    ASSERT_EQ(1u, reported_key_count.size());
+    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
+    EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 }
 
 TEST_F(KmonitorMetricsReporterTest, GrpcStatusQpsPreservesTagsAndUpdatesLocalCounter) {
@@ -351,4 +410,121 @@ TEST_F(KmonitorMetricsReporterTest, LifetimeSamplesAreReportedPerRequestWithInst
     reporter_->ReportPerQuery(&zero);
     ASSERT_EQ(9u, reported_lifetimes.size());
     ExpectLifetime(reported_lifetimes, 6, lifetime_tags, {0, 0, 0});
+}
+
+TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritability) {
+    auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_root_path(GetPrivateTestRuntimeDataPath() + "role_nfs/");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "role_store", spec);
+    ASSERT_EQ(EC_OK, backend->Open(config, "trace_role"));
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("role_store", backend);
+
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureStorage);
+    bool leader = false;
+    int role_samples = 0;
+    reporter_->SetStorageUsageProvider([&]() {
+        ++role_samples;
+        return leader;
+    });
+    for (bool next_role : {false, true, false, false, true}) {
+        leader = next_role;
+        role_samples = 0;
+        reported_storage.clear();
+        reporter_->ReportInterval();
+        EXPECT_EQ(1, role_samples);
+        int ratios = 0;
+        int health = 0;
+        int writable = 0;
+        for (const auto &sample : reported_storage) {
+            if (sample.name == "data_storage.storage_usage_ratio") {
+                ++ratios;
+                EXPECT_DOUBLE_EQ(0.0, sample.value);
+            } else if (sample.name == "data_storage.healthy_status") {
+                ++health;
+                EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0, sample.value);
+            } else if (sample.name == "data_storage.writable_status") {
+                ++writable;
+                EXPECT_DOUBLE_EQ(backend->Writable() ? 1.0 : 0.0, sample.value);
+            } else {
+                continue;
+            }
+            EXPECT_EQ("role_store", sample.tags.at("unique_name"));
+        }
+        EXPECT_EQ(leader ? 1 : 0, ratios);
+        EXPECT_EQ(1, health);
+        EXPECT_EQ(1, writable);
+    }
+
+    // If cleanup has also removed the manager, cached collectors must not
+    // continue pushing the previous leader's capacity reading.
+    ASSERT_EQ(EC_OK, registry_manager_->data_storage_manager_->DoCleanup());
+    registry_manager_->data_storage_manager_.reset();
+    leader = false;
+    reported_storage.clear();
+    reporter_->ReportInterval();
+    for (const auto &sample : reported_storage) {
+        EXPECT_NE("data_storage.storage_usage_ratio", sample.name);
+    }
+    const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
+    ASSERT_NE(nullptr, ratios);
+    EXPECT_TRUE(ratios->GetMetricsValues().empty());
+}
+
+TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingAllowsOnlyCurrentRoundSnapshot) {
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    reporter_->SetStorageUsageProvider([] { return true; });
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureStorage);
+    for (bool replace : {false, true}) {
+        auto backend = std::make_shared<FixedUsageNfsBackend>(metrics_registry_, 1.0);
+        backend->SetOpen(true);
+        backend->SetAvailable(true);
+        manager->storage_map_["reused_store"] = backend;
+        reported_storage.clear();
+        before_storage_report = [&, replace] {
+            EXPECT_EQ(EC_OK, manager->DoCleanup());
+            if (replace) {
+                auto replacement = std::make_shared<FixedUsageNfsBackend>(metrics_registry_, 0.25);
+                replacement->SetOpen(true);
+                replacement->SetAvailable(true);
+                manager->storage_map_["reused_store"] = replacement;
+                // Model fresh samples for a new lifetime with identical tags.
+                const MetricsTags tags{{"type", "file"}, {"unique_name", "reused_store"}};
+                metrics_registry_->GetGauge("data_storage.healthy_status", tags) = 1;
+                metrics_registry_->GetGauge("data_storage.writable_status", tags) = 1;
+                metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags) = 0.25;
+            }
+        };
+        reporter_->ReportInterval();
+        EXPECT_FALSE(before_storage_report);
+        // Accepted push-path window: the sampled collector survives this
+        // round even though Local registry cleanup has already completed.
+        int capacity_samples = 0;
+        for (const auto &sample : reported_storage) {
+            if (sample.name == "data_storage.storage_usage_ratio") {
+                ++capacity_samples;
+                EXPECT_DOUBLE_EQ(1.0, sample.value);
+            }
+        }
+        EXPECT_EQ(1, capacity_samples);
+        reported_storage.clear();
+        reporter_->ReportInterval();
+        capacity_samples = 0;
+        for (const auto &sample : reported_storage) {
+            if (sample.name == "data_storage.storage_usage_ratio") {
+                ++capacity_samples;
+                EXPECT_DOUBLE_EQ(0.25, sample.value);
+            }
+        }
+        EXPECT_EQ(replace ? 1 : 0, capacity_samples);
+        before_storage_report = {};
+    }
 }

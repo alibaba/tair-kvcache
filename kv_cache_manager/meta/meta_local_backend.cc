@@ -1808,6 +1808,8 @@ ErrorCode MetaLocalBackend::DeleteMetaData() noexcept { return EC_OK; }
 
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_ ? cache_->GetUsage() : 0; }
 
+size_t MetaLocalBackend::GetLocalKeyCount() const noexcept { return cache_ ? cache_->GetOccupancyCount() : 0; }
+
 bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept {
     if (!cache_) {
         return false;

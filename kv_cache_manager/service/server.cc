@@ -551,6 +551,13 @@ bool Server::StartMetricsReportThread() {
         config_.metrics_report_interval_ms() * 1000,
         "role_state",
         true);
+    if (leader_elector_) {
+        std::weak_ptr<LeaderElector> weak_storage_elector = leader_elector_;
+        metrics_reporter_->SetStorageUsageProvider([weak_storage_elector]() {
+            const auto elector = weak_storage_elector.lock();
+            return elector && elector->IsLeader();
+        });
+    }
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
     KVCM_LOG_INFO("start metrics reporter success.");

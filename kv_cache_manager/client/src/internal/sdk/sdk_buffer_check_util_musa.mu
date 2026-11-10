@@ -1,4 +1,8 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
+
+#include <memory>
+#include <utility>
+
 #include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
 #include "kv_cache_manager/common/env_util.h"
 
@@ -46,6 +50,7 @@ constexpr uint32_t kDefaultThreadsPerBlock = 512;
 
 struct ScopedMusaStream {
     musaStream_t h = nullptr;
+    ScopedMusaStream() = default;
     ~ScopedMusaStream() {
         if (h != nullptr) {
             musaStreamDestroy(h);
@@ -59,7 +64,14 @@ struct ScopedMusaStream {
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(
     const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream) {
-    size_t cal_byte_size = std::min(min_cal_byte_size_, iovs_h_ptr->size / 2);
+    return GetIovsCrc(iovs_h_ptr, iovs_size, iovs_d, crcs_d, stream, nullptr);
+}
+
+std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(
+    const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream,
+    bool *caller_read_pending) {
+    if (caller_read_pending) *caller_read_pending = false;
+    size_t cal_byte_size = CrcSampleBytes(iovs_h_ptr->size);
     if (cal_byte_size == 0) {
         return {};
     }
@@ -73,20 +85,35 @@ std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(
     } else {
         musa_actual_stream = static_cast<musaStream_t>(stream);
     }
-    auto iovs_byte_size = sizeof(IovDevice) * iovs_size;
-    CHECK_MUSA_ERROR_RETURN(
-        musaMemcpyAsync(iovs_d, iovs_h_ptr, iovs_byte_size, musaMemcpyHostToDevice, musa_actual_stream), {},
-        "musaMemcpy iovs_d fail");
-    int block_num = (iovs_size + kDefaultThreadsPerBlock - 1) / kDefaultThreadsPerBlock;
-    GetIovsCrcDevice<<<block_num, kDefaultThreadsPerBlock, 0, musa_actual_stream>>>(iovs_d, iovs_size, crcs_d,
-                                                                               cal_byte_size);
-    std::vector<uint32_t> crcs(iovs_size);
-    auto crc_byte_size = sizeof(uint32_t) * iovs_size;
-    CHECK_MUSA_ERROR_RETURN(
-        musaMemcpyAsync(crcs.data(), crcs_d, crc_byte_size, musaMemcpyDeviceToHost, musa_actual_stream), {},
-        "musaMemcpy crcs_d fail");
-    CHECK_MUSA_ERROR_RETURN(musaStreamSynchronize(musa_actual_stream), {}, "musa stream synchronize fail");
-    return crcs;
+    // Legacy overloads accept a caller-owned table; keep its upload source alive.
+    std::unique_ptr<std::vector<IovDevice>> owned_iovs;
+    if (!caller_read_pending) {
+        owned_iovs = std::make_unique<std::vector<IovDevice>>(iovs_h_ptr, iovs_h_ptr + iovs_size);
+        iovs_h_ptr = owned_iovs->data();
+    }
+    auto crcs = std::make_unique<std::vector<uint32_t>>(iovs_size);
+    const auto iovs_byte_size = sizeof(IovDevice) * iovs_size;
+    const auto upload_error = musaMemcpyAsync(
+        iovs_d, iovs_h_ptr, iovs_byte_size, musaMemcpyHostToDevice, musa_actual_stream);
+    auto copy_error = upload_error;
+    if (upload_error == musaSuccess) {
+        if (caller_read_pending) *caller_read_pending = true;
+        int block_num = (iovs_size + kDefaultThreadsPerBlock - 1) / kDefaultThreadsPerBlock;
+        GetIovsCrcDevice<<<block_num, kDefaultThreadsPerBlock, 0, musa_actual_stream>>>(
+            iovs_d, iovs_size, crcs_d, cal_byte_size);
+        copy_error = musaMemcpyAsync(
+            crcs->data(), crcs_d, sizeof(uint32_t) * iovs_size, musaMemcpyDeviceToHost, musa_actual_stream);
+    }
+    // Copy errors can report earlier asynchronous failures. Fence before releasing either host buffer.
+    const auto sync_error = musaStreamSynchronize(musa_actual_stream);
+    if (sync_error != musaSuccess) {
+        if (upload_error == musaSuccess) (void)crcs.release();
+        (void)owned_iovs.release();
+        CHECK_MUSA_ERROR_RETURN(sync_error, {}, "SDK buffer check fence failed; retaining pending host buffers");
+    }
+    if (caller_read_pending) *caller_read_pending = false;
+    CHECK_MUSA_ERROR_RETURN(copy_error, {}, "asynchronous SDK buffer check copy failed");
+    return std::move(*crcs);
 }
 
 }  // namespace kv_cache_manager

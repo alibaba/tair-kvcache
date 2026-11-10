@@ -356,6 +356,13 @@ public:
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        struct SpecChecksum {
+            std::string location_spec_name;
+            std::string checksum;
+        };
+        // Optional independently stored spec payload checksums. Unnamed specs
+        // and empty values leave existing checksums untouched.
+        std::vector<SpecChecksum> spec_checksums;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,
@@ -379,10 +386,16 @@ public:
         std::string location_id;
         CacheLocationStatus expect_status;
     };
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchCADLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results);
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,

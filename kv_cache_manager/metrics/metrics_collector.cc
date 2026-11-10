@@ -337,14 +337,18 @@ DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept
     : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
 
-bool DataStorageIntervalMetricsCollector::Init() {
+bool DataStorageIntervalMetricsCollector::Init() { return Init(true); }
+
+bool DataStorageIntervalMetricsCollector::Init(bool report_storage_usage) {
     if (metrics_registry_ == nullptr) {
         return false;
     }
 
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(healthy_status);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(writable_status);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+    if (report_storage_usage) {
+        REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+    }
 
     return true;
 }
@@ -424,6 +428,7 @@ bool CacheManagerGroupMetricsCollector::Init() {
 }
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, local_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, meta_cache_usage);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
@@ -472,6 +477,7 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     }
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, local_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);
