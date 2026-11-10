@@ -96,3 +96,29 @@ TEST_F(ServerRedisHealthMetricsTest, CoordinationFailureReportsInEveryPhaseDespi
     // The ordinary reporter is still blocked, yet all four samples were published.
     EXPECT_FALSE(server_.stop_.load());
 }
+
+TEST_F(ServerRedisHealthMetricsTest, DisabledProbeCreatesNoProbeObjectsOrThreads) {
+    ASSERT_TRUE(server_.config_.Parse(
+        "", {{"kvcm.coordination.uri", "redis://127.0.0.1:0"},
+             {"kvcm.metrics.report_interval_ms", "10"},
+             {"kvcm.metrics.redis_health_probe_enabled", "false"}}));
+    ASSERT_TRUE(server_.StartMetricsReportThread());
+    EXPECT_TRUE(server_.metrics_report_thread_);
+    EXPECT_FALSE(server_.redis_health_metrics_);
+    EXPECT_FALSE(server_.redis_health_thread_);
+    EXPECT_FALSE(server_.coordination_redis_health_metrics_);
+    EXPECT_FALSE(server_.coordination_redis_health_thread_);
+    ASSERT_EQ(std::future_status::ready, reporter_->started.get_future().wait_for(std::chrono::seconds(2)));
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*server_.metrics_registry_).find("redis_healthy_status"));
+}
+
+TEST_F(ServerRedisHealthMetricsTest, EnabledProbeWithNonRedisCoordinationCreatesOnlyMetadataThread) {
+    ASSERT_TRUE(server_.config_.Parse(
+        "", {{"kvcm.coordination.uri", "memory://"},
+             {"kvcm.metrics.report_interval_ms", "10"},
+             {"kvcm.metrics.redis_health_probe_enabled", "true"}}));
+    ASSERT_TRUE(server_.StartMetricsReportThread());
+    EXPECT_TRUE(server_.redis_health_metrics_);
+    EXPECT_TRUE(server_.redis_health_thread_);
+    EXPECT_FALSE(server_.coordination_redis_health_thread_);
+}

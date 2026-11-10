@@ -100,7 +100,31 @@ private:
 };
 } // namespace
 
-class RedisHealthMetricsTest : public TESTBASE {};
+class RedisHealthMetricsTest : public TESTBASE {
+public:
+    void SetUp() override {
+        registry_manager_ = std::make_shared<RegistryManager>("", std::make_shared<MetricsRegistry>());
+        indexer_manager_ = std::make_shared<MetaIndexerManager>();
+    }
+    // Populate real runtime snapshots without opening business connections.
+    void SetTargets(const RedisHealthMetrics::Targets &targets) {
+        std::scoped_lock lock(registry_manager_->mutex_, indexer_manager_->mutex_);
+        registry_manager_->instance_infos_.clear();
+        indexer_manager_->meta_indexers_.clear();
+        size_t id = 0;
+        for (const auto &[group, uri] : targets) {
+            const auto name = std::to_string(id++);
+            auto info = std::make_shared<InstanceInfo>();
+            info->set_instance_group_name(group);
+            registry_manager_->instance_infos_[name] = info;
+            auto indexer = std::make_shared<MetaIndexer>();
+            indexer->storage_backend_config_ = {"redis", uri};
+            indexer_manager_->meta_indexers_[name] = indexer;
+        }
+    }
+    std::shared_ptr<RegistryManager> registry_manager_;
+    std::shared_ptr<MetaIndexerManager> indexer_manager_;
+};
 
 TEST_F(RedisHealthMetricsTest, CoordinationReportsFailureRecoveryWithoutExposingCredentials) {
     auto registry = std::make_shared<MetricsRegistry>();
@@ -168,10 +192,11 @@ TEST_F(RedisHealthMetricsTest, CoordinationIsIndependentOfBlockedMetadataProbe) 
     auto lifecycle = std::make_shared<MetricsLifecycle>();
     std::promise<void> entered, release;
     auto released = release.get_future().share();
+    SetTargets({{"group", "redis://meta.example:6379"}});
     RedisHealthMetrics metadata(
         registry,
         lifecycle,
-        [] { return RedisHealthMetrics::Targets{{"group", "redis://meta.example:6379"}}; },
+        registry_manager_, indexer_manager_, [] { return true; },
         [&](const std::string &) {
             entered.set_value();
             released.wait();
@@ -279,13 +304,14 @@ TEST_F(RedisHealthMetricsTest, PublishesFailureRecoveryAndDeduplicatesGroups) {
                                        {"group_c", "redis://other:6379"}};
     int calls = 0;
     bool healthy = true;
-    RedisHealthMetrics metrics(registry, lifecycle, [&]() { return targets; }, [&](const std::string &uri) {
+    RedisHealthMetrics metrics(registry, lifecycle, registry_manager_, indexer_manager_, [] { return true; }, [&](const std::string &uri) {
         ++calls;
         return uri == "redis://other:6379" || healthy;
     });
     for (bool state : {true, false, true}) {
         healthy = state;
         calls = 0;
+        SetTargets(targets);
         metrics.Report();
         EXPECT_EQ(2, calls);
         EXPECT_DOUBLE_EQ(state ? 1 : 0, registry->GetGauge(RedisHealthMetrics::kMetricName, {{"host", "host"}, {"instance_group", "group_a"}, {"port", "6379"}}).Get());
@@ -297,13 +323,16 @@ TEST_F(RedisHealthMetricsTest, PublishesFailureRecoveryAndDeduplicatesGroups) {
     EXPECT_EQ(std::string::npos, output.find("secret"));
     EXPECT_EQ(std::string::npos, output.find("host:6379"));
     targets.erase({"group_b", "redis://secret@host:6379"});
+    SetTargets(targets);
     metrics.Report();
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("group_b"));
     targets.clear(); // demotion or removal of the last Redis group
+    SetTargets(targets);
     metrics.Report();
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
     targets.emplace("group_a", "redis://host:6379"); // promotion / group recreated
     healthy = false;
+    SetTargets(targets);
     metrics.Report();
     EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*registry).find("instance_group=\"group_a\",port=\"6379\"} 0"));
 }
@@ -314,16 +343,19 @@ TEST_F(RedisHealthMetricsTest, DoesNotRepublishObsoleteProbes) {
         auto lifecycle = std::make_shared<MetricsLifecycle>();
         RedisHealthMetrics::Targets targets{{"group", "old"}};
         bool mutate = false;
-        RedisHealthMetrics metrics(registry, lifecycle, [&]() { return targets; }, [&](const std::string &) {
+        RedisHealthMetrics metrics(registry, lifecycle, registry_manager_, indexer_manager_, [] { return true; }, [&](const std::string &) {
             if (mutate) {
                 // Network work must not hold the lifecycle lock.
                 std::unique_lock lock(lifecycle->mut_);
                 targets = demotion ? RedisHealthMetrics::Targets{} : RedisHealthMetrics::Targets{{"group", "new"}};
+                SetTargets(targets);
             }
             return true;
         });
+        SetTargets(targets);
         metrics.Report();
         mutate = true;
+        SetTargets(targets);
         metrics.Report();
         EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
     }
@@ -334,14 +366,16 @@ TEST_F(RedisHealthMetricsTest, ReplacesHostAndPortLabelsWithoutLeakingCredential
     auto lifecycle = std::make_shared<MetricsLifecycle>();
     RedisHealthMetrics::Targets targets{{"group", "redis://old-password@redis-a.example:6379/?db=3"}};
     bool healthy = true;
-    RedisHealthMetrics metrics(registry, lifecycle, [&]() { return targets; }, [&](const std::string &) {
+    RedisHealthMetrics metrics(registry, lifecycle, registry_manager_, indexer_manager_, [] { return true; }, [&](const std::string &) {
         return healthy;
     });
+    SetTargets(targets);
     metrics.Report();
     EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*registry).find(
                                     "{host=\"redis-a.example\",instance_group=\"group\",port=\"6379\"} 1"));
     targets = {{"group", "redis://new-password@10.0.0.8:6380/?db=4"}};
     healthy = false;
+    SetTargets(targets);
     metrics.Report();
     auto output = PrometheusExporter::Expose(*registry);
     EXPECT_EQ(std::string::npos, output.find("redis-a.example"));
@@ -351,14 +385,15 @@ TEST_F(RedisHealthMetricsTest, ReplacesHostAndPortLabelsWithoutLeakingCredential
     EXPECT_EQ(std::string::npos, output.find("db="));
     EXPECT_EQ(std::string::npos, output.find("redis://"));
     targets.clear();
+    SetTargets(targets);
     metrics.Report();
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
 }
 
 TEST_F(RedisHealthMetricsTest, CollectsRuntimeAndConfiguredRedisAfterGroupUpdate) {
     auto metrics = std::make_shared<MetricsRegistry>();
-    RegistryManager registry("", metrics);
-    MetaIndexerManager indexers;
+    auto registry = std::make_shared<RegistryManager>("", metrics);
+    auto indexers = std::make_shared<MetaIndexerManager>();
     auto group = std::make_shared<InstanceGroup>();
     group->set_name("group");
     auto backend = std::make_shared<MetaStorageBackendConfig>();
@@ -367,22 +402,22 @@ TEST_F(RedisHealthMetricsTest, CollectsRuntimeAndConfiguredRedisAfterGroupUpdate
     auto config = std::make_shared<MetaIndexerConfig>();
     config->SetMetaStorageBackendConfig(backend);
     group->set_cache_config(std::make_shared<CacheConfig>(CachePreferStrategy::CPS_UNSPECIFIED, nullptr, config));
-    registry.instance_group_configs_[group->name()] = group;
+    registry->instance_group_configs_[group->name()] = group;
     auto info = std::make_shared<InstanceInfo>();
     info->set_instance_group_name(group->name());
-    registry.instance_infos_["instance"] = info;
+    registry->instance_infos_["instance"] = info;
     auto indexer = std::make_shared<MetaIndexer>();
     indexer->storage_backend_config_ = {"redis", "redis://old:6379"};
-    indexers.meta_indexers_["instance"] = indexer;
+    indexers->meta_indexers_["instance"] = indexer;
 
-    auto targets = RedisHealthMetrics::CollectTargets(registry, indexers);
+    auto targets = RedisHealthMetrics::CollectTargets(*registry, *indexers);
     ASSERT_TRUE(targets);
     EXPECT_EQ((RedisHealthMetrics::Targets{{"group", "redis://old:6379"}, {"group", "redis://new:6380"}}), *targets);
     auto lifecycle = std::make_shared<MetricsLifecycle>();
     RedisHealthMetrics reporter(
         metrics,
         lifecycle,
-        [&]() { return RedisHealthMetrics::CollectTargets(registry, indexers); },
+        registry, indexers, [] { return true; },
         [](const std::string &uri) { return uri != "redis://old:6379"; });
     reporter.Report();
     EXPECT_DOUBLE_EQ(0,
@@ -399,11 +434,11 @@ TEST_F(RedisHealthMetricsTest, CollectsRuntimeAndConfiguredRedisAfterGroupUpdate
     backend->SetStorageType("local");
     reporter.Report();
     EXPECT_EQ((RedisHealthMetrics::Targets{{"group", "redis://old:6379"}}),
-              *RedisHealthMetrics::CollectTargets(registry, indexers));
+              *RedisHealthMetrics::CollectTargets(*registry, *indexers));
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics).find("host=\"new\""));
     // Once the instance is actually removed, its old endpoint can be removed.
-    indexers.meta_indexers_.clear();
-    registry.instance_infos_.clear();
+    indexers->meta_indexers_.clear();
+    registry->instance_infos_.clear();
     reporter.Report();
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics).find("redis_healthy_status"));
 }
@@ -416,10 +451,11 @@ TEST_F(RedisHealthMetricsTest, SameEndpointCombinesAllLiveDatabaseAndAuthSetting
     RedisHealthMetrics reporter(
         registry,
         lifecycle,
-        [&]() { return targets; },
+        registry_manager_, indexer_manager_, [] { return true; },
         [&](const std::string &uri) { return uri.find("db=1") != std::string::npos || healthy; });
     for (bool state : {false, true, false}) {
         healthy = state;
+        SetTargets(targets);
         reporter.Report();
         EXPECT_DOUBLE_EQ(state ? 1 : 0,
                          registry
@@ -429,6 +465,7 @@ TEST_F(RedisHealthMetricsTest, SameEndpointCombinesAllLiveDatabaseAndAuthSetting
     }
     // Removing one dependency with the same public labels must retain the other.
     targets.erase({"group", "redis://host:6379/?db=2"});
+    SetTargets(targets);
     reporter.Report();
     EXPECT_DOUBLE_EQ(1,
                      registry
@@ -440,20 +477,27 @@ TEST_F(RedisHealthMetricsTest, SameEndpointCombinesAllLiveDatabaseAndAuthSetting
 TEST_F(RedisHealthMetricsTest, BusySnapshotPreservesPublishedStateAndSkipsProbes) {
     auto registry = std::make_shared<MetricsRegistry>();
     auto lifecycle = std::make_shared<MetricsLifecycle>();
-    std::optional<RedisHealthMetrics::Targets> targets = RedisHealthMetrics::Targets{{"group", "redis://host:6379"}};
+    RedisHealthMetrics::Targets targets = RedisHealthMetrics::Targets{{"group", "redis://host:6379"}};
     int calls = 0;
     RedisHealthMetrics reporter(
         registry,
         lifecycle,
-        [&]() { return targets; },
+        registry_manager_, indexer_manager_, [] { return true; },
         [&](const std::string &) {
             ++calls;
             return true;
         });
+    SetTargets(targets);
     reporter.Report();
     const auto before = PrometheusExporter::Expose(*registry);
-    targets = std::nullopt;
-    reporter.Report();
+    {
+        std::unique_lock lock(registry_manager_->mutex_);
+        auto skipped = std::async(std::launch::async, [&]() { reporter.Report(); });
+        const auto status = skipped.wait_for(std::chrono::seconds(1));
+        lock.unlock();
+        skipped.get();
+        EXPECT_EQ(std::future_status::ready, status);
+    }
     EXPECT_EQ(1, calls);
     EXPECT_EQ(before, PrometheusExporter::Expose(*registry));
     // A writer holding the lifecycle lock must not be waited on by the probe.
@@ -493,13 +537,14 @@ TEST_F(RedisHealthMetricsTest, CancellationDoesNotWaitForProbeOrStartMoreTargets
     RedisHealthMetrics reporter(
         registry,
         lifecycle,
-        [&]() { return targets; },
+        registry_manager_, indexer_manager_, [] { return true; },
         [&](const std::string &) {
             ++calls;
             started.set_value();
             released.wait();
             return true;
         });
+    SetTargets(targets);
     auto report = std::async(std::launch::async, [&]() { reporter.Report(); });
     started.get_future().wait();
     // Simulate removal/demotion while network I/O is still stalled.
@@ -512,6 +557,7 @@ TEST_F(RedisHealthMetricsTest, CancellationDoesNotWaitForProbeOrStartMoreTargets
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
     release.set_value();
     report.get();
+    SetTargets(targets);
     reporter.Report();
     EXPECT_EQ(1, calls);
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
@@ -533,37 +579,51 @@ TEST_F(RedisHealthMetricsTest, RuntimeSnapshotKeepsInitializationValues) {
     EXPECT_TRUE(indexers.TryGetStorageBackendConfigs()->empty());
 }
 
-TEST_F(RedisHealthMetricsTest, DemotionCancelsRemainingProbesAndBoundsSnapshotCount) {
+TEST_F(RedisHealthMetricsTest, DemotionCancelsRemainingProbesAndRemovesSeries) {
     auto registry = std::make_shared<MetricsRegistry>();
     auto lifecycle = std::make_shared<MetricsLifecycle>();
     RedisHealthMetrics::Targets targets{
         {"a", "redis://host:6379"}, {"b", "redis://host:6380"}, {"c", "redis://host:6381"}};
-    int snapshots = 0;
     int probes = 0;
     bool active = true;
     bool demote = false;
     RedisHealthMetrics reporter(
         registry,
         lifecycle,
-        [&]() {
-            ++snapshots;
-            return active ? targets : RedisHealthMetrics::Targets{};
-        },
+        registry_manager_, indexer_manager_, [&]() { return active; },
         [&](const std::string &) {
             ++probes;
             if (demote) {
                 active = false;
             }
             return true;
-        },
-        [&]() { return active; });
+        });
+    SetTargets(targets);
     reporter.Report();
     EXPECT_EQ(3, probes);
-    EXPECT_EQ(2, snapshots);
-    probes = snapshots = 0;
+    probes = 0;
     demote = true;
+    SetTargets(targets);
     reporter.Report();
     EXPECT_EQ(1, probes);
-    EXPECT_EQ(2, snapshots);
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
+}
+
+TEST_F(RedisHealthMetricsTest, ConcreteSourcesAndDefaultProbeFollowLeadership) {
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto lifecycle = std::make_shared<MetricsLifecycle>();
+    ScriptedRedis server({"+PONG\r\n"});
+    SetTargets({{"group", server.Uri()}});
+    bool leader = false;
+    RedisHealthMetrics reporter(registry, lifecycle, registry_manager_, indexer_manager_, [&] { return leader; });
+    reporter.Report();
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
+    leader = true;
+    reporter.Report();
+    server.Finish();
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"PING"}}), server.commands);
+    EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*registry).find("instance_group=\"group\""));
+    leader = false;
+    reporter.Report();
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*registry).find("redis_healthy_status"));
 }

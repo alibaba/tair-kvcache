@@ -19,17 +19,15 @@ struct MetricsLifecycle;
 class RedisHealthMetrics {
 public:
     using Targets = std::set<std::pair<std::string, std::string>>; // (instance_group, private Redis URI)
-    // nullopt means a busy snapshot, not deletion or loss of leadership.
-    using TargetProvider = std::function<std::optional<Targets>()>;
     using Probe = std::function<bool(const std::string &)>;
     static constexpr const char *kMetricName = "meta_storage.redis_healthy_status";
 
-    RedisHealthMetrics(
-        std::shared_ptr<MetricsRegistry> registry,
-        std::shared_ptr<MetricsLifecycle> lifecycle,
-        TargetProvider targets,
-        Probe probe = [](const std::string &uri) { return ProbeRedis(uri, 1000); },
-        std::function<bool()> active = []() { return true; });
+    RedisHealthMetrics(std::shared_ptr<MetricsRegistry> registry,
+                       std::shared_ptr<MetricsLifecycle> lifecycle,
+                       std::shared_ptr<RegistryManager> registry_manager,
+                       std::shared_ptr<MetaIndexerManager> indexer_manager,
+                       std::function<bool()> is_leader,
+                       Probe probe = {});
 
     // An empty target set (including followers) removes previously published series.
     void Report();
@@ -46,9 +44,12 @@ private:
     void RemoveStale(const Series &targets);
     std::shared_ptr<MetricsRegistry> registry_;
     std::shared_ptr<MetricsLifecycle> lifecycle_;
-    TargetProvider targets_;
+    // nullopt means a busy snapshot, not deletion or loss of leadership.
+    std::optional<Targets> ReadTargets() const;
+    std::shared_ptr<RegistryManager> registry_manager_;
+    std::shared_ptr<MetaIndexerManager> indexer_manager_;
     Probe probe_;
-    std::function<bool()> active_;
+    std::function<bool()> is_leader_;
     Series published_;
     std::atomic<bool> stopped_{false};
 };

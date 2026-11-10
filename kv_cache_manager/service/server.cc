@@ -563,43 +563,33 @@ bool Server::StartMetricsReportThread() {
     }
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
-    std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
-    auto active = [weak_elector]() {
-        const auto elector = weak_elector.lock();
-        return elector && elector->IsLeader();
-    };
-    auto targets = [registry = registry_manager_,
-                    indexers = cache_manager_->meta_indexer_manager(),
-                    active]() -> std::optional<RedisHealthMetrics::Targets> {
-        if (!active()) {
-            return RedisHealthMetrics::Targets{};
-        }
-        return RedisHealthMetrics::CollectTargets(*registry, *indexers);
-    };
-    redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
-        metrics_registry_,
-        metrics_lifecycle_,
-        std::move(targets),
-        [](const std::string &uri) { return RedisHealthMetrics::ProbeRedis(uri); },
-        std::move(active));
-    redis_health_thread_ = LoopThread::CreateLoopThread([metrics = redis_health_metrics_]() { metrics->Report(); },
-                                                        config_.metrics_report_interval_ms() * 1000,
-                                                        "redis_health",
-                                                        true);
-    coordination_redis_health_metrics_ =
-        std::make_shared<CoordinationRedisHealthMetrics>(metrics_registry_, config_.GetCoordinationUri());
-    if (coordination_redis_health_metrics_->IsEnabled()) {
-        // Neither slow metadata probes nor loss of leadership may suppress this
-        // observation. A minimum interval also bounds load for fast metrics configurations.
-        try {
-            coordination_redis_health_thread_ =
-                LoopThread::CreateLoopThread([metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
-                                             std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
-                                             "coord_redis_health",
-                                             true);
-        } catch (const std::system_error &error) {
-            // Observability must not prevent the existing service from starting.
-            KVCM_LOG_WARN("cannot start coordination Redis health probe thread: %s", error.what());
+    if (config_.redis_health_probe_enabled()) {
+        std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
+        redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
+            metrics_registry_, metrics_lifecycle_, registry_manager_, cache_manager_->meta_indexer_manager(),
+            [weak_elector]() {
+                const auto elector = weak_elector.lock();
+                return elector && elector->IsLeader();
+            });
+        redis_health_thread_ = LoopThread::CreateLoopThread([metrics = redis_health_metrics_]() { metrics->Report(); },
+                                                            config_.metrics_report_interval_ms() * 1000,
+                                                            "redis_health",
+                                                            true);
+        coordination_redis_health_metrics_ =
+            std::make_shared<CoordinationRedisHealthMetrics>(metrics_registry_, config_.GetCoordinationUri());
+        if (coordination_redis_health_metrics_->IsEnabled()) {
+            // Neither slow metadata probes nor loss of leadership may suppress this
+            // observation. A minimum interval also bounds load for fast metrics configurations.
+            try {
+                coordination_redis_health_thread_ =
+                    LoopThread::CreateLoopThread([metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
+                                                 std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
+                                                 "coord_redis_health",
+                                                 true);
+            } catch (const std::system_error &error) {
+                // Observability must not prevent the existing service from starting.
+                KVCM_LOG_WARN("cannot start coordination Redis health probe thread: %s", error.what());
+            }
         }
     }
     KVCM_LOG_INFO("start metrics reporter success.");

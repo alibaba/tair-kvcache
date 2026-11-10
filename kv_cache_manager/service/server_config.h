@@ -78,6 +78,7 @@ public:
     const MetricsTags &metrics_common_tags() const { return metrics_common_tags_; }
     const MetricsTags &prometheus_common_tags() const { return prometheus_common_tags_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
+    bool redis_health_probe_enabled() const { return redis_health_probe_enabled_; }
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
@@ -150,6 +151,7 @@ private:
     MetricsTags metrics_common_tags_;
     MetricsTags prometheus_common_tags_;
     int64_t metrics_report_interval_ms_ = 0;
+    bool redis_health_probe_enabled_ = true;
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm";
     std::string event_publishers_configs_;

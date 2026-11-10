@@ -326,6 +326,9 @@ Prometheus 端点从中读取。
 
 ### 元数据 Redis 主动健康探测
 
+两类 Redis 主动探测默认开启（`kvcm.metrics.redis_health_probe_enabled=true`）。如需关闭，可在启动配置中设置 `kvcm.metrics.redis_health_probe_enabled=false`，重启生效。关闭时不创建探测对象和线程，也不发布这两类 Redis 健康指标；业务和选主连接、普通指标上报不受该开关影响。
+
+
 `kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` 表示 KVCM 到该组元数据 Redis 的最近一次探测结果：
 `1` 为连接、必要的认证、PING 和配置的 DB 选择均成功；`0` 为其中任一步失败或超时。
 该指标覆盖 `redis`、`async_redis`，以及 `cached` 的 Redis 持久层（包括 memory-primary 异步备份），

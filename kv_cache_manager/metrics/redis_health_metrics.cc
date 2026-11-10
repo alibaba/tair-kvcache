@@ -22,14 +22,23 @@ MetricsTags RedisMetricTags(const std::string &group, const std::string &uri) {
 
 RedisHealthMetrics::RedisHealthMetrics(std::shared_ptr<MetricsRegistry> registry,
                                        std::shared_ptr<MetricsLifecycle> lifecycle,
-                                       TargetProvider targets,
-                                       Probe probe,
-                                       std::function<bool()> active)
+                                       std::shared_ptr<RegistryManager> registry_manager,
+                                       std::shared_ptr<MetaIndexerManager> indexer_manager,
+                                       std::function<bool()> is_leader,
+                                       Probe probe)
     : registry_(std::move(registry))
     , lifecycle_(std::move(lifecycle))
-    , targets_(std::move(targets))
-    , probe_(std::move(probe))
-    , active_(std::move(active)) {}
+    , registry_manager_(std::move(registry_manager))
+    , indexer_manager_(std::move(indexer_manager))
+    , probe_(probe ? std::move(probe) : Probe([](const std::string &uri) { return ProbeRedis(uri); }))
+    , is_leader_(std::move(is_leader)) {}
+
+std::optional<RedisHealthMetrics::Targets> RedisHealthMetrics::ReadTargets() const {
+    if (!is_leader_()) {
+        return Targets{};
+    }
+    return CollectTargets(*registry_manager_, *indexer_manager_);
+}
 
 std::optional<std::string> RedisHealthMetrics::RedisUri(const std::string &storage_type,
                                                       const std::string &storage_uri) {
@@ -160,7 +169,7 @@ void RedisHealthMetrics::Report() {
         if (!lock.owns_lock()) {
             return;
         }
-        const auto targets = targets_();
+        const auto targets = ReadTargets();
         if (!targets) {
             return;
         }
@@ -171,14 +180,14 @@ void RedisHealthMetrics::Report() {
     // Snapshot the indexer/registry maps only twice per cycle, not per endpoint.
     std::map<std::string, bool> results;
     for (const auto &[tags, uris] : snapshot) {
-        if (!active_()) {
+        if (!is_leader_()) {
             break;
         }
         for (const auto &uri : uris) {
             if (stopped_.load(std::memory_order_relaxed)) {
                 return;
             }
-            if (!active_()) {
+            if (!is_leader_()) {
                 break;
             }
             if (results.find(uri) == results.end()) {
@@ -193,7 +202,7 @@ void RedisHealthMetrics::Report() {
     if (!lock.owns_lock()) {
         return;
     }
-    const auto targets = targets_();
+    const auto targets = ReadTargets();
     if (!targets) {
         return;
     }

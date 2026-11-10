@@ -341,6 +341,9 @@ the same `MetricsRegistry`, and the Prometheus endpoint reads from it.
 
 ### Active metadata Redis health checks
 
+Both active Redis probes are enabled by default (`kvcm.metrics.redis_health_probe_enabled=true`). To disable them, set `kvcm.metrics.redis_health_probe_enabled=false` in the startup configuration and restart. When disabled, neither probe object nor thread is created, and neither Redis health metric is published. Existing business/election connections and ordinary metric reporting are unaffected.
+
+
 `kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` reports the latest metadata Redis probe:
 `1` means connection, required authentication, PING and configured database selection succeeded;
 `0` means any step failed or timed out. It covers `redis`, `async_redis`, and the Redis persistent layer
