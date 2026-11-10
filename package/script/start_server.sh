@@ -6,6 +6,11 @@ SCRIPT_PATH=$(readlink -f "$0")
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 ROOT_PATH=${SCRIPT_DIR%/bin}
 KVCM_OPS_WHEEL_PATH=$ROOT_PATH/kvcm_ops-0.1.0-py3-none-any.whl
+# Hippo may put the system Python ahead of the image's ac2 environment.
+PYTHON_BIN=python3
+if [ -x "/opt/ac2/bin/python3" ]; then
+    PYTHON_BIN="/opt/ac2/bin/python3"
+fi
 BINARY_PATH=$ROOT_PATH/bin
 CONFIG_PATH=$ROOT_PATH/etc
 DEFAULT_SERVER_CONFIG=$CONFIG_PATH/default_server_config.conf
@@ -75,11 +80,12 @@ function configure_jemalloc() {
 }
 
 function install_kvcm_ops() {
-    if python3 -c 'import kvcm_ops, requests' > /dev/null 2>&1; then
+    if "$PYTHON_BIN" -c 'import kvcm_ops.kvcm.bootstrap, requests' > /dev/null 2>&1; then
         echo "kvcm_ops and its dependencies are already installed"
         return 0
     fi
-    python3 -m pip install "$KVCM_OPS_WHEEL_PATH"
+    # Older CLI wheels also use version 0.1.0 but do not contain bootstrap.
+    "$PYTHON_BIN" -m pip install --force-reinstall "$KVCM_OPS_WHEEL_PATH"
 }
 
 function use_home_admin_logger_config_if_writable() {
@@ -260,7 +266,7 @@ function wait_for_admin_health() {
             if curl -fsS --max-time 2 "$ADMIN_URL/api/healthy" >/dev/null 2>&1; then
                 return 0
             fi
-        elif python3 -c 'import requests,sys; r=requests.get(sys.argv[1], timeout=2); sys.exit(0 if r.status_code == 200 else 1)' "$ADMIN_URL/api/healthy" >/dev/null 2>&1; then
+        elif "$PYTHON_BIN" -c 'import requests,sys; r=requests.get(sys.argv[1], timeout=2); sys.exit(0 if r.status_code == 200 else 1)' "$ADMIN_URL/api/healthy" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -282,7 +288,7 @@ function wait_for_bootstrap_retry() {
 
 function run_bootstrap_command() {
     local bootstrap_status=0
-    python3 -m kvcm_ops bootstrap --host "$ADMIN_URL" &
+    "$PYTHON_BIN" -m kvcm_ops bootstrap --host "$ADMIN_URL" &
     bootstrap_pid=$!
     wait_for_pid "$bootstrap_pid" || bootstrap_status=$?
     bootstrap_pid=""
