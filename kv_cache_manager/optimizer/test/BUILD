@@ -164,6 +164,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:dynamic_fenwick_tree",
         "//kv_cache_manager/optimizer/liteHit:hit_curve",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
         "//kv_cache_manager/optimizer/liteHit:request_preprocess",
