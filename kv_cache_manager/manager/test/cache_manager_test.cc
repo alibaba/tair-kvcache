@@ -10530,6 +10530,34 @@ TEST_F(HostCacheStateWithoutP2PTest, MambaPrefixMatchUsesTairWithoutP2P) {
     Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
 }
 
+TEST_F(HostCacheStateWithoutP2PTest, MambaIgnoresWindowGroupForLocalTairAndPeerMatches) {
+    // No sliding_window_tokens: Mamba only evaluates the registered F/L groups.
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+            {LocationSpecInfo("L0", 512),
+             LocationSpecInfo("L1", 512),
+             LocationSpecInfo("L2", 512),
+             LocationSpecInfo("F3", 512),
+             LocationSpecInfo("W4", 512)},
+            {LocationSpecGroup("L0", {"L0"}),
+             LocationSpecGroup("L1", {"L1"}),
+             LocationSpecGroup("L2", {"L2"}),
+             LocationSpecGroup("F3", {"F3"}),
+             LocationSpecGroup("W4", {"W4"})});
+    // Local F has a gap at 102; L2 is missing at 103/104. W is sparse
+    // and must neither limit a complete F/L match nor fill an F/L gap.
+    Report(101, {"F3", "L0", "L1", "L2"});
+    Report(102, {"L0", "L1", "L2", "W4"});
+    Report(103, {"F3", "L0", "L1"});
+    Report(104, {"F3", "L0", "L1", "W4"});
+    AddTair(102, "F3");
+    AddTair(103, "L2");
+    Report(104, {"L2"}, true);
+
+    // local=1; readable Tair extends global to 3; Tair + P2P extends it to 4.
+    Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
+    Verify(CacheManager::QueryType::QT_UNSPECIFIED);
+}
+
 TEST_F(HostCacheStateWithoutP2PTest, SwaRequiresBothFullGroupsBeforeMatchingWindow) {
     Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA,
             {LocationSpecInfo("full0", 512), LocationSpecInfo("full1", 512), LocationSpecInfo("swa", 512)},

@@ -693,6 +693,7 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 - `medium` 非空时只约束本地和 V6D 上报介质，不过滤 TairMempool 的路径；
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
 - 支持 `QT_PREFIX_MATCH`、`QT_PREFIX_MATCH_WITH_MAMBA` 和 `QT_PREFIX_MATCH_WITH_SWA`，其他类型返回参数错误；
+- Mamba 按 group 名称首字符识别 F/L，两类都必须存在；其余 group（包括 W）不参与匹配，也不会导致参数错误。仍按完整 F 连续前缀和恢复位置的完整 L 状态计算命中，不检查 SWA 窗口完整性；
 - SWA 只接受 F/W 两类 group，且两类都必须存在；group 名称首字符决定类别，同类所有 group 的全部 spec 齐全才算该 block 完整；
 - SWA 从 `model_deployment.sliding_window_tokens` 读取窗口 token 数，按 instance 的 `block_size` 向上取整为窗口块数 `w`；两者必须为正；
 - SWA 返回最大的 `k`：Full 在 `[1,k]` 完整，W 在 `[max(1,k-w+1),k]` 完整；不足一整个窗口的起始前缀也可以命中。W 的缺口不终止后续窗口搜索；

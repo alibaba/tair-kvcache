@@ -873,6 +873,10 @@ ErrorCode ClassifySpecGroups(RequestContext *request_context,
             full_groups.push_back(&group);
         } else if (category == state_category) {
             state_groups.push_back(&group);
+        } else if (state_category == 'L') {
+            // Mamba evaluates only F/L groups. Other categories do not
+            // constrain its prefix or checkpoint, even when registered.
+            continue;
         } else {
             const std::string error_msg = "expected F/" + std::string(1, state_category) +
                                           " location spec groups, unexpected group: " + group_name;

@@ -29,6 +29,8 @@ curl -g -vvv -X POST http://localhost:6382/api/registerInstance \
 ```
 `default_query_type` is optional. When `GetHostCacheState` does not set request-level `query_type`, the service uses this registered value.
 
+For `QT_PREFIX_MATCH_WITH_MAMBA`, register both F and L location spec groups (classified by the first character of the group name). `GetHostCacheState` evaluates only these groups: it requires a complete Full prefix and a complete Linear state at the resume point. Other registered groups, including W, are ignored without rejecting the request. This mode does not validate sliding-window completeness or require `sliding_window_tokens`.
+
 For `QT_PREFIX_MATCH_WITH_SWA`, register F/W location spec groups and a positive `model_deployment.sliding_window_tokens` (token count). `GetHostCacheState` rounds the window up to blocks using the instance `block_size`. It returns the longest Full prefix whose trailing SWA window is complete; near the prompt start, the available shorter history is sufficient. This query type applies to `GetHostCacheState`.
 
 ## Get Instance Info
