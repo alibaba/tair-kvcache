@@ -87,9 +87,15 @@ class GitLogTest(unittest.TestCase):
         self.git(self.workspace, "worktree", "add", "--detach", str(worktree), earlier)
         self.stub.unlink()
         self.stub.symlink_to(worktree)
-        output = git_log.generate(self.workspace, self.status())
-        self.assertIn("=== stub_source ===", output)
-        self.assertTrue(output.split("=== stub_source ===", 1)[1].lstrip().startswith("commit " + earlier + "\n"))
+        self.git(self.workspace, "config", "log.decorate", "full")
+        status = self.status()
+        for pretty in ("medium", "oneline"):
+            with self.subTest(pretty=pretty):
+                self.git(self.workspace, "config", "format.pretty", pretty)
+                output = git_log.generate(self.workspace, status)
+                self.assertIn("=== stub_source ===", output)
+                stub_history = output.split("=== stub_source ===", 1)[1].strip()
+                self.assertEqual(stub_history, self.git(worktree, "log", "-10", earlier))
 
     def test_missing_stub_does_not_fall_back_to_workspace(self):
         self.stub.unlink()
