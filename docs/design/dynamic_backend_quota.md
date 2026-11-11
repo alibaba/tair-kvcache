@@ -35,11 +35,13 @@ TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provide
 | 后端模式 | KVCM 类型与分配介质 | 自动容量基数 |
 | --- | --- | --- |
 | 纯 DRAM（`off`） | `pace`，AUTO 或 DRAM（2） | DRAM `total_bytes` |
-| 透明分层（`transparent`） | `pace`，AUTO | DRAM `total_bytes` + SSD `ssd_total_bytes`，每个池只计一份逻辑预算 |
+| 透明分层（`transparent`） | `pace`，AUTO | `max(Σ total_bytes, Σ ssd_total_bytes)`，分别汇总同一后端池的两层容量后取较大值 |
 | 主动分层（`explicit`） | `pace`，AUTO 或 DRAM（2） | DRAM `total_bytes`；主动模式的 AUTO 实际分配 DRAM |
 | 主动分层（`explicit`） | `pace_ssd`，SSD（5） | SSD `ssd_total_bytes` |
 
-透明模式下 KVCM 按 GA 逻辑大小统计 `pace` 用量，不随 DRAM/SSD 驻留变化重新归类；后端将冷 GA 降到 SSD 后释放 DRAM，可以承载两层中的不同 GA。两层总量作为名义容量基数，通过比例预留余量；它不代表某个 GA 此刻可分配的空闲量，也不保证消除双份驻留、SSD slot 放大、碎片和后端水位门禁造成的 alloc fail。透明模式不支持显式 DRAM 或独立 `pace_ssd` 自动预算，避免同一 SSD 容量重复用于两个类型。透明模式明确报告 tiering 已关闭时只计 DRAM；开启时 SSD 数据缺失、为零或溢出，整个样本失败，不能发布较小的 DRAM 部分和。分层已开启但缺少模式时，容量未知。共享远端 tier 需要独立的 owner quota 口径，不能把每个 provider 的 SSD 字段相加，当前自动容量返回不支持。
+透明模式下 KVCM 按 GA 逻辑大小统计 `pace` 用量，不随 DRAM/SSD 驻留变化重新归类。自动 quota 选择两层总容量的较大值作为保守预算，避免把两层当作完全独立的额度相加；这是一项预算策略，不等价于后端物理总量或某个 GA 此刻可分配的空闲量。`max` 在每个后端池分别汇总两层之后计算，不按节点取 `max` 再相加；例如两个节点分别为 DRAM/SSD 100/20 GiB、20/100 GiB，该池基数为 120 GiB。不同独立池仍按前述规则相加，然后应用 Group 的类型比例。比例还可预留余量；双份驻留、SSD slot 放大、碎片和后端水位门禁仍可能造成 alloc fail。
+
+透明模式不支持显式 DRAM 或独立 `pace_ssd` 自动预算，避免同一 SSD 容量重复用于两个类型。透明模式明确报告 tiering 已关闭时只计 DRAM；开启时 SSD 数据缺失、为零或溢出，整个样本失败，不能发布较小的 DRAM 部分值。分层已开启但缺少模式时，容量未知。共享远端 tier 需要独立的 owner quota 口径，不能把每个 provider 的 SSD 字段相加，当前自动容量返回不支持。
 
 DataStorageManager 注册第一个后端后立即启动采集，以 10 秒为目标周期串行轮询；各查询受后端超时约束。变化到成功观察的时延上界约为 10 秒加排队及查询耗时。写入、回收、迁移和 Admin 查询只读内存快照，不发容量查询。监控另有最多约 5 秒的 recorder 采样延迟。
 
