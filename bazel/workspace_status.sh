@@ -17,7 +17,11 @@ emit_git_status() {
     fi
     echo "${prefix}_COMMIT $(git -C "$directory" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
     echo "${prefix}_COMMIT_FULL $(git -C "$directory" rev-parse HEAD 2>/dev/null || echo unknown)"
-    echo "${prefix}_REPO $(git -C "$directory" remote get-url origin 2>/dev/null || echo unknown)"
+    local repository_url
+    repository_url=$(git -C "$directory" remote get-url origin 2>/dev/null || echo unknown)
+    # Checkout URLs may contain credentials; never stamp URL userinfo.
+    repository_url=$(printf '%s' "$repository_url" | sed -E 's|^([[:alpha:]][[:alnum:]+.-]*://)[^/?#]*@|\1|')
+    echo "${prefix}_REPO $repository_url"
 }
 
 emit_git_status STABLE_GIT .
