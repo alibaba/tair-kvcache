@@ -89,7 +89,7 @@ class GitLogTest(unittest.TestCase):
         self.stub.symlink_to(worktree)
         output = git_log.generate(self.workspace, self.status())
         self.assertIn("=== stub_source ===", output)
-        self.assertIn("STABLE_STUB_GIT_COMMIT_FULL " + earlier, output)
+        self.assertTrue(output.split("=== stub_source ===", 1)[1].lstrip().startswith("commit " + earlier + "\n"))
 
     def test_missing_stub_does_not_fall_back_to_workspace(self):
         self.stub.unlink()
@@ -110,7 +110,7 @@ class GitLogTest(unittest.TestCase):
                 self.assertEqual(status["STABLE_STUB_GIT_REPO"], "https://example.invalid/parent.git")
                 output = git_log.generate(self.workspace, status)
                 self.assertNotIn(userinfo, output)
-                self.assertIn("STABLE_STUB_GIT_REPO https://example.invalid/parent.git", output)
+                self.assertNotIn("STABLE_STUB_GIT_", output)
 
     def test_other_repository_url_forms(self):
         for remote, expected in (
