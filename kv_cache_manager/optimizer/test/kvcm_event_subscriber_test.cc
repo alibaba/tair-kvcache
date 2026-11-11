@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/common/static_service_discovery.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -176,11 +177,15 @@ private:
 class TestKvcmServer {
 public:
     explicit TestKvcmServer(bool keep_stream_open = true) : event_service_(keep_stream_open) {
+        static std::atomic<int> next_seed_id{1};
+        seed_ip_ = "127.0.10." + std::to_string(next_seed_id.fetch_add(1));
         grpc::ServerBuilder builder;
+        builder.AddListeningPort(seed_ip_ + ":6381", grpc::InsecureServerCredentials());
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
         builder.RegisterService(&meta_service_);
         builder.RegisterService(&event_service_);
         server_ = builder.BuildAndStart();
+        EXPECT_NE(nullptr, server_);
         meta_service_.SetLeader("127.0.0.1", port_);
     }
 
@@ -190,13 +195,16 @@ public:
         }
     }
 
-    std::string endpoint() const { return "127.0.0.1:" + std::to_string(port_); }
+    // Advertise an HTTP port, while GetClusterInfo returns the actual dynamic Leader RPC port.
+    std::string endpoint() const { return seed_ip_ + ":6382"; }
+    std::string rpc_endpoint() const { return "127.0.0.1:" + std::to_string(port_); }
     int port() const { return port_; }
 
     TestMetaService meta_service_;
     TestEventService event_service_;
 
 private:
+    std::string seed_ip_;
     int port_ = 0;
     std::unique_ptr<grpc::Server> server_;
 };
@@ -255,7 +263,7 @@ protected:
     std::shared_ptr<OptimizerServiceImpl> optimizer_service_;
 };
 
-TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeConsuming) {
+TEST_F(KvcmEventSubscriberTest, DiscoversLeaderViaFixedRpcPortWhenDiscoveryAdvertisesHttp) {
     TestKvcmServer seed;
     TestKvcmServer leader;
     seed.meta_service_.SetLeader("127.0.0.1", leader.port());
@@ -296,7 +304,7 @@ TEST_F(KvcmEventSubscriberTest, BlockSizeChangeRetiresStateAndRejectsMismatchedE
     KvcmEventSubscriber subscriber(
         MakeConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     auto event = MakeEvent("known", "old", 1);
     subscriber.ProcessEvent(event, "127.0.0.1");
     subscriber.ProcessEvent(event, "127.0.0.1");
@@ -313,7 +321,7 @@ TEST_F(KvcmEventSubscriberTest, BlockSizeChangeRetiresStateAndRejectsMismatchedE
     auto configuration = MakeConfiguration({"known"});
     configuration.mutable_instances(0)->set_block_size(8);
     leader.event_service_.SetConfiguration(configuration);
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     EXPECT_FALSE(IsRegistered("known", 4));
     ASSERT_TRUE(IsRegistered("known", 8));
     EXPECT_EQ(0u, metrics_registry_->GetCounter("service.query_counter", old_tags).Get());
@@ -330,7 +338,7 @@ TEST_F(KvcmEventSubscriberTest, BlockSizeChangeRetiresStateAndRejectsMismatchedE
         {"instance_group", "g1"}, {"instance_id", "known_bs8-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
     EXPECT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("query_max_hit_count", hit_tags).Get());
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     EXPECT_FALSE(IsRegistered("known", 8));
     EXPECT_EQ(0, TotalQueries("known", 4));
     subscriber.ProcessEvent(event, "127.0.0.1");
@@ -365,6 +373,34 @@ TEST_F(KvcmEventSubscriberTest, InstanceConflictDoesNotBlockOtherInstancesOrLead
     EXPECT_EQ(1, TotalQueries("healthy"));
     EXPECT_EQ(1, TotalQueries("new"));
     subscriber.Stop();
+}
+
+TEST_F(KvcmEventSubscriberTest, DiscoveryRequiresHealthyIpButNotAdvertisedHost) {
+    TestKvcmServer seed;
+    KvcmEventSubscriber subscriber(
+        MakeConfig(seed.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    std::vector<ServiceEndpoint> endpoints;
+    ASSERT_TRUE(StaticServiceDiscovery::ParseHostPortList(seed.endpoint(), endpoints));
+    const auto healthy_endpoint = endpoints.front();
+    auto discovery = std::make_unique<StaticServiceDiscovery>();
+    auto *discovery_ptr = discovery.get();
+    subscriber.service_discovery_ = std::move(discovery);
+    std::string leader_endpoint;
+
+    endpoints.front().healthy = false;
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    EXPECT_FALSE(subscriber.DiscoverLeader(leader_endpoint));
+
+    endpoints.front() = healthy_endpoint;
+    endpoints.front().ip.clear();
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    EXPECT_FALSE(subscriber.DiscoverLeader(leader_endpoint));
+
+    endpoints.front() = healthy_endpoint;
+    endpoints.front().host.clear();
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    ASSERT_TRUE(subscriber.DiscoverLeader(leader_endpoint));
+    EXPECT_EQ("127.0.0.1:" + std::to_string(seed.port()), leader_endpoint);
 }
 
 TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
@@ -555,7 +591,7 @@ TEST_F(KvcmEventSubscriberTest, UnsupportedInstancesDoNotRequestRefreshAndRecove
     ASSERT_TRUE(subscriber.Init());
     // Drive sync and event consumption synchronously so the supervisor cannot
     // clear the refresh flag before the assertion.
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     EXPECT_FALSE(IsRegistered("ambiguous"));
     for (int i = 0; i < 100; ++i) {
         subscriber.ProcessEvent(MakeEvent("ambiguous", "unsupported", i), "127.0.0.1");
@@ -565,19 +601,19 @@ TEST_F(KvcmEventSubscriberTest, UnsupportedInstancesDoNotRequestRefreshAndRecove
 
     // A failed sync must not discard the last successful unsupported set.
     leader.event_service_.SetConfigurationAvailable(false);
-    EXPECT_FALSE(subscriber.SyncConfiguration(leader.endpoint()));
+    EXPECT_FALSE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     subscriber.ProcessEvent(MakeEvent("ambiguous", "failed-sync", 1), "127.0.0.1");
     EXPECT_FALSE(subscriber.configuration_refresh_requested_);
     leader.event_service_.SetConfigurationAvailable(true);
 
     // A successful replacement snapshot removes stale exclusions.
     leader.event_service_.SetConfiguration(MakeConfiguration({}));
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     subscriber.ProcessEvent(MakeEvent("ambiguous", "now-unknown", 1), "127.0.0.1");
     EXPECT_TRUE(subscriber.configuration_refresh_requested_);
 
     leader.event_service_.SetConfiguration(MakeConfiguration({"ambiguous"}));
-    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
     ASSERT_TRUE(IsRegistered("ambiguous"));
     subscriber.ProcessEvent(MakeEvent("ambiguous", "now-supported", 1), "127.0.0.1");
     EXPECT_EQ(1, TotalQueries("ambiguous"));

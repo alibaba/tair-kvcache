@@ -31,6 +31,7 @@ constexpr int kReconnectJitterPercent = 20;
 constexpr std::chrono::minutes kKeepaliveTime(6);
 constexpr std::chrono::seconds kKeepaliveTimeout(20);
 constexpr std::chrono::milliseconds kUnaryRpcTimeout(1000);
+constexpr int kKvcmMetaRpcPort = 6381;
 
 } // namespace
 
@@ -128,10 +129,12 @@ bool KvcmEventSubscriber::DiscoverLeader(std::string &leader_endpoint) {
     }
 
     for (const auto &endpoint : endpoints) {
-        if (!endpoint.healthy || endpoint.host.empty()) {
+        if (!endpoint.healthy || endpoint.ip.empty()) {
             continue;
         }
-        auto channel = grpc::CreateChannel(endpoint.host, grpc::InsecureChannelCredentials());
+        // Discovery may advertise an HTTP port; bootstrap Meta gRPC on the fixed port instead.
+        const auto seed_endpoint = FormatEndpoint(endpoint.ip, kKvcmMetaRpcPort);
+        auto channel = grpc::CreateChannel(seed_endpoint, grpc::InsecureChannelCredentials());
         auto stub = proto::meta::MetaService::NewStub(channel);
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + kUnaryRpcTimeout);
@@ -142,13 +145,13 @@ bool KvcmEventSubscriber::DiscoverLeader(std::string &leader_endpoint) {
         if (!grpc_status.ok() || !response.has_header() || response.header().status().code() != proto::meta::OK ||
             !response.has_leader_endpoint()) {
             KVCM_LOG_WARN("KvcmEventSubscriber: GetClusterInfo failed via seed[%s], grpc_code=%d",
-                          endpoint.host.c_str(),
+                          seed_endpoint.c_str(),
                           static_cast<int>(grpc_status.error_code()));
             continue;
         }
         const auto &leader = response.leader_endpoint();
         if (leader.host().empty() || leader.meta_rpc_port() <= 0 || leader.meta_rpc_port() > 65535) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: invalid leader endpoint returned by seed[%s]", endpoint.host.c_str());
+            KVCM_LOG_WARN("KvcmEventSubscriber: invalid leader endpoint returned by seed[%s]", seed_endpoint.c_str());
             continue;
         }
         leader_endpoint = FormatEndpoint(leader.host(), leader.meta_rpc_port());

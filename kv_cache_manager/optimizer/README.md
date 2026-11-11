@@ -86,7 +86,7 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 }
 ```
 
-空数组表示不订阅 KVCM。每个数组元素对应一个独立 KVCM 部署；`service_discovery_url` 指向该 KVCM 的 `kvcm.service.rpc_port`，支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`），同一个 URL 不能重复配置。每个 KVCM 的发现结果只作为 seed：Optimizer 周期调用任一健康 seed 的 `MetaService.GetClusterInfo` 获取当前 Leader，并且只向该 Leader 维持一条 `SubscribeEvents` stream。某个 KVCM 切主后，它自己的下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流和切主不影响其他 KVCM 的订阅。
+空数组表示不订阅 KVCM。每个数组元素对应一个独立 KVCM 部署；`service_discovery_url` 支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`），同一个 URL 不能重复配置。发现结果只用于获取健康 seed 的 IP：Optimizer 忽略注册中心返回的端口，统一连接 `IP:6381` 调用 `MetaService.GetClusterInfo`，因此 seed 的 Meta gRPC 必须监听 `6381`，注册中心仍可发布 HTTP 端口（例如 `6382`），不需要改动 KVCM 的服务注册。拿到当前 Leader 后，配置同步和 `SubscribeEvents` 使用响应中的 `leader_endpoint.host` 与 `meta_rpc_port`，不再覆盖该端口，并且每个 KVCM 只维持一条 stream。某个 KVCM 切主后，它自己的下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流和切主不影响其他 KVCM 的订阅。
 
 部署时也可以通过 `kvcm_optimizer.kvcm_event_subscriptions`（或下划线形式 `kvcm_optimizer_kvcm_event_subscriptions`）传入完整 JSON 数组，不需要为每个 KVCM 增加独立配置文件。
 
