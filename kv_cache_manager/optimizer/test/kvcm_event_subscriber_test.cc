@@ -42,6 +42,7 @@ proto::optimizer::TraceQueryRequest
 MakeEvent(const std::string &instance_id, const std::string &trace_id, int64_t key) {
     proto::optimizer::TraceQueryRequest event;
     event.set_instance_id(instance_id);
+    event.set_block_size(4);
     event.set_trace_id(trace_id);
     event.set_input_token_len(4);
     event.set_timestamp_ns(1000LL * 1000000000);
@@ -231,15 +232,16 @@ protected:
         optimizer_service_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
     }
 
-    bool IsRegistered(const std::string &instance_id) const {
-        return manager_->GetInstanceState(instance_id, [](const InstanceState &) {}) == EC_OK;
+    bool IsRegistered(const std::string &instance_id, int32_t block_size = 4) const {
+        return manager_->GetInstanceState(OptimizerServiceImpl::KvcmAnalysisInstanceId(instance_id, block_size),
+                                          [](const InstanceState &) {}) == EC_OK;
     }
 
-    int64_t TotalQueries(const std::string &instance_id) const {
+    int64_t TotalQueries(const std::string &instance_id, int32_t block_size = 4) const {
         std::vector<InstanceSummary> summaries;
         EXPECT_EQ(EC_OK, manager_->ListInstances("", summaries));
         for (const auto &summary : summaries) {
-            if (summary.instance_id == instance_id) {
+            if (summary.instance_id == OptimizerServiceImpl::KvcmAnalysisInstanceId(instance_id, block_size)) {
                 return summary.total_queries;
             }
         }
@@ -288,6 +290,83 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     EXPECT_EQ(nullptr, subscriber.worker_);
 }
 
+TEST_F(KvcmEventSubscriberTest, BlockSizeChangeRetiresStateAndRejectsMismatchedEvents) {
+    TestKvcmServer leader;
+    leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+    KvcmEventSubscriber subscriber(
+        MakeConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    auto event = MakeEvent("known", "old", 1);
+    subscriber.ProcessEvent(event, "127.0.0.1");
+    subscriber.ProcessEvent(event, "127.0.0.1");
+    EXPECT_EQ(2, TotalQueries("known"));
+    const MetricsTags old_tags = {{"instance_group", "g1"}, {"instance_id", "known_bs4"}};
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", old_tags).Get());
+
+    auto next_event = event;
+    next_event.set_block_size(8);
+    next_event.set_input_token_len(8);
+    subscriber.ProcessEvent(next_event, "127.0.0.1");
+    EXPECT_TRUE(subscriber.configuration_refresh_requested_);
+    EXPECT_EQ(2, TotalQueries("known"));
+    auto configuration = MakeConfiguration({"known"});
+    configuration.mutable_instances(0)->set_block_size(8);
+    leader.event_service_.SetConfiguration(configuration);
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    EXPECT_FALSE(IsRegistered("known", 4));
+    ASSERT_TRUE(IsRegistered("known", 8));
+    EXPECT_EQ(0u, metrics_registry_->GetCounter("service.query_counter", old_tags).Get());
+    subscriber.ProcessEvent(next_event, "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("known", 8));
+    // Delayed events from the previous layout must not be replayed into the new state.
+    subscriber.ProcessEvent(event, "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("known", 8));
+    EXPECT_EQ(0u, metrics_registry_->GetCounter("service.query_counter", old_tags).Get());
+    next_event.clear_block_size();
+    subscriber.ProcessEvent(next_event, "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("known", 8));
+    const MetricsTags hit_tags = {
+        {"instance_group", "g1"}, {"instance_id", "known_bs8-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
+    EXPECT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("query_max_hit_count", hit_tags).Get());
+    leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+    ASSERT_TRUE(subscriber.SyncConfiguration(leader.endpoint()));
+    EXPECT_FALSE(IsRegistered("known", 8));
+    EXPECT_EQ(0, TotalQueries("known", 4));
+    subscriber.ProcessEvent(event, "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("known", 4));
+}
+
+TEST_F(KvcmEventSubscriberTest, InstanceConflictDoesNotBlockOtherInstancesOrLeaderMigration) {
+    TestKvcmServer first;
+    TestKvcmServer second;
+    first.event_service_.SetConfiguration(MakeConfiguration({"conflict", "healthy"}));
+    KvcmEventSubscriber subscriber(
+        MakeConfig(first.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    subscriber.running_ = true;
+    subscriber.RefreshLeader();
+    ASSERT_TRUE(WaitUntil([&] { return first.event_service_.active_subscribers_ == 1; }));
+    auto configuration = MakeConfiguration({"conflict", "invalid", "healthy", "new"});
+    configuration.add_instance_groups()->set_name("other");
+    configuration.mutable_instances(0)->set_instance_group_name("other");
+    configuration.mutable_instances(1)->set_block_size(0);
+    second.event_service_.SetConfiguration(configuration);
+    first.meta_service_.SetLeader("127.0.0.1", second.port());
+    subscriber.RefreshLeader();
+    ASSERT_TRUE(WaitUntil([&] { return second.event_service_.active_subscribers_ == 1; }));
+    EXPECT_EQ(0, first.event_service_.active_subscribers_);
+    EXPECT_TRUE(IsRegistered("new"));
+    subscriber.ProcessEvent(MakeEvent("conflict", "blocked", 1), "127.0.0.1");
+    EXPECT_EQ(0, TotalQueries("conflict"));
+    EXPECT_FALSE(subscriber.configuration_refresh_requested_);
+    subscriber.ProcessEvent(MakeEvent("healthy", "ok", 1), "127.0.0.1");
+    subscriber.ProcessEvent(MakeEvent("new", "ok", 1), "127.0.0.1");
+    EXPECT_EQ(1, TotalQueries("healthy"));
+    EXPECT_EQ(1, TotalQueries("new"));
+    subscriber.Stop();
+}
+
 TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
     TestKvcmServer leader;
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
@@ -327,8 +406,8 @@ TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRef
 
     leader.event_service_.Publish(MakeEvent("new-instance", "accepted", 2));
     ASSERT_TRUE(WaitUntil([this] { return TotalQueries("new-instance") == 1; }));
-    const MetricsTags unknown_instance_tags = {{"instance_group", ""}, {"instance_id", "new-instance"}};
-    const MetricsTags known_instance_tags = {{"instance_group", "g1"}, {"instance_id", "new-instance"}};
+    const MetricsTags unknown_instance_tags = {{"instance_group", ""}, {"instance_id", "new-instance_bs4"}};
+    const MetricsTags known_instance_tags = {{"instance_group", "g1"}, {"instance_id", "new-instance_bs4"}};
     ASSERT_TRUE(WaitUntil([this, &unknown_instance_tags, &known_instance_tags] {
         return metrics_registry_->GetCounter("service.query_counter").Get() == 2u &&
                metrics_registry_->GetCounter("service.error_counter").Get() == 1u &&
@@ -351,9 +430,9 @@ TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
     ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
 
     const MetricsTags base_tags = {
-        {"instance_group", "g1"}, {"instance_id", "known-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
+        {"instance_group", "g1"}, {"instance_id", "known_bs4-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
     const MetricsTags capacity_tags = {{"instance_group", "g1"},
-                                       {"instance_id", "known-ttl-86400s"},
+                                       {"instance_id", "known_bs4-ttl-86400s"},
                                        {"client_ip", "127.0.0.1"},
                                        {"capacity_gb", std::to_string(2.0)}};
 
@@ -367,7 +446,7 @@ TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
     ASSERT_TRUE(WaitUntil(
         [this, &capacity_tags] { return metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get() == 1.0; }));
     EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("query_hit_rate", capacity_tags).Get());
-    const MetricsTags service_instance_tags = {{"instance_group", "g1"}, {"instance_id", "known"}};
+    const MetricsTags service_instance_tags = {{"instance_group", "g1"}, {"instance_id", "known_bs4"}};
     EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", service_instance_tags).Get());
     EXPECT_EQ(0u, metrics_registry_->GetCounter("service.error_counter", service_instance_tags).Get());
     EXPECT_GE(metrics_registry_->GetGauge("service.query_rt_us", service_instance_tags).Get(), 0.0);

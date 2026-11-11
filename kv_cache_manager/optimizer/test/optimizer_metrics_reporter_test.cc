@@ -539,8 +539,10 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     Gauge qt = registry_->GetGauge("trace_query_total", tags);
     EXPECT_EQ(2.0, qt.Get());
 
-    // Remove instance metrics
+    ASSERT_EQ(EC_OK, manager_->RemoveInstance("inst1"));
     reporter_->RemoveInstanceMetrics("inst1");
+    reporter_->ReportInterval();
+    EXPECT_TRUE(registry_->GetMetricsData("trace_query_total")->GetMetricsValues().empty());
 
     // After removal, getting the gauge creates a fresh entry with default 0.0
     Gauge qt_after = registry_->GetGauge("trace_query_total", tags);

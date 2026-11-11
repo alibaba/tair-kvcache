@@ -305,8 +305,10 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
                                                        const KvcmEventSubscriptionConfig &config,
-                                                       std::unordered_set<std::string> *unsupported_instance_ids) {
+                                                       std::unordered_set<std::string> *unsupported_instance_ids,
+                                                       std::unordered_map<std::string, int32_t> *registered_instances) {
     std::unordered_set<std::string> unsupported;
+    std::unordered_map<std::string, int32_t> registered;
     if (!manager_ || !manager_->registry_manager()) {
         return EC_ERROR;
     }
@@ -346,10 +348,13 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
     for (const auto &source : configuration.instances()) {
         const auto block_size = source.block_size();
         if (source.instance_id().empty() || block_size <= 0) {
-            return EC_BADARGS;
+            KVCM_LOG_ERROR("Ignore invalid KVCM instance[%s], block_size=%d", source.instance_id().c_str(), block_size);
+            unsupported.insert(source.instance_id());
+            continue;
         }
+        const auto analysis_id = KvcmAnalysisInstanceId(source.instance_id(), block_size);
         bool matches = true;
-        const auto exists = manager_->GetInstanceState(source.instance_id(), [&](const InstanceState &state) {
+        const auto exists = manager_->GetInstanceState(analysis_id, [&](const InstanceState &state) {
             matches = state.instance_info->block_size() == block_size &&
                       state.instance_info->instance_group_name() == source.instance_group_name() &&
                       state.linear_step == 0 && (!config.mock_cache_layout() || state.size_full == 1);
@@ -357,8 +362,10 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (exists == EC_OK) {
             if (!matches) {
                 KVCM_LOG_ERROR("KVCM configuration differs for registered instance[%s]", source.instance_id().c_str());
-                return EC_BADARGS;
+                unsupported.insert(source.instance_id());
+                continue;
             }
+            registered.emplace(source.instance_id(), block_size);
             continue;
         }
         std::vector<LocationSpecInfo> spec_infos;
@@ -388,21 +395,22 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
             spec_infos.emplace_back("block", 1);
             spec_groups.emplace_back("full", std::vector<std::string>{"block"});
         }
-        OptimizerInstanceInfo instance(source.instance_group_name(),
-                                       source.instance_id(),
-                                       block_size,
-                                       spec_infos,
-                                       spec_groups,
-                                       0,
-                                       OptimizerStateInfo());
+        OptimizerInstanceInfo instance(
+            source.instance_group_name(), analysis_id, block_size, spec_infos, spec_groups, 0, OptimizerStateInfo());
         RegisterInstanceResult result;
         auto ec = manager_->RegisterInstance(instance, result);
         if (ec != EC_OK) {
-            return ec;
+            KVCM_LOG_ERROR("Ignore KVCM instance[%s]: registration failed, ec=%d", source.instance_id().c_str(), ec);
+            unsupported.insert(source.instance_id());
+            continue;
         }
+        registered.emplace(source.instance_id(), block_size);
     }
     if (unsupported_instance_ids) {
         *unsupported_instance_ids = std::move(unsupported);
+    }
+    if (registered_instances) {
+        *registered_instances = std::move(registered);
     }
     return EC_OK;
 }

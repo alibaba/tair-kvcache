@@ -126,6 +126,7 @@ bool OptimizerEventPublisher::Convert(const std::shared_ptr<BaseEvent> &event,
     out->set_trace_id(get_event->trace_id());
     // CacheGetEvent's source is the instance the request was served for.
     out->set_instance_id(get_event->event_source());
+    out->set_block_size(get_event->block_size());
     for (const auto key : get_event->get_keys()) {
         out->add_block_keys(key);
     }

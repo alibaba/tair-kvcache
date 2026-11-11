@@ -80,6 +80,7 @@ std::shared_ptr<CacheGetEvent> MakeGetEvent(const std::string &instance_id,
     auto event = std::make_shared<CacheGetEvent>(instance_id);
     event->set_capture_epoch(1);
     event->set_optimizer_observation(true);
+    event->set_block_size(256);
     event->SetEventTriggerTime();
     event->set_trace_id(trace_id);
     event->SetAddtionalArgs(query_type, keys, tokens, BlockMask(), 0, location_spec_names);
@@ -147,6 +148,7 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsCacheGetEvent) {
     ASSERT_EQ(1u, events.size());
     const auto &request = events[0];
     EXPECT_EQ("instance-a", request.instance_id());
+    EXPECT_EQ(256, request.block_size());
     ASSERT_EQ(3, request.block_keys_size());
     EXPECT_EQ(11, request.block_keys(0));
     EXPECT_EQ(22, request.block_keys(1));

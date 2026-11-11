@@ -560,7 +560,7 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     EXPECT_TRUE(stored_group->enable_theoretical_max_cache());
     EXPECT_EQ(24 * 60 * 60, stored_group->ttl_seconds_list().front());
 
-    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance_bs4", [](const InstanceState &state) {
         EXPECT_EQ("kvcm-group", state.instance_info->instance_group_name());
         EXPECT_EQ(4, state.instance_info->block_size());
         ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
@@ -600,7 +600,7 @@ TEST_F(OptimizerServiceImplTest, DefaultMockLayoutIgnoresQuotaChangesAndMultiple
     ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
     EXPECT_TRUE(registry_->GetInstanceGroup("mock-group")->capacity_gb().empty());
     for (const auto *id : {"first", "second"}) {
-        ASSERT_EQ(EC_OK, manager_->GetInstanceState(id, [](const InstanceState &state) {
+        ASSERT_EQ(EC_OK, manager_->GetInstanceState(std::string(id) + "_bs128", [](const InstanceState &state) {
             EXPECT_EQ(128, state.instance_info->block_size());
             EXPECT_EQ(1, state.size_full);
             ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
@@ -644,13 +644,13 @@ TEST_F(OptimizerServiceImplTest, RealCacheLayoutUsesKvcmCapacitySpecsAndConfigur
     EXPECT_EQ((std::vector<double>{2}), registry_->GetInstanceGroup("kvcm")->capacity_gb());
     EXPECT_EQ((std::vector<int64_t>{10, 30}), registry_->GetInstanceGroup("kvcm")->ttl_seconds_list());
     for (const auto *id : {"with-group", "no-group"}) {
-        ASSERT_EQ(EC_OK, manager_->GetInstanceState(id, [](const InstanceState &state) {
+        ASSERT_EQ(EC_OK, manager_->GetInstanceState(std::string(id) + "_bs128", [](const InstanceState &state) {
             EXPECT_EQ(128, state.instance_info->block_size());
             EXPECT_EQ(48, state.size_full);
             EXPECT_EQ(2u, state.instance_info->location_spec_infos().size());
         }));
     }
-    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, manager_->GetInstanceState("multi-group", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, manager_->GetInstanceState("multi-group_bs128", [](const InstanceState &) {}));
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
 }
 
@@ -673,7 +673,7 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenA
 
     ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
 
-    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance_bs4", [](const InstanceState &state) {
         ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
         const auto &full_group = state.instance_info->location_spec_groups().front();
         EXPECT_EQ("full", full_group.name());
@@ -726,8 +726,8 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationIgnoresSourceSpecGroups) 
     supported_group->add_spec_names("tp0");
 
     ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
-    EXPECT_EQ(EC_OK, manager_->GetInstanceState("ambiguous-instance", [](const InstanceState &) {}));
-    EXPECT_EQ(EC_OK, manager_->GetInstanceState("supported-instance", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("ambiguous-instance_bs4", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("supported-instance_bs4", [](const InstanceState &) {}));
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidBlockSize) {
@@ -747,8 +747,10 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidBlockSize) 
     spec_group->set_name("serving-state");
     spec_group->add_spec_names("missing-spec");
 
-    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
-    EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance", [](const InstanceState &) {}));
+    std::unordered_set<std::string> unsupported;
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400}), &unsupported));
+    EXPECT_EQ(1u, unsupported.count("invalid-instance"));
+    EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance_bs4", [](const InstanceState &) {}));
 }
 
 TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {

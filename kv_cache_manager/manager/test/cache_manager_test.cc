@@ -10465,6 +10465,8 @@ TEST_F(HostCacheStateWithoutP2PTest, OptimizerObservationDoesNotAffectQuery) {
     auto event = std::dynamic_pointer_cast<CacheGetEvent>(publisher->events.front());
     ASSERT_NE(nullptr, event);
     EXPECT_TRUE(event->optimizer_observation());
+    EXPECT_EQ(registry_manager_->GetInstanceInfo(request_context_.get(), instance_id_)->block_size(),
+              event->block_size());
     EXPECT_EQ(request_context_->trace_id(), event->trace_id());
     EXPECT_EQ(instance_id_, event->event_source());
     EXPECT_EQ((CacheManager::KeyVector{101, 102}), event->get_keys());

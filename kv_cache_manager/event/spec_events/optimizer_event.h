@@ -32,6 +32,8 @@ public:
         return input_token_len_ > 0 ? input_token_len_ : static_cast<int64_t>(tokens_.size());
     }
     void set_input_token_len(int64_t input_token_len) { input_token_len_ = input_token_len; }
+    int32_t block_size() const { return block_size_; }
+    void set_block_size(int32_t block_size) { block_size_ = block_size; }
     // Trace id of the request that produced this event. BaseEvent only has a
     // randomly generated event id, which cannot be joined against the access
     // log; carrying the trace id makes a consumer-side anomaly traceable back
@@ -64,6 +66,7 @@ public:
         Put(writer, "sw_size", sw_size_);
         Put(writer, "location_spec_names", location_spec_names_);
         Put(writer, "input_token_len", input_token_len());
+        Put(writer, "block_size", block_size_);
     }
 
 private:
@@ -77,6 +80,7 @@ private:
     int32_t sw_size_{0};
     std::vector<std::string> location_spec_names_;
     int64_t input_token_len_{0};
+    int32_t block_size_{0};
 };
 
 class StartWriteCacheEvent : public BaseEvent {

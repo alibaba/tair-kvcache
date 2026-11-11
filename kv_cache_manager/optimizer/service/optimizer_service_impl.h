@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -62,9 +63,13 @@ public:
                      proto::optimizer::OptimizerGetInstanceResponse *response);
 
     // KVCM ingress
+    static std::string KvcmAnalysisInstanceId(const std::string &source_id, int32_t block_size) {
+        return source_id + "_bs" + std::to_string(block_size);
+    }
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
                                      const KvcmEventSubscriptionConfig &config,
-                                     std::unordered_set<std::string> *unsupported_instance_ids = nullptr);
+                                     std::unordered_set<std::string> *unsupported_instance_ids = nullptr,
+                                     std::unordered_map<std::string, int32_t> *registered_instances = nullptr);
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,

@@ -53,6 +53,7 @@ OptimizerMetricsReporter::OptimizerMetricsReporter(std::shared_ptr<OnlineOptimiz
 OptimizerMetricsReporter::~OptimizerMetricsReporter() = default;
 
 void OptimizerMetricsReporter::ReportInterval() {
+    std::lock_guard interval_lock(interval_report_mutex_);
     std::vector<InstanceSummary> summaries;
     manager_->ListInstances("", summaries);
     std::vector<IntervalMetricInfo> interval_metrics;
@@ -237,6 +238,7 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 }
 
 void OptimizerMetricsReporter::RemoveInstanceMetrics(const std::string &instance_id) {
+    std::lock_guard interval_lock(interval_report_mutex_);
     if (!metrics_registry_) {
         return;
     }

@@ -164,6 +164,9 @@ message TraceQueryRequest {
     // 旁路 gRPC 上报可用的紧凑输入：连续 little-endian int64 token ids。
     // 与 token_ids 互斥；KVCM 解码后仍按同一套 block hash 逻辑处理。
     bytes token_ids_le64 = 8;
+    // KVCM subscription events carry the block size used when capturing the query.
+    // Required on SubscribeEvents; instance_id on that stream remains the KVCM source ID.
+    int32 block_size = 9;
 }
 
 message TraceQueryResponse {

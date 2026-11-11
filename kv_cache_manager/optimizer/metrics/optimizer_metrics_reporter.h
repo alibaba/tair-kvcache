@@ -30,6 +30,8 @@ public:
     void RemoveInstanceMetrics(const std::string &instance_id);
 
 private:
+    // Prevent an in-flight interval snapshot from restoring metrics after instance removal.
+    std::mutex interval_report_mutex_;
     std::mutex reported_ids_mutex_;
     std::unordered_map<std::string, std::unordered_set<std::string>> reported_ids_;
 

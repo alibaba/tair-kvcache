@@ -467,6 +467,7 @@ private:
     std::shared_ptr<EventManager> event_manager_;
     bool EnqueueOptimizerEvent(const std::string &trace_id,
                                const std::string &instance_id,
+                               int32_t block_size,
                                const KeyVector &keys,
                                int64_t input_token_len,
                                int64_t timestamp_ns,

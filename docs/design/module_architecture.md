@@ -383,9 +383,9 @@ flowchart LR
 
 ### 4.10 KVCM 到在线 Optimizer 的事件流
 
-`CacheManager` 在读取路径产生 `CacheGetEvent`，`EventManager` 将其同时交给各 publisher。启用 optimizer publisher 后，单 worker 按事件顺序转换为 `TraceQueryRequest`，再写入每个 gRPC 订阅者的独立有界队列。KVCM 的 `OptimizerEventStreamService` 注册在现有 Meta gRPC server 上，不新增端口。
+`CacheManager` 在有活跃 optimizer 订阅的 `GetHostCacheState` 路径采集查询，并携带该请求配置中的 block size；普通缓存读取事件不重复送入 optimizer。启用 optimizer publisher 后，单 worker 按事件顺序转换为 `TraceQueryRequest`，保留原始 instance ID 和采集时的 block size，再写入每个 gRPC 订阅者的独立有界队列。KVCM 的 `OptimizerEventStreamService` 注册在现有 Meta gRPC server 上，不新增端口。
 
-Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpoint，再调用 `MetaService.GetClusterInfo` 定位当前 Leader；任意时刻只向 Leader 保持一条 `SubscribeEvents` response stream。supervisor 周期刷新服务发现和 Leader，并通过同一 Meta gRPC 端口上的 `OptimizerEventStreamService.GetConfiguration` 拉取 Instance Group / Instance 快照，按 Group 后 Instance 的顺序自动注册新增配置；未知 `instance_id` 会立即触发一次额外刷新。切主时先同步配置，再迁移 stream。stream 收到事件后直接调用 `OnlineOptimizerManager::TraceQuery`，Optimizer 侧不再增加业务队列。
+Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpoint，再调用 `MetaService.GetClusterInfo` 定位当前 Leader；任意时刻只向 Leader 保持一条 `SubscribeEvents` response stream。supervisor 周期刷新服务发现和 Leader，并通过同一 Meta gRPC 端口上的 `OptimizerEventStreamService.GetConfiguration` 拉取 Instance Group / Instance 快照，按 Group 后 Instance 的顺序自动注册新增配置；分析 ID 为 `<原 instance_id>_bs<block_size>`，事件必须与已注册的 block size 匹配，未知实例或尺寸不匹配会触发额外刷新，不将事件投递给另一尺寸的状态。单实例冲突单独跳过，其他实例继续同步；Group 级冲突仍会阻断同步。block size 切换成功后清理旧分析状态和指标。切主时先同步配置，再迁移 stream。配置替换与事件回放在订阅器内串行，stream 收到有效事件后直接调用 `OnlineOptimizerManager::TraceQuery`，Optimizer 侧不再增加业务队列。
 
 ---
 

@@ -90,13 +90,15 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 部署时也可以通过 `kvcm_optimizer.kvcm_event_subscriptions`（或下划线形式 `kvcm_optimizer_kvcm_event_subscriptions`）传入完整 JSON 数组，不需要为每个 KVCM 增加独立配置文件。
 
-`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知 `instance_id` 时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。当前同步只添加新配置，不删除或热更新已存在配置；同名配置冲突明确报错。
+`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知实例事件时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。同名 Group 配置冲突仍会终止本轮同步；单个实例配置无效、注册失败或所属 Group 冲突则单独记录并跳过，不阻断其他实例同步或 Leader 订阅迁移，也不按旧配置继续处理该冲突实例的事件。每次周期同步重新校验，配置恢复后可继续处理。
+
+订阅事件保留 KVCM 原始 `instance_id`，并携带采集时的正整数 `block_size`。Optimizer 自动注册和事件回放统一使用分析 ID `<原 instance_id>_bs<block_size>`，例如 `foo_bs128`，不根据当前配置猜测事件的 block size。新版本未注册时丢弃事件并请求配置刷新，不补回；block size 缺失或非法的订阅事件直接拒绝。block size 切换成功后，清理该订阅先前版本的分析状态和指标，新版本从冷状态开始；旧版本迟到事件不会写入新状态。Group 迁移不自动处理。直接调用 TraceQuery API 时传注册后的分析 ID，block size 仍由该实例的注册配置确定。
 
 订阅始终发现并注册 KVCM 的 Group / Instance，block size 始终取 KVCM 实例配置。`mock_cache_layout=true`（默认）时，TTL 和容量列表使用 optimizer 订阅配置，每 block 字节数 mock 为 1，不解释源 spec，也不继承 KVCM quota；容量列表允许为空，此时只分析各 TTL 下的无限容量理论命中。按 full-attention 回放并开启 prefix hash，不再计算 block hash。
 
 `mock_cache_layout=false` 时容量取 KVCM Group quota，TTL 使用订阅项的 `ttl_seconds_list`，未填写时默认 `[86400]`；单个 spec group 按 full-attention 使用，没有 group 时将全部 spec 组成 full group，不使用订阅项的容量列表。当前尚未约定可可靠识别 FA / Mamba 等缓存角色的 spec 映射协议，因此真实布局路径不支持多组 spec，跳过这类实例；mock 路径也不模拟混合缓存布局。真实布局路径暂不支持动态 quota 更新：同名 Group 的 quota 变化会导致配置同步失败，阻止新增实例同步，并可能阻止订阅切换到新 Leader。这是已知限制，不影响默认 mock 模式对源 quota 变化的处理。
 
-在线 Group 使用必填的 `ttl_seconds_list`，每项是非负秒数，0 表示不限制时间；空列表、重复、负数和纳秒换算溢出均拒绝。每个真实 Instance 持有各 TTL 独立回放状态，共享一次输入归一化和 prefix hash。TraceQuery 返回 `ttl_results`，每项包含 TTL 与对应结果；ListInstances 每 TTL 一行，保留真实 ID 并携带 TTL。分析指标的现有 `instance_id` 值追加 `-ttl-<秒数>s`，不新增 tag；service QPS/TPM 仍按真实 ID 计数一次。空容量不生成容量命中率，理论命中率、MRC 等照常输出；mock 字节数模式下的 MRC 字节值基于占位字节数，不能用于实际容量规划。旧 Group 单 TTL 字段不再接受。
+在线 Group 使用必填的 `ttl_seconds_list`，每项是非负秒数，0 表示不限制时间；空列表、重复、负数和纳秒换算溢出均拒绝。每个分析 Instance 持有各 TTL 独立回放状态，共享一次输入归一化和 prefix hash。TraceQuery 返回 `ttl_results`，每项包含 TTL 与对应结果；ListInstances 每 TTL 一行，保留分析 ID 并携带 TTL。分析指标的现有 `instance_id` 值追加 `-ttl-<秒数>s`，如 `foo_bs128-ttl-86400s`，不新增 tag；service QPS/TPM 按分析 ID（如 `foo_bs128`）计数一次，不按 TTL 重复计数。空容量不生成容量命中率，理论命中率、MRC 等照常输出；mock 字节数模式下的 MRC 字节值基于占位字节数，不能用于实际容量规划。旧 Group 单 TTL 字段不再接受。
 
 KVCM 默认在启动时注册 optimizer 订阅服务；设置 `optimizer.enable=false` 则不注册 publisher 和订阅服务。开启但没有订阅者时直接跳过，不创建查询事件；存在订阅者时，在有效 GetHostCacheState 请求中将原始 block keys 和 trace_id 直接送入已有 optimizer 有界队列，时间为 KVCM 到达时间；不发同步 RPC、不等待分析结果，上报失败不改变查询返回。队列满或队列锁竞争时丢弃分析样本，不等待网络发送。最后一个订阅者离开后停止采集，旧订阅批次的排队事件不会发送给重新连接的订阅者。普通缓存读取不再重复进入该 optimizer publisher。没有 input length 时按完整 block 数乘注册 block size 计数，不额外读取 token。独立 Optimizer 仍通过原有 SubscribeEvents 接收事件。
 

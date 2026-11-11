@@ -352,6 +352,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     ASSERT_TRUE(reader->Read(&received));
     EXPECT_EQ("reported-trace", received.trace_id());
     EXPECT_EQ("report-instance", received.instance_id());
+    EXPECT_EQ(2, received.block_size());
     EXPECT_EQ(2, received.block_keys_size());
     EXPECT_EQ(5, received.input_token_len());
     EXPECT_EQ(123456789000, received.timestamp_ns());
@@ -373,6 +374,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     proto::optimizer::TraceQueryRequest raw_received;
     ASSERT_TRUE(reader->Read(&raw_received));
     EXPECT_EQ("reported-raw-trace", raw_received.trace_id());
+    EXPECT_EQ(2, raw_received.block_size());
     EXPECT_EQ(std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()),
               std::vector<int64_t>(raw_received.block_keys().begin(), raw_received.block_keys().end()));
     EXPECT_EQ(5, raw_received.input_token_len());
