@@ -221,15 +221,14 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     EXPECT_EQ(8888, config.http_port());
 }
 
-TEST_F(OnlineOptimizerServerConfigTest, ValidatesAutoRegistrationTtls) {
+TEST_F(OnlineOptimizerServerConfigTest, ValidatesCacheLayoutTtls) {
     KvcmEventSubscriptionConfig config;
-    EXPECT_FALSE(
-        config.FromJsonString(R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":false})"));
-    EXPECT_FALSE(config.auto_register_from_kvcm());
-    EXPECT_TRUE(config.FromJsonString(R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":true})"));
+    EXPECT_FALSE(config.FromJsonString(R"({"service_discovery_url":"static://host:1","mock_cache_layout":true})"));
+    EXPECT_TRUE(config.mock_cache_layout());
+    EXPECT_TRUE(config.FromJsonString(R"({"service_discovery_url":"static://host:1","mock_cache_layout":false})"));
     EXPECT_EQ((std::vector<int64_t>{86400}), config.ttl_seconds_list());
     EXPECT_TRUE(config.FromJsonString(
-        R"({"service_discovery_url":"static://host:1","auto_register_from_kvcm":true,"ttl_seconds_list":[3600,86400]})"));
+        R"({"service_discovery_url":"static://host:1","mock_cache_layout":false,"ttl_seconds_list":[3600,86400]})"));
     EXPECT_EQ((std::vector<int64_t>{3600, 86400}), config.ttl_seconds_list());
     for (const auto &list : {"[]", "[-1]", "[1,1]", "[9223372036854775807]"}) {
         EXPECT_FALSE(config.FromJsonString(
@@ -239,6 +238,12 @@ TEST_F(OnlineOptimizerServerConfigTest, ValidatesAutoRegistrationTtls) {
         R"({"service_discovery_url":"static://host:1","ttl_seconds_list":[10,30],"capacity_gb":[]})"));
     EXPECT_EQ((std::vector<int64_t>{10, 30}), config.ttl_seconds_list());
     EXPECT_TRUE(config.capacity_gb().empty());
+    EXPECT_TRUE(config.mock_cache_layout());
+    KvcmEventSubscriptionConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config.ToJsonString()));
+    EXPECT_TRUE(restored.mock_cache_layout());
+    EXPECT_EQ(config.ttl_seconds_list(), restored.ttl_seconds_list());
+    EXPECT_EQ(std::string::npos, config.ToJsonString().find("auto_register_from_kvcm"));
 }
 
 } // namespace kv_cache_manager

@@ -183,7 +183,8 @@ kvcm.metrics.enable_prometheus=true
 # Prometheus metrics名称前缀，默认kvcm
 kvcm.metrics.prometheus_prefix=kvcm
 
-# Event publisher 配置。log 默认开启；optimizer.enable=true 时，会在现有
+# Event publisher 配置。log 和 optimizer 默认开启；optimizer.enable=false 可禁用。
+# optimizer.enable=true 时仍需活跃订阅者才采集查询事件，会在现有
 # kvcm.service.rpc_port 上注册 OptimizerEventStreamService，不新增监听端口。
 # 每个 publisher 的 queue_size 是它自己的发布队列上限；max_subscribers 是并发订阅数上限，
 # subscriber_queue_size 是每个订阅者的独立缓冲上限；字段省略时使用下列默认值。

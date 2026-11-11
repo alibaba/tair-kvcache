@@ -41,7 +41,7 @@ public:
 static KvcmEventSubscriptionConfig RegistrationConfig(const std::vector<double> &capacities,
                                                       const std::vector<int64_t> &ttls) {
     std::ostringstream json;
-    json << R"({"service_discovery_url":"static://test:1","auto_register_from_kvcm":false,"capacity_gb":[)";
+    json << R"({"service_discovery_url":"static://test:1","mock_cache_layout":true,"capacity_gb":[)";
     for (size_t i = 0; i < capacities.size(); ++i) {
         if (i)
             json << ',';
@@ -571,10 +571,48 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
 }
 
-TEST_F(OptimizerServiceImplTest, AutoConfigurationUsesKvcmCapacitySpecsAndConfiguredTtls) {
+TEST_F(OptimizerServiceImplTest, DefaultMockLayoutIgnoresQuotaChangesAndMultipleSpecGroups) {
     KvcmEventSubscriptionConfig config;
     ASSERT_TRUE(config.FromJsonString(
-        R"({"service_discovery_url":"static://test:1","auto_register_from_kvcm":true,"capacity_gb":[99],"ttl_seconds_list":[10,30]})"));
+        R"({"service_discovery_url":"static://test:1","ttl_seconds_list":[10,30],"capacity_gb":[]})"));
+    ASSERT_TRUE(config.mock_cache_layout());
+    proto::optimizer::KvcmConfigurationResponse source;
+    auto *group = source.add_instance_groups();
+    group->set_name("mock-group");
+    group->set_capacity_bytes(1024);
+    auto *instance = source.add_instances();
+    instance->set_instance_group_name("mock-group");
+    instance->set_instance_id("first");
+    instance->set_block_size(128);
+    for (const auto *name : {"unknown-a", "unknown-b"}) {
+        auto *spec = instance->add_location_spec_infos();
+        spec->set_name(name);
+        spec->set_size(4096);
+        auto *spec_group = instance->add_location_spec_groups();
+        spec_group->set_name(name);
+        spec_group->add_spec_names(name);
+    }
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    source.mutable_instance_groups(0)->set_capacity_bytes(8192);
+    auto second = source.instances(0);
+    second.set_instance_id("second");
+    *source.add_instances() = second;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    EXPECT_TRUE(registry_->GetInstanceGroup("mock-group")->capacity_gb().empty());
+    for (const auto *id : {"first", "second"}) {
+        ASSERT_EQ(EC_OK, manager_->GetInstanceState(id, [](const InstanceState &state) {
+            EXPECT_EQ(128, state.instance_info->block_size());
+            EXPECT_EQ(1, state.size_full);
+            ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
+            EXPECT_EQ("full", state.instance_info->location_spec_groups().front().name());
+        }));
+    }
+}
+
+TEST_F(OptimizerServiceImplTest, RealCacheLayoutUsesKvcmCapacitySpecsAndConfiguredTtls) {
+    KvcmEventSubscriptionConfig config;
+    ASSERT_TRUE(config.FromJsonString(
+        R"({"service_discovery_url":"static://test:1","mock_cache_layout":false,"capacity_gb":[99],"ttl_seconds_list":[10,30]})"));
     proto::optimizer::KvcmConfigurationResponse source;
     auto *group = source.add_instance_groups();
     group->set_name("kvcm");

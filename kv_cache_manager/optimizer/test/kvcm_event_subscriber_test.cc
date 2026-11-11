@@ -470,9 +470,8 @@ TEST_F(KvcmEventSubscriberTest, UnsupportedInstancesDoNotRequestRefreshAndRecove
     leader.event_service_.SetConfiguration(configuration);
 
     KvcmEventSubscriptionConfig config;
-    ASSERT_TRUE(
-        config.FromJsonString(std::string(R"({"auto_register_from_kvcm":true,"service_discovery_url":"static://)") +
-                              leader.endpoint() + R"(","discovery_refresh_interval_ms":5000})"));
+    ASSERT_TRUE(config.FromJsonString(std::string(R"({"mock_cache_layout":false,"service_discovery_url":"static://)") +
+                                      leader.endpoint() + R"(","discovery_refresh_interval_ms":5000})"));
     KvcmEventSubscriber subscriber(config, optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     // Drive sync and event consumption synchronously so the supervisor cannot
@@ -540,8 +539,7 @@ TEST_F(KvcmEventSubscriberTest, ManualAnalysisConfigurationStillDiscoversInstanc
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     KvcmEventSubscriptionConfig config;
     ASSERT_TRUE(config.FromJsonString(
-        std::string(
-            R"({"auto_register_from_kvcm":false,"ttl_seconds_list":[10,30],"service_discovery_url":"static://)") +
+        std::string(R"({"mock_cache_layout":true,"ttl_seconds_list":[10,30],"service_discovery_url":"static://)") +
         leader.endpoint() + R"(","discovery_refresh_interval_ms":50})"));
     KvcmEventSubscriber subscriber(config, optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());

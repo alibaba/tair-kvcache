@@ -25,11 +25,11 @@ bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_v
     capacity_gb_.clear();
     ttl_seconds_list_.clear();
     KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "auto_register_from_kvcm", auto_register_from_kvcm_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mock_cache_layout", mock_cache_layout_, true);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
                                 "ttl_seconds_list",
                                 ttl_seconds_list_,
-                                auto_register_from_kvcm_ ? std::vector<int64_t>{86400} : std::vector<int64_t>{});
+                                mock_cache_layout_ ? std::vector<int64_t>{} : std::vector<int64_t>{86400});
     return Validate();
 }
 
@@ -38,7 +38,7 @@ void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
     Put(writer, "capacity_gb", capacity_gb_);
-    Put(writer, "auto_register_from_kvcm", auto_register_from_kvcm_);
+    Put(writer, "mock_cache_layout", mock_cache_layout_);
     Put(writer, "ttl_seconds_list", ttl_seconds_list_);
 }
 

@@ -23,14 +23,28 @@ TEST_F(EventPublishersConfigTest, TestLogPublisherDefaultsAndOverrides) {
 
 TEST_F(EventPublishersConfigTest, TestOptimizerPublisherDefaults) {
     EventPublishersConfig config;
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
     ASSERT_TRUE(config.FromJsonString(R"({})"));
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
 
     ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{}})"));
 
     const auto &optimizer = config.optimizer_event_publisher_config();
+    EXPECT_TRUE(optimizer.enable());
     EXPECT_EQ(100000u, optimizer.queue_size());
     EXPECT_EQ(4u, optimizer.max_subscribers());
     EXPECT_EQ(10000u, optimizer.subscriber_queue_size());
+}
+
+TEST_F(EventPublishersConfigTest, TestOptimizerPublisherDisableAndRoundTrip) {
+    EventPublishersConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{"enable":false}})"));
+    EXPECT_FALSE(config.enable_optimizer_event_publisher());
+    EventPublishersConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config.ToJsonString()));
+    EXPECT_FALSE(restored.enable_optimizer_event_publisher());
+    ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{}})"));
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
 }
 
 TEST_F(EventPublishersConfigTest, TestOptimizerPublisherConfigOverridesDefaults) {

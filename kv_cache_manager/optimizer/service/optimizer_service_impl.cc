@@ -317,7 +317,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
     for (const auto &source : configuration.instance_groups()) {
         OptimizerInstanceGroup group;
         group.set_name(source.name());
-        if (config.auto_register_from_kvcm()) {
+        if (!config.mock_cache_layout()) {
             group.set_capacity_gb({static_cast<double>(source.capacity_bytes()) / (1024.0 * 1024 * 1024)});
         } else {
             group.set_capacity_gb(config.capacity_gb());
@@ -352,7 +352,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         const auto exists = manager_->GetInstanceState(source.instance_id(), [&](const InstanceState &state) {
             matches = state.instance_info->block_size() == block_size &&
                       state.instance_info->instance_group_name() == source.instance_group_name() &&
-                      state.linear_step == 0 && (config.auto_register_from_kvcm() || state.size_full == 1);
+                      state.linear_step == 0 && (!config.mock_cache_layout() || state.size_full == 1);
         });
         if (exists == EC_OK) {
             if (!matches) {
@@ -363,7 +363,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         }
         std::vector<LocationSpecInfo> spec_infos;
         std::vector<LocationSpecGroup> spec_groups;
-        if (config.auto_register_from_kvcm()) {
+        if (!config.mock_cache_layout()) {
             // Keep the original KVCM spec mapping: a single group is full-attention.
             if (source.location_spec_groups_size() > 1) {
                 KVCM_LOG_WARN("Ignore unsupported multi-group instance[%s]", source.instance_id().c_str());

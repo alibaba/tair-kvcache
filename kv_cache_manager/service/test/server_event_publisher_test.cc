@@ -39,6 +39,10 @@ TEST_F(ServerEventPublisherTest, TestOptimizerPublisherIsRegisteredByDefault) {
     EXPECT_TRUE(event_manager->HasPublisher("log_event_publisher"));
     EXPECT_TRUE(event_manager->HasPublisher("optimizer_event_publisher"));
     EXPECT_NE(nullptr, server.optimizer_event_service_);
+    auto publisher =
+        std::dynamic_pointer_cast<OptimizerEventPublisher>(event_manager->GetPublisher("optimizer_event_publisher"));
+    ASSERT_NE(nullptr, publisher);
+    EXPECT_EQ(0u, publisher->CaptureEpoch());
     event_manager->Stop();
 }
 
@@ -59,6 +63,17 @@ TEST_F(ServerEventPublisherTest, TestConfiguredOptimizerPublisherIsRegistered) {
     EXPECT_EQ(4096u, sink->config_.subscriber_queue_size());
     ASSERT_NE(nullptr, server.optimizer_event_service_);
     EXPECT_EQ(2u, server.optimizer_event_service_->MaxSubscribers());
+    event_manager->Stop();
+}
+
+TEST_F(ServerEventPublisherTest, TestOptimizerPublisherCanBeDisabled) {
+    Server server;
+    server.config_.event_publishers_configs_ = R"({"optimizer":{"enable":false}})";
+    auto event_manager = MakeEventManager();
+    server.RegisterEventPublishers(event_manager);
+    EXPECT_TRUE(event_manager->HasPublisher("log_event_publisher"));
+    EXPECT_FALSE(event_manager->HasPublisher("optimizer_event_publisher"));
+    EXPECT_EQ(nullptr, server.optimizer_event_service_);
     event_manager->Stop();
 }
 
