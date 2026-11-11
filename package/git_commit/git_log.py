@@ -44,10 +44,7 @@ def generate(workspace, status):
     same_repository = repository_id(workspace) == repository_id(stub)
     if same_repository and revision == stub_revision:
         return output
-    output += "\n=== stub_source ===\n"
-    for key in ("STABLE_STUB_GIT_REPO", "STABLE_STUB_GIT_COMMIT", "STABLE_STUB_GIT_COMMIT_FULL"):
-        output += "{} {}\n".format(key, status.get(key, "unknown"))
-    return output + "\n" + history(stub, stub_revision)
+    return output + "\n=== stub_source ===\n\n" + history(stub, stub_revision)
 
 
 def main():
