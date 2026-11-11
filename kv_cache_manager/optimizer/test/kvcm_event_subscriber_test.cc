@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/common/static_service_discovery.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -175,11 +176,15 @@ private:
 class TestKvcmServer {
 public:
     explicit TestKvcmServer(bool keep_stream_open = true) : event_service_(keep_stream_open) {
+        static std::atomic<int> next_seed_id{1};
+        seed_ip_ = "127.0.10." + std::to_string(next_seed_id.fetch_add(1));
         grpc::ServerBuilder builder;
+        builder.AddListeningPort(seed_ip_ + ":6381", grpc::InsecureServerCredentials());
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
         builder.RegisterService(&meta_service_);
         builder.RegisterService(&event_service_);
         server_ = builder.BuildAndStart();
+        EXPECT_NE(nullptr, server_);
         meta_service_.SetLeader("127.0.0.1", port_);
     }
 
@@ -189,13 +194,15 @@ public:
         }
     }
 
-    std::string endpoint() const { return "127.0.0.1:" + std::to_string(port_); }
+    // Advertise an HTTP port, while GetClusterInfo returns the actual dynamic Leader RPC port.
+    std::string endpoint() const { return seed_ip_ + ":6382"; }
     int port() const { return port_; }
 
     TestMetaService meta_service_;
     TestEventService event_service_;
 
 private:
+    std::string seed_ip_;
     int port_ = 0;
     std::unique_ptr<grpc::Server> server_;
 };
@@ -252,7 +259,7 @@ protected:
     std::shared_ptr<OptimizerServiceImpl> optimizer_service_;
 };
 
-TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeConsuming) {
+TEST_F(KvcmEventSubscriberTest, DiscoversLeaderViaFixedRpcPortWhenDiscoveryAdvertisesHttp) {
     TestKvcmServer seed;
     TestKvcmServer leader;
     seed.meta_service_.SetLeader("127.0.0.1", leader.port());
@@ -286,6 +293,34 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     subscriber.Stop();
     EXPECT_FALSE(subscriber.running_);
     EXPECT_EQ(nullptr, subscriber.worker_);
+}
+
+TEST_F(KvcmEventSubscriberTest, DiscoveryRequiresHealthyIpButNotAdvertisedHost) {
+    TestKvcmServer seed;
+    KvcmEventSubscriber subscriber(
+        MakeConfig(seed.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    std::vector<ServiceEndpoint> endpoints;
+    ASSERT_TRUE(StaticServiceDiscovery::ParseHostPortList(seed.endpoint(), endpoints));
+    const auto healthy_endpoint = endpoints.front();
+    auto discovery = std::make_unique<StaticServiceDiscovery>();
+    auto *discovery_ptr = discovery.get();
+    subscriber.service_discovery_ = std::move(discovery);
+    std::string leader_endpoint;
+
+    endpoints.front().healthy = false;
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    EXPECT_FALSE(subscriber.DiscoverLeader(leader_endpoint));
+
+    endpoints.front() = healthy_endpoint;
+    endpoints.front().ip.clear();
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    EXPECT_FALSE(subscriber.DiscoverLeader(leader_endpoint));
+
+    endpoints.front() = healthy_endpoint;
+    endpoints.front().host.clear();
+    ASSERT_TRUE(discovery_ptr->InitWithEndpoints(endpoints));
+    ASSERT_TRUE(subscriber.DiscoverLeader(leader_endpoint));
+    EXPECT_EQ("127.0.0.1:" + std::to_string(seed.port()), leader_endpoint);
 }
 
 TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
