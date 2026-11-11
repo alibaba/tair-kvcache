@@ -29,6 +29,9 @@ build --workspace_status_command=bazel/workspace_status.sh
 | `STABLE_GIT_COMMIT` | `2cd6c5a9` | git short commit hash (8位) |
 | `STABLE_GIT_COMMIT_FULL` | `2cd6c5a9...` | git 完整 commit hash |
 | `STABLE_GIT_REPO` | `git@github.com:alibaba/tair-kvcache.git` | 远程仓库地址 |
+| `STABLE_STUB_GIT_COMMIT` | `2cd6c5a9` | `stub_source` 所属 Git 仓库的短 hash |
+| `STABLE_STUB_GIT_COMMIT_FULL` | `2cd6c5a9...` | `stub_source` 所属 Git 仓库的完整 hash |
+| `STABLE_STUB_GIT_REPO` | `https://example.com/team/backend.git` | `stub_source` 所属 Git 仓库的 origin 地址 |
 | `STABLE_KVCM_VERSION` | `0.0.1` | 语义版本号 |
 | `STABLE_BUILD_TIMESTAMP` | `20260409113826` | 构建日期+时间，用于完整版本号，避免同 commit 打包冲突 |
 | `BUILD_DATE` | `20260409` | 构建日期 |
@@ -215,3 +218,16 @@ echo "STABLE_KVCM_VERSION 0.0.1"
 - 最终版本号为 `0.0.1+20260409113826.unknown`，PEP 440 合法
 - py_wheel stamp 中 `{STABLE_GIT_COMMIT}` 被替换为 `unknown`，wheel 正常构建
 - C++ 常量同理，编译不受影响
+
+## stub_source 版本溯源
+
+`workspace_status.sh` 通过 `stub_source` 的真实目录采集其所属 Git 仓库版本，
+无需配置 provider 脚本。默认 `stub_source -> open_source`，两组字段对应同一仓库。
+如果 `stub_source` 指向另一个仓库中的目录，`STABLE_STUB_GIT_*` 自动记录该仓库。
+无法读取 Git 信息时，相应字段为 `unknown`。
+
+`git_commit` 规则复制全部 status，自动包含新增字段；`git_commit_log` 使用双方
+采集的完整 SHA 生成各自最近 10 条提交，同仓库同 SHA 时不重复。不同仓库的
+第二段以 `=== stub_source ===` 标识。生成过程支持子模块和 worktree 的 `.git` 文件。
+这两个文件由现有 Bazel 规则在打包前生成，原 target、包路径和版本号格式不变。
+`gen_version_info.py` 继续只消费已有字段，无需修改。

@@ -15,7 +15,7 @@ genrule(
         ":git_commit_version",
     ],
     outs = ["git_commit_log"],
-    cmd = "python3 $(location git_log.py) -o $(OUTS)",
+    cmd = "python3 $(location git_log.py) --status $(location :git_commit_version) -o $(OUTS)",
 )
 
 bundle_files(
@@ -26,4 +26,14 @@ bundle_files(
     ],
     prefix = "etc",
     visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "git_log_test",
+    srcs = ["git_log_test.py"],
+    data = [
+        "git_log.py",
+        "//bazel:workspace_status.sh",
+    ],
+    python_version = "PY3",
 )
