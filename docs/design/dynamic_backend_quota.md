@@ -30,7 +30,16 @@
 
 TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
 
-纯 DRAM 模式支持原有默认 AUTO 分配；有分层的部署，`pace` 自动 quota 需要配置 `media_type=2`，以保证其用量是 DRAM；`pace_ssd` 对应显式 SSD 分配。透明 AUTO 的一个 GA 可在两种介质间驻留，无法直接映射为这两个独立类型的预算，自动容量返回不支持，需使用固定 quota。不会把 DRAM 和 SSD 相加后重复用于两个类型，也不将 DRAM 指标冒充透明分层总容量。
+容量与实际分配模式对齐：
+
+| 后端模式 | KVCM 类型与分配介质 | 自动容量基数 |
+| --- | --- | --- |
+| 纯 DRAM（`off`） | `pace`，AUTO 或 DRAM（2） | DRAM `total_bytes` |
+| 透明分层（`transparent`） | `pace`，AUTO | DRAM `total_bytes` + SSD `ssd_total_bytes`，每个池只计一份逻辑预算 |
+| 主动分层（`explicit`） | `pace`，AUTO 或 DRAM（2） | DRAM `total_bytes`；主动模式的 AUTO 实际分配 DRAM |
+| 主动分层（`explicit`） | `pace_ssd`，SSD（5） | SSD `ssd_total_bytes` |
+
+透明模式下 KVCM 按 GA 逻辑大小统计 `pace` 用量，不随 DRAM/SSD 驻留变化重新归类；后端将冷 GA 降到 SSD 后释放 DRAM，可以承载两层中的不同 GA。两层总量作为名义容量基数，通过比例预留余量；它不代表某个 GA 此刻可分配的空闲量，也不保证消除双份驻留、SSD slot 放大、碎片和后端水位门禁造成的 alloc fail。透明模式不支持显式 DRAM 或独立 `pace_ssd` 自动预算，避免同一 SSD 容量重复用于两个类型。透明模式明确报告 tiering 已关闭时只计 DRAM；开启时 SSD 数据缺失、为零或溢出，整个样本失败，不能发布较小的 DRAM 部分和。分层已开启但缺少模式时，容量未知。共享远端 tier 需要独立的 owner quota 口径，不能把每个 provider 的 SSD 字段相加，当前自动容量返回不支持。
 
 DataStorageManager 注册第一个后端后立即启动采集，以 10 秒为目标周期串行轮询；各查询受后端超时约束。变化到成功观察的时延上界约为 10 秒加排队及查询耗时。写入、回收、迁移和 Admin 查询只读内存快照，不发容量查询。监控另有最多约 5 秒的 recorder 采样延迟。
 
