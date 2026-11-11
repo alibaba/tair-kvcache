@@ -336,7 +336,11 @@ cc_test(
     srcs = [
         "online_optimizer_server_event_subscription_test.cc",
     ],
-    copts = ["-fno-access-control"],
+    copts = [
+        "-fno-access-control",
+        "-std=c++20",
+        "-fcoroutines",
+    ],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/event:event_publisher",
@@ -344,5 +348,6 @@ cc_test(
         "//kv_cache_manager/optimizer:online_optimizer_server",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "@grpc//:grpc++",
+        "@yalantinglibs//:ylt",
     ],
 )

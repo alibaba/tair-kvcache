@@ -43,6 +43,15 @@ OptimizerServiceHttp::OptimizerServiceHttp(std::shared_ptr<OptimizerServiceImpl>
 void OptimizerServiceHttp::Init() {}
 
 void OptimizerServiceHttp::RegisterHandler() {
+    // Lightweight liveness probe, independent of KVCM subscriptions and metrics.
+    RegisterGetHandler(
+        "/api/healthy",
+        [](coro_http::coro_http_request &, coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+            res.add_header("Content-Type", "application/json");
+            res.set_status_and_content(coro_http::status_type::ok, R"({"status":"OK"})");
+            co_return;
+        });
+
     // InstanceGroup CRUD
     REGISTER_HTTP_HANDLER_COMMON_RESP(
         Post, "/api/optimizer/createInstanceGroup", CreateInstanceGroup, CreateInstanceGroup);

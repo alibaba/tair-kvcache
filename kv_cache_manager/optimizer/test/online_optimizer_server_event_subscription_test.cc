@@ -15,6 +15,7 @@
 #include "kv_cache_manager/optimizer/service/online_optimizer_server.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
+#include "ylt/coro_http/coro_http_client.hpp"
 
 namespace kv_cache_manager {
 
@@ -110,6 +111,44 @@ int AllocatePort() {
 } // namespace
 
 class OnlineOptimizerServerEventSubscriptionTest : public TESTBASE {};
+
+TEST_F(OnlineOptimizerServerEventSubscriptionTest, HealthEndpointWithoutSubscriptionsOrPrometheus) {
+    const int rpc_port = AllocatePort();
+    const int http_port = AllocatePort();
+    ASSERT_GT(rpc_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_NE(rpc_port, http_port);
+
+    const std::string config_path = GetPrivateTestRuntimeDataPath() + "optimizer-health.json";
+    std::ofstream output(config_path);
+    ASSERT_TRUE(output.is_open());
+    output << "{\"rpc_port\":" << rpc_port << ",\"http_port\":" << http_port
+           << R"(,"io_thread_num":1,"registry_storage_uri":"","metrics_report_interval_ms":0,
+                  "enable_prometheus":false,"kvcm_event_subscriptions":[]})";
+    output.close();
+
+    OnlineOptimizerServer server;
+    ASSERT_TRUE(server.Init(config_path));
+    ASSERT_TRUE(server.Start());
+    const std::string url = "http://127.0.0.1:" + std::to_string(http_port);
+    ASSERT_TRUE(WaitUntil([&url] {
+        coro_http::coro_http_client client;
+        return client.get(url + "/api/healthy").status == 200;
+    }));
+    coro_http::coro_http_client client;
+    auto response = client.get(url + "/api/healthy");
+    EXPECT_EQ(200, response.status);
+    EXPECT_EQ(R"({"status":"OK"})", response.resp_body);
+    bool json_content_type = false;
+    for (const auto &[key, value] : response.resp_headers) {
+        if (key == "Content-Type" && value == "application/json") {
+            json_content_type = true;
+        }
+    }
+    EXPECT_TRUE(json_content_type);
+    EXPECT_EQ(404, client.get(url + "/metrics").status);
+    server.Stop();
+}
 
 TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscribersWithServer) {
     LeaderMetaService meta_service_a;

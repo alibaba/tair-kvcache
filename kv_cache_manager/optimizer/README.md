@@ -51,6 +51,14 @@ OptimizerManager (core coordinator)
     HitAnalysis (result analysis)
 ```
 
+### 在线服务健康检查
+
+Optimizer 在自身 `http_port` 上提供 `GET /api/healthy`，返回 HTTP 200、
+`Content-Type: application/json` 和 `{"status":"OK"}`。平台健康探针应使用
+Optimizer 实际监听的 HTTP 端口及该路径，不使用 KVCM 的 Admin 端口。
+这是轻量存活检查，只表示 HTTP 服务可响应，不代表 KVCM 已连接、回放已追平或监控上报成功；
+无需配置订阅，也不依赖 `enable_prometheus`，探测不会发起上游 RPC 或修改回放状态。
+
 ### 在线订阅 KVCM 事件
 
 `online_optimizer_server_main` 可以主动发现 KVCM，并通过 KVCM 现有的 Meta gRPC 端口订阅缓存读取事件。KVCM 不需要知道 Optimizer 地址，也不新增事件端口；Optimizer 是 gRPC 客户端，调用 `OptimizerEventStreamService.SubscribeEvents`，KVCM 通过 response stream 写入 `TraceQueryRequest`。
