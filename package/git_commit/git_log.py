@@ -3,6 +3,7 @@
 import argparse
 from pathlib import Path
 import subprocess
+import sys
 
 
 def git(repo, *args):
@@ -23,7 +24,12 @@ def repository_id(repo):
 
 
 def history(repo, revision):
-    return git(repo, "log", "-10", revision) or "Git history unavailable for revision {}.\n".format(revision)
+    output = git(repo, "log", "-10", revision)
+    if output is not None:
+        return output
+    message = "Git history unavailable for revision {}.".format(revision)
+    print("WARNING: " + message, file=sys.stderr)
+    return message + "\n"
 
 
 def generate(workspace, status):
@@ -32,6 +38,7 @@ def generate(workspace, status):
     stub = workspace / "stub_source"
     stub_revision = status.get("STABLE_STUB_GIT_COMMIT_FULL", "unknown")
     if stub_revision == "unknown":
+        print("WARNING: stub_source revision unavailable.", file=sys.stderr)
         return output
     # Worktrees may share a repository but build different revisions.
     same_repository = repository_id(workspace) == repository_id(stub)

@@ -1,6 +1,8 @@
 """Regression tests for generic stub_source build provenance."""
 
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -95,13 +97,77 @@ class GitLogTest(unittest.TestCase):
         self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], "unknown")
         self.assertNotIn("=== stub_source ===", git_log.generate(self.workspace, status))
 
+    def test_checkout_url_credentials_are_removed_from_both_repositories(self):
+        self.stub.unlink()
+        self.stub.symlink_to("..")
+        for userinfo in ("user:fake-secret", "fake-token", "user:p@ss"):
+            with self.subTest(userinfo=userinfo):
+                for repo, name in ((self.workspace, "workspace"), (self.parent, "parent")):
+                    self.git(repo, "remote", "set-url", "origin",
+                             "https://{}@example.invalid/{}.git".format(userinfo, name))
+                status = self.status()
+                self.assertEqual(status["STABLE_GIT_REPO"], "https://example.invalid/workspace.git")
+                self.assertEqual(status["STABLE_STUB_GIT_REPO"], "https://example.invalid/parent.git")
+                output = git_log.generate(self.workspace, status)
+                self.assertNotIn(userinfo, output)
+                self.assertIn("STABLE_STUB_GIT_REPO https://example.invalid/parent.git", output)
+
+    def test_other_repository_url_forms(self):
+        for remote, expected in (
+            ("ssh://git@example.invalid/team/repo.git", "ssh://example.invalid/team/repo.git"),
+            ("git@example.invalid:team/repo.git", "git@example.invalid:team/repo.git"),
+            ("https://example.invalid/repo@ref.git", "https://example.invalid/repo@ref.git"),
+        ):
+            with self.subTest(remote=remote):
+                self.git(self.workspace, "remote", "set-url", "origin", remote)
+                status = self.status()
+                self.assertEqual(status["STABLE_GIT_REPO"], expected)
+                self.assertEqual(status["STABLE_STUB_GIT_REPO"], expected)
+
+    def test_stub_without_origin_keeps_commit_history(self):
+        self.stub.unlink()
+        self.stub.symlink_to("..")
+        self.git(self.parent, "remote", "remove", "origin")
+        status = self.status()
+        self.assertEqual(status["STABLE_STUB_GIT_REPO"], "unknown")
+        self.assertIn("commit " + status["STABLE_STUB_GIT_COMMIT_FULL"],
+                      git_log.generate(self.workspace, status))
+
+    def test_real_submodule_repository(self):
+        self.stub.unlink()
+        self.git(self.workspace, "-c", "protocol.file.allow=always", "submodule", "add",
+                 str(self.parent), "stub_source")
+        self.assertIn(".git/modules/", (self.stub / ".git").read_text())
+        status = self.status()
+        self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], self.git(self.parent, "rev-parse", "HEAD"))
+        self.assertEqual(git_log.repository_id(self.stub), (self.workspace / ".git/modules/stub_source").resolve())
+        output = git_log.generate(self.workspace, status)
+        self.assertIn("=== stub_source ===", output)
+        self.assertIn("commit " + status["STABLE_STUB_GIT_COMMIT_FULL"], output)
+
+    def test_separate_repositories_with_same_sha_keep_both_histories(self):
+        clone = self.root / "clone"
+        self.git(self.workspace, "clone", "--no-local", str(self.workspace), str(clone))
+        self.stub.unlink()
+        self.stub.symlink_to(clone)
+        status = self.status()
+        self.assertEqual(status["STABLE_GIT_COMMIT_FULL"], status["STABLE_STUB_GIT_COMMIT_FULL"])
+        output = git_log.generate(self.workspace, status)
+        self.assertIn("=== stub_source ===", output)
+        self.assertEqual(output.count("commit " + status["STABLE_GIT_COMMIT_FULL"]), 2)
+
     def test_source_archive_without_git(self):
         shutil.rmtree(str(self.parent / ".git"))
         shutil.rmtree(str(self.workspace / ".git"))
         status = self.status()
         self.assertEqual(status["STABLE_GIT_COMMIT_FULL"], "unknown")
         self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], "unknown")
-        self.assertIn("Git history unavailable", git_log.generate(self.workspace, status))
+        warning = io.StringIO()
+        with contextlib.redirect_stderr(warning):
+            output = git_log.generate(self.workspace, status)
+        self.assertIn("Git history unavailable", output)
+        self.assertIn("WARNING: Git history unavailable", warning.getvalue())
+        self.assertIn("WARNING: stub_source revision unavailable", warning.getvalue())
 
 
 if __name__ == "__main__":

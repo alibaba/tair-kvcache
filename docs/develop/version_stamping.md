@@ -231,3 +231,9 @@ echo "STABLE_KVCM_VERSION 0.0.1"
 第二段以 `=== stub_source ===` 标识。生成过程支持子模块和 worktree 的 `.git` 文件。
 这两个文件由现有 Bazel 规则在打包前生成，原 target、包路径和版本号格式不变。
 `gen_version_info.py` 继续只消费已有字段，无需修改。
+
+仓库 URL 会去除 `https://user:token@host/path`、`ssh://user@host/path` 中的
+userinfo，避免把 checkout 凭据写进版本文件；SCP 风格的 SSH 地址保留原格式。
+Git 历史或 stub 版本无法读取时，构建日志会输出 warning，同时保留降级产物。
+`STABLE_STUB_GIT_*` 变化会使依赖 workspace status 的 stamped 目标重新生成，
+可能包括二进制版本信息和 wheel，不只是提交日志文件。
