@@ -261,6 +261,7 @@ cc_test(
 
 cc_test(
     name = "OptimizerMetricsReporterTest",
+    linkstatic = True,
     srcs = [
         "optimizer_metrics_reporter_test.cc",
     ],
@@ -271,8 +272,11 @@ cc_test(
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
+        "//kv_cache_manager/optimizer/metrics:optimizer_kmonitor_metrics_reporter",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "@cpp_stub",
+        "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],
 )
 

@@ -1,13 +1,33 @@
 #include <cmath>
+#include <map>
+#include <vector>
 
+#include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "stub.h"
 
 namespace kv_cache_manager {
+
+namespace {
+using KmonSamples = std::map<std::pair<std::string, MetricsTags>, std::vector<double>>;
+thread_local KmonSamples kmon_samples;
+
+void CaptureOptimizerMetric(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    for (const auto *prefix : {"service.", "query.", "trace.", "interval.", "mrc"}) {
+        const auto pos = metric->metric_name_.find(std::string(".") + prefix);
+        if (pos != std::string::npos) {
+            kmon_samples[{metric->metric_name_.substr(pos + 1), tags->GetTagsMap()}].push_back(value);
+            return;
+        }
+    }
+}
+} // namespace
 
 class OptimizerMetricsReporterTest : public TESTBASE {
 protected:
@@ -52,6 +72,144 @@ protected:
     std::shared_ptr<MetricsRegistry> registry_;
     std::shared_ptr<OptimizerMetricsReporter> reporter_;
 };
+
+TEST_F(OptimizerMetricsReporterTest, KmonitorAndPrometheusShareMultiTtlSnapshots) {
+    auto kmon = std::make_shared<OptimizerKmonitorMetricsReporter>("test_optimizer_parity");
+    ASSERT_TRUE(kmon->Init());
+    reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, registry_, kmon);
+    Stub stub;
+    stub.set(static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+                 &kmonitor::MutableMetric::Report),
+             CaptureOptimizerMetric);
+
+    OptimizerInstanceGroup group;
+    group.set_name("grp1");
+    group.set_ttl_seconds_list({2, 30});
+    group.set_capacity_gb({1.0});
+    group.set_enable_theoretical_max_cache(true);
+    ASSERT_EQ(EC_OK, manager_->CreateInstanceGroup(group));
+    OptimizerInstanceInfo info("grp1",
+                               "inst1",
+                               16,
+                               {LocationSpecInfo("full", 1024)},
+                               {LocationSpecGroup("full_group", {"full"})},
+                               0,
+                               OptimizerStateInfo("full_group", ""));
+    RegisterInstanceResult registration;
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(info, registration));
+    TraceQueryResult result;
+    constexpr int64_t second = 1000000000LL;
+    // Two full blocks plus one trailing token: input denominator must be 33,
+    // not 32. Only complete blocks have keys.
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 33, 100 * second, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 33, 104 * second, result));
+    kmon_samples.clear();
+    reporter_->ReportInterval();
+
+    for (int64_t ttl : {2, 30}) {
+        const MetricsTags tags{{"instance_group", "grp1"}, {"instance_id", TtlMetricsInstanceId("inst1", ttl)}};
+        EXPECT_DOUBLE_EQ(66., registry_->GetGauge("trace_query_input_tokens_total", tags).Get());
+        EXPECT_DOUBLE_EQ(ttl == 2 ? 0. : 32., registry_->GetGauge("trace_query_max_hit_tokens_total", tags).Get());
+        const auto key = std::make_pair(std::string("trace.query_input_tokens_total"), tags);
+        ASSERT_EQ(1u, kmon_samples.count(key)) << ::testing::PrintToString(kmon_samples);
+        ASSERT_EQ(1u, kmon_samples.at(key).size());
+        EXPECT_DOUBLE_EQ(66., kmon_samples.at(key).front());
+    }
+    // Compare every emitted interval metric, including all MRC targets and
+    // reuse quantiles. Both backends must consume the same (non-empty) window.
+    for (const auto &[key, values] : kmon_samples) {
+        auto name = key.first;
+        if (name.rfind("trace.", 0) == 0) {
+            name.replace(0, 6, "trace_");
+        }
+        ASSERT_NE(nullptr, registry_->GetMetricsData(name)) << name;
+        ASSERT_EQ(1u, values.size()) << name;
+        EXPECT_DOUBLE_EQ(registry_->GetGauge(name, key.second).Get(), values.front()) << name;
+        EXPECT_EQ(std::string::npos, name.find("capacity_history"));
+    }
+    const MetricsTags long_tags{{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-30s"}};
+    for (const auto *suffix : {"p995", "p999"}) {
+        const std::string name = std::string("trace.query_reuse_interval_") + suffix + "_seconds";
+        ASSERT_EQ(1u, kmon_samples.count({name, long_tags}));
+        EXPECT_DOUBLE_EQ(4., kmon_samples.at({name, long_tags}).front());
+    }
+    kmon_samples.clear();
+    reporter_->ReportInterval();
+    for (const auto &[key, values] : kmon_samples) {
+        EXPECT_EQ(std::string::npos, key.first.find("reuse_interval"));
+    }
+    EXPECT_TRUE(std::isnan(registry_->GetGauge("trace_query_reuse_interval_p999_seconds", long_tags).Get()));
+    // Cumulative token snapshots do not reset when the reporting window resets.
+    EXPECT_DOUBLE_EQ(66., registry_->GetGauge("trace_query_input_tokens_total", long_tags).Get());
+    // A real zero interval is not an empty window: both backends report zero.
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 33, 104 * second, result));
+    kmon_samples.clear();
+    reporter_->ReportInterval();
+    for (const auto *suffix : {"p995", "p999"}) {
+        const std::string kmon_name = std::string("trace.query_reuse_interval_") + suffix + "_seconds";
+        ASSERT_EQ(1u, kmon_samples.count({kmon_name, long_tags}));
+        EXPECT_DOUBLE_EQ(0., kmon_samples.at({kmon_name, long_tags}).front());
+        EXPECT_DOUBLE_EQ(
+            0., registry_->GetGauge(std::string("trace_query_reuse_interval_") + suffix + "_seconds", long_tags).Get());
+    }
+    ASSERT_EQ(EC_OK, manager_->ResetStats("inst1"));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0., registry_->GetGauge("trace_query_input_tokens_total", long_tags).Get());
+    EXPECT_DOUBLE_EQ(0., registry_->GetGauge("trace_query_max_hit_tokens_total", long_tags).Get());
+    reporter_->RemoveInstanceMetrics("inst1");
+    EXPECT_TRUE(registry_->GetMetricsData("trace_query_input_tokens_total")->GetMetricsValues().empty());
+}
+
+TEST_F(OptimizerMetricsReporterTest, KmonitorServiceRatesCountTokensAndQueriesOnce) {
+    auto kmon = std::make_shared<OptimizerKmonitorMetricsReporter>("test_optimizer_service");
+    ASSERT_TRUE(kmon->Init());
+    reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, registry_, kmon);
+    Stub stub;
+    stub.set(static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+                 &kmonitor::MutableMetric::Report),
+             CaptureOptimizerMetric);
+    kmon_samples.clear();
+    OptimizerServiceMetricsCollector collector(registry_);
+    ASSERT_TRUE(collector.Init());
+    collector.set_instance_id("inst1");
+    collector.set_input_token_len(33);
+    collector.set_total_blocks(2);
+    collector.set_ttl_results({{2, {}, 0, 0.}, {30, {}, 2, 32. / 33.}});
+    collector.set_service_query_rt_us_metrics(123.);
+    collector.set_service_error_code_metrics(static_cast<double>(EC_ERROR));
+    reporter_->ReportPerQuery(&collector);
+    const MetricsTags tags{{"instance_group", ""}, {"instance_id", "inst1"}};
+    for (const auto &[name, value] :
+         std::map<std::string, double>{{"service.qps", 1.},
+                                       {"service.error_qps", 1.},
+                                       {"service.input_tokens_qps", 33.},
+                                       {"service.query_rt_us", 123.},
+                                       {"service.error_code", static_cast<double>(EC_ERROR)}}) {
+        ASSERT_EQ(1u, kmon_samples.count({name, tags})) << name << ::testing::PrintToString(kmon_samples);
+        ASSERT_EQ(1u, kmon_samples.at({name, tags}).size()) << name;
+        EXPECT_DOUBLE_EQ(value, kmon_samples.at({name, tags}).front()) << name;
+    }
+    EXPECT_EQ(33u, registry_->GetCounter("service.input_tokens_total", tags).Get());
+    EXPECT_EQ(1u, registry_->GetCounter("service.query_counter", tags).Get());
+}
+
+TEST_F(OptimizerMetricsReporterTest, TokenSnapshotsOmitDisabledTheory) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 30, false));
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 0, 0, result));
+    reporter_->ReportInterval();
+    const MetricsTags tags{{"instance_group", "grp1"}, {"instance_id", "inst1-ttl-30s"}};
+    EXPECT_DOUBLE_EQ(2048., registry_->GetGauge("trace_query_input_tokens_total", tags).Get());
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_max_hit_tokens_total"));
+    EXPECT_NE(nullptr, registry_->GetMetricsData("trace_query_hit_tokens_total"));
+}
+
+TEST_F(OptimizerMetricsReporterTest, TokenSnapshotsOmitUnconfiguredCapacity) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {}, 30, true));
+    reporter_->ReportInterval();
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_tokens_total"));
+    EXPECT_NE(nullptr, registry_->GetMetricsData("trace_query_max_hit_tokens_total"));
+}
 
 TEST_F(OptimizerMetricsReporterTest, ReportEmptyState) { reporter_->ReportInterval(); }
 
@@ -470,6 +628,11 @@ TEST_F(OptimizerMetricsReporterTest, LegacyIndexerDoesNotReportReuseInterval) {
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_avg_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p95_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p99_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p995_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p999_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_input_tokens_total"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_max_hit_tokens_total"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_tokens_total"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_age_bucket_ratio"));
         MetricsTags tags = {{"instance_group", "grp1"},
                             {"instance_id", TtlMetricsInstanceId(instance_id, ttl_seconds)}};

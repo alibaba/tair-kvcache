@@ -74,6 +74,16 @@ void OptimizerMetricsReporter::ReportInterval() {
         metrics_registry_->GetGauge("trace_query_total", instance_tags) = static_cast<double>(summary.total_queries);
         metrics_registry_->GetGauge("trace_query_blocks_total", instance_tags) =
             static_cast<double>(summary.total_blocks_queried);
+        // Token totals are analyzer snapshots, reset together with replay state.
+        // The legacy linear analyzer only maintains block-based statistics.
+        if (summary.linear_step == 0) {
+            metrics_registry_->GetGauge("trace_query_input_tokens_total", instance_tags) =
+                static_cast<double>(summary.total_input_tokens);
+            if (summary.max_hit_rate >= 0) {
+                metrics_registry_->GetGauge("trace_query_max_hit_tokens_total", instance_tags) =
+                    static_cast<double>(summary.total_max_hits) * summary.block_size;
+            }
+        }
         if (summary.max_hit_rate >= 0) {
             metrics_registry_->GetGauge("trace_query_max_hit_rate", instance_tags) = summary.max_hit_rate;
         }
@@ -96,6 +106,10 @@ void OptimizerMetricsReporter::ReportInterval() {
             MetricsTags capacity_tags = instance_tags;
             capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
             metrics_registry_->GetGauge("trace_query_hit_rate", capacity_tags) = capacity.hit_rate;
+            if (summary.linear_step == 0) {
+                metrics_registry_->GetGauge("trace_query_hit_tokens_total", capacity_tags) =
+                    static_cast<double>(capacity.total_hits) * summary.block_size;
+            }
             metrics_registry_->GetGauge("trace_query_capacity_efficiency", capacity_tags) =
                 summary.max_hit_rate > 0 ? capacity.hit_rate / summary.max_hit_rate
                                          : std::numeric_limits<double>::quiet_NaN();
@@ -139,6 +153,10 @@ void OptimizerMetricsReporter::ReportInterval() {
             stats.count > 0 ? static_cast<double>(stats.p95_ns) / 1e9 : no_samples;
         metrics_registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags) =
             stats.count > 0 ? static_cast<double>(stats.p99_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p995_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p999_ns) / 1e9 : no_samples;
     }
 
     if (kmonitor_reporter_) {

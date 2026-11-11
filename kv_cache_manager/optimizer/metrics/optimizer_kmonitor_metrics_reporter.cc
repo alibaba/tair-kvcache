@@ -44,6 +44,8 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(service, qps);
     DECLARE_METRICS(service, query_rt_us);
     DECLARE_METRICS(service, error_qps);
+    DECLARE_METRICS(service, input_tokens_qps);
+    DECLARE_METRICS(service, error_code);
 
     DECLARE_METRICS(query, hit_rate);
     DECLARE_METRICS(query, hit_count);
@@ -58,6 +60,9 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
 
     DECLARE_METRICS(trace, query_total);
     DECLARE_METRICS(trace, query_blocks_total);
+    DECLARE_METRICS(trace, query_input_tokens_total);
+    DECLARE_METRICS(trace, query_max_hit_tokens_total);
+    DECLARE_METRICS(trace, query_hit_tokens_total);
     DECLARE_METRICS(trace, query_max_hit_rate);
     DECLARE_METRICS(trace, query_unique_keys);
     DECLARE_METRICS(trace, query_bytes_per_block);
@@ -73,6 +78,8 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_reuse_interval_avg_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p95_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p99_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p995_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p999_seconds);
 
     std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
 
@@ -209,6 +216,8 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_QPS_METRIC(service, qps);
     REGISTER_GAUGE_METRIC(service, query_rt_us);
     REGISTER_QPS_METRIC(service, error_qps);
+    REGISTER_QPS_METRIC(service, input_tokens_qps);
+    REGISTER_GAUGE_METRIC(service, error_code);
 
     REGISTER_GAUGE_METRIC(query, hit_rate);
     REGISTER_GAUGE_METRIC(query, hit_count);
@@ -223,6 +232,9 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
 
     REGISTER_GAUGE_METRIC(trace, query_total);
     REGISTER_GAUGE_METRIC(trace, query_blocks_total);
+    REGISTER_GAUGE_METRIC(trace, query_input_tokens_total);
+    REGISTER_GAUGE_METRIC(trace, query_max_hit_tokens_total);
+    REGISTER_GAUGE_METRIC(trace, query_hit_tokens_total);
     REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_unique_keys);
     REGISTER_GAUGE_METRIC(trace, query_bytes_per_block);
@@ -238,6 +250,8 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_avg_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p95_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p99_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p995_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p999_seconds);
 
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
@@ -261,6 +275,12 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 
     const auto kmonitor_service_tags = kmon_ctx_->GetKmonitorTags(service_tags);
     kmon_ctx_->service_qps_metrics->Report(&kmonitor_service_tags, 1.0);
+    // QPS accumulates token increments into tokens/second; report once per
+    // request, not once per TTL replay. Multiply the resulting rate by 60 for TPM.
+    if (collector->input_token_len() > 0) {
+        kmon_ctx_->service_input_tokens_qps_metrics->Report(&kmonitor_service_tags,
+                                                            static_cast<double>(collector->input_token_len()));
+    }
 
     double query_rt_us;
     GET_METRICS_(collector, service, query_rt_us, query_rt_us);
@@ -270,6 +290,9 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 
     double error_code;
     GET_METRICS_(collector, service, error_code, error_code);
+    if (!std::isnan(error_code)) {
+        kmon_ctx_->service_error_code_metrics->Report(&kmonitor_service_tags, error_code);
+    }
     if (!std::isnan(error_code) && !CommonUtil::IsZeroDouble(error_code)) {
         kmon_ctx_->service_error_qps_metrics->Report(&kmonitor_service_tags, 1.0);
     }
@@ -318,6 +341,14 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->trace_query_total_metrics->Report(&tags, static_cast<double>(summary.total_queries));
         kmon_ctx_->trace_query_blocks_total_metrics->Report(&tags, static_cast<double>(summary.total_blocks_queried));
+        if (summary.linear_step == 0) {
+            kmon_ctx_->trace_query_input_tokens_total_metrics->Report(&tags,
+                                                                      static_cast<double>(summary.total_input_tokens));
+            if (summary.max_hit_rate >= 0) {
+                kmon_ctx_->trace_query_max_hit_tokens_total_metrics->Report(
+                    &tags, static_cast<double>(summary.total_max_hits) * summary.block_size);
+            }
+        }
         if (summary.max_hit_rate >= 0) {
             kmon_ctx_->trace_query_max_hit_rate_metrics->Report(&tags, summary.max_hit_rate);
         }
@@ -337,6 +368,10 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             capacity_base_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
             const auto capacity_tags = kmon_ctx_->GetKmonitorTags(capacity_base_tags);
             kmon_ctx_->trace_query_hit_rate_metrics->Report(&capacity_tags, capacity.hit_rate);
+            if (summary.linear_step == 0) {
+                kmon_ctx_->trace_query_hit_tokens_total_metrics->Report(
+                    &capacity_tags, static_cast<double>(capacity.total_hits) * summary.block_size);
+            }
             if (summary.max_hit_rate > 0) {
                 kmon_ctx_->trace_query_capacity_efficiency_metrics->Report(&capacity_tags,
                                                                            capacity.hit_rate / summary.max_hit_rate);
@@ -360,6 +395,10 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             &tags, static_cast<double>(metric.stats.p95_ns) / 1e9);
         kmon_ctx_->trace_query_reuse_interval_p99_seconds_metrics->Report(
             &tags, static_cast<double>(metric.stats.p99_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p995_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p995_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p999_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p999_ns) / 1e9);
     }
 
     for (const auto &metric : interval_metrics) {

@@ -114,9 +114,30 @@ KVCM 默认在启动时注册 optimizer 订阅服务；设置 `optimizer.enable=
 
 在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
 
-在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_min_seconds`、`trace_query_reuse_interval_max_seconds` 、`trace_query_reuse_interval_avg_seconds`、`trace_query_reuse_interval_p95_seconds` 和 `trace_query_reuse_interval_p99_seconds`，单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。p95/p99 采用 nearest-rank（ceil(N×p)）口径，使用固定 58 KiB/Instance 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
+在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_{min,max,avg,p95,p99,p995,p999}_seconds`，单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。P95/P99/P99.5/P99.9 采用 nearest-rank（ceil(N×p)）口径，每份 TTL 回放使用固定 58 KiB 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
 
 当前仅 LiteHit full-attention 路径提供原生 reuse interval 统计；旧 linear indexer 不上报这些指标，也不再使用旧 hit-age 分桶作为兼容数据源。
+
+#### Prometheus / KMON 指标对应
+
+两种后端共用一次回放快照和一次窗口提取，不分别清空窗口。下表省略服务名前缀；Prometheus 会将指标名中的 `.` 转成 `_`，KMON 保留 `.`。KMON 的服务名前缀由环境变量 `kmonitorServiceName` 配置，不能直接照搬 Prometheus 前缀。
+
+| 口径 | Prometheus | KMON | 使用方式 |
+|---|---|---|---|
+| 请求吞吐 | `service.query_counter` counter | `service.qps` QPS | Prometheus 取 rate；KMON 已是请求/秒 |
+| 输入吞吐 | `service.input_tokens_total` counter | `service.input_tokens_qps` QPS | Prometheus rate × 60；KMON × 60，得到 TPM |
+| 错误吞吐 | `service.error_counter` counter | `service.error_qps` QPS | 同请求吞吐，不按 TTL 重复计数 |
+| 处理耗时 | `service.query_rt_us_sum` / `service.query_counter` 的增量比 | `service.query_rt_us` GAUGE 的请求样本均值 | 单位微秒；跨实例应按请求量加权，而不是平均各实例均值 |
+| 错误码 | `service.error_code` | `service.error_code` | 请求样本，不把错误码平均值当错误率 |
+| 逐请求分析 | `query_{hit_rate,hit_count,total_blocks,max_hit_count,max_hit_rate,capacity_efficiency}` | `query.{同名后缀}` | TTL 后缀 instance_id，容量相关项另带 capacity_gb |
+| 周期命中 | `interval.query_{hit_rate,max_hit_rate,capacity_efficiency}` | 同名 | 两边同一上报窗口，直接展示比例 |
+| 累计回放和状态 | `trace_query_*` | `trace.query_*` | 两边相同累计快照、token 命中率、内存/工作集/驱逐统计 |
+| 复用时间 | `trace_query_reuse_interval_*_seconds` | `trace.query_reuse_interval_*_seconds` | min/max/avg/P95/P99/P99.5/P99.9；空窗口不补零、不延用旧样本 |
+| MRC | `mrc` | `mrc` | 同一窗口、同一 target_hit_rate_percent、单位 byte |
+
+累计 token 快照包括 `trace_query_input_tokens_total`、`trace_query_max_hit_tokens_total` 和带 `capacity_gb` 的 `trace_query_hit_tokens_total`。只在 full-attention 回放上输出，后两项由命中完整 block 数乘 block size 得到；输入 token 数包含尾部不足一块的 token。理论分析关闭时不输出理论命中量；容量列表为空时不输出容量命中量。它们是随 ResetStats / 重建实例清零的 gauge，不是永久递增 counter。计算选定时间段的加权命中率需对每条序列分别处理重置、取得命中 token 与输入 token 增量，再分别求和相除，不能平均命中率样本，也不能将不同 TTL 的分母混加。KMON 对累计 gauge 的降采样也不等同于 Prometheus counter 的 rate，查询端必须按累计快照语义处理。
+
+不输出 Capacity Estimate / retrospective capacity history 指标；这不影响现有 MRC 和已配置容量下的命中率。
 
 ### Eviction Policies
 
