@@ -1273,6 +1273,113 @@ TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAnd
     EXPECT_EQ(1, matches[0].local);
 }
 
+TEST_F(MetaSearcherTest, TestMambaIgnoresOtherGroupsAndPreservesFullAndStateRequirements) {
+    const MetaSearcher::KeyVector keys = {120100, 120101, 120102, 120103, 120104, 120105};
+    const std::string host = "mamba-extra-groups:80";
+    const std::vector<std::vector<std::string>> specs_by_key = {
+        {"fa", "fb", "la", "lb"},        // Complete checkpoint, no W/X data.
+        {"fa", "fb", "w", "x"},          // W/X cannot replace the L state.
+        {"fa", "fb", "la", "w"},         // One L group is still missing.
+        {"fa", "fb", "la", "lb"},        // Last complete checkpoint before the F gap.
+        {"fa", "la", "lb", "w", "x"},  // W/X cannot replace a missing F spec.
+        {"fa", "fb", "la", "lb", "w"}, // Complete data after the F gap cannot extend the prefix.
+    };
+    CacheLocationMapVector locations(keys.size());
+    const std::string id = "kvs#event_report_l1p5#mem#" + host;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<LocationSpec> specs;
+        for (const auto &name : specs_by_key[i]) {
+            specs.emplace_back(name, "event_report://" + host + "/mem");
+        }
+        locations[i][id] = std::make_shared<CacheLocation>(
+            id, CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, specs.size(), specs);
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, locations, properties).ec);
+
+    const std::vector<LocationSpecGroup> fl_groups = {
+        LocationSpecGroup("F3", {"fa", "fb"}),
+        LocationSpecGroup("L0", {"la"}),
+        LocationSpecGroup("L1", {"lb"}),
+    };
+    struct Case {
+        MetaSearcher::KeyVector keys;
+        bool eagle;
+        int64_t expected;
+    };
+    const std::vector<Case> cases = {
+        {keys, false, 4},
+        {keys, true, 1},
+        {{keys[0], keys[1], keys[2]}, false, 1},
+        {{keys[4]}, false, 0},
+    };
+    for (size_t extra_groups : {0u, 1u, 2u}) {
+        SCOPED_TRACE(extra_groups);
+        auto groups = fl_groups;
+        if (extra_groups >= 1) {
+            groups.emplace_back("W4", std::vector<std::string>{"w"});
+        }
+        if (extra_groups >= 2) {
+            groups.emplace_back("X5", std::vector<std::string>{"x"});
+        }
+        for (const auto &test : cases) {
+            SCOPED_TRACE(test.keys.size());
+            SCOPED_TRACE(test.eagle);
+            for (size_t top_k : {0u, 1u}) {
+                SCOPED_TRACE(top_k);
+                std::vector<MetaSearcher::HostCacheMatch> matches;
+                ASSERT_EQ(EC_OK,
+                          meta_searcher_->PrefixMatchWithMambaByHost(
+                              request_context_.get(),
+                              test.keys,
+                              test.eagle,
+                              {"mem"},
+                              groups,
+                              matches,
+                              nullptr,
+                              top_k,
+                              {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+                if (test.expected == 0) {
+                    EXPECT_TRUE(matches.empty());
+                } else {
+                    ASSERT_EQ(1u, matches.size());
+                    EXPECT_EQ(host, matches[0].host_ip_port);
+                    EXPECT_EQ(test.expected, matches[0].local);
+                    EXPECT_EQ(test.expected, matches[0].global);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(MetaSearcherTest, TestMambaStillRequiresFullAndLinearGroupsWithOtherGroupsPresent) {
+    const std::vector<std::vector<LocationSpecGroup>> invalid_groups = {
+        {},
+        {LocationSpecGroup("W4", {"w"})},
+        {LocationSpecGroup("F3", {"f"}), LocationSpecGroup("W4", {"w"})},
+        {LocationSpecGroup("L0", {"l"}), LocationSpecGroup("W4", {"w"})},
+        {LocationSpecGroup("F3", {"f"}), LocationSpecGroup("X5", {"x"})},
+        {LocationSpecGroup("L0", {"l"}), LocationSpecGroup("X5", {"x"})},
+    };
+    for (const auto &groups : invalid_groups) {
+        for (size_t top_k : {0u, 1u}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            EXPECT_EQ(EC_BADARGS,
+                      meta_searcher_->PrefixMatchWithMambaByHost(
+                          request_context_.get(),
+                          {1},
+                          false,
+                          {},
+                          groups,
+                          matches,
+                          nullptr,
+                          top_k,
+                          {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+            EXPECT_TRUE(matches.empty());
+        }
+    }
+}
+
 TEST_F(MetaSearcherTest, TestSwaWindowsRequireAllSpecsAndAllowShortHistory) {
     const std::vector<LocationSpecGroup> groups = {
         LocationSpecGroup("F0", {"fa", "fb"}),
@@ -1367,6 +1474,7 @@ TEST_F(MetaSearcherTest, TestSwaRejectsUnsupportedOrMissingGroups) {
         {LocationSpecGroup("F0", {"f"})},
         {LocationSpecGroup("W0", {"w"})},
         {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("L0", {"w"})},
+        {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("W0", {"w"}), LocationSpecGroup("L0", {"l"})},
         {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("W0", {"w"}), LocationSpecGroup("X0", {"x"})},
     };
     for (const auto &groups : invalid_groups) {
