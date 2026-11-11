@@ -18,6 +18,12 @@ _TRACE = os.environ.get("KVCM_TRACE") == "1"
 _HISTORY = 8192
 #: The query socket lives next to the PUSH/PULL one. Both ends derive it.
 _QUERY_PORT_OFFSET = 1
+#: The commands the query socket answers. A request socket needs a payload to
+#: pair with its reply, and naming the question is what lets one socket answer
+#: more than one: anything unrecognized is the load history, which is what the
+#: ranks that predate the second command keep asking for.
+_QUERY_LOADS = b"loads"
+_QUERY_ROSTER = b"roster"
 
 
 @dataclass
@@ -48,8 +54,31 @@ class LoadBlockFinishedEvent:
     type: str = "LoadBlockFinishedEvent"
 
 
+@dataclass
+class StorageConfigsEvent:
+    """One instance's storage roster, verbatim from the registration response.
+
+    The manager publishes it as the ``storage_configs`` JSON *string* of a
+    ``registerInstance`` reply, and only the registrant (the scheduler) sees that
+    reply. Workers live in other processes and other pods and need the same
+    bytes to build their transfer client, so the string travels through the
+    coordinator unchanged: it is parsed by the client's own schema, and
+    re-serializing it here would be a second, slowly-drifting definition of it.
+
+    It is a message rather than a field on every event because it is sent once
+    per instance: the layout is frozen at the first registration, so the roster
+    cannot change afterwards.
+    """
+
+    storage_configs: str
+    type: str = "StorageConfigsEvent"
+
+
 CoordinateEventUnion = Union[
-    SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent
+    SendBlockFinishedEvent,
+    LoadBlockFinishedEvent,
+    SendBlockStartEvent,
+    StorageConfigsEvent,
 ]
 
 
@@ -64,6 +93,7 @@ msg_type_mapping: Dict[str, type] = {
     "SendBlockStartEvent": SendBlockStartEvent,
     "SendBlockFinishedEvent": SendBlockFinishedEvent,
     "LoadBlockFinishedEvent": LoadBlockFinishedEvent,
+    "StorageConfigsEvent": StorageConfigsEvent,
 }
 
 
@@ -147,6 +177,12 @@ class TpCoordinatorServer:
         # Bounded: a stale entry costs a lookup, not a leak.
         self._loading_history: List[str] = []
         self._loading_history_lock = threading.Lock()
+        # The storage roster of the instance, exactly as the manager published it
+        # in the scheduler's `registerInstance` reply; empty until that reply has
+        # been handed over. Every other process of the deployment reads it here,
+        # because the registration response reaches only the registrant.
+        self._storage_configs: str = ""
+        self._storage_configs_lock = threading.Lock()
         self._failed_loading_block_idxs = []
         self._finished_loading_lock = threading.Lock()
         self._finished_saving = []
@@ -163,18 +199,29 @@ class TpCoordinatorServer:
         logger.warning("TairKvCacheConnector coordinator started")
 
         def serve_queries() -> None:
-            """Answers "which loads are complete?" for every rank.
+            """Answers the ranks' questions: "which loads are complete?", "what roster?".
 
             A PULL socket hands each message to exactly one consumer, so the
             completion a PULL-based report consumed could never be re-read by
             another rank. This socket is how a rank that was *not* the one the
-            engine listens to still learns the global barrier fired.
+            engine listens to still learns the global barrier fired -- and how a
+            rank in another pod learns the storage roster, which only the
+            scheduler's registration response carries.
+
+            The roster is answered even before it arrived: an empty payload means
+            "not registered yet", which is a state the caller can retry in, and a
+            reply that arrived is never withdrawn (the instance's layout is
+            frozen at its first registration).
             """
             while True:
                 try:
-                    query.recv()
-                    with self._loading_history_lock:
-                        payload = "\n".join(self._loading_history)
+                    command = query.recv()
+                    if command == _QUERY_ROSTER:
+                        with self._storage_configs_lock:
+                            payload = self._storage_configs
+                    else:
+                        with self._loading_history_lock:
+                            payload = "\n".join(self._loading_history)
                     query.send(payload.encode())
                 except Exception as exc:  # noqa: BLE001 - a dead query socket is logged
                     logger.warning("[coordinator] query socket failed: %s", exc)
@@ -277,8 +324,41 @@ class TpCoordinatorServer:
                         self._loading_history.append(content.request_id)
                         del self._loading_history[:-_HISTORY]
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)
+            elif isinstance(msg.content, StorageConfigsEvent):
+                content: StorageConfigsEvent = msg.content
+                self._store_storage_configs(content.storage_configs)
             else:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
+
+    def _store_storage_configs(self, storage_configs: str) -> None:
+        """Keeps the roster the scheduler registered this instance with.
+
+        The first one wins. The manager freezes an instance's layout at its first
+        registration, so a later registration of the same instance_group answers
+        the same array; a *different* array would mean the workers build their
+        client against storage the manager does not allocate from, which is a
+        silent miss at best, so it is refused here instead of overwriting.
+        """
+        with self._storage_configs_lock:
+            known, held = self._storage_configs, len(self._storage_configs)
+            if not known:
+                self._storage_configs = storage_configs
+        if not known:
+            logger.info(
+                "[coordinator] storage roster received: %d bytes, %s",
+                len(storage_configs),
+                "empty -- the instance's group has no storage" if not storage_configs
+                else "published for every rank to build its client from",
+            )
+        elif known != storage_configs:
+            logger.warning(
+                "[coordinator] ignored a storage roster that differs from the one "
+                "this instance was registered with (%d vs %d bytes): the layout is "
+                "frozen at the first registration, so the first answer is the "
+                "instance's roster",
+                held,
+                len(storage_configs),
+            )
 
     def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
         finished_saving = []
@@ -342,6 +422,25 @@ class TpCoordinatorClient:
             self._query_socket = socket
         return self._query_socket
 
+    def _ask(self, command: bytes, timeout_ms: int) -> Optional[bytes]:
+        """One question over the coordinator's query socket, or None for no answer.
+
+        `None` is "the coordinator did not answer" (unreachable, timed out), which
+        is a different fact from an empty reply and the callers say which.
+        """
+        with self._query_lock:
+            socket = self._query_connection(timeout_ms)
+            try:
+                socket.send(command)
+                self.query_count += 1
+                return socket.recv()
+            except Exception:  # noqa: BLE001 - no answer is not an error
+                # A REQ socket that timed out still owes a reply, so it cannot be
+                # reused; drop it and let the next call reconnect.
+                socket.close(linger=0)
+                self._query_socket = None
+                return None
+
     def finished_loads(self, timeout_ms: int = 1000) -> Set[str]:
         """The loads the coordinator has folded completely, or an empty set.
 
@@ -350,16 +449,24 @@ class TpCoordinatorClient:
         TCP connection per call, and thirty-two ranks doing that every step is
         the fan-in that stalled the engine.
         """
-        with self._query_lock:
-            socket = self._query_connection(timeout_ms)
-            try:
-                socket.send(b"loads")
-                self.query_count += 1
-                payload = socket.recv().decode()
-            except Exception:  # noqa: BLE001 - no answer is not an error
-                # A REQ socket that timed out still owes a reply, so it cannot be
-                # reused; drop it and let the next call reconnect.
-                socket.close(linger=0)
-                self._query_socket = None
-                return set()
-            return {line for line in payload.split("\n") if line}
+        payload = self._ask(_QUERY_LOADS, timeout_ms)
+        if payload is None:
+            return set()
+        return {line for line in payload.decode().split("\n") if line}
+
+    def roster(self, timeout_ms: int = 1000) -> Optional[str]:
+        """The storage roster the manager registered this instance with.
+
+        Returns the ``storage_configs`` string of the scheduler's
+        ``registerInstance`` reply, byte for byte, or:
+
+        * ``""`` -- the coordinator answered, but the registration has not landed
+          yet (the scheduler registers once, from the pipeline handshake, and the
+          workers' first save can arrive before it did);
+        * ``None`` -- the coordinator did not answer within `timeout_ms`.
+
+        Asked once per worker, when its transfer client is created; the answer
+        cannot change afterwards (the manager freezes the layout).
+        """
+        payload = self._ask(_QUERY_ROSTER, timeout_ms)
+        return None if payload is None else payload.decode()
