@@ -2421,6 +2421,12 @@ TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosed
     const ReporterSnapshotKey reporter{"instance-a", "10.0.0.90:8080"};
     ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
     const std::string location_id = backend.BuildLocationId("mem", reporter.host_ip_port);
+    const std::string legacy_uri = "event_report://physical-cache:9600/mem?s_version=0123456789abcdef0123456789abcdef";
+    const auto before_snapshot =
+        backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {legacy_uri}}});
+    ASSERT_EQ(1u, before_snapshot.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, before_snapshot[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kSnapshotState, before_snapshot[0].unknown_reason);
 
     auto commit_snapshot = [&]() {
         std::string token;
@@ -2452,6 +2458,10 @@ TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosed
         {reporter.instance_id, "malformed-location-id", {old_uri}},
         {reporter.instance_id, location_id, {malformed_legacy_uri}},
         {reporter.instance_id, location_id, {malformed_uri, current_uri}},
+        {reporter.instance_id, location_id, {legacy_uri}},
+        {reporter.instance_id, location_id, {legacy_uri, current_uri}},
+        {reporter.instance_id, location_id, {legacy_uri + "&s_version=0123456789abcdef0123456789abcdef"}},
+        {reporter.instance_id, location_id, {legacy_uri + "&s_v=" + current_version}},
     };
     const auto results = backend.ProbeLocationsForMaintenance(probes);
     ASSERT_EQ(probes.size(), results.size());
@@ -2469,10 +2479,15 @@ TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosed
     EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[7].decision);
     EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kLocationMalformed, results[7].unknown_reason);
     EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, results[8].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, results[9].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupReason::kStaleSnapshot, results[9].token.reason);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, results[10].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[11].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[12].decision);
 
     EventReportBackend::LifecycleMutationLease lease;
     EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
-              backend.AcquireMaintenanceCleanupLease(results[1].token, lease));
+              backend.AcquireMaintenanceCleanupLease(results[9].token, lease));
     lease.reset();
 
     std::string next_version;
@@ -2504,7 +2519,7 @@ TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosed
     lease.reset();
     ASSERT_EQ(std::future_status::ready, abort_future.wait_for(1s));
     abort_future.get();
-    const auto soft_result = backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {old_uri}}});
+    const auto soft_result = backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {legacy_uri}}});
     ASSERT_EQ(1u, soft_result.size());
     EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, soft_result[0].decision);
     EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kSnapshotState, soft_result[0].unknown_reason);

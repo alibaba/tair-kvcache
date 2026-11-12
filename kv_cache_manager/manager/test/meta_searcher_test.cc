@@ -2332,6 +2332,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
     const std::string version_a = "00112233";
     const std::string version_b = "ffeeddcc";
+    const std::string legacy_uri = "event_report://127.0.0.1:8080/mem?s_version=00112233445566778899aabbccddeeff";
     auto uri = [](const std::string &source, const std::string &version) {
         return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
@@ -2372,12 +2373,27 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("duplicate",
-                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b +
-                             "&s_v=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b + "&s_v=" + version_b),
         },
         {
-            LocationSpec("max_size",
-                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
+            LocationSpec("legacy", legacy_uri),
+            LocationSpec("unversioned", "event_report://127.0.0.1:8080/mem"),
+        },
+        {
+            LocationSpec("legacy", legacy_uri),
+            LocationSpec("current", uri("current", version_b)),
+        },
+        {
+            LocationSpec("duplicate", legacy_uri + "&s_version=00112233445566778899aabbccddeeff"),
+        },
+        {
+            LocationSpec("both", legacy_uri + "&s_v=" + version_b),
+        },
+        {
+            LocationSpec("short_legacy", "event_report://127.0.0.1:8080/mem?s_version=00112233"),
+        },
+        {
+            LocationSpec("max_size", "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
             LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_v=" + version_b),
         },
     };
