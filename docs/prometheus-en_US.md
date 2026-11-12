@@ -217,6 +217,7 @@ errors in response bodies remain in `service.error_counter`.
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers omit this metric and remove previously published series on the next reporting interval after demotion. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
+| `data_storage.total_capacity_bytes` | gauge | Backend capacity in bytes before any Group quota ratio, with the same `type, unique_name` labels. Unknown/unsupported is -1; failed/stale refreshes retain the last successful value; confirmed zero is 0. Followers omit it; demotion/unload removes the corresponding series. TairMempool's existing usage ratio retains its DRAM semantics; this capacity is not necessarily its denominator |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |

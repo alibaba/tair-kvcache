@@ -122,6 +122,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, writable_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
+    DECLARE_METRICS(data_storage, total_capacity_bytes);
     DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
@@ -450,6 +451,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, writable_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
+    REGISTER_GAUGE_METRIC(data_storage, total_capacity_bytes);
     REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
@@ -770,6 +772,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     double storage_usage_ratio_v;
                     GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                     REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                    double total_capacity_bytes_v;
+                    GET_METRICS_(p, data_storage, total_capacity_bytes, total_capacity_bytes_v);
+                    REPORT_METRICS(data_storage, total_capacity_bytes, total_capacity_bytes_v);
                 }
             }
         }

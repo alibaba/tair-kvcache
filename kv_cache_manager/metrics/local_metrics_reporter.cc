@@ -157,6 +157,8 @@ void LocalMetricsReporter::ReportInterval() {
             const double writable = storage_backend->Writable() ? 1.0 : 0.0;
             const double usage_ratio =
                 report_storage_usage_ ? storage_backend->GetStorageUsageRatio("trace_report_interval") : 0.0;
+            const auto capacity =
+                report_storage_usage_ ? storage_backend->GetStorageCapacity() : StorageCapacitySnapshot{};
             data_storage_manager->PublishMetricsIfCurrent(unique_name, storage_backend, [&]() {
                 const MetricsTags tags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}};
                 if (!report_storage_usage_) {
@@ -164,6 +166,9 @@ void LocalMetricsReporter::ReportInterval() {
                     // Omit its capacity without scanning historical series.
                     metrics_registry_->Remove(
                         SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio),
+                        tags);
+                    metrics_registry_->Remove(
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, total_capacity_bytes),
                         tags);
                 }
                 const auto p = std::make_shared<DataStorageIntervalMetricsCollector>(metrics_registry_, tags);
@@ -173,6 +178,13 @@ void LocalMetricsReporter::ReportInterval() {
                 data_storage_interval_metrics_collectors_.AddMetricsCollector(p);
                 SET_METRICS_(p, data_storage, healthy_status, healthy);
                 SET_METRICS_(p, data_storage, writable_status, writable);
+                if (report_storage_usage_) {
+                    // The backend retains its last good capacity on errors.
+                    // Unknown/unsupported must not be exported as a real zero.
+                    const bool known = capacity.capacity >= 0 &&
+                                       (capacity.refresh_code == EC_OK || capacity.last_success_steady_us > 0);
+                    SET_METRICS_(p, data_storage, total_capacity_bytes, known ? capacity.capacity : -1);
+                }
                 // Preserve default zero; an unknown negative value does not
                 // overwrite the last valid observation in this backend lifetime.
                 if (report_storage_usage_ && usage_ratio >= 0.0) {

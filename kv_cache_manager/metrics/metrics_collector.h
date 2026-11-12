@@ -463,6 +463,7 @@ class DataStorageIntervalMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(data_storage, healthy_status)
     KVCM_GAUGE_METRICS(data_storage, writable_status)
     KVCM_GAUGE_METRICS(data_storage, storage_usage_ratio)
+    KVCM_GAUGE_METRICS(data_storage, total_capacity_bytes)
 
 public:
     DataStorageIntervalMetricsCollector() = delete;

@@ -76,6 +76,8 @@ Group 参考容量为各类型有效 quota 之和，包含固定与自动模式�
 
 `cache_manager_group.usage_ratio` 在固定正数总 quota 下沿用原分母，总量 `-1` 时使用参考容量。未知使用率为 NaN；确认零容量且有用量为 +Inf，空用量为 0，通过容量和 known 区分无容量状态。后端原有 `data_storage.storage_usage_ratio` 含义不变。
 
+`data_storage.total_capacity_bytes` 按 `type, unique_name` 上报每个后端的容量基数，使用同一内存快照，不新增采集请求。它未应用 Group 比例，也不汇总多个 Group；未知/不支持为 -1，失败或过期保留最近成功值，成功的零容量为 0。透明分层取两层总量的 max，主动分层按后端类型取对应介质。现有 TairMempool `storage_usage_ratio` 保留物理 DRAM 水位口径及原有过滤规则，新总量不保证是旧 ratio 的分母，不能据此相乘推算用量。同池别名各自上报，求物理总量时需避免重复相加。follower 省略该指标，降级和卸载沿用存储指标的清理机制。
+
 CLI 新建默认总量 `-1`，支持 `--quota_configs 'ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8'`，显式范围格式为 `type,auto,ratio,backend1|backend2`。Bootstrap 新建采用相同默认；升级同步未显式配置 quota 时保留已有配置，显式 `quota_capacity=-1` 才改为默认自动模式。不支持容量查询的后端需要显式固定 quota。
 
 启用自动模式或总量 `-1` 后，回滚到不支持此功能的旧二进制前，应先恢复正数固定总 quota 和固定分类型 quota；旧版本无法正确解释这些新配置语义。

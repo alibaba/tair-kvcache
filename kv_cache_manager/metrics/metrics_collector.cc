@@ -328,6 +328,7 @@ bool DataStorageMetricsCollector::Init() {
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(healthy_status);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(writable_status);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(storage_usage_ratio);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(total_capacity_bytes);
 
 DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -348,6 +349,7 @@ bool DataStorageIntervalMetricsCollector::Init(bool report_storage_usage) {
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(writable_status);
     if (report_storage_usage) {
         REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+        REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(total_capacity_bytes);
     }
 
     return true;

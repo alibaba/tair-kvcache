@@ -491,6 +491,12 @@ public:
         return ratio_;
     }
     mutable int usage_queries_ = 0;
+    StorageCapacitySnapshot GetStorageCapacity() const override {
+        ++capacity_queries_;
+        return capacity;
+    }
+    StorageCapacitySnapshot capacity;
+    mutable int capacity_queries_ = 0;
     void SetUsageRatio(double ratio) { ratio_ = ratio; }
     bool Writable() override { return Available() && writable_; }
     void SetWritable(bool writable) { writable_ = writable; }
@@ -500,6 +506,49 @@ private:
     bool writable_ = true;
 };
 } // namespace
+
+TEST_F(LocalMetricsReporterTest, StorageTotalCapacityPublishesCachedBytesAndDistinguishesUnknownFromZero) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(0.25);
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    manager->storage_map_["capacity_store"] = backend;
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "capacity_store"}};
+    const auto report = [&](double expected) {
+        reporter_->ReportInterval();
+        EXPECT_DOUBLE_EQ(expected, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
+        EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    };
+    report(-1); // No successful observation yet.
+    backend->capacity.refresh_code = EC_UNIMPLEMENTED;
+    report(-1);
+    backend->capacity = {1000, 1000, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    report(1000);
+    const auto output = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_NE(
+        std::string::npos,
+        output.find("kvcm_data_storage_total_capacity_bytes{type=\"file\",unique_name=\"capacity_store\"} 1000\n"));
+    backend->capacity.capacity = 2000;
+    report(2000); // Expansion.
+    backend->capacity.capacity = 600;
+    report(600); // Shrinkage.
+    backend->capacity.refresh_code = EC_ERROR;
+    backend->capacity.last_success_steady_us -= 31000000;
+    report(600); // Failed/stale refresh keeps the last successful observation visible.
+    backend->capacity = {0, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    report(0); // Authoritative empty capacity.
+    backend->capacity = {};
+    backend->capacity.capacity = 0;
+    report(-1); // An error with no successful timestamp is not an authoritative zero.
+    ASSERT_EQ(EC_OK, manager->UnRegisterStorage("capacity_store"));
+    const auto removed = metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes");
+    EXPECT_TRUE(!removed || removed->GetMetricsValues().empty());
+    manager->storage_map_["capacity_store"] = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
+}
 
 TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeValues) {
     auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
@@ -563,8 +612,10 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeV
         EXPECT_TRUE(v == 0.75 || v == 0.0) << "unexpected published usage ratio: " << v;
     }
     const std::string exported_text = PrometheusExporter::Expose(*metrics_registry_);
-    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
-    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
+    const std::string never_ok_ratio =
+        "kvcm_data_storage_storage_usage_ratio{type=\"file\",unique_name=\"never_ok_store\"} ";
+    EXPECT_EQ(std::string::npos, exported_text.find(never_ok_ratio + "1"));
+    EXPECT_EQ(std::string::npos, exported_text.find(never_ok_ratio + "-"));
 
     // Filtering a negative ratio must not suppress the backend health signal.
     // An unavailable backend still exports healthy_status 0; a healthy one
@@ -605,16 +656,21 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
     const MetricsTags tags{{"type", "file"}, {"unique_name", "role_store"}};
     const auto verify = [&](double expected_ratio) {
         const int previous_queries = backend->usage_queries_;
+        const int previous_capacity_queries = backend->capacity_queries_;
         role_samples = 0;
         reporter_->ReportInterval();
         EXPECT_EQ(1, role_samples);
         EXPECT_EQ(previous_queries + (leader ? 1 : 0), backend->usage_queries_);
+        EXPECT_EQ(previous_capacity_queries + (leader ? 1 : 0), backend->capacity_queries_);
         if (leader) {
             EXPECT_DOUBLE_EQ(expected_ratio,
                              metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+            EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
         } else {
             const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
             EXPECT_TRUE(!ratios || ratios->GetMetricsValues().empty());
+            const auto totals = metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes");
+            EXPECT_TRUE(!totals || totals->GetMetricsValues().empty());
         }
         EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0,
                          metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
@@ -629,6 +685,7 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
         };
         if (!leader) {
             EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_storage_usage_ratio"));
+            EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_total_capacity_bytes"));
         }
         expect_export("healthy_status", backend->Available() ? "1" : "0");
         expect_export("writable_status", backend->Writable() ? "1" : "0");

@@ -56,6 +56,8 @@ public:
     FixedUsageNfsBackend(std::shared_ptr<MetricsRegistry> registry, double usage)
         : NfsBackend(std::move(registry)), usage_(usage) {}
     double GetStorageUsageRatio(const std::string &) const override { return usage_; }
+    StorageCapacitySnapshot GetStorageCapacity() const override { return capacity; }
+    StorageCapacitySnapshot capacity;
 
 private:
     const double usage_;
@@ -413,7 +415,8 @@ TEST_F(KmonitorMetricsReporterTest, LifetimeSamplesAreReportedPerRequestWithInst
 }
 
 TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritability) {
-    auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+    auto backend = std::make_shared<FixedUsageNfsBackend>(metrics_registry_, 0.0);
+    backend->capacity = {1000, 1000, TimestampUtil::GetSteadyTimeUs(), EC_OK};
     auto spec = std::make_shared<NfsStorageSpec>();
     spec->set_root_path(GetPrivateTestRuntimeDataPath() + "role_nfs/");
     StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "role_store", spec);
@@ -438,12 +441,16 @@ TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritab
         reporter_->ReportInterval();
         EXPECT_EQ(1, role_samples);
         int ratios = 0;
+        int totals = 0;
         int health = 0;
         int writable = 0;
         for (const auto &sample : reported_storage) {
             if (sample.name == "data_storage.storage_usage_ratio") {
                 ++ratios;
                 EXPECT_DOUBLE_EQ(0.0, sample.value);
+            } else if (sample.name == "data_storage.total_capacity_bytes") {
+                ++totals;
+                EXPECT_DOUBLE_EQ(1000.0, sample.value);
             } else if (sample.name == "data_storage.healthy_status") {
                 ++health;
                 EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0, sample.value);
@@ -456,6 +463,7 @@ TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritab
             EXPECT_EQ("role_store", sample.tags.at("unique_name"));
         }
         EXPECT_EQ(leader ? 1 : 0, ratios);
+        EXPECT_EQ(leader ? 1 : 0, totals);
         EXPECT_EQ(1, health);
         EXPECT_EQ(1, writable);
     }
@@ -469,10 +477,14 @@ TEST_F(KmonitorMetricsReporterTest, FollowerOmitsCapacityButKeepsHealthAndWritab
     reporter_->ReportInterval();
     for (const auto &sample : reported_storage) {
         EXPECT_NE("data_storage.storage_usage_ratio", sample.name);
+        EXPECT_NE("data_storage.total_capacity_bytes", sample.name);
     }
     const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
     ASSERT_NE(nullptr, ratios);
     EXPECT_TRUE(ratios->GetMetricsValues().empty());
+    const auto totals = metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes");
+    ASSERT_NE(nullptr, totals);
+    EXPECT_TRUE(totals->GetMetricsValues().empty());
 }
 
 TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingAllowsOnlyCurrentRoundSnapshot) {
