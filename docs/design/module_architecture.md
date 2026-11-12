@@ -385,9 +385,10 @@ flowchart LR
 
 `CacheManager` 使用独立的有界 worker 恢复 Instance，每任务持有自己的 `RequestContext`，执行前在实例生命周期
 锁内重新读取 Registry；已删除的快照条目直接跳过，不重新注册。每个 `MetaAsyncRedisBackend` 使用另一组有界
-worker 创建专属 consumer 连接；RedisClient 的首次连接、读池懒建和重连在 `common::RedisClient` 入口共享
-进程级握手上限。两层 worker 不共用父子等待的线程池；连接任务全部结束后才发布 backend，首轮 Instance
-任务全部结束后恢复回调才返回。部分失败沿用原有后台重试，Server 的租约校验与业务门禁保持原语义。
+worker 创建专属 consumer 连接；普通 RedisClient 的首次连接、读池懒建和重连共用默认 64 的进程级握手预算，
+协调 RedisClient 使用独立的固定 4 个许可；主动健康探测直接使用 hiredis，不占用任一预算。
+两层 worker 不共用父子等待的线程池；连接任务全部结束后才发布 backend，首轮 Instance 任务全部结束后
+恢复回调才返回。部分失败沿用原有后台重试，Server 的租约校验与业务门禁保持原语义。
 上述变化不新增模块或依赖边；参数和失败处理见 [HA 设计](ha_leader_elector.md#43-有界并行恢复)。
 
 ### 4.10 KVCM 到在线 Optimizer 的事件流

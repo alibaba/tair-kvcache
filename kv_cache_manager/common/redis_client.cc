@@ -14,17 +14,18 @@ namespace kv_cache_manager {
 
 namespace {
 
-// Limit connection handshakes across the process, including reconnects.
+// Keep coordination handshakes independent of metadata recovery.
 class RedisConnectLimiter {
 public:
-    RedisConnectLimiter() {
-        constexpr int32_t kDefaultLimit = 64;
-        limit_ = EnvUtil::GetEnv("kvcm.redis_client.max_concurrent_connects",
-                                 EnvUtil::GetEnv("kvcm_redis_client_max_concurrent_connects", kDefaultLimit));
-        if (limit_ <= 0 || limit_ > 4096) {
-            KVCM_LOG_WARN("invalid Redis connection concurrency[%d], using default[%d]", limit_, kDefaultLimit);
-            limit_ = kDefaultLimit;
+    explicit RedisConnectLimiter(int32_t limit) : limit_(limit) {}
+
+    static RedisConnectLimiter &Instance(RedisClient::ConnectionType connection_type) {
+        if (connection_type == RedisClient::ConnectionType::kCoordination) {
+            static RedisConnectLimiter limiter(4);
+            return limiter;
         }
+        static RedisConnectLimiter limiter(GetDefaultLimit());
+        return limiter;
     }
 
     class Permit {
@@ -56,15 +57,22 @@ public:
         bool acquired_ = false;
     };
 
-    static RedisConnectLimiter &Instance() {
-        static RedisConnectLimiter limiter;
-        return limiter;
+private:
+    static int32_t GetDefaultLimit() {
+        constexpr int32_t kDefaultLimit = 64;
+        const int32_t limit =
+            EnvUtil::GetEnv("kvcm.redis_client.max_concurrent_connects",
+                            EnvUtil::GetEnv("kvcm_redis_client_max_concurrent_connects", kDefaultLimit));
+        if (limit <= 0 || limit > 4096) {
+            KVCM_LOG_WARN("invalid Redis connection concurrency[%d], using default[%d]", limit, kDefaultLimit);
+            return kDefaultLimit;
+        }
+        return limit;
     }
 
-private:
     std::mutex mutex_;
     std::condition_variable available_;
-    int32_t limit_ = 64;
+    int32_t limit_;
     int32_t active_ = 0;
 };
 
@@ -78,8 +86,11 @@ private:
     KVCM_LOG_ERROR(                                                                                                    \
         "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
 
-RedisClient::RedisClient(const StandardUri &storage_uri)
-    : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
+RedisClient::RedisClient(const StandardUri &storage_uri, ConnectionType connection_type)
+    : connection_type_(connection_type)
+    , user_info_(storage_uri.GetUserInfo())
+    , host_(storage_uri.GetHostName())
+    , port_(storage_uri.GetPort()) {
     int64_t tmp_db = 0;
     storage_uri.GetParamAs("db", tmp_db);
     if (tmp_db >= 0) {
@@ -163,7 +174,7 @@ bool RedisClient::GetReplyStrOrNil(const redisReply *reply, std::string &out_str
 }
 
 bool RedisClient::Connect() {
-    RedisConnectLimiter::Permit permit(RedisConnectLimiter::Instance(), timeout_ms_);
+    RedisConnectLimiter::Permit permit(RedisConnectLimiter::Instance(connection_type_), timeout_ms_);
     if (!permit) {
         KVCM_REDIS_LOG_WARN("timed out waiting for Redis connection concurrency permit");
         return false;

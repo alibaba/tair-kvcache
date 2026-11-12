@@ -13,7 +13,12 @@ namespace kv_cache_manager {
 
 class RedisClient {
 public:
-    RedisClient(const StandardUri &storage_uri);
+    enum class ConnectionType {
+        kDefault,
+        kCoordination
+    };
+
+    RedisClient(const StandardUri &storage_uri, ConnectionType connection_type = ConnectionType::kDefault);
     virtual ~RedisClient(); // virtual for test
 
     RedisClient(const RedisClient &) = delete;
@@ -102,6 +107,7 @@ protected:
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
 
 private:
+    ConnectionType connection_type_;
     redisContext *context_ = nullptr;
     std::string user_info_;
     std::string host_;

@@ -178,9 +178,10 @@ Server::Init()
 
 逐 Instance 恢复和单个 async Redis backend 的 consumer 建连分别使用有界 worker，默认并发度均为 8。
 每次调用拥有独立 worker，调用线程也参与工作；父任务不会占用同一个线程池等待子任务。
-所有 `RedisClient` 的真实首次建连及重连共用进程级握手上限，默认 64，包含读池懒建、Registry 和协调客户端。
-该上限限制同时进行的握手，不限制已建立连接数、consumer 数或普通 Redis 命令的并发。
-主动健康探测使用独立 hiredis 连接，不经过上述 RedisClient 限流。
+元数据、Registry 等普通 `RedisClient` 共用进程级握手预算，默认 64，包含首次建连、读池懒建及重连。
+协调 RedisClient 使用独立的固定 4 个握手许可，批量恢复不会占用协调预算。
+两类预算只限制同时进行的握手，不限制已建立连接数、consumer 数或普通 Redis 命令的并发。
+主动健康探测使用独立 hiredis 连接，不占用任一握手预算。
 
 恢复步骤及约束：
 
@@ -197,8 +198,7 @@ Server::Init()
 4. 进程级握手许可按该客户端的 `timeout_ms` 有界等待，超时沿原重试路径处理；许可不覆盖重试退避或普通命令。
    TCP 建连及握手命令使用原 `timeout_ms`，握手成功后恢复原有普通命令 I/O 超时设置，避免改变稳态大 pipeline
    的超时契约。排队、TCP 和各握手 I/O 分别计时，`timeout_ms` 不是整次恢复的端到端 deadline。
-   当前 hiredis 的同步 DNS 解析不受此超时限制，且解析时仍占用许可；metadata 解析阻塞可能影响协调 Redis
-   的新建连接或重连，故障验证需覆盖这种竞争。
+   当前 hiredis 的同步 DNS 解析不受此超时限制，解析时仍占用各自预算的许可。
 5. `DoRecoverOnce` 等待所有已启动 Instance worker 返回；单个实例失败仍继续其他实例。保留既有语义：
    首轮部分失败时，`DoRecover` 启动后台重试并返回 `EC_OK`，已成功实例可按 Server 原流程提供服务。
    不等待全量异步回填，不新增按 Instance 开门的协议。Cleanup 先停止并 join 重试，再与同步恢复轮次互斥清理。

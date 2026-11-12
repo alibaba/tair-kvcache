@@ -277,24 +277,25 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 |---|---:|---|---|
 | `kvcm.cache_manager.recover_instance_concurrency` | `8` | `1..64` | 单轮同时恢复的 Instance 数，包含调用线程 |
 | `kvcm.meta_async_redis.open_concurrency` | `8` | `1..64` | 单个 async Redis backend 内 consumer 连接创建的并发数 |
-| `kvcm.redis_client.max_concurrent_connects` | `64` | `1..4096` | 全进程 RedisClient 同时握手上限，包含首次建连、读池懒建及重连 |
+| `kvcm.redis_client.max_concurrent_connects` | `64` | `1..4096` | 普通 RedisClient 的进程级同时握手上限，包含首次建连、读池懒建及重连 |
 
 这些参数直接读取进程环境变量，超出范围的整数记录告警并回退表中默认值。
 下划线形式分别为 `kvcm_cache_manager_recover_instance_concurrency`、
 `kvcm_meta_async_redis_open_concurrency`、`kvcm_redis_client_max_concurrent_connects`；也可使用同名带点的
 环境变量，带点形式优先；带点形式未设置或无法解析时回退下划线形式，两者均未设置或无法解析时使用
 表中默认值。这三项不经过普通 Server 配置文件或 `--env` 解析。
-进程级上限在第一次 RedisClient 握手时固定，应在启动前配置；修改后重启。
+普通握手上限在首次普通 RedisClient 握手时固定，应在启动前配置；修改后重启。
 单轮恢复并发在恢复轮次开始时读取，backend 内并发在 `Init` 时读取。
+协调 RedisClient 使用独立的固定 4 个握手许可，不占用普通预算，也不受该参数调整。
 
-例如设置恢复并发 8、backend 内并发 8、总握手上限 32，会使两层 worker 的真实网络握手合计不超过 32。
+例如设置恢复并发 8、backend 内并发 8、普通握手上限 32，会使两层 worker 的真实网络握手合计不超过 32。
 握手许可等待最多该客户端 URI 的 `timeout_ms`，超时沿既有 Redis 重试策略处理；TCP 与各握手命令也使用
 此超时，握手后恢复原有普通命令 I/O 超时设置。排队超时、网络超时和重试分别计时，不是端到端 deadline。
 当前 hiredis 的同步 DNS 解析不受此超时限制，解析期间仍占用握手许可。
-协调 Redis 也受进程上限约束；等待许可有超时，许可在握手尝试返回时释放，不会在连接建成后一直占用。
-主动健康探测直接使用 hiredis 独立连接，不经过 RedisClient，也不占用上述许可。
+两类许可都在握手尝试返回时释放，不会在连接建成后一直占用。
+主动健康探测直接使用 hiredis 独立连接，不经过 RedisClient，也不占用任一握手预算。
 
-设置两层并发为 `1` 可回退逐 Instance、逐 consumer 建连；进程上限仍生效。
+设置两层并发为 `1` 可回退逐 Instance、逐 consumer 建连；两类进程预算仍生效。
 连接数与 `async_queue_count` 不因并行而减少，队列 FIFO、失败回收和服务就绪门禁沿用原语义。
 首轮部分失败后仍沿用后台恢复重试；不会把未初始化 backend 发布给请求。
 详细顺序及故障边界见 [HA 恢复设计](design/ha_leader_elector.md#43-有界并行恢复)。
