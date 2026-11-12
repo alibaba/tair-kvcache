@@ -512,10 +512,13 @@ struct FakeSdkControl {
     std::atomic<int> put_call_count{0};
     std::atomic<int> get_delay_ms{0}; // Get 内的睡眠时长（模拟慢 I/O）
     std::atomic<int> get_result{static_cast<int>(ER_OK)};
+    std::atomic<bool> return_put_uris{false};
     // Init 时观测到的注入预算（TestStaticBudgetInjection 用）：wrapper 应把自身
     // timeout_config 注入 SdkBackendConfig，后端据此自律。
     std::atomic<int> observed_get_budget_ms{0};
     std::atomic<int> observed_put_budget_ms{0};
+    std::atomic<int64_t> observed_get_deadline_ms{0};
+    std::atomic<int64_t> observed_put_deadline_ms{0};
 };
 
 class FakeSdk : public SdkInterface {
@@ -539,11 +542,27 @@ public:
         }
         return static_cast<ClientErrorCode>(ctrl_->get_result.load());
     }
-    ClientErrorCode Put(const std::vector<DataStorageUri> &,
+    ClientErrorCode Put(const std::vector<DataStorageUri> &uris,
                         const BlockBuffers &,
-                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_uris) override {
         ctrl_->put_call_count.fetch_add(1);
+        if (ctrl_->return_put_uris.load()) {
+            *actual_uris = uris;
+        }
         return ER_OK;
+    }
+    ClientErrorCode GetWithDeadline(const std::vector<DataStorageUri> &uris,
+                                    const BlockBuffers &buffers,
+                                    int64_t deadline_ms) override {
+        ctrl_->observed_get_deadline_ms.store(deadline_ms);
+        return Get(uris, buffers);
+    }
+    ClientErrorCode PutWithDeadline(const std::vector<DataStorageUri> &uris,
+                                    const BlockBuffers &buffers,
+                                    std::shared_ptr<std::vector<DataStorageUri>> actual_uris,
+                                    int64_t deadline_ms) override {
+        ctrl_->observed_put_deadline_ms.store(deadline_ms);
+        return Put(uris, buffers, std::move(actual_uris));
     }
 
 protected:
@@ -737,6 +756,60 @@ TEST_F(SdkWrapperTest, TestStaticBudgetInjection) {
     // fixture 的 client_config_：put_timeout_ms=2000, get_timeout_ms=2000。
     ASSERT_EQ(2000, ctrl->observed_get_budget_ms.load());
     ASSERT_EQ(2000, ctrl->observed_put_budget_ms.load());
+}
+
+TEST_F(SdkWrapperTest, ReadAndWriteGroupsInheritTheSameParentDeadline) {
+    auto first = std::make_shared<FakeSdkControl>();
+    auto second = std::make_shared<FakeSdkControl>();
+    first->return_put_uris.store(true);
+    second->return_put_uris.store(true);
+    auto config = MakeClientConfigWithTimeouts(20000, 20000);
+    SdkWrapper wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(wrapper, first, config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+    wrapper.sdk_map_.emplace("nfs_peer", std::make_shared<FakeSdk>(second));
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/nfs/0/0/1?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_peer/nfs/0/0/2?blkid=1&size=1024"),
+        DataStorageUri("file://nfs_test/nfs/0/0/3?blkid=2&size=1024")};
+    const BlockBuffers buffers{BlockBuffer(), BlockBuffer(), BlockBuffer()};
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    const auto deadline = SteadyClockMs() + 10000;
+
+    ASSERT_EQ(ER_OK, wrapper.Get(uris, buffers, deadline));
+    ASSERT_EQ(ER_OK, wrapper.Put(uris, buffers, actual, deadline));
+    EXPECT_EQ(deadline, first->observed_get_deadline_ms.load());
+    EXPECT_EQ(deadline, second->observed_get_deadline_ms.load());
+    EXPECT_EQ(deadline, first->observed_put_deadline_ms.load());
+    EXPECT_EQ(deadline, second->observed_put_deadline_ms.load());
+    ASSERT_EQ(uris.size(), actual->size());
+    for (size_t i = 0; i < uris.size(); ++i) {
+        EXPECT_EQ(uris[i].ToUriString(), (*actual)[i].ToUriString());
+    }
+}
+
+TEST_F(SdkWrapperTest, ParentDeadlineDoesNotExtendConfiguredStageCaps) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    ctrl->return_put_uris.store(true);
+    SdkWrapper wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(wrapper, ctrl, client_config_, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+    const std::vector<DataStorageUri> uris{DataStorageUri("file://nfs_test/nfs/0/0/1?blkid=0&size=1024")};
+    const BlockBuffers buffers{BlockBuffer()};
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    const auto parent = SteadyClockMs() + 60000;
+    auto began = SteadyClockMs();
+    ASSERT_EQ(ER_OK, wrapper.Get(uris, buffers, parent));
+    EXPECT_GE(ctrl->observed_get_deadline_ms.load(), began + 2000);
+    EXPECT_LE(ctrl->observed_get_deadline_ms.load(), SteadyClockMs() + 2000);
+    EXPECT_LT(ctrl->observed_get_deadline_ms.load(), parent);
+    began = SteadyClockMs();
+    ASSERT_EQ(ER_OK, wrapper.Put(uris, buffers, actual, parent));
+    EXPECT_GE(ctrl->observed_put_deadline_ms.load(), began + 2000);
+    EXPECT_LE(ctrl->observed_put_deadline_ms.load(), SteadyClockMs() + 2000);
+    EXPECT_LT(ctrl->observed_put_deadline_ms.load(), parent);
 }
 
 // 用于直接调用受保护方法 SplitByPath 的最小实现。

@@ -36,6 +36,7 @@ cc_library(
     name = "sdk_common",
     srcs = ["sdk_interface.cc"],
     hdrs = [
+        "deadline_util.h",
         "sdk_interface.h",
         "sdk_type.h",
     ],

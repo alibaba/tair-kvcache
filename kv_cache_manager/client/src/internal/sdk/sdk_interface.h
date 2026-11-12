@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
@@ -12,12 +13,9 @@
 namespace kv_cache_manager {
 
 // 各存储后端 SDK 的统一接口。
-// 超时契约（静态，无调用参数）：SdkWrapper 在 Init 阶段把自身配置的静态预算注入
-// SdkBackendConfig::timeout_config()（get/put_timeout_ms）。后端从自身任务起点
-// 起算 deadline，在预算内完成或内部取消；到点后不得再触碰 caller 的 local
-// buffers。能做到的（localfile/hf3fs）须如实做到，做不到的（mooncake，上游无
-// 取消语义）须声明 soft 并输出可归因日志。不读取该字段的后端（tair_mempool）
-// 自行管理内部超时，要求其内部超时严格小于 wrapper 预算。
+// Wrapper 在有调用方期限时通过 WithDeadline 传入绝对 steady_clock 毫秒期限，
+// 后端在已有逐组/逐块检查和等待位置使用它，与自身配置的阶段上限取最小值。
+// 直接调用旧 Get/Put 仍使用 Init 时注入的静态阶段上限。
 // 规范全文见 docs/design/client_sdk_io_contract.md。
 class SdkInterface {
 public:
@@ -44,6 +42,20 @@ public:
     virtual ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) = 0;
+
+    // Legacy/custom backends keep their existing behavior unless they override
+    // these methods to consume the deadline.
+    virtual ClientErrorCode GetWithDeadline(const std::vector<DataStorageUri> &remote_uris,
+                                            const BlockBuffers &local_buffers,
+                                            int64_t /*deadline_ms*/) {
+        return Get(remote_uris, local_buffers);
+    }
+    virtual ClientErrorCode PutWithDeadline(const std::vector<DataStorageUri> &remote_uris,
+                                            const BlockBuffers &local_buffers,
+                                            std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                            int64_t /*deadline_ms*/) {
+        return Put(remote_uris, local_buffers, std::move(actual_remote_uris));
+    }
 
 protected:
     virtual ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,

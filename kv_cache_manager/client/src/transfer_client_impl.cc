@@ -184,12 +184,19 @@ ClientErrorCode TransferClientImpl::PrintBlockHashAndUri(const std::string &pref
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
                                                  std::shared_ptr<TransferTraceInfo> trace_info) {
+    return LoadKvCachesWithDeadline(uri_str_vec, block_buffers, 0, std::move(trace_info));
+}
+
+ClientErrorCode TransferClientImpl::LoadKvCachesWithDeadline(const UriStrVec &uri_str_vec,
+                                                             const BlockBuffers &block_buffers,
+                                                             int64_t deadline_ms,
+                                                             std::shared_ptr<TransferTraceInfo> trace_info) {
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK();
     auto remote_uris = ParseLocations(uri_str_vec);
-    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers);
+    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers, deadline_ms);
     if (ec != ER_OK) {
         return ec;
     }
@@ -203,6 +210,14 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                        const BlockBuffers &block_buffers,
                                                                        std::shared_ptr<TransferTraceInfo> trace_info) {
+    return SaveKvCachesWithDeadline(uri_str_vec, block_buffers, 0, std::move(trace_info));
+}
+
+std::pair<ClientErrorCode, UriStrVec>
+TransferClientImpl::SaveKvCachesWithDeadline(const UriStrVec &uri_str_vec,
+                                             const BlockBuffers &block_buffers,
+                                             int64_t deadline_ms,
+                                             std::shared_ptr<TransferTraceInfo> trace_info) {
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -215,7 +230,7 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    auto ec = sdk_wrapper_->Put(remote_uris, block_buffers, actual_remote_uris);
+    auto ec = sdk_wrapper_->Put(remote_uris, block_buffers, actual_remote_uris, deadline_ms);
     if (ec != ER_OK) {
         KVCM_LOG_ERROR("save kv cache failed");
         return {ec, {}};

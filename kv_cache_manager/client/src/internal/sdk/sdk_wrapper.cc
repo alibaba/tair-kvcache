@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "kv_cache_manager/common/lock_free_thread_pool.h"
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"
@@ -113,8 +114,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
-        // 注入静态超时预算：后端用它从自身任务起点起算 deadline 并自律（内部取消）。
-        // 不读取该字段的后端（tair_mempool 等）行为不受影响。
+        // 保留后端的静态阶段上限；调用方传入期限时，再透传绝对 deadline。
         sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
 
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
@@ -155,7 +155,9 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
     return ER_OK;
 }
 
-ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
+                                const BlockBuffers &local_buffers,
+                                int64_t parent_deadline_ms) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ER_SDK_ERROR_BUFFER_SAFE;
@@ -165,24 +167,29 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
     if (ec != ER_OK) {
         return ER_SDK_ERROR_BUFFER_SAFE;
     }
+    const int64_t deadline_ms = parent_deadline_ms > 0
+                                    ? ClampDeadline(wrapper_config_->timeout_config().get_timeout_ms(), parent_deadline_ms)
+                                    : 0;
 
     // Build task vector for parallel dispatch
     std::vector<std::function<ClientErrorCode()>> tasks;
     tasks.reserve(groups.size());
     for (const auto &group : groups) {
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
+        tasks.push_back([group, deadline_ms]() {
+            return deadline_ms > 0 ? group.sdk->GetWithDeadline(group.uris, group.buffers, deadline_ms)
+                                  : group.sdk->Get(group.uris, group.buffers);
+        });
     }
 
-    // 静态预算：同一份已在 Init 时注入各后端（SdkBackendConfig::timeout_config），
-    // 后端从自身任务起点起算 deadline 并自律。
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
+    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms, deadline_ms);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
-                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                int64_t parent_deadline_ms) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
@@ -193,6 +200,9 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     if (ec != ER_OK) {
         return ER_SDK_ERROR_BUFFER_SAFE;
     }
+    const int64_t deadline_ms = parent_deadline_ms > 0
+                                    ? ClampDeadline(wrapper_config_->timeout_config().put_timeout_ms(), parent_deadline_ms)
+                                    : 0;
     actual_remote_uris->resize(remote_uris.size());
 
     // Build task vector and result containers for parallel dispatch
@@ -205,14 +215,14 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
+        tasks.push_back([group, group_actual_uris, deadline_ms]() {
+            return deadline_ms > 0 ? group.sdk->PutWithDeadline(group.uris, group.buffers, group_actual_uris, deadline_ms)
+                                  : group.sdk->Put(group.uris, group.buffers, group_actual_uris);
         });
     }
 
-    // 与 Get 同理：静态预算已在 Init 时注入后端。
     int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
-    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms, deadline_ms);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
         return ec;
@@ -281,7 +291,8 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                                   int timeout_ms) const {
+                                                   int timeout_ms,
+                                                   int64_t deadline_ms) const {
     if (tasks.empty()) {
         return ER_OK;
     }
@@ -294,7 +305,9 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     }
 
     // Submit all tasks with shared stop flag
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto deadline = deadline_ms > 0
+                        ? std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms))
+                        : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     // stop：错误/超时路径置位后，排队中尚未被拾起的任务直接短路，不再发起新的 I/O。
     // 时间准入（now >= deadline）只覆盖"已到 deadline"的情形；普通错误往往发生在

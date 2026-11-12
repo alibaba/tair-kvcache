@@ -1,43 +1,48 @@
-# Client SDK I/O 契约（静态超时预算 / 内部取消 / Buffer 生命周期）
+# Client SDK I/O 契约（超时预算 / 内部取消 / Buffer 生命周期）
 
 ## 1. 核心契约（一句话）
 
-**调用接口不携带任何时间参数；SdkWrapper 在 Init 阶段把自身配置的静态超时预算
+**旧读写接口不携带时间参数；SdkWrapper 在 Init 阶段把自身配置的静态超时预算
 （`sdk_config.timeout_config` 的 get/put_timeout_ms）注入每个后端的
 `SdkBackendConfig::timeout_config()`，后端从自身任务起点起算 deadline，
-预算内完成或内部取消 —— 到点后不得再触碰调用方的 local buffers。**
+按各后端能力进行准入与超时收尾；超时返回不证明在飞 I/O 已停止访问 caller buffer。**
 
 各后端按自身能力履约（见 §3 矩阵）。做不到"绝不碰"的后端必须如实声明为 soft 级。
+hard/soft 描述后端已有能力，不能据此判断 wrapper 超时返回时 Buffer 是否安全。
+
+`LoadKvCachesWithDeadline` / `SaveKvCachesWithDeadline` 接收本进程 `steady_clock` 绝对毫秒期限；
+正值按 `min(调用方期限, 当前阶段起点 + get/put_timeout_ms)` 收紧预算，非正值沿用旧行为。
+各分组继承该期限；自定义包装层须重写 WithDeadline 继续转发。
+新 API 以 `KVCM_HAS_TRANSFER_DEADLINE` 标识，SDK 与调用方需使用配套头文件、动态库重编译。
 
 ## 2. 机制分层
 
 | 层 | 职责 |
 |---|---|
-| SdkWrapper | 等待上限 = 入口 + 静态预算；任务从线程池被拾起时做**准入检查**（已过预算的任务拒绝发起 I/O）；Init 时注入预算给后端 |
-| 存储后端 | 从**自身任务起点**起算 deadline（= 起点 + 注入预算）；组级/逐 block/逐 key 准入；超时时执行内部取消 |
+| SdkWrapper | 等待上限 = 入口 + 静态预算（有调用方期限时取较早者）；任务从线程池被拾起时做**准入检查**（已过预算的任务拒绝发起 I/O）；Init 时注入预算给后端 |
+| 存储后端 | 从**自身任务起点**起算 deadline（有调用方期限时取较早者）；组级/逐 block/逐 key 准入；按后端能力处理超时 |
 
-两个起算点的关系：后端起点晚于 wrapper 入口，差值为 wrapper 线程池的排队等待 W_q。
-**排序不变量**：`W_q + 后端内部耗时 ≤ wrapper 预算`。同步调用方（排队为零）
-自然满足；异步调用方依赖排队有界（池线程数配置）。后端内部超时取值应给 W_q
-留出余量 —— PACE 的实践是内部 10s 对 wrapper 15s（5s 余量）。
+未传调用方期限时，后端起点晚于 wrapper 入口，差值为线程池排队等待 W_q。
+预算配置应满足 `W_q + 后端内部耗时 ≤ wrapper 预算`，为排队等待留出余量。
+传入期限时，各层继承较早的绝对期限，排队或分组不会重新起算这份预算。
 
 ## 3. 后端履约矩阵
 
 | 后端 | 有界性 | 准入检查 | Buffer 级别 | 超时行为 |
 |---|---|---|---|---|
-| LocalFile / NFS | 逐 block | 组级 + 逐 block | hard | abort 路径 sync GPU stream（GpuStreamDrainGuard），真取消 |
+| LocalFile / NFS | 逐 block | 组级 + 逐 block | hard | abort 路径 sync GPU stream（GpuStreamDrainGuard），排空已启动的 copy |
 | HF3FS | hf3fs_wait_for_ios(abs_timeout) | 逐 block | hard | 数据先落自有 shm iov；超时不执行 CopyIovs；泄漏 iov/IOR 而不 free（free = UAF） |
 | Mooncake | 逐 key 前置检查 | 逐 key | soft | 上游无取消语义；超时路径输出可归因日志（key/buffer/elapsed） |
-| TairMempool (PACE) | PACE 内部超时（10s） | PACE 自管理 | hard（staging + cancel_and_drain） | **不读取注入的预算**（自行管理内部超时）；要求内部超时 < wrapper 预算（10s < 15s） |
+| TairMempool (PACE) | 原有等待上限与调用方期限取较早者 | PACE 自管理 | 未确认完成时不保证安全 | 既有等待/重试消费期限，不强制取消在飞 DMA |
 
-注：PACE 属跨仓库生产路径，本仓库不修改其实现；注入字段对它是纯增量（不读即无行为
-变化），未来若希望显式对齐可读取 `timeout_config()` 校验自身配置。
+注：PACE 预算透传需配套提供 `PACE_HAS_TRANSFER_DEADLINE` 的新 client 库。
+阻塞 UDS/CUDA 和安全排空仍可能超过期限，超时不能代替 Buffer 安全确认。
 
 ## 4. Known Limitations
 
-1. **W_q 残留窗口**：后端 deadline 锚定自身起点，排队等待 W_q 使后端可能晚于
-   wrapper 预算完成（同步调用方无此问题；生产 v6d 路径为同步直调）。后端内部
-   取消机制保证其自身 deadline 之后不再触碰 caller buffer。
+1. **W_q 残留窗口（旧接口）**：未传调用方期限时，后端 deadline 仍从自身起点起算，
+   排队可能使后端晚于 wrapper 预算完成。传入期限可收紧这些检查和等待，
+   但不能强制中断已经启动的系统调用、GPU copy 或 DMA。
 2. **ManagerClient / RTPLLMClient 层**：走 TransferClient 的既有路径，自动获得
    wrapper 预算，无额外配置。
 3. **超时路径不等在飞任务；普通错误路径有界等待**：RunWithTimeoutParallel 在
