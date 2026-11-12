@@ -67,6 +67,29 @@ class _Query:
     ask_time: float = 0.0  # monotonic clock, at query issue
 
 
+def manager_block_keys(token_ids, block_size: int) -> List[int]:
+    """The manager's chained block hash, replicated exactly (hash_util.h).
+
+    The signed shifts and uint64 wrapping mirror the manager's chained hash.
+    """
+    mask = (1 << 64) - 1
+
+    def s64(x: int) -> int:
+        x &= mask
+        return x - (1 << 64) if x >= (1 << 63) else x
+
+    h = 0
+    keys: List[int] = []
+    for i in range(len(token_ids) // block_size):
+        for v in token_ids[i * block_size : (i + 1) * block_size]:
+            t = (
+                v + 0x9E3779B97F4A7C15 + (s64(h << 12) & mask) + ((h >> 32) & mask)
+            ) & mask
+            h = s64((h & mask) ^ t)
+        keys.append(h)
+    return keys
+
+
 class LocationQueryManager:
     """Per-request location query cache: produce on match, consume on alloc.
 
@@ -84,12 +107,14 @@ class LocationQueryManager:
         instance_id: str,
         async_get_cache_location: bool,
         max_answer_age_s: float = 1.0,
+        manager_block_size: int = 0,
     ) -> None:
         self._manager_client = manager_client
         self._http_executor = http_executor
         self._instance_id = instance_id
         self._async_get_cache_location = async_get_cache_location
         self._max_answer_age_s = max_answer_age_s
+        self._manager_block_size = manager_block_size
         self._lock = threading.Lock()
         # req_id -> the request's one active query slot.
         self._queries: Dict[str, _Query] = {}
@@ -124,7 +149,22 @@ class LocationQueryManager:
         logger.debug("get_kvcache_location request: %s", get_request)
         result = self._manager_client.get_cache_location(get_request)
         logger.debug("get_kvcache_location result: %s", result)
-        return result["locations"]
+        locations = result["locations"]
+        if not locations:
+            # Empty answers contain no locations. Log the derived block keys so the
+# reader and writer paths can be compared without logging complete token lists.
+            logger.info(
+                "req:%s no location: offset=%d n_tokens=%d block_keys=%s",
+                request.request_id,
+                computed_blocks,
+                len(get_request["token_ids"] or ()),
+                manager_block_keys(
+                    get_request["token_ids"] or (), self._manager_block_size
+                )[:4]
+                if self._manager_block_size
+                else [],
+            )
+        return locations
 
     def _query_async(self, request: "Request", key: QueryCacheKey, q: _Query) -> None:
         def run() -> None:

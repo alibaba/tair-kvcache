@@ -132,6 +132,7 @@ class ConnectorScheduler:
             extra_config.instance_id,
             extra_config.async_get_cache_location,
             extra_config.location_query_max_age_seconds,
+            manager_block_size,
         )
 
         self._tracked: Dict[str, RequestLedger] = {}
