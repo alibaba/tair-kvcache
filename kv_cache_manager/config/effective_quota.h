@@ -4,7 +4,7 @@
 #include <string>
 
 #include "kv_cache_manager/config/instance_group.h"
-#include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 
 namespace kv_cache_manager {
 

@@ -15,23 +15,12 @@
 namespace kv_cache_manager {
 
 class MetricsRegistry;
-class LoopThread;
-
-struct StorageCapacitySnapshot {
-    // -1 is unknown; a successful zero is authoritative.
-    int64_t capacity = -1;
-    int64_t last_success_time_s = 0;
-    int64_t last_success_steady_us = 0;
-    ErrorCode refresh_code = EC_ERROR;
-    std::string identity;
-    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-};
 
 class DataStorageManager {
 public:
     DataStorageManager() = delete;
     explicit DataStorageManager(std::shared_ptr<MetricsRegistry> metrics_registry);
-    ~DataStorageManager();
+    ~DataStorageManager() = default;
 
     DataStorageManager(const DataStorageManager &) = delete;
     DataStorageManager &operator=(const DataStorageManager &) = delete;
@@ -42,7 +31,6 @@ public:
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
     std::vector<StorageConfig> ListStorageConfig();
     std::map<std::string, StorageCapacitySnapshot> GetCapacitySnapshots() const;
-    void RefreshCapacities();
 
     ErrorCode EnableStorage(const std::string &name);
     ErrorCode DisableStorage(const std::string &name);
@@ -112,9 +100,6 @@ private:
     // stroage unique name -> storage_backend
     std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_map_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
-    // Runtime observations only; cleared with the corresponding backend on cleanup/removal.
-    std::map<std::string, StorageCapacitySnapshot> capacity_snapshots_;
-    std::shared_ptr<LoopThread> capacity_refresh_thread_;
 };
 
 } // namespace kv_cache_manager

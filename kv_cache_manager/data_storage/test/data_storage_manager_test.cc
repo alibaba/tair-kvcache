@@ -47,14 +47,8 @@ public:
 class CapacityBackend : public DummyBackend {
 public:
     using DummyBackend::DummyBackend;
-    std::pair<ErrorCode, int64_t> GetStorageCapacity(const std::string &) const override {
-        if (on_query) {
-            on_query();
-        }
-        return result;
-    }
-    std::pair<ErrorCode, int64_t> result{EC_OK, 100};
-    std::function<void()> on_query;
+    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot snapshot;
 };
 
 class RecordingBatchBackend : public RecordingCreateBackend {
@@ -147,27 +141,22 @@ public:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
-TEST_F(DataStorageManagerTest, CapacityRefreshRetainsLastGoodAndResetsOnRemoval) {
+TEST_F(DataStorageManagerTest, CapacitySnapshotsReadBackendCacheAndResetOnRemoval) {
     DataStorageManager manager(metrics_registry_);
     auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
     manager.storage_map_["pool"] = backend;
     EXPECT_EQ(-1, manager.GetCapacitySnapshots().at("pool").capacity);
-    manager.RefreshCapacities();
+    backend->snapshot = {100, 1000, 100000, EC_OK};
     auto snapshot = manager.GetCapacitySnapshots().at("pool");
     EXPECT_EQ(100, snapshot.capacity);
-    EXPECT_GT(snapshot.last_success_time_s, 0);
-    backend->result = {EC_ERROR, 0};
-    manager.RefreshCapacities();
-    auto failed = manager.GetCapacitySnapshots().at("pool");
+    EXPECT_EQ(1000, snapshot.last_success_time_s);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, snapshot.type);
+    backend->snapshot.refresh_code = EC_ERROR;
+    const auto failed = manager.GetCapacitySnapshots().at("pool");
     EXPECT_EQ(100, failed.capacity);
     EXPECT_EQ(EC_ERROR, failed.refresh_code);
     EXPECT_EQ(snapshot.last_success_steady_us, failed.last_success_steady_us);
-    backend->result = {EC_OK, -1};
-    manager.RefreshCapacities();
-    EXPECT_EQ(100, manager.GetCapacitySnapshots().at("pool").capacity);
-    EXPECT_EQ(EC_ERROR, manager.GetCapacitySnapshots().at("pool").refresh_code);
-    backend->result = {EC_OK, 0};
-    manager.RefreshCapacities();
+    backend->snapshot = {0, 1001, 200000, EC_OK};
     EXPECT_EQ(0, manager.GetCapacitySnapshots().at("pool").capacity);
     EXPECT_EQ(EC_OK, manager.UnRegisterStorage("pool"));
     EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
@@ -177,25 +166,17 @@ TEST_F(DataStorageManagerTest, CapacityRefreshRetainsLastGoodAndResetsOnRemoval)
     EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
 }
 
-TEST_F(DataStorageManagerTest, CapacityQueryDoesNotBlockSnapshotReaders) {
+TEST_F(DataStorageManagerTest, CapacitySnapshotsDistinguishUnsupportedAndInvalidObservations) {
     DataStorageManager manager(metrics_registry_);
+    manager.storage_map_["unsupported"] = std::make_shared<DummyBackend>(metrics_registry_);
     auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
-    std::promise<void> started;
-    std::promise<void> release;
-    auto released = release.get_future().share();
-    backend->on_query = [&]() {
-        started.set_value();
-        released.wait();
-    };
-    manager.storage_map_["pool"] = backend;
-    auto refresh = std::async(std::launch::async, [&]() { manager.RefreshCapacities(); });
-    started.get_future().wait();
-    auto read = std::async(std::launch::async, [&]() { return manager.GetCapacitySnapshots(); });
-    const auto state = read.wait_for(std::chrono::seconds(1));
-    release.set_value();
-    EXPECT_EQ(std::future_status::ready, state);
-    refresh.get();
-    EXPECT_TRUE(read.get().count("pool"));
+    backend->snapshot.refresh_code = EC_OK; // Invalid success with an unknown capacity.
+    manager.storage_map_["invalid"] = backend;
+    const auto snapshots = manager.GetCapacitySnapshots();
+    EXPECT_EQ(EC_UNIMPLEMENTED, snapshots.at("unsupported").refresh_code);
+    EXPECT_EQ(-1, snapshots.at("unsupported").capacity);
+    EXPECT_EQ(EC_ERROR, snapshots.at("invalid").refresh_code);
+    EXPECT_EQ(-1, snapshots.at("invalid").capacity);
 }
 
 TEST_F(DataStorageManagerTest, TestSimple) {

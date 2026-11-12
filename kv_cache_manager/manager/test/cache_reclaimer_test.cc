@@ -96,6 +96,8 @@ public:
         : DataStorageBackend(std::move(metrics_registry)), type_(type) {}
 
     DataStorageType GetType() override { return type_; }
+    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot snapshot;
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &trace_id) const override {
         static_cast<void>(trace_id);
@@ -2289,7 +2291,8 @@ TEST_F(CacheReclaimerTest, UnknownAndExpiredAutoQuotaNeverTriggerTypeEviction) {
     group->set_quota(InstanceGroupQuota(-1, {automatic}));
     rm_->instance_group_configs_[group->name()] = group;
     rm_->data_storage_manager_ = dsm_;
-    dsm_->storage_map_["dram"] = std::make_shared<TypedTestBackend>(mr_, type);
+    auto dram_backend = std::make_shared<TypedTestBackend>(mr_, type);
+    dsm_->storage_map_["dram"] = dram_backend;
     key_count = 0;
     max_key_count = 100;
     cache_reclaimer_->job_state_flag_ = true;
@@ -2303,14 +2306,14 @@ TEST_F(CacheReclaimerTest, UnknownAndExpiredAutoQuotaNeverTriggerTypeEviction) {
     auto water = check();
     ASSERT_NE(nullptr, water);
     EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water));
-    dsm_->capacity_snapshots_["dram"] = {100, 1000, TimestampUtil::GetSteadyTimeUs() - 31000000, EC_ERROR};
+    dram_backend->snapshot = {100, 1000, TimestampUtil::GetSteadyTimeUs() - 31000000, EC_ERROR};
     water = check();
     EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water));
-    dsm_->capacity_snapshots_["dram"] = {100, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    dram_backend->snapshot = {100, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
     water = check();
     EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
     EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
-    dsm_->capacity_snapshots_["dram"].capacity = 0;
+    dram_backend->snapshot.capacity = 0;
     water = check();
     EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
 }

@@ -26,7 +26,7 @@
 
 ## 容量口径与失败保护
 
-`DataStorageBackend::GetStorageCapacity` 返回指定介质可分配的**总字节数**和独立错误码，不返回剩余空闲容量。未实现时返回 `EC_UNIMPLEMENTED`，不能以成功零值代替。
+`DataStorageBackend::GetStorageCapacity()` 读取指定介质**总字节数**的内存快照，包含最近成功容量、成功时间和最近刷新结果。接口禁止网络/磁盘 I/O，不触发同步刷新，不等待首次采集或正在执行的刷新。后端负责异步采集及保留最近成功值；首次未知立即返回未知，未实现时立即返回 `EC_UNIMPLEMENTED`，不能以成功零值代替。`DataStorageManager` 只汇集各后端快照，不保存第二份容量缓存，也不创建采集线程。
 
 TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
 
@@ -43,7 +43,7 @@ TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provide
 
 透明模式不支持显式 DRAM 或独立 `pace_ssd` 自动预算，避免同一 SSD 容量重复用于两个类型。透明模式明确报告 tiering 已关闭时只计 DRAM；开启时 SSD 数据缺失、为零或溢出，整个样本失败，不能发布较小的 DRAM 部分值。分层已开启但缺少模式时，容量未知。共享远端 tier 需要独立的 owner quota 口径，不能把每个 provider 的 SSD 字段相加，当前自动容量返回不支持。
 
-DataStorageManager 注册第一个后端后立即启动采集，以 10 秒为目标周期串行轮询；各查询受后端超时约束。变化到成功观察的时延上界约为 10 秒加排队及查询耗时。写入、回收、迁移和 Admin 查询只读内存快照，不发容量查询。监控另有最多约 5 秒的 recorder 采样延迟。
+TairMempool 复用原有探活/节点同步循环，每轮读取一次 memnode，分别更新节点集合、容量和物理 DRAM 使用率。`GetStorageCapacity()` 与原有 `GetStorageUsageRatio()` 都只读缓存；监控和 quota 读取不再各自请求 meta。容量字段无效时保留成功容量及其时间，仍可更新有效的节点信息和 DRAM 水位；原有后端水位的统计口径和错误返回语义保留。正常循环约 10 秒，失败探活的重试、查询超时会增加间隔，过期判定仍以最近成功时间为准。监控另有最多约 5 秒的 recorder 采样延迟。
 
 | 状态 | 展示容量 | 新分配 | 按该类型容量水位回收/迁移 |
 | --- | --- | --- | --- |

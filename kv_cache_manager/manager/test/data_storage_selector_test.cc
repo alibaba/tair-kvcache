@@ -34,6 +34,14 @@
 
 using namespace kv_cache_manager;
 
+template <typename Backend>
+class CapacityTestBackend : public Backend {
+public:
+    using Backend::Backend;
+    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot snapshot;
+};
+
 ErrorCode ec_g;
 
 std::shared_ptr<InstanceGroup> InstanceGroupFactory() {
@@ -200,13 +208,13 @@ public:
             std::make_shared<MetaIndexerManager>(), std::make_shared<RegistryManager>("foo", metrics_registry_));
 
         // initially we have 2 backends, both opened and available
-        const auto sb0 = std::make_shared<NfsBackend>(metrics_registry_);
+        const auto sb0 = std::make_shared<CapacityTestBackend<NfsBackend>>(metrics_registry_);
         sb0->config_.set_global_unique_name("nfs_storage_00");
         sb0->is_open_ = true;
         sb0->is_available_ = true;
         avail_backends_g.emplace_back(sb0);
 
-        const auto sb1 = std::make_shared<Hf3fsBackend>(metrics_registry_);
+        const auto sb1 = std::make_shared<CapacityTestBackend<Hf3fsBackend>>(metrics_registry_);
         sb1->config_.set_global_unique_name("3fs_storage_01");
         sb1->is_open_ = true;
         sb1->is_available_ = true;
@@ -719,13 +727,14 @@ TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabili
 TEST_F(DataStorageSelectorTest, QuotaResolutionKeepsTheCapturedConfigurationDuringAnUpdate) {
     const auto registry = data_storage_selector_->registry_manager_;
     registry->data_storage_manager_ = data_storage_manager_g;
-    auto second = std::make_shared<Hf3fsBackend>(metrics_registry_);
+    auto second = std::make_shared<CapacityTestBackend<Hf3fsBackend>>(metrics_registry_);
     second->config_.set_global_unique_name("3fs_storage_02");
     data_storage_manager_g->storage_map_["3fs_storage_01"] = avail_backends_g[1];
     data_storage_manager_g->storage_map_["3fs_storage_02"] = second;
     const auto now = TimestampUtil::GetSteadyTimeUs();
-    data_storage_manager_g->capacity_snapshots_["3fs_storage_01"] = {100, 1000, now, EC_OK};
-    data_storage_manager_g->capacity_snapshots_["3fs_storage_02"] = {200, 1000, now, EC_OK};
+    std::static_pointer_cast<CapacityTestBackend<Hf3fsBackend>>(avail_backends_g[1])->snapshot = {
+        100, 1000, now, EC_OK};
+    second->snapshot = {200, 1000, now, EC_OK};
     QuotaConfig quota(0, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     quota.set_mode("auto");
     quota.set_ratio(0.5);
@@ -758,7 +767,7 @@ TEST_F(DataStorageSelectorTest, AutomaticDefaultsRequireAnAssociationForExplicit
     // Adding NFS to the group automatically creates its quota, even though the
     // only explicit override is the fixed HF3FS entry.
     instance_group_g->set_storage_candidates({"3fs_storage_01", "nfs_storage_00"});
-    data_storage_manager_g->capacity_snapshots_["nfs_storage_00"] = {
+    std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot = {
         200, 1000, TimestampUtil::GetSteadyTimeUs(), EC_OK};
     admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
@@ -781,8 +790,9 @@ TEST_F(DataStorageSelectorTest, UnlimitedTotalUsesDynamicTypeQuotaForNormalAndEx
     meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2000);
     meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 10);
     const auto now = TimestampUtil::GetSteadyTimeUs();
-    data_storage_manager_g->capacity_snapshots_["nfs_storage_00"] = {100, 1000, now, EC_OK};
-    data_storage_manager_g->capacity_snapshots_["3fs_storage_01"] = {100, 1000, now, EC_OK};
+    std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot = {100, 1000, now, EC_OK};
+    std::static_pointer_cast<CapacityTestBackend<Hf3fsBackend>>(avail_backends_g[1])->snapshot = {
+        100, 1000, now, EC_OK};
 
     auto selected =
         data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), instance_group_g->name());
@@ -796,7 +806,7 @@ TEST_F(DataStorageSelectorTest, UnlimitedTotalUsesDynamicTypeQuotaForNormalAndEx
 
     // Short failures keep the existing budget; expired data blocks allocation
     // without changing the observed capacity to zero.
-    auto &snapshot = data_storage_manager_g->capacity_snapshots_["nfs_storage_00"];
+    auto &snapshot = std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot;
     snapshot.refresh_code = EC_ERROR;
     admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
