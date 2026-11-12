@@ -242,18 +242,19 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
     ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
-    ClientMemoryRegistrations memory_registrations;
-    memory_registrations.host = prepared_registration;
-    memory_registrations.gpu.push_back({reinterpret_cast<void *>(0x1000), 4096, 0});
+    std::vector<SharedMemoryRegistration> host_registrations{prepared_registration};
+    std::vector<GpuMemorySpan> gpu_registrations{{reinterpret_cast<void *>(0x1000), 4096, 0}};
 
     for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
                             DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
-        ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &memory_registrations));
+        ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, host_registrations, gpu_registrations));
         EXPECT_EQ(config->shm_fd(), prepared_registration.fd);
         EXPECT_EQ(config->shm_size(), registration.size);
         EXPECT_EQ(config->client_base(), registration.base);
+        ASSERT_EQ(config->host_memory_spans().size(), 1u);
+        EXPECT_EQ(config->host_memory_spans()[0].base, registration.base);
         ASSERT_EQ(config->gpu_memory_spans().size(), 1u);
         EXPECT_EQ(config->gpu_memory_spans()[0].base, reinterpret_cast<void *>(0x1000));
         EXPECT_EQ(config->gpu_memory_spans()[0].size, 4096u);
@@ -261,6 +262,71 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     }
 
     ASSERT_EQ(fclose(file), 0);
+}
+
+TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigCarriesEveryHostSpanInOrder) {
+    std::vector<SharedMemoryRegistration> host_registrations;
+    for (size_t i = 0; i < 3; ++i) {
+        auto *base = static_cast<uint8_t *>(init_params_.regist_span->base) + 4096 * i;
+        host_registrations.push_back(SharedMemoryRegistration{base, 4096 * (i + 1), 100 + static_cast<int>(i)});
+    }
+
+    SdkWrapper sdk_wrapper;
+    auto config = std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, host_registrations, {}));
+
+    const auto &spans = config->host_memory_spans();
+    ASSERT_EQ(spans.size(), host_registrations.size());
+    for (size_t i = 0; i < spans.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(spans[i].base, host_registrations[i].base);
+        EXPECT_EQ(spans[i].size, host_registrations[i].size);
+        EXPECT_EQ(spans[i].fd, host_registrations[i].fd);
+    }
+    // The legacy single-segment fields mirror the first span.
+    EXPECT_EQ(config->shm_fd(), host_registrations.front().fd);
+    EXPECT_EQ(config->shm_size(), host_registrations.front().size);
+    EXPECT_EQ(config->client_base(), host_registrations.front().base);
+}
+
+TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithoutHostSpansClearsLegacyFields) {
+    SdkWrapper sdk_wrapper;
+    auto config = std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    config->set_shm_fd(42);
+    config->set_shm_size(1024);
+    config->set_client_base(init_params_.regist_span->base);
+
+    ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, {}, {}));
+    EXPECT_TRUE(config->host_memory_spans().empty());
+    EXPECT_EQ(config->shm_fd(), -1);
+    EXPECT_EQ(config->shm_size(), 0u);
+    EXPECT_EQ(config->client_base(), nullptr);
+}
+
+TEST_F(SdkWrapperTest, TestInitOwnsOneFdPerHostSpan) {
+    std::vector<FILE *> files;
+    std::vector<SharedMemoryRegistration> host_registrations;
+    for (size_t i = 0; i < 2; ++i) {
+        FILE *file = tmpfile();
+        ASSERT_NE(file, nullptr);
+        files.push_back(file);
+        ASSERT_EQ(ftruncate(fileno(file), 4096), 0);
+        auto *base = static_cast<uint8_t *>(init_params_.regist_span->base) + 4096 * i;
+        host_registrations.push_back(SharedMemoryRegistration{base, 4096, fileno(file)});
+    }
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_, host_registrations));
+    ASSERT_EQ(sdk_wrapper.owned_shm_fds_.size(), host_registrations.size());
+    for (size_t i = 0; i < host_registrations.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_NE(sdk_wrapper.owned_shm_fds_[i], host_registrations[i].fd);
+        struct stat file_stat{};
+        EXPECT_EQ(fstat(sdk_wrapper.owned_shm_fds_[i], &file_stat), 0);
+    }
+    for (FILE *file : files) {
+        ASSERT_EQ(fclose(file), 0);
+    }
 }
 
 // TODO: mock mooncake
@@ -332,19 +398,71 @@ TEST_F(SdkWrapperTest, TestGetSdk) {
 TEST_F(SdkWrapperTest, TestUpdateMooncakeSdkConfig) {
     SdkWrapper sdk_wrapper;
     RegistSpan span;
+    span.base = init_params_.regist_span->base;
+    span.size = init_params_.regist_span->size;
     auto sdk_backend_config =
         client_config_->sdk_wrapper_config()->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_TRUE(sdk_backend_config);
     ASSERT_EQ(ER_OK, sdk_wrapper.UpdateMooncakeSdkConfig(sdk_backend_config, nullptr, ""));
     ASSERT_EQ(ER_OK, sdk_wrapper.UpdateMooncakeSdkConfig(sdk_backend_config, &span, ""));
-#ifdef ENABLE_MOONCAKE
+
+    // Mooncake takes exactly the span it is handed: a caller that only fills the
+    // multi-segment host list leaves it null, and that must fail loudly instead of
+    // silently covering just the first segment.
     auto mooncake_config = std::make_shared<MooncakeSdkConfig>();
-    mooncake_config->set_type(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     mooncake_config->set_location("*");
     mooncake_config->set_put_replica_num(2);
-    ASSERT_EQ(ER_INVALID_PARAMS, sdk_wrapper.UpdateMooncakeSdkConfig(mooncake_config, nullptr, ""));
-    ASSERT_EQ(ER_OK, sdk_wrapper.UpdateMooncakeSdkConfig(mooncake_config, &span, ""));
-#endif
+    ASSERT_EQ(ER_INVALID_PARAMS, sdk_wrapper.UpdateMooncakeSdkConfig(mooncake_config, nullptr, "tp0"));
+    EXPECT_EQ(nullptr, mooncake_config->local_mem_ptr());
+    EXPECT_EQ(0u, mooncake_config->local_buffer_size());
+
+    ASSERT_EQ(ER_OK, sdk_wrapper.UpdateMooncakeSdkConfig(mooncake_config, &span, "tp0"));
+    EXPECT_EQ(mooncake_config->local_mem_ptr(), span.base);
+    EXPECT_EQ(mooncake_config->local_buffer_size(), span.size);
+    EXPECT_EQ("tp0", mooncake_config->self_location_spec_name());
+}
+
+TEST_F(SdkWrapperTest, TestInitMooncakeRequiresOneHostRegion) {
+    auto client_config = std::make_unique<ClientConfig>();
+    ASSERT_TRUE(client_config->FromJsonString(R"({
+        "instance_group": "group",
+        "instance_id": "instance",
+        "address": ["127.0.0.1:8080"],
+        "block_size": 128,
+        "sdk_config": {
+            "thread_num": 8,
+            "queue_size": 2000,
+            "sdk_backend_configs": [{"type": "mooncake", "location": "*", "put_replica_num": 1}],
+            "timeout_config": {"put_timeout_ms": 2000, "get_timeout_ms": 2000}
+        },
+        "model_deployment": {
+            "model_name": "test_model",
+            "dtype": "FP8",
+            "use_mla": false,
+            "tp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1
+        },
+        "location_spec_infos": {"tp0": 1024}
+    })"));
+    InitParams params = init_params_;
+    params.storage_configs = R"([{"type": "mooncake", "global_unique_name": "mooncake_test", "storage_spec": {}}])";
+
+    // No single host region (e.g. a caller that filled several segments): mooncake
+    // is rejected while configuring it, so the failure names the real cause and
+    // happens before the SDK is created.
+    params.regist_span = nullptr;
+    {
+        SdkWrapper sdk_wrapper;
+        EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.Init(client_config, params));
+    }
+    // With the single region present, configuration passes; creating the SDK is
+    // what fails next, and only because this build has no mooncake support.
+    params.regist_span = init_params_.regist_span;
+    {
+        SdkWrapper sdk_wrapper;
+        EXPECT_NE(ER_INVALID_PARAMS, sdk_wrapper.Init(client_config, params));
+    }
 }
 
 // ============================================================================

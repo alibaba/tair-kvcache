@@ -13,12 +13,18 @@
 
 ## C++ memory registration
 
-`TransferClient::Create` accepts either a `SharedMemoryRegistration` for host
-shared memory or `ClientMemoryRegistrations` for host and GPU memory. The
-registration object does not own GPU allocations; callers must keep them alive
-until the `TransferClient` is destroyed.
+`TransferClient::Create` accepts a `SharedMemoryRegistration` for one host
+shared-memory segment, `ClientMemoryRegistrations` for that segment plus GPU
+memory, or a `std::vector<SharedMemoryRegistration>` (`+ optional
+std::vector<GpuMemorySpan>`) for several host segments. The vector overload
+registers every segment in submission order; an empty vector registers no host
+memory. `ClientMemoryRegistrations` keeps its single `host` field because it is
+part of the published `include/` ABI — do not add fields to it, add an overload.
 
-Because both registration types are accepted by overloads, brace-only calls
+The registration object owns neither the host mappings nor the GPU allocations;
+callers must keep them alive until the `TransferClient` is destroyed.
+
+Because several registration types are accepted by overloads, brace-only calls
 that previously selected the host registration overload are ambiguous in
 C++17. Name the intended type explicitly:
 
@@ -32,8 +38,13 @@ auto host_client = TransferClient::Create(
     SharedMemoryRegistration{host_base, host_size, host_fd});
 
 ClientMemoryRegistrations registrations;
+registrations.host = SharedMemoryRegistration{host_base, host_size, host_fd};
 registrations.gpu.push_back(GpuMemorySpan{gpu_base, gpu_size, device_id});
 auto gpu_client = TransferClient::Create(client_config, init_params, registrations);
+
+std::vector<SharedMemoryRegistration> host_registrations{
+    {host_base, host_size, host_fd}, {other_base, other_size, other_fd}};
+auto multi_host_client = TransferClient::Create(client_config, init_params, host_registrations);
 ```
 
 Do not pass an untyped `{}` or `{base, size, fd}` as the third argument. This

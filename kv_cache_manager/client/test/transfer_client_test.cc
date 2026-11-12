@@ -1,10 +1,12 @@
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <unistd.h>
+#include <vector>
 
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -129,6 +131,27 @@ TEST_F(TransferClientTest, TestCreateWithMemoryRegistrations) {
     ClientMemoryRegistrations registrations;
     auto client = TransferClient::Create(client_config_, init_params_, registrations);
     EXPECT_NE(client, nullptr);
+}
+
+TEST_F(TransferClientTest, TestCreateWithHostRegistrationList) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    auto *base = static_cast<uint8_t *>(init_params_.regist_span->base);
+    std::vector<SharedMemoryRegistration> host_registrations{
+        SharedMemoryRegistration{base, 4096, fileno(file)},
+        SharedMemoryRegistration{base + 4096, 4096, fileno(file)},
+    };
+    auto client = TransferClient::Create(client_config_, init_params_, host_registrations);
+    EXPECT_NE(client, nullptr);
+    client.reset();
+
+    // Every segment is validated, not just the first one.
+    host_registrations.back().base = nullptr;
+    EXPECT_EQ(TransferClient::Create(client_config_, init_params_, host_registrations), nullptr);
+
+    ASSERT_EQ(fclose(file), 0);
 }
 
 TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {

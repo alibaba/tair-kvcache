@@ -22,15 +22,18 @@ SdkWrapper::~SdkWrapper() {
         wait_task_thread_pool_.reset();
     }
     sdk_map_.clear();
-    if (owned_shm_fd_ >= 0) {
-        close(owned_shm_fd_);
-        owned_shm_fd_ = -1;
+    for (int fd : owned_shm_fds_) {
+        if (fd >= 0) {
+            close(fd);
+        }
     }
+    owned_shm_fds_.clear();
 }
 
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
-                                 const ClientMemoryRegistrations *memory_registrations) {
+                                 const std::vector<SharedMemoryRegistration> &host_registrations,
+                                 const std::vector<GpuMemorySpan> &gpu_registrations) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
@@ -50,23 +53,17 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
         return ER_INVALID_STORAGE_CONFIG;
     }
 
-    SharedMemoryRegistration prepared_registration;
-    const SharedMemoryRegistration *active_registration = nullptr;
-    if (memory_registrations != nullptr) {
-        auto ec = PrepareSharedMemoryRegistration(memory_registrations->host, prepared_registration);
+    std::vector<SharedMemoryRegistration> prepared_host_registrations;
+    prepared_host_registrations.reserve(host_registrations.size());
+    for (const auto &host : host_registrations) {
+        SharedMemoryRegistration prepared_registration;
+        auto ec = PrepareSharedMemoryRegistration(host, prepared_registration);
         if (ec != ER_OK) {
             return ec;
         }
         if (prepared_registration.fd >= 0) {
-            active_registration = &prepared_registration;
+            prepared_host_registrations.push_back(prepared_registration);
         }
-    }
-    ClientMemoryRegistrations prepared_memory_registrations;
-    if (active_registration != nullptr) {
-        prepared_memory_registrations.host = *active_registration;
-    }
-    if (memory_registrations != nullptr) {
-        prepared_memory_registrations.gpu = memory_registrations->gpu;
     }
 
     wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(
@@ -104,8 +101,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
-        ec = UpdateTairMempoolSdkConfig(
-            sdk_backend_config, memory_registrations == nullptr ? nullptr : &prepared_memory_registrations);
+        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, prepared_host_registrations, gpu_registrations);
         if (ec != ER_OK) {
             KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
@@ -428,17 +424,15 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
         KVCM_LOG_WARN("duplicate shared memory fd failed");
         return ER_INVALID_PARAMS;
     }
-    if (owned_shm_fd_ >= 0) {
-        close(owned_shm_fd_);
-    }
-    owned_shm_fd_ = duplicated_fd;
+    owned_shm_fds_.push_back(duplicated_fd);
     prepared_registration = shared_memory_registration;
-    prepared_registration.fd = owned_shm_fd_;
+    prepared_registration.fd = duplicated_fd;
     return ER_OK;
 }
 
 ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                                       const ClientMemoryRegistrations *memory_registrations) {
+                                                      const std::vector<SharedMemoryRegistration> &host_registrations,
+                                                      const std::vector<GpuMemorySpan> &gpu_registrations) {
     if (!IsTairMempoolStorageType(sdk_backend_config->type())) {
         return ER_OK;
     }
@@ -447,15 +441,13 @@ ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<Sdk
         KVCM_LOG_WARN("convert to tair mempool config failed");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-    if (memory_registrations == nullptr) {
-        return ER_OK;
-    }
-    if (memory_registrations->host.fd >= 0) {
-        config->set_shm_fd(memory_registrations->host.fd);
-        config->set_shm_size(memory_registrations->host.size);
-        config->set_client_base(memory_registrations->host.base);
-    }
-    config->set_gpu_memory_spans(memory_registrations->gpu);
+    // Legacy single-segment fields mirror the first span so old callers keep working.
+    const SharedMemoryRegistration *first = host_registrations.empty() ? nullptr : &host_registrations.front();
+    config->set_shm_fd(first == nullptr ? -1 : first->fd);
+    config->set_shm_size(first == nullptr ? 0 : first->size);
+    config->set_client_base(first == nullptr ? nullptr : first->base);
+    config->set_host_memory_spans(host_registrations);
+    config->set_gpu_memory_spans(gpu_registrations);
     return ER_OK;
 }
 
