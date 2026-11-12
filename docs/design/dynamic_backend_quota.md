@@ -30,6 +30,8 @@
 
 TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
 
+Provider 的心跳或连接异常不能视为确认缩容：运行中但不健康、连接可疑/失败或错误状态会使整个容量样本失败，沿用最近成功值及过期策略，避免异常节点被过滤后发布部分容量甚至零容量。明确删除状态及成功完整快照中消失的节点仍正常减少容量。拓扑中的不健康 provider 仍可能持有有效 GA，不能仅凭健康状态判定数据不存在；memnode 刷新失败后，旧拓扑也不再用于否定新节点上的 location，直到下一次成功刷新。
+
 容量与实际分配模式对齐：
 
 | 后端模式 | KVCM 类型与分配介质 | 自动容量基数 |
