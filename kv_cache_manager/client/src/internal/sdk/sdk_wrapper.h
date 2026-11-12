@@ -27,10 +27,13 @@ public:
                          const ClientMemoryRegistrations *memory_registrations = nullptr,
                          bool wait_for_completion = false);
 
-    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
+    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
+                        const BlockBuffers &local_buffers,
+                        int64_t parent_deadline_ms = 0);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris);
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                        int64_t parent_deadline_ms = 0);
 
 private:
     enum class OpType : uint8_t {
@@ -55,8 +58,10 @@ private:
                                std::vector<SdkGroup> &groups);
 
     std::string getOpTypeString(OpType op_type) const;
-    ClientErrorCode
-    RunWithTimeoutParallel(OpType op_type, std::vector<std::function<ClientErrorCode()>> &&tasks, int timeout_ms) const;
+    ClientErrorCode RunWithTimeoutParallel(OpType op_type,
+                                           std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                           int timeout_ms,
+                                           int64_t deadline_ms = 0) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);

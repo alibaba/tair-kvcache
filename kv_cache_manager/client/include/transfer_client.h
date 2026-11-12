@@ -35,6 +35,22 @@ public:
                  const BlockBuffers &block_buffers,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
+    // Absolute steady_clock milliseconds, in this process; <=0 uses the configured
+    // SDK budget. Wrapping clients override these methods to forward the deadline.
+    virtual ClientErrorCode LoadKvCachesWithDeadline(const UriStrVec &uri_str_vec,
+                                                     const BlockBuffers &block_buffers,
+                                                     int64_t /*deadline_ms*/,
+                                                     std::shared_ptr<TransferTraceInfo> trace_info = nullptr) {
+        return LoadKvCaches(uri_str_vec, block_buffers, std::move(trace_info));
+    }
+    virtual std::pair<ClientErrorCode, UriStrVec>
+    SaveKvCachesWithDeadline(const UriStrVec &uri_str_vec,
+                             const BlockBuffers &block_buffers,
+                             int64_t /*deadline_ms*/,
+                             std::shared_ptr<TransferTraceInfo> trace_info = nullptr) {
+        return SaveKvCaches(uri_str_vec, block_buffers, std::move(trace_info));
+    }
+
 protected:
     TransferClient() = default;
     virtual ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) = 0;
