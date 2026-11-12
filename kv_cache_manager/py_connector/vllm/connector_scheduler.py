@@ -841,6 +841,18 @@ class ConnectorScheduler:
                     state_complete_mask.count(False),
                     target_save_num,
                 )
+        # Symmetric with the reader's "no location" line: the writer sends a
+        # *truncated* token list (all_token_ids[:target*mbs]) while the reader
+        # sends the whole prompt, so "key[0] only depends on the first block"
+        # is a theory until the two integers are compared side by side.
+        keys = manager_block_keys(token_ids, self._manager_block_size)
+        if len(keys) <= 4:
+            logger.info(
+                "req:%s save keys: n_tokens=%d block_keys=%s",
+                req_id,
+                len(token_ids),
+                keys,
+            )
         response = None
         last_error: Optional[Exception] = None
         for attempt in range(_START_WRITE_ATTEMPTS):
