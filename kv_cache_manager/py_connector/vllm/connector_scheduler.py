@@ -32,6 +32,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.location_query_manager import (
+    manager_block_keys,
     LocationQueryManager,
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
