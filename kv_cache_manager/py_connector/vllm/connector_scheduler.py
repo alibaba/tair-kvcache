@@ -32,6 +32,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.location_query_manager import (
+    manager_block_keys,
     LocationQueryManager,
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
@@ -799,6 +800,16 @@ class ConnectorScheduler:
                     state_complete_mask.count(False),
                     target_save_num,
                 )
+        # Reader and writer use the same block-key derivation. Log the keys for
+# short writes to compare both paths without recording complete token lists.
+        keys = manager_block_keys(token_ids, self._manager_block_size)
+        if len(keys) <= 4:
+            logger.info(
+                "req:%s save keys: n_tokens=%d block_keys=%s",
+                req_id,
+                len(token_ids),
+                keys,
+            )
         response = None
         last_error: Optional[Exception] = None
         for attempt in range(_START_WRITE_ATTEMPTS):
