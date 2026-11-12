@@ -232,8 +232,11 @@ struct GpuMemorySpan {
 };
 
 struct ClientMemoryRegistrations {
-    // A default-constructed host registration means that only GPU memory, or no
-    // external memory, is registered.
+    // Single host segment, kept so callers compiled against older headers keep
+    // working: this struct is part of the published include/ ABI. Multiple host
+    // segments go through TransferClient::Create's
+    // std::vector<SharedMemoryRegistration> overload.
+    // A default-constructed host registration means no host memory is registered.
     SharedMemoryRegistration host;
     std::vector<GpuMemorySpan> gpu;
 };
