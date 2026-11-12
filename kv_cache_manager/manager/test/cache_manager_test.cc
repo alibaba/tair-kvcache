@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 
@@ -76,6 +77,59 @@ ErrorCode BatchAddLocationForTest(const std::shared_ptr<MetaSearcher> &meta_sear
     return ec;
 }
 } // namespace
+
+namespace parallel_recover_stub {
+struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t active = 0;
+    size_t max_active = 0;
+    size_t calls = 0;
+    bool released = false;
+    bool fail_first = false;
+    bool throw_first = false;
+    bool shared_context = false;
+    bool wrong_trace = false;
+    std::set<RequestContext *> active_contexts;
+    std::set<std::string> visited;
+
+    bool WaitForActive(size_t count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(5), [&] { return active >= count; });
+    }
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+};
+State *state = nullptr;
+
+ErrorCode TryCreate(void *, RequestContext *context, const std::string &instance_id) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const size_t call = ++state->calls;
+    state->visited.insert(instance_id);
+    if (context->trace_id() != "cache_manager_recover_trace/" + instance_id) {
+        state->wrong_trace = true;
+    }
+    if (call == 1 && state->throw_first) {
+        throw std::runtime_error("injected instance recovery failure");
+    }
+    if (call == 1 && state->fail_first) {
+        return EC_ERROR;
+    }
+    ++state->active;
+    state->max_active = std::max(state->active, state->max_active);
+    if (!state->active_contexts.insert(context).second) {
+        state->shared_context = true;
+    }
+    state->cv.notify_all();
+    state->cv.wait(lock, [] { return state->released; });
+    state->active_contexts.erase(context);
+    --state->active;
+    return EC_OK;
+}
+} // namespace parallel_recover_stub
 
 namespace mark_query_read_error_stub {
 ErrorCode ReadError_stub(void * /*obj*/,
@@ -8417,6 +8471,126 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
                 << "key index " << i << " should have 2 F0 specs after filtering";
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestParallelRecoverIsBoundedAndJoinsAllWorkers) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "3");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (int i = 0; i < 6; ++i) {
+            const auto id = "parallel_instance_" + std::to_string(i);
+            registry_manager_->instance_infos_[id] = std::make_shared<InstanceInfo>(
+                "test_quota_group", "default", id, 64, createLocationSpecInfos(), createModelDeployment());
+        }
+    }
+    parallel_recover_stub::State state;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
+    const bool overlapped = state.WaitForActive(3);
+    EXPECT_EQ(std::future_status::timeout, recovery.wait_for(std::chrono::milliseconds(0)));
+    state.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_TRUE(overlapped);
+    EXPECT_EQ(3, state.max_active);
+    EXPECT_EQ(7, state.calls);
+    EXPECT_EQ(7, state.visited.size());
+    EXPECT_FALSE(state.shared_context);
+    EXPECT_FALSE(state.wrong_trace);
+}
+
+TEST_F(CacheManagerTest, TestParallelRecoverRetainsPartialFailureAndRetriesEveryInstance) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "2");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        registry_manager_->instance_infos_["another_instance"] = std::make_shared<InstanceInfo>(
+            "test_quota_group", "default", "another_instance", 64, createLocationSpecInfos(), createModelDeployment());
+    }
+    for (const bool throw_first : {false, true}) {
+        SCOPED_TRACE(throw_first ? "exception" : "error code");
+        parallel_recover_stub::State state;
+        state.fail_first = !throw_first;
+        state.throw_first = throw_first;
+        state.released = true;
+        parallel_recover_stub::state = &state;
+        Stub stub;
+        stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+        EXPECT_EQ(EC_OK, cache_manager_->DoRecover());
+        EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
+        cache_manager_->StopRecoverRetryLoop();
+        EXPECT_EQ(2, state.calls);
+        EXPECT_EQ(2, state.visited.size());
+
+        state.calls = 0;
+        state.fail_first = false;
+        state.throw_first = false;
+        EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+        EXPECT_EQ(2, state.calls);
+    }
+}
+
+TEST_F(CacheManagerTest, TestRecoverySnapshotDoesNotRegisterInstancesRemovedBeforeExecution) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (int i = 0; i < 3; ++i) {
+            const auto id = "removed_before_recover_" + std::to_string(i);
+            registry_manager_->instance_infos_[id] = std::make_shared<InstanceInfo>(
+                "test_quota_group", "default", id, 64, createLocationSpecInfos(), createModelDeployment());
+        }
+    }
+    parallel_recover_stub::State state;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
+    const bool blocked = state.WaitForActive(1);
+    std::string current;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.visited.empty()) {
+            current = *state.visited.begin();
+        }
+    }
+    // Simulate the registry no longer containing queued snapshot entries.
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (auto it = registry_manager_->instance_infos_.begin(); it != registry_manager_->instance_infos_.end();) {
+            if (it->first != current) {
+                it = registry_manager_->instance_infos_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    state.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(1, state.calls);
+    EXPECT_EQ(1, registry_manager_->instance_infos_.size());
+}
+
+TEST_F(CacheManagerTest, TestCleanupWaitsForForegroundRecoveryWorkers) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    parallel_recover_stub::State state;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
+    const bool blocked = state.WaitForActive(1);
+    auto cleanup = std::async(std::launch::async, [&] { return cache_manager_->DoCleanup(); });
+    EXPECT_EQ(std::future_status::timeout, cleanup.wait_for(std::chrono::milliseconds(30)));
+    state.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_EQ(EC_OK, cleanup.get());
+    EXPECT_TRUE(blocked);
+    EXPECT_FALSE(cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_EQ(0, cache_manager_->meta_indexer_manager_->GetIndexerSize());
 }
 
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {

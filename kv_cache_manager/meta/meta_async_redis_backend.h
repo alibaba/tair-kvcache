@@ -156,6 +156,7 @@ private:
 
     // Async config
     int32_t queue_count_ = 8;
+    int32_t open_concurrency_ = 8;
     int64_t max_batch_size_ = 102400;
     int64_t batch_wait_timeout_us_ = 1000000;
     int64_t queue_max_size_ = 102400;

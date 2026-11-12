@@ -1,4 +1,9 @@
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <mutex>
 #include <thread>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -11,6 +16,52 @@
 #include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
+
+namespace {
+
+class IndexerInitializationGate {
+public:
+    void Enter() {
+        std::unique_lock lock(mutex_);
+        ++entered_;
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+    }
+
+    bool WaitForEntered(size_t count) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [this, count] { return entered_ >= count; });
+    }
+
+    void Release() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t entered_ = 0;
+    bool released_ = false;
+};
+
+class ControlledMetaIndexerManager : public MetaIndexerManager {
+public:
+    std::atomic<size_t> init_count{0};
+    std::function<ErrorCode(const std::string &)> initialize;
+
+protected:
+    ErrorCode InitMetaIndexer(const std::shared_ptr<MetaIndexer> &indexer,
+                              const std::string &instance_id,
+                              const std::shared_ptr<MetaIndexerConfig> &config) override {
+        init_count.fetch_add(1);
+        const auto ec = initialize ? initialize(instance_id) : EC_OK;
+        return ec == EC_OK ? MetaIndexerManager::InitMetaIndexer(indexer, instance_id, config) : ec;
+    }
+};
+
+} // namespace
 
 class MetaIndexerManagerTest : public TESTBASE {
 public:
@@ -96,6 +147,136 @@ TEST_F(MetaIndexerManagerTest, TestCreateFailed) {
     std::string id_1 = "1";
     ASSERT_EQ(ErrorCode::EC_ERROR, CreateMetaIndexer(id_1, "test"));
     ASSERT_EQ(0, manager_->GetIndexerSize());
+}
+
+TEST_F(MetaIndexerManagerTest, DifferentInstancesInitializeConcurrentlyWithoutBlockingReaders) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto first = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("first", config); });
+    const bool first_entered = gate.WaitForEntered(1);
+    auto second = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("second", config); });
+    const bool both_entered = gate.WaitForEntered(2);
+    auto read = std::async(std::launch::async, [&] { return manager.GetMetaIndexer("first"); });
+    const auto read_status = read.wait_for(std::chrono::seconds(1));
+    gate.Release();
+    EXPECT_TRUE(first_entered);
+    EXPECT_TRUE(both_entered);
+    EXPECT_EQ(std::future_status::ready, read_status);
+    EXPECT_EQ(nullptr, read.get());
+    EXPECT_EQ(EC_OK, first.get());
+    EXPECT_EQ(EC_OK, second.get());
+    EXPECT_EQ(2, manager.GetIndexerSize());
+}
+
+TEST_F(MetaIndexerManagerTest, SameInstanceInitializesOnceAndPublishesAfterSuccess) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto first = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    const bool entered = gate.WaitForEntered(1);
+    auto second = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("shared"));
+    const auto second_status = second.wait_for(std::chrono::milliseconds(50));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, second_status);
+    EXPECT_EQ(EC_OK, first.get());
+    EXPECT_EQ(EC_EXIST, second.get());
+    EXPECT_EQ(1, manager.init_count.load());
+    EXPECT_NE(nullptr, manager.GetMetaIndexer("shared"));
+}
+
+TEST_F(MetaIndexerManagerTest, CleanupWaitsForInFlightInitializationAndLeavesNoPublishedIndexer) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto create = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> cleanup_started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        cleanup_started.set_value();
+        manager.DoCleanup();
+    });
+    cleanup_started.get_future().wait();
+    const auto cleanup_status = cleanup.wait_for(std::chrono::milliseconds(50));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, cleanup_status);
+    EXPECT_EQ(EC_OK, create.get());
+    cleanup.get();
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("shared"));
+    EXPECT_EQ(0, manager.GetIndexerSize());
+}
+
+TEST_F(MetaIndexerManagerTest, ExtractWaitsForInFlightInitialization) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto create = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> extract_started;
+    auto extract = std::async(std::launch::async, [&] {
+        extract_started.set_value();
+        return manager.ExtractMetaIndexer("shared");
+    });
+    extract_started.get_future().wait();
+    const auto extract_status = extract.wait_for(std::chrono::milliseconds(50));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, extract_status);
+    EXPECT_EQ(EC_OK, create.get());
+    EXPECT_NE(nullptr, extract.get());
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("shared"));
+}
+
+TEST_F(MetaIndexerManagerTest, RestoreWaitsForInFlightInitializationWithoutReplacingIt) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto create = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    const bool entered = gate.WaitForEntered(1);
+    auto restored = std::make_shared<MetaIndexer>();
+    auto restore = std::async(std::launch::async, [&] { return manager.RestoreMetaIndexer("shared", restored); });
+    const auto restore_status = restore.wait_for(std::chrono::milliseconds(50));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, restore_status);
+    EXPECT_EQ(EC_OK, create.get());
+    EXPECT_FALSE(restore.get());
+    EXPECT_NE(restored, manager.GetMetaIndexer("shared"));
+}
+
+TEST_F(MetaIndexerManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
+    ControlledMetaIndexerManager manager;
+    manager.initialize = [](const std::string &) { return EC_ERROR; };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    EXPECT_EQ(EC_ERROR, manager.CreateMetaIndexer("retry", config));
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("retry"));
+    manager.initialize = [](const std::string &) { return EC_OK; };
+    EXPECT_EQ(EC_OK, manager.CreateMetaIndexer("retry", config));
+    EXPECT_NE(nullptr, manager.GetMetaIndexer("retry"));
+    EXPECT_EQ(2, manager.init_count.load());
 }
 
 TEST_F(MetaIndexerManagerTest, TestConfigureQueryExecutorBeforeCreatingIndexers) {

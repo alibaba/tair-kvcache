@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -21,7 +22,7 @@ class MetaIndexerManager {
 public:
     MetaIndexerManager() = default;
 
-    ~MetaIndexerManager() = default;
+    virtual ~MetaIndexerManager() = default;
 
     // Set histogram configuration for revisit interval tracking.
     // Must be called before CreateMetaIndexer.
@@ -50,13 +51,23 @@ public:
 
     void DoCleanup();
 
+protected:
+    // Allows tests to block initialization without holding the map lock.
+    virtual ErrorCode InitMetaIndexer(const std::shared_ptr<MetaIndexer> &indexer,
+                                      const std::string &instance_id,
+                                      const std::shared_ptr<MetaIndexerConfig> &config);
+
 private:
     std::shared_ptr<MetaIndexer> GetMetaIndexerUnsafe(const std::string &instance_id) const;
+    std::shared_ptr<std::mutex> GetInstanceMutex(const std::string &instance_id);
 
 private:
     // instance_id -> MetaIndexer
     std::map<std::string, std::shared_ptr<MetaIndexer>> meta_indexers_;
     mutable std::shared_mutex mutex_;
+    // Lock order: lifecycle -> instance -> map; cleanup waits for initialization.
+    mutable std::shared_mutex lifecycle_mutex_;
+    std::map<std::string, std::shared_ptr<std::mutex>> instance_mutexes_;
 
     // Histogram configuration (shared across all indexers)
     std::shared_ptr<MetricsRegistry> metrics_registry_;

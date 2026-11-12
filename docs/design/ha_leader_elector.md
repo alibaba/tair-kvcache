@@ -174,6 +174,44 @@ Server::Init()
 
 优雅退出也会完成降级清理，将尚未完成的写会话按失败处理。模拟进程崩溃后孤立 WRITING 的集成测试使用 SIGKILL，并在崩溃前确认所需元数据已持久化；SIGTERM 用例单独验证退出前完成未完成写入的清理。
 
+### 4.3 有界并行恢复
+
+逐 Instance 恢复和单个 async Redis backend 的 consumer 建连分别使用有界 worker，默认并发度均为 8。
+每次调用拥有独立 worker，调用线程也参与工作；父任务不会占用同一个线程池等待子任务。
+所有 `RedisClient` 的真实首次建连及重连共用进程级握手上限，默认 64，包含读池懒建、Registry 和协调客户端。
+该上限限制同时进行的握手，不限制已建立连接数、consumer 数或普通 Redis 命令的并发。
+主动健康探测使用独立 hiredis 连接，不经过上述 RedisClient 限流。
+
+恢复步骤及约束：
+
+1. 串行收集 Registry 的 Instance ID 快照，再有界分发。每个任务创建独立 `RequestContext`，在
+   `metrics_lifecycle` 共享锁内重新确认实例仍存在，只创建 Searcher/Indexer，不重新注册快照实例。
+   因此后台重试与 Admin 删除并发时，旧快照不会复活已删除的 Instance。
+2. 两个 Manager 都采用“生命周期锁 → Instance 锁 → map 锁”的顺序。慢 `Init/Open` 不持全局 map 锁，
+   同 ID 只初始化一次，完成后才发布。Extract/Restore 与同 ID 创建互斥；Cleanup 等待已进入的创建完成。
+   跨 Manager 的清理仍由 CacheManager 的生命周期锁和 Server 串行回调保证顺序。
+3. backend 内部各任务创建独立 RedisClient，预先分配结果槽位。任一任务失败或抛出异常，其他 worker 观察到
+   失败标记后停止领取任务；已通过检查的 worker 仍可能启动任务。等待全部已启动任务结束后再清理成功连接。
+   consumer 只在所有连接和队列就绪后启动；启动线程部分失败也会
+   停止、join 并回收已启动的 consumer。每个队列仍独占原连接，FIFO、Sync barrier 和 Instance 隔离不变。
+4. 进程级握手许可按该客户端的 `timeout_ms` 有界等待，超时沿原重试路径处理；许可不覆盖重试退避或普通命令。
+   TCP 建连及握手命令使用原 `timeout_ms`，握手成功后恢复原有普通命令 I/O 超时设置，避免改变稳态大 pipeline
+   的超时契约。排队、TCP 和各握手 I/O 分别计时，`timeout_ms` 不是整次恢复的端到端 deadline。
+   当前 hiredis 的同步 DNS 解析不受此超时限制，且解析时仍占用许可；metadata 解析阻塞可能影响协调 Redis
+   的新建连接或重连，故障验证需覆盖这种竞争。
+5. `DoRecoverOnce` 等待所有已启动 Instance worker 返回；单个实例失败仍继续其他实例。保留既有语义：
+   首轮部分失败时，`DoRecover` 启动后台重试并返回 `EC_OK`，已成功实例可按 Server 原流程提供服务。
+   不等待全量异步回填，不新增按 Instance 开门的协议。Cleanup 先停止并 join 重试，再与同步恢复轮次互斥清理。
+
+Instance 完成日志包含 `completed/total` 与 elapsed 时间，便于区分同步恢复进度和后台回填。
+恢复 worker 全部返回后，Server 仍通过 `RunIfCurrentPromotionValid` 校验本轮租约；恢复期间失锁不会让旧任务
+重新打开门禁。续租由独立 LeaderLock 线程执行，恢复耗时超过 lease 时长本身不代表失租。
+
+以 74 个 Instance、每个 32 条 consumer 连接、完整握手 162 ms 为例，原串行 consumer 建连约 384 秒。
+8 个 Instance × 每个 8 路建连时，理想 consumer 建连等待约为 `ceil(74/8) × ceil(32/8) × 162ms = 6.48s`。
+该值不包含 Registry、读池首连接、metadata 命令、调度和 Redis 负载，不能作为整体恢复 SLA。
+配置见 [并行恢复与 Redis 建连](../configuration.md#leader-并行恢复与-redis-建连)。
+
 ## 5. Leader 发现
 
 ### 5.1 MetaService - GetClusterInfo

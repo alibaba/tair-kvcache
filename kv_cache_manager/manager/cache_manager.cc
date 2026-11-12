@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -21,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/common/bounded_parallel.h"
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -5043,12 +5045,15 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
 }
 
 ErrorCode CacheManager::DoRecoverOnce() {
+    // Cleanup must wait for all instance workers.
+    std::lock_guard<std::mutex> recover_guard(recover_run_mutex_);
     ActivateEventCleanupCallbacks();
     if (!registry_manager_) {
         KVCM_LOG_ERROR("CacheManager do recover failed, registry_manager is nullptr");
         return EC_ERROR;
     }
-    size_t error_count = 0;
+    std::atomic<size_t> error_count{0};
+    std::vector<std::string> instance_ids;
     auto request_context = std::make_shared<RequestContext>("cache_manager_recover_trace");
     auto [ec1, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
     if (ec1 != EC_OK) {
@@ -5066,27 +5071,60 @@ ErrorCode CacheManager::DoRecoverOnce() {
             continue;
         }
         for (const auto &instance_info : instance_infos) {
-            auto [ec3, config_str] = RegisterInstance(request_context.get(),
-                                                      group_name,
-                                                      instance_info->instance_id(),
-                                                      instance_info->block_size(),
-                                                      instance_info->location_spec_infos(),
-                                                      instance_info->model_deployment(),
-                                                      instance_info->location_spec_groups(),
-                                                      static_cast<QueryType>(instance_info->default_query_type()));
-            if (ec3 != EC_OK) {
-                KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
-                              "name[%s] instance_id[%s]",
-                              ec3,
-                              group_name.c_str(),
-                              instance_info->instance_id().c_str());
-                ++error_count;
-                continue;
-            }
-            KVCM_LOG_INFO("CacheManager RegisterInstance success when recover, instance_id[%s], storage_config[%s]",
-                          instance_info->instance_id().c_str(),
-                          config_str.c_str());
+            instance_ids.push_back(instance_info->instance_id());
         }
+    }
+
+    constexpr int32_t kDefaultRecoverConcurrency = 8;
+    int32_t concurrency = EnvUtil::GetEnv<int32_t>(
+        "kvcm.cache_manager.recover_instance_concurrency",
+        EnvUtil::GetEnv<int32_t>("kvcm_cache_manager_recover_instance_concurrency", kDefaultRecoverConcurrency));
+    if (concurrency <= 0 || concurrency > 64) {
+        KVCM_LOG_WARN(
+            "invalid recover_instance_concurrency[%d], using default[%d]", concurrency, kDefaultRecoverConcurrency);
+        concurrency = kDefaultRecoverConcurrency;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    std::atomic<size_t> completed{0};
+    const bool workers_ok = RunBoundedParallel(instance_ids.size(), concurrency, [&](size_t index) {
+        const auto &instance_id = instance_ids[index];
+        try {
+            RequestContext instance_context("cache_manager_recover_trace/" + instance_id);
+            std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
+            // Recheck under the removal fence; never re-register a stale snapshot.
+            const auto instance_info = registry_manager_->GetInstanceInfo(&instance_context, instance_id);
+            if (instance_info) {
+                const auto ec = TryCreateMetaSearcher(&instance_context, instance_id);
+                if (ec != EC_OK) {
+                    ++error_count;
+                    KVCM_LOG_WARN(
+                        "CacheManager recover instance failed, ec[%d] instance_id[%s]", ec, instance_id.c_str());
+                }
+            } else {
+                KVCM_LOG_INFO("CacheManager recover skipped removed instance[%s]", instance_id.c_str());
+            }
+        } catch (const std::exception &e) {
+            ++error_count;
+            KVCM_LOG_ERROR("CacheManager recover instance[%s] threw: %s", instance_id.c_str(), e.what());
+        } catch (...) {
+            ++error_count;
+            KVCM_LOG_ERROR("CacheManager recover instance[%s] threw an unknown exception", instance_id.c_str());
+        }
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+        const size_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+        KVCM_LOG_INFO("CacheManager recover progress[%zu/%zu], instance_id[%s], elapsed_ms[%ld]",
+                      done,
+                      instance_ids.size(),
+                      instance_id.c_str(),
+                      static_cast<int64_t>(elapsed));
+        // Keep recovering other instances after a failure.
+        return true;
+    });
+    if (!workers_ok) {
+        ++error_count;
+        KVCM_LOG_ERROR(
+            "CacheManager recovery workers failed, completed[%zu/%zu]", completed.load(), instance_ids.size());
     }
 
     for (const auto &pending : registry_manager_->ListRemovingInstanceInfos()) {
@@ -5102,8 +5140,8 @@ ErrorCode CacheManager::DoRecoverOnce() {
         ++error_count;
     }
 
-    KVCM_LOG_INFO("CacheManager do recover once done, error_count[%lu]", error_count);
-    return error_count > 0 ? EC_ERROR : EC_OK;
+    KVCM_LOG_INFO("CacheManager do recover once done, error_count[%zu]", error_count.load());
+    return error_count.load() > 0 ? EC_ERROR : EC_OK;
 }
 
 ErrorCode CacheManager::DoRecover() {
@@ -5178,8 +5216,10 @@ ErrorCode CacheManager::DoCleanup() {
     if (cache_garbage_collector_) {
         cache_garbage_collector_->Stop();
     }
-    ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
+    // Join retry before locking: it may be waiting to enter DoRecoverOnce.
+    std::lock_guard<std::mutex> recover_guard(recover_run_mutex_);
+    ClearEventCleanupCallbacks();
     DeactivateEventCleanupCallbacks();
     // aborting write session need meta indexer
     if (write_location_manager_) {

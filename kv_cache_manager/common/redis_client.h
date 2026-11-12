@@ -97,6 +97,7 @@ protected:
 
     // virtual for test
     virtual bool IsContextOk() const;
+    virtual bool DoConnect();
     virtual bool Reconnect();
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
 
