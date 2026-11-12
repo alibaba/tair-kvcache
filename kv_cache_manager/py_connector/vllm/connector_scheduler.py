@@ -428,12 +428,22 @@ class ConnectorScheduler:
         for i, location in enumerate(locations[:limit]):
             if self._location_covers_states(location):
                 keep = i + 1
-        if keep < len(locations):
+        # Capacity truncation and missing recurrent state are logged separately so
+# each external-match result has an explicit reason.
+        if limit < len(locations):
             logger.info(
-                "req:%s truncated external match from %d to %d blocks "
-                "(full-hit cap / no recurrent state at the end)",
+                "req:%s capped external match from %d to %d blocks "
+                "(a full hit leaves no token to sample from)",
                 req_id,
                 len(locations),
+                limit,
+            )
+        if keep < limit:
+            logger.info(
+                "req:%s truncated external match from %d to %d blocks "
+                "(no recurrent state at the end)",
+                req_id,
+                limit,
                 keep,
             )
         return locations[:keep]
