@@ -44,7 +44,6 @@ cc_library(
         # 不一定用
         # "//3rdparty/3fs:hf3fs",
         "//kv_cache_manager/common/hash",  # for xxph3
-        "//kv_cache_manager/common:loop_thread",
         ":common_define",
         ":snapshot_uri_utils",
         # Internal implementations
