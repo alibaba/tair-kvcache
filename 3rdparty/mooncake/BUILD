@@ -58,3 +58,22 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+# Cross-node put/get smoke test, e.g. over EFA: see header of client_c_smoke.cc.
+cc_binary(
+    name = "client_c_smoke",
+    srcs = ["client_c_smoke.cc"],
+    copts = [
+        "-std=c++20",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-fPIC",
+    ],
+    tags = ["manual"],
+    deps = [
+        ":mooncake_client_c",
+        "@com_github_gflags_gflags//:gflags",
+    ],
+)
