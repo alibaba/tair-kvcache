@@ -317,3 +317,21 @@ TEST_F(MetaSearcherManagerTest, SearcherCreationFailureReusesInitializedIndexerO
     EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
     EXPECT_EQ(1, indexers->init_count.load());
 }
+
+TEST_F(MetaSearcherManagerTest, RemovedInstancesDoNotAccumulateMutexEntries) {
+    auto indexers = UseControlledIndexerManager();
+    for (int i = 0; i < 16; ++i) {
+        const auto id = "removed_instance_" + std::to_string(i);
+        registry_manager_->instance_infos_[id] = std::make_shared<InstanceInfo>(
+            "test_quota_group", "test_group", id, 64, std::vector<LocationSpecInfo>{}, ModelDeployment());
+        auto searcher = CreateSearcher(id);
+        ASSERT_NE(nullptr, searcher);
+        auto indexer = indexers->GetMetaIndexer(id);
+        ASSERT_NE(nullptr, indexer);
+        EXPECT_EQ(searcher, meta_searcher_manager_->ExtractMetaSearcher(id));
+        EXPECT_EQ(indexer, indexers->ExtractMetaIndexer(id));
+        registry_manager_->instance_infos_.erase(id);
+    }
+    EXPECT_LE(meta_searcher_manager_->instance_mutexes_.size(), 1);
+    EXPECT_LE(indexers->instance_mutexes_.size(), 1);
+}

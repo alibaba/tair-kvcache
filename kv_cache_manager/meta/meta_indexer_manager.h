@@ -67,7 +67,8 @@ private:
     mutable std::shared_mutex mutex_;
     // Lock order: lifecycle -> instance -> map; cleanup waits for initialization.
     mutable std::shared_mutex lifecycle_mutex_;
-    std::map<std::string, std::shared_ptr<std::mutex>> instance_mutexes_;
+    // Operations retain the mutex; the next lookup removes expired entries.
+    std::map<std::string, std::weak_ptr<std::mutex>> instance_mutexes_;
 
     // Histogram configuration (shared across all indexers)
     std::shared_ptr<MetricsRegistry> metrics_registry_;

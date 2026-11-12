@@ -40,7 +40,8 @@ private:
     mutable std::shared_mutex mutex_;
     // Lock order: lifecycle -> instance -> map; initialize outside the map lock.
     mutable std::shared_mutex lifecycle_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<std::mutex>> instance_mutexes_;
+    // Operations retain the mutex; the next lookup removes expired entries.
+    std::unordered_map<std::string, std::weak_ptr<std::mutex>> instance_mutexes_;
 };
 
 } // namespace kv_cache_manager

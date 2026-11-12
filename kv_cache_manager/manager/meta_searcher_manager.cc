@@ -75,9 +75,18 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
 
 std::shared_ptr<std::mutex> MetaSearcherManager::GetInstanceMutex(const std::string &instance_id) {
     std::scoped_lock write_guard(mutex_);
-    auto &instance_mutex = instance_mutexes_[instance_id];
+    for (auto it = instance_mutexes_.begin(); it != instance_mutexes_.end();) {
+        if (it->second.expired()) {
+            it = instance_mutexes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto &weak_mutex = instance_mutexes_[instance_id];
+    auto instance_mutex = weak_mutex.lock();
     if (!instance_mutex) {
         instance_mutex = std::make_shared<std::mutex>();
+        weak_mutex = instance_mutex;
     }
     return instance_mutex;
 }
