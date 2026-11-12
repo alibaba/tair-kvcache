@@ -27,6 +27,13 @@ public:
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
+    ClientErrorCode GetWithDeadline(const std::vector<DataStorageUri> &remote_uris,
+                                    const BlockBuffers &local_buffers,
+                                    int64_t deadline_ms) override;
+    ClientErrorCode PutWithDeadline(const std::vector<DataStorageUri> &remote_uris,
+                                    const BlockBuffers &local_buffers,
+                                    std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                    int64_t deadline_ms) override;
 
 protected:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
