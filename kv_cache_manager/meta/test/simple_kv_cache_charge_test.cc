@@ -133,28 +133,5 @@ TEST_F(SimpleKVCacheChargeTest, JemallocSizeClassesMatchOneAndSixtyLocations) {
     EXPECT_EQ(128u + 288u, backend_->GetMemUsage());
 }
 
-TEST_F(SimpleKVCacheChargeTest, LocalLocationCountTracksOverwriteMergeDeleteAndRejectedWrite) {
-    EXPECT_EQ(0u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Put(nullptr, {1}, {Locations(2, 60)}, PropertyMapVector(1)));
-    EXPECT_EQ(2u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              backend_->Upsert(nullptr, {1}, {Locations(3, 60)}, PropertyMapVector(1)));
-    EXPECT_EQ(3u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              backend_->PutIfAbsent(nullptr, {1}, {Locations(60, 60)}, PropertyMapVector(1)));
-    EXPECT_EQ(3u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              backend_->DeleteLocations(nullptr, {1}, {{"kvs#event_report_l1p5#hbm#10.0.0.1:1234", "absent"}}));
-    EXPECT_EQ(2u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Put(nullptr, {1}, {Locations(1, 60)}, PropertyMapVector(1)));
-    EXPECT_EQ(1u, backend_->GetLocalLocationCount());
-    EXPECT_EQ((std::vector<ErrorCode>{EC_NOSPC}),
-              backend_->Upsert(nullptr, {1}, {Locations(2, 2 * 1024 * 1024)}, PropertyMapVector(1)));
-    EXPECT_EQ(1u, backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Delete(nullptr, {1}));
-    EXPECT_EQ(0u, backend_->GetLocalLocationCount());
-    ASSERT_EQ(EC_OK, backend_->Close());
-    EXPECT_EQ(0u, backend_->GetLocalLocationCount());
-}
 
 } // namespace kv_cache_manager

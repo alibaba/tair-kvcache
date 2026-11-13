@@ -73,11 +73,15 @@ def _get_response(revisit_interval_buckets=None):
 
 
 class MetaIndexerConfigCompatibilityTest(unittest.TestCase):
-    def test_legacy_search_cache_config_is_ignored(self):
+    def test_legacy_search_cache_values_round_trip_with_compatible_output(self):
         value = _get_response()["instance_group"]["cache_config"]["meta_indexer_config"]
-        value["meta_cache_policy_config"] = {"type": "removed", "capacity": 1024}
+        value["meta_cache_policy_config"] = {
+            "type": "LRU", "capacity": 1024, "cache_shard_bits": 6, "high_pri_pool_ratio": 0.0
+        }
         restored = MetaIndexerConfig.from_json_data(value)
-        self.assertNotIn("meta_cache_policy_config", restored.to_json_data())
+        self.assertEqual(
+            {"type": "LRU", "capacity": 1024, "cache_shard_bits": 6, "high_pri_pool_ratio": 0.0},
+            restored.to_json_data()["meta_cache_policy_config"])
         self.assertEqual("local", restored.to_json_data()["meta_storage_backend_config"]["storage_type"])
 
 

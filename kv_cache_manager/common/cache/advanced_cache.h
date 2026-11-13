@@ -150,8 +150,6 @@ public: // type defs
         // nullptr is only for entries that require no destruction, such as
         // "placeholder" cache entries with nullptr object.
         DeleterFn del_cb; // (<- Most performance critical)
-        // Counts logical values inside one cache entry; read under the shard lock.
-        size_t (*value_count_cb)(ObjectPtr obj) noexcept = nullptr;
         // Next three are used for persisting values as described above.
         // If any is nullptr, then all three should be nullptr and persisting the
         // entry to/from secondary cache is not supported.
@@ -424,7 +422,6 @@ public: // functions
     // means "not supported." This is used for inspecting the load factor, along
     // with GetTableAddressCount().
     virtual size_t GetOccupancyCount() const { return SIZE_MAX; }
-    virtual size_t GetValueCount() const { return 0; }
 
     // Returns the number of ways the hash function is divided for addressing
     // entries. Zero means "not supported." This is used for inspecting the load
@@ -531,12 +528,6 @@ public: // functions
         return false;
     }
 
-    // Mutates a retained, still-cached entry under its shard lock and updates charge/count.
-    virtual bool
-    ApplyToHandleNoTouch(Handle * /*handle*/,
-                         const std::function<ssize_t(ObjectPtr, size_t, const CacheItemHelper *)> & /*callback*/) {
-        return false;
-    }
 
     // Insert a mapping from key->object only if the key does not already exist.
     // Returns EC_OK on successful insertion, EC_EXIST if the key is already
@@ -776,7 +767,6 @@ public:
     bool HasStrictCapacityLimit() const override { return target_->HasStrictCapacityLimit(); }
 
     size_t GetOccupancyCount() const override { return target_->GetOccupancyCount(); }
-    size_t GetValueCount() const override { return target_->GetValueCount(); }
 
     size_t GetTableAddressCount() const override { return target_->GetTableAddressCount(); }
 
@@ -834,11 +824,6 @@ public:
         const std::string_view &key,
         const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
         return target_->ApplyToEntryNoTouch(key, callback);
-    }
-    bool
-    ApplyToHandleNoTouch(Handle *handle,
-                         const std::function<ssize_t(ObjectPtr, size_t, const CacheItemHelper *)> &callback) override {
-        return target_->ApplyToHandleNoTouch(handle, callback);
     }
     size_t GetAvailableCapacity(const std::string_view &key) const override {
         return target_->GetAvailableCapacity(key);

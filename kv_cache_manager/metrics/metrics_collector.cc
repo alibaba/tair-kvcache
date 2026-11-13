@@ -364,7 +364,7 @@ bool DataStorageIntervalMetricsCollector::Init() {
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_indexer, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_key_count);
-DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_local_location_count);
+DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_location_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_cache_usage);
 
 MetaIndexerAccumulativeMetricsCollector::MetaIndexerAccumulativeMetricsCollector(
@@ -381,7 +381,7 @@ bool MetaIndexerAccumulativeMetricsCollector::Init() {
     }
 
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_key_count);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_local_location_count);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_location_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_cache_usage);
 
     return true;
@@ -436,7 +436,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cach
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, local_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
-                                      local_location_count);
+                                      location_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, meta_cache_usage);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
@@ -486,7 +486,7 @@ bool CacheManagerInstanceMetricsCollector::Init() {
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, local_key_count);
-    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, local_location_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, location_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);

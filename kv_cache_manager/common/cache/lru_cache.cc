@@ -75,7 +75,6 @@ LRUHandle *LRUHandleTable::Insert(LRUHandle *h) {
     LRUHandle *old = *ptr;
     h->next_hash = (old == nullptr ? nullptr : old->next_hash);
     *ptr = h;
-    UpdateValueCount(old ? old->GetValueCount() : 0, h->GetValueCount());
     if (old == nullptr) {
         ++elems_;
         if ((elems_ >> length_bits_) > 0) { // elems_ >= length
@@ -92,7 +91,6 @@ LRUHandle *LRUHandleTable::Remove(const std::string_view &key, uint32_t hash) {
     LRUHandle *result = *ptr;
     if (result != nullptr) {
         *ptr = result->next_hash;
-        UpdateValueCount(result->GetValueCount(), 0);
         --elems_;
     }
     return result;
@@ -559,29 +557,9 @@ bool LRUCacheShard::ApplyToEntryNoTouch(
     if (e == nullptr) {
         return false;
     }
-    ApplyToEntryUnsafe(e, callback);
-    return true;
-}
-
-bool LRUCacheShard::ApplyToHandleNoTouch(
-    LRUHandle *handle,
-    const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    assert(handle->HasRefs());
-    if (!handle->InCache()) {
-        return false;
-    }
-    ApplyToEntryUnsafe(handle, callback);
-    return true;
-}
-
-void LRUCacheShard::ApplyToEntryUnsafe(
-    LRUHandle *e, const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback) {
     assert(e->InCache());
     const bool in_lru = !e->HasRefs();
-    const size_t before = e->GetValueCount();
     const ssize_t delta = callback(e->value, e->total_charge, e->helper);
-    table_.UpdateValueCount(before, e->GetValueCount());
     if (delta > 0) {
         const size_t increase = static_cast<size_t>(delta);
         e->total_charge += increase;
@@ -613,7 +591,10 @@ void LRUCacheShard::ApplyToEntryUnsafe(
             }
         }
     }
+    return true;
 }
+
+
 
 bool LRUCacheShard::Ref(LRUHandle *e) {
     std::lock_guard<std::mutex> l(mutex_);
@@ -879,10 +860,6 @@ size_t LRUCacheShard::GetOccupancyCount() const {
     return table_.GetOccupancyCount();
 }
 
-size_t LRUCacheShard::GetValueCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return table_.GetValueCount();
-}
 
 size_t LRUCacheShard::GetTableAddressCount() const {
     std::lock_guard<std::mutex> l(mutex_);

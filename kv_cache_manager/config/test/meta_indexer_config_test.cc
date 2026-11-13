@@ -27,6 +27,7 @@ TEST_F(MetaIndexerConfigTest, TestSimple) {
     ASSERT_EQ("local", config_->GetMetaStorageBackendConfig()->GetStorageType());
     ASSERT_FALSE(config_->GetMetaStorageBackendConfig()->GetMemoryPrimary());
     ASSERT_TRUE(config_->GetMetaStorageBackendConfig()->GetForceDeletingAsyncEnqueue());
+    EXPECT_NE(std::string::npos, config_->ToJsonString().find("meta_cache_policy_config"));
 
     configStr = R"({
         "max_key_count": 1000,
@@ -81,14 +82,31 @@ TEST_F(MetaIndexerConfigTest, TestMemoryPrimaryJsonRoundTripAndDefault) {
     EXPECT_FALSE(restored.FromJsonString(R"({"storage_type":"local","force_deleting_async_enqueue":"false"})"));
 }
 
-TEST_F(MetaIndexerConfigTest, TestLegacySearchCacheConfigIsIgnored) {
+TEST_F(MetaIndexerConfigTest, TestLegacySearchCacheValuesRoundTripWithoutRuntimeValidation) {
     ASSERT_TRUE(config_->FromJsonString(R"({
         "meta_storage_backend_config": {"storage_type": "local"},
-        "meta_cache_policy_config": {"type": "removed", "capacity": 1024}
+        "meta_cache_policy_config": {
+            "type": "removed", "capacity": 1024, "cache_shard_bits": 23, "high_pri_pool_ratio": 0.25
+        }
     })"));
     std::string invalid_fields;
     EXPECT_TRUE(config_->ValidateRequiredFields(invalid_fields));
     EXPECT_TRUE(invalid_fields.empty());
     EXPECT_EQ("local", config_->GetMetaStorageBackendConfig()->GetStorageType());
-    EXPECT_EQ(std::string::npos, config_->ToJsonString().find("meta_cache_policy_config"));
+    rapidjson::Document json;
+    json.Parse(config_->ToJsonString().c_str());
+    ASSERT_FALSE(json.HasParseError());
+    ASSERT_TRUE(json.HasMember("meta_cache_policy_config"));
+    const rapidjson::Value &policy = json["meta_cache_policy_config"];
+    ASSERT_TRUE(policy.IsObject());
+    EXPECT_STREQ("LRU", policy["type"].GetString());
+    EXPECT_EQ(1024, policy["capacity"].GetInt());
+    EXPECT_EQ(23, policy["cache_shard_bits"].GetInt());
+    EXPECT_DOUBLE_EQ(0.0, policy["high_pri_pool_ratio"].GetDouble());
+    MetaIndexerConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config_->ToJsonString()));
+    EXPECT_EQ(config_->ToJsonString(), restored.ToJsonString());
+    ASSERT_TRUE(restored.FromJsonString(R"({"meta_storage_backend_config":{"storage_type":"local"}})"));
+    EXPECT_EQ(0u, restored.GetLegacySearchCacheCapacity());
+    EXPECT_EQ(6, restored.GetLegacySearchCacheShardBits());
 }

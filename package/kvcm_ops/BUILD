@@ -79,3 +79,9 @@ py_test(
     srcs = ["test/bootstrap_test.py"],
     deps = [":kvcm_ops_lib"],
 )
+
+py_test(
+    name = "legacy_search_cache_config_test",
+    srcs = ["test/legacy_search_cache_config_test.py"],
+    deps = [":kvcm_ops_lib"],
+)

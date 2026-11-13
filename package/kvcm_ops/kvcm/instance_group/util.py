@@ -263,6 +263,8 @@ class MetaIndexerConfig(JsonData):
         self._mutex_shard_num = mutex_shard_num
         self._batch_key_size = batch_key_size
         self._meta_storage_backend_config = meta_storage_backend_config
+        self._legacy_search_cache_capacity = 10 * 1024
+        self._legacy_search_cache_shard_bits = 6
         self.check()
 
     def to_json_data(self) -> dict:
@@ -271,6 +273,12 @@ class MetaIndexerConfig(JsonData):
             "mutex_shard_num": self._mutex_shard_num,
             "batch_key_size": self._batch_key_size,
             "meta_storage_backend_config": self._meta_storage_backend_config.to_json_data(),
+            "meta_cache_policy_config": {
+                "type": "LRU",
+                "capacity": self._legacy_search_cache_capacity,
+                "cache_shard_bits": self._legacy_search_cache_shard_bits,
+                "high_pri_pool_ratio": 0.0,
+            }
         }
 
     def check(self) -> bool:
@@ -287,11 +295,15 @@ class MetaIndexerConfig(JsonData):
         if JsonData.expect_exist("meta_storage_backend_config", json_data, dict):
             meta_storage_backend_config = MetaStorageBackendConfig.from_json_data(
                 json_data["meta_storage_backend_config"])
-        return cls(
+        config = cls(
             max_key_count,
             mutex_shard_num,
             batch_key_size,
             meta_storage_backend_config)
+        legacy = json_data.get("meta_cache_policy_config") or {}
+        config._legacy_search_cache_capacity = int(legacy.get("capacity", config._legacy_search_cache_capacity))
+        config._legacy_search_cache_shard_bits = int(legacy.get("cache_shard_bits", config._legacy_search_cache_shard_bits))
+        return config
 
 
 class CacheConfig(JsonData):
@@ -585,6 +597,20 @@ def parse_instance_group_args(is_create: bool):
         default=MetaStorageBackendConfig() if is_create else argparse.SUPPRESS,
         help="type[,uri[,memory_primary[,force_deleting_async_enqueue]]], e.g. local or "
              "'cached,redis://host:6379/?persistent_type=async_redis,true,true'"
+    )
+
+    parser.add_argument(
+        "--search_cache_capacity",
+        type=int,
+        default=10 * 1024 if is_create else argparse.SUPPRESS,  # 10 * 1024 MB
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
+    )
+
+    parser.add_argument(
+        "--search_cache_shard_bits",
+        type=int,
+        default=6 if is_create else argparse.SUPPRESS,
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
     )
 
     parser.add_argument(

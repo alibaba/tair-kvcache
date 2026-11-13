@@ -35,7 +35,6 @@ public:
     // Metadata memory accounted for in this process; remote storage contributes zero.
     virtual size_t GetMemUsage() const noexcept = 0;
     virtual size_t GetLocalKeyCount() const noexcept { return 0; }
-    virtual size_t GetLocalLocationCount() const noexcept { return 0; }
 
     // Oldest access timestamp in microseconds; INT64_MAX if unavailable or empty.
     virtual int64_t GetOldestAccessTime() const noexcept = 0;

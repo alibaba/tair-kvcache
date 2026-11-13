@@ -487,9 +487,6 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     }
     cache_item_helper_ = std::make_shared<Cache::CacheItemHelper>();
     cache_item_helper_->del_cb = MetaMemCacheItem::Deleter;
-    cache_item_helper_->value_count_cb = [](Cache::ObjectPtr value) noexcept {
-        return static_cast<const MetaMemCacheItem *>(value)->LocationCount();
-    };
 
     // Initialize per-shard oldest access time tracking.
     size_t num_shards = shard_mask_ + 1;
@@ -611,21 +608,22 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
                                                 const PropertyMap &properties,
                                                 bool check_capacity) {
     assert(handle != nullptr);
+    MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     const size_t available = check_capacity ? cache_->GetAvailableCapacity(KeyToView(key)) : 0;
-    ErrorCode result = EC_OK;
-    const bool updated = cache_->ApplyToHandleNoTouch(
-        handle, [&](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
-            MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(value);
-            std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
-            if (check_capacity && existing->EstimateMergeGrowth(locations, properties) > available) {
-                result = EC_NOSPC;
-                return 0;
-            }
-            existing->TouchAccessTime();
-            const ssize_t location_delta = existing->MergeLocations(locations);
-            return location_delta + existing->MergeProperties(properties);
-        });
-    return updated ? result : EC_NOENT;
+    ssize_t charge_delta = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
+        if (check_capacity && existing->EstimateMergeGrowth(locations, properties) > available) {
+            return EC_NOSPC;
+        }
+        existing->TouchAccessTime();
+        charge_delta += existing->MergeLocations(locations);
+        charge_delta += existing->MergeProperties(properties);
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
+    }
+    return EC_OK;
 }
 
 ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(KeyType key,
@@ -634,20 +632,21 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(KeyType key,
                                                               CacheLocationConstPtr location,
                                                               CacheLocationVector *retired_locations) {
     assert(handle != nullptr);
+    MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     const size_t available = cache_->GetAvailableCapacity(KeyToView(key));
-    ErrorCode result = EC_OK;
-    const bool updated = cache_->ApplyToHandleNoTouch(
-        handle, [&](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
-            MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(value);
-            std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
-            if (existing->EstimateLocationGrowth(location_id, location) > available) {
-                result = EC_NOSPC;
-                return 0;
-            }
-            existing->TouchAccessTime();
-            return existing->UpsertLocation(location_id, std::move(location), retired_locations);
-        });
-    return updated ? result : EC_NOENT;
+    ssize_t charge_delta = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
+        if (existing->EstimateLocationGrowth(location_id, location) > available) {
+            return EC_NOSPC;
+        }
+        existing->TouchAccessTime();
+        charge_delta = existing->UpsertLocation(location_id, std::move(location), retired_locations);
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
+    }
+    return EC_OK;
 }
 
 ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
@@ -725,15 +724,18 @@ ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vec
     if (!handle) {
         return EC_NOENT;
     }
-    const bool updated = cache_->ApplyToHandleNoTouch(
-        handle, [&](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
-            MetaMemCacheItem *item = static_cast<MetaMemCacheItem *>(value);
-            std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
-            item->TouchAccessTime();
-            return item->EraseLocations(location_ids);
-        });
+    MetaMemCacheItem *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    item->TouchAccessTime();
+    ssize_t charge_delta = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
+        charge_delta = item->EraseLocations(location_ids);
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
+    }
     cache_->Release(handle);
-    return updated ? EC_OK : EC_NOENT;
+    return EC_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,6 +1944,5 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
 
 size_t MetaLocalBackend::GetLocalKeyCount() const noexcept { return cache_ ? cache_->GetOccupancyCount() : 0; }
 
-size_t MetaLocalBackend::GetLocalLocationCount() const noexcept { return cache_ ? cache_->GetValueCount() : 0; }
 
 } // namespace kv_cache_manager

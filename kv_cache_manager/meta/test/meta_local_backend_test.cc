@@ -2589,40 +2589,5 @@ TEST_F(MetaLocalBackendTest, TestStrictCapacityInsertFails) {
     ASSERT_EQ(EC_OK, backend->Close());
 }
 
-TEST_F(MetaLocalBackendTest, LocalLocationCountTracksAllLocalMutationPaths) {
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("location_count", meta_storage_backend_config_));
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
-    const auto location = [](const std::string &id) {
-        std::shared_ptr<CacheLocation> value = std::make_shared<CacheLocation>();
-        value->set_id(id);
-        value->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
-        value->set_status(CLS_SERVING);
-        value->push_location_spec(LocationSpec("spec", "uri"));
-        return value;
-    };
-    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{EC_OK}),
-        meta_storage_backend_->Put(nullptr, {1}, {{{"a", location("a")}, {"b", location("b")}}}, PropertyMapVector(1)));
-    EXPECT_EQ(2u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->Upsert(
-                  nullptr, {1}, {{{"a", location("a")}, {"c", location("c")}}}, PropertyMapVector(1)));
-    EXPECT_EQ(3u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->DeleteLocations(nullptr, {1}, {{"a", "missing"}}));
-    EXPECT_EQ(2u, meta_storage_backend_->GetLocalLocationCount());
-    const LocationId id = "d";
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              GetLocalBackend()->UpsertSingleLocations(nullptr, {1}, {&id}, {location(id)}));
-    EXPECT_EQ(3u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->Put(nullptr, {1}, {{{"b", location("b")}}}, PropertyMapVector(1)));
-    EXPECT_EQ(1u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
-    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
-    EXPECT_EQ(0u, meta_storage_backend_->GetLocalLocationCount());
-}
 
 } // namespace kv_cache_manager

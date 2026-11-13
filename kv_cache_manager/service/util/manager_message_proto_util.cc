@@ -253,6 +253,13 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             meta_storage_backend_config->mutable_force_deleting_async_enqueue()->set_value(
                 origin_meta_storage_backend_config->GetForceDeletingAsyncEnqueue());
         }
+
+        // Preserve only the values compared by legacy bootstrap; search cache remains disabled.
+        proto::admin::MetaCachePolicyConfig *legacy_policy = meta_indexer_config->mutable_meta_cache_policy_config();
+        legacy_policy->set_type("LRU");
+        legacy_policy->set_capacity(origin_meta_indexer_config->GetLegacySearchCacheCapacity());
+        legacy_policy->set_cache_shard_bits(origin_meta_indexer_config->GetLegacySearchCacheShardBits());
+        legacy_policy->set_high_pri_pool_ratio(0.0);
     }
 
     // 转换migration_config
@@ -338,6 +345,13 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
             proto_meta_storage_backend_config.force_deleting_async_enqueue().value());
     }
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
+
+    if (proto_cache_config->meta_indexer_config().has_meta_cache_policy_config()) {
+        const proto::admin::MetaCachePolicyConfig &legacy =
+            proto_cache_config->meta_indexer_config().meta_cache_policy_config();
+        meta_indexer_config->SetLegacySearchCacheCapacity(legacy.capacity());
+        meta_indexer_config->SetLegacySearchCacheShardBits(legacy.cache_shard_bits());
+    }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
 

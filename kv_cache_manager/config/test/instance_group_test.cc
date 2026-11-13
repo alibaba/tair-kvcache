@@ -5,6 +5,7 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
+#include "kv_cache_manager/service/util/proto_message_json_util.h"
 
 namespace kv_cache_manager {
 
@@ -318,6 +319,54 @@ TEST_F(InstanceGroupTest, TairMempoolGcDeletePolicySurvivesProtoAndRegistryRound
             EXPECT_EQ(skip, restored_spec->skip_confirmed_missing_backend_delete());
         }
     }
+}
+
+TEST_F(InstanceGroupTest, LegacySearchCacheValuesSurviveProtoAndRegistryRoundTrip) {
+    proto::admin::CacheConfig request;
+    request.mutable_meta_indexer_config()->mutable_meta_storage_backend_config()->set_storage_type("local");
+    request.mutable_meta_indexer_config()->set_mutex_shard_num(MetaIndexerConfig::kDefaultMutexShardNum);
+    CacheConfig model;
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    proto::admin::CacheConfig response;
+    ProtoConvert::CacheConfigToProto(model, &response);
+    ASSERT_TRUE(response.meta_indexer_config().has_meta_cache_policy_config());
+    EXPECT_EQ("LRU", response.meta_indexer_config().meta_cache_policy_config().type());
+    EXPECT_EQ(0u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(6, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
+    std::string json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&response, json));
+    rapidjson::Document wire;
+    wire.Parse(json.c_str());
+    ASSERT_FALSE(wire.HasParseError());
+    const rapidjson::Value &legacy = wire["meta_indexer_config"]["meta_cache_policy_config"];
+    ASSERT_TRUE(legacy.HasMember("type"));
+    EXPECT_STREQ("LRU", legacy["type"].GetString());
+    EXPECT_TRUE(legacy.HasMember("capacity"));
+    EXPECT_TRUE(legacy.HasMember("cache_shard_bits"));
+    EXPECT_TRUE(legacy.HasMember("high_pri_pool_ratio"));
+
+    proto::admin::MetaCachePolicyConfig *policy =
+        request.mutable_meta_indexer_config()->mutable_meta_cache_policy_config();
+    policy->set_type("LRU");
+    policy->set_capacity(3072);
+    policy->set_cache_shard_bits(9);
+    policy->set_high_pri_pool_ratio(0.25);
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    CacheConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(model.ToJsonString()));
+    ProtoConvert::CacheConfigToProto(restored, &response);
+    ASSERT_TRUE(response.meta_indexer_config().has_meta_cache_policy_config());
+    EXPECT_EQ(3072u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(9, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
+    EXPECT_EQ("LRU", response.meta_indexer_config().meta_cache_policy_config().type());
+    EXPECT_DOUBLE_EQ(0.0, response.meta_indexer_config().meta_cache_policy_config().high_pri_pool_ratio());
+
+    policy->set_capacity(0);
+    policy->set_cache_shard_bits(0);
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    ProtoConvert::CacheConfigToProto(model, &response);
+    EXPECT_EQ(0u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(0, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
 }
 
 TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPerInstance) {

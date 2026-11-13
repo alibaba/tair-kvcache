@@ -36,7 +36,7 @@ public:
         // Local metadata LRU charge in bytes, using MetaIndexer::GetMemUsage().
         size_t meta_cache_usage = 0;
         size_t local_key_count = 0;
-        size_t local_location_count = 0;
+        size_t location_count = 0;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;
     using GroupInstanceIdMetricMap = std::map<std::string, std::unordered_map<std::string, InstanceMetric>>;

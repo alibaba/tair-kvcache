@@ -69,9 +69,6 @@ ErrorCode SimpleKVCacheBackend::Init(const std::string &instance_id,
     auto cache = std::make_shared<LRUCache>(options);
     auto helper = std::make_shared<Cache::CacheItemHelper>();
     helper->del_cb = DeleteCacheValue;
-    helper->value_count_cb = [](Cache::ObjectPtr value) noexcept {
-        return (*static_cast<CacheValue *>(value))->LocationCount();
-    };
     const size_t shard_count = size_t{1} << shard_bits;
     std::vector<std::mutex> mutexes(shard_count);
     mutation_mutex_shards_.swap(mutexes);
@@ -803,6 +800,5 @@ size_t SimpleKVCacheBackend::TouchKeysForMaintenance(const KeyTypeVec & /*keys*/
 
 size_t SimpleKVCacheBackend::GetLocalKeyCount() const noexcept { return cache_ ? cache_->GetOccupancyCount() : 0; }
 
-size_t SimpleKVCacheBackend::GetLocalLocationCount() const noexcept { return cache_ ? cache_->GetValueCount() : 0; }
 
 } // namespace kv_cache_manager

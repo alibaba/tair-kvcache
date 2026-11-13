@@ -12952,7 +12952,7 @@ TEST_F(SnapshotBatchTest, CommitsOnlyAfterLastBatchAndKeepsAllMediaOfAKeyTogethe
     EXPECT_NE(baseline.second.committed_snapshot_version(), result.second.committed_snapshot_version());
     EXPECT_FALSE(result.second.snapshot_required());
     EXPECT_EQ(3u, indexer_->GetKeyCount());
-    EXPECT_EQ(5u, indexer_->GetLocalLocationCount());
+    EXPECT_EQ(5u, indexer_->GetLocationCount());
     EXPECT_EQ(3u, QueryRawEventReportUris(101).size());
     EXPECT_EQ(3u, indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     for (const int64_t key : {101, 103, 105}) {
@@ -13104,7 +13104,7 @@ TEST_F(SnapshotBatchTest, BlockedSnapshotDoesNotFenceOtherShardSnapshotReadOrBat
     EXPECT_EQ(EC_OK, write.get().first);
     EXPECT_EQ(1u, read.get().size());
     EXPECT_EQ(1127u, indexer_->GetKeyCount());
-    EXPECT_EQ(1127u, indexer_->GetLocalLocationCount());
+    EXPECT_EQ(1127u, indexer_->GetLocationCount());
     for (size_t i = 0; i < 51; ++i) {
         EXPECT_TRUE(QueryEventReportUris({probe_keys[i]}).empty());
         EXPECT_EQ(1u, QueryEventReportUris({probe_keys[51 + i]}).size());
@@ -13139,7 +13139,7 @@ TEST_F(SnapshotBatchTest, OneSpecEnvUsesBatchedSnapshotWithUnchangedClientReques
         cache_manager_->meta_indexer_manager_->GetMetaIndexer("snapshot_one_spec");
     ASSERT_NE(nullptr, indexer);
     EXPECT_EQ(5u, indexer->GetKeyCount());
-    EXPECT_EQ(5u, indexer->GetLocalLocationCount());
+    EXPECT_EQ(5u, indexer->GetLocationCount());
 }
 
 TEST_F(SnapshotBatchTest, ConcurrentOneSpecSnapshotsWithReadsAndDeltasPreserveDataAndLifetime) {
@@ -13255,7 +13255,7 @@ TEST_F(SnapshotBatchTest, ConcurrentOneSpecSnapshotsWithReadsAndDeltasPreserveDa
     EXPECT_EQ(EC_OK, writer.get());
     EXPECT_EQ(EC_OK, reader.get());
     EXPECT_EQ(4162u, indexer->GetKeyCount());
-    EXPECT_EQ(4610u, indexer->GetLocalLocationCount());
+    EXPECT_EQ(4610u, indexer->GetLocationCount());
     LocationsPerKey final;
     ASSERT_EQ(EC_OK, indexer->GetLocationValues(&audit_context, {20000, 9000000, 9100063}, final).ec);
     ASSERT_EQ(3u, final.size());

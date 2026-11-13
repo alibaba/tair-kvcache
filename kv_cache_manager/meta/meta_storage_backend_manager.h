@@ -217,7 +217,6 @@ public:
 
     size_t GetMemUsage() const noexcept;
     size_t GetLocalKeyCount() const noexcept;
-    size_t GetLocalLocationCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).

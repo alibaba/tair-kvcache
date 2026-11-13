@@ -117,6 +117,14 @@ class FakeAdminClient:
 
 
 class EnvironmentParsingTest(unittest.TestCase):
+    def test_legacy_search_cache_fields_are_accepted_without_runtime_limits(self):
+        environ = dict(BASE_ENV)
+        environ["KVCM_INSTANCE_GROUP"] = group_env(search_cache_capacity=4096, search_cache_shard_bits=23)
+        config = parse_environment(environ)
+        policy = _build_new_instance_group(config)["cache_config"]["meta_indexer_config"]["meta_cache_policy_config"]
+        self.assertEqual(4096, policy["capacity"])
+        self.assertEqual(23, policy["cache_shard_bits"])
+
     def test_all_storage_types_and_primary_priority(self):
         environ = dict(BASE_ENV)
         environ["KVCM_PACE_STORAGE"] = json.dumps({
@@ -517,6 +525,20 @@ class DesiredConfigurationTest(unittest.TestCase):
 
 
 class BootstrapReconciliationTest(unittest.TestCase):
+    def test_legacy_search_cache_only_update_does_not_require_restart(self):
+        client = FakeAdminClient()
+        self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(parse_environment(dict(BASE_ENV)), client))
+        client.instances = [{"instance_id": "i1"}]
+        environ = dict(BASE_ENV)
+        environ["KVCM_INSTANCE_GROUP"] = group_env(search_cache_capacity=4096, search_cache_shard_bits=9)
+        self.assertEqual(BootstrapOutcome.COMPLETE,
+                         bootstrap_once(parse_environment(environ), client, reconcile=True))
+        self.assertEqual(1, client.update_group_calls)
+        self.assertEqual(0, client.list_instance_calls)
+        policy = client.groups[0]["cache_config"]["meta_indexer_config"]["meta_cache_policy_config"]
+        self.assertEqual(4096, policy["capacity"])
+        self.assertEqual(9, policy["cache_shard_bits"])
+
     def test_first_run_creates_group_with_local_meta_backend(self):
         environ = dict(BASE_ENV)
         environ["KVCM_INSTANCE_GROUP"] = group_env(

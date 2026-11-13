@@ -200,7 +200,8 @@ public:
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;
     size_t GetLocalKeyCount() const noexcept;
-    size_t GetLocalLocationCount() const noexcept;
+    // Logical location count, maintained with the same consistency boundary as key_count.
+    size_t GetLocationCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
@@ -248,6 +249,7 @@ private:
     ErrorCode RecoverMetaData() noexcept;
     ErrorCode SaveMetaData() noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
+    void AdjustLocationCountMeta(int64_t delta) noexcept;
     int32_t ProcessErrorCodes(const std::string &trace_id,
                               const std::vector<ErrorCode> &error_codes,
                               const std::vector<int32_t> &indexs,
@@ -277,6 +279,9 @@ private:
         int64_t put_key_count = 0;    // brand-new keys created by upsert
         int64_t update_key_count = 0; // existing keys updated by upsert
         int64_t delete_key_count = 0; // keys deleted by whole-key delete
+        // Per-key deltas aligned with the current write sub-batches.
+        std::vector<int64_t> upsert_location_deltas;
+        std::vector<int64_t> delete_location_counts;
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,
@@ -306,6 +311,7 @@ private:
     std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
+    std::atomic<int64_t> location_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;

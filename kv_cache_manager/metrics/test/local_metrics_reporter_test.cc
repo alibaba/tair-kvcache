@@ -659,17 +659,17 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
         EXPECT_NE(output.find(series), std::string::npos) << output;
     };
     ASSERT_TRUE(sample());
-    EXPECT_EQ(1u, small->GetLocalLocationCount());
-    EXPECT_EQ(2u, large->GetLocalLocationCount());
-    EXPECT_DOUBLE_EQ(3, metrics_registry_->GetGauge("meta_indexer.total_local_location_count").Get());
+    EXPECT_EQ(1u, small->GetLocationCount());
+    EXPECT_EQ(2u, large->GetLocationCount());
+    EXPECT_DOUBLE_EQ(3, metrics_registry_->GetGauge("meta_indexer.total_location_count").Get());
     EXPECT_DOUBLE_EQ(1,
                      metrics_registry_
-                         ->GetGauge("cache_manager_instance.local_location_count",
+                         ->GetGauge("cache_manager_instance.location_count",
                                     {{"instance_group", "group_a"}, {"instance_id", "small"}})
                          .Get());
     EXPECT_DOUBLE_EQ(2,
                      metrics_registry_
-                         ->GetGauge("cache_manager_instance.local_location_count",
+                         ->GetGauge("cache_manager_instance.location_count",
                                     {{"instance_group", "group_b"}, {"instance_id", "large"}})
                          .Get());
     expect_usage("small", small_usage);
@@ -686,10 +686,10 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
 
     ASSERT_EQ(EC_OK, small->Delete(&context, {7}).ec);
     ASSERT_TRUE(sample());
-    EXPECT_DOUBLE_EQ(2, metrics_registry_->GetGauge("meta_indexer.total_local_location_count").Get());
+    EXPECT_DOUBLE_EQ(2, metrics_registry_->GetGauge("meta_indexer.total_location_count").Get());
     EXPECT_DOUBLE_EQ(0,
                      metrics_registry_
-                         ->GetGauge("cache_manager_instance.local_location_count",
+                         ->GetGauge("cache_manager_instance.location_count",
                                     {{"instance_group", "group_a"}, {"instance_id", "small"}})
                          .Get());
     expect_usage("small", small_bucket_usage);
@@ -707,10 +707,10 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
     expect_usage("large", large_usage);
     expect_usage("empty", empty_usage);
     const std::string location_series =
-        "kvcm_cache_manager_instance_local_location_count{instance_group=\"group_b\",instance_id=\"large\"} 2\n";
+        "kvcm_cache_manager_instance_location_count{instance_group=\"group_b\",instance_id=\"large\"} 2\n";
     EXPECT_NE(PrometheusExporter::Expose(*metrics_registry_).find(location_series), std::string::npos);
-    ASSERT_NE(nullptr, metrics_registry_->GetMetricsData("cache_manager_instance.local_location_count"));
-    EXPECT_EQ(2u, metrics_registry_->GetMetricsData("cache_manager_instance.local_location_count")->GetSize());
+    ASSERT_NE(nullptr, metrics_registry_->GetMetricsData("cache_manager_instance.location_count"));
+    EXPECT_EQ(2u, metrics_registry_->GetMetricsData("cache_manager_instance.location_count")->GetSize());
 }
 
 TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {

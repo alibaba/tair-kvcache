@@ -2368,10 +2368,6 @@ void MetaStorageBackendManager::SetRevisitHistogram(std::shared_ptr<RevisitInter
     }
 }
 
-size_t MetaStorageBackendManager::GetLocalLocationCount() const noexcept {
-    return cache_backend_ ? cache_backend_->GetLocalLocationCount()
-                          : (persistent_backend_ ? persistent_backend_->GetLocalLocationCount() : 0);
-}
 
 size_t MetaStorageBackendManager::GetLocalKeyCount() const noexcept {
     return cache_backend_ ? cache_backend_->GetLocalKeyCount()

@@ -483,7 +483,7 @@ public:
 
 class MetaIndexerAccumulativeMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, total_key_count)
-    KVCM_GAUGE_METRICS(meta_indexer, total_local_location_count)
+    KVCM_GAUGE_METRICS(meta_indexer, total_location_count)
     KVCM_GAUGE_METRICS(meta_indexer, total_cache_usage)
 
 public:
@@ -531,7 +531,7 @@ public:
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, local_key_count)
-    KVCM_GAUGE_METRICS(cache_manager_instance, local_location_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, location_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, meta_cache_usage)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)

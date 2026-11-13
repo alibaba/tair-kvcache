@@ -27,6 +27,7 @@ static const std::string PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
 
 // Instance-level metadata (under "metadata" key, not per-block hashes).
 static const std::string METADATA_PROPERTY_KEY_COUNT = "__key_count__";
+static const std::string METADATA_PROPERTY_LOCATION_COUNT = "__location_count__";
 static const std::string METADATA_PROPERTY_STORAGE_USAGE_DATA = "__storage_usage_data__";
 
 static const std::string SCAN_BASE_CURSOR = "0";

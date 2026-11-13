@@ -110,7 +110,7 @@ struct KmonitorMetricsReporter::Context {
 
     // meta indexer metrics
     DECLARE_METRICS(meta_indexer, total_key_count);
-    DECLARE_METRICS(meta_indexer, total_local_location_count);
+    DECLARE_METRICS(meta_indexer, total_location_count);
     DECLARE_METRICS(meta_indexer, total_cache_usage);
 
     // data storage metrics
@@ -216,7 +216,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, local_key_count);
-    DECLARE_METRICS(cache_manager_instance, local_location_count);
+    DECLARE_METRICS(cache_manager_instance, location_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
     DECLARE_METRICS(cache_manager_instance, meta_cache_usage);
     DECLARE_METRICS(cache_manager_instance, async_queue_max_size);
@@ -425,7 +425,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta indexer metrics
     REGISTER_GAUGE_METRIC(meta_indexer, total_key_count);
-    REGISTER_GAUGE_METRIC(meta_indexer, total_local_location_count);
+    REGISTER_GAUGE_METRIC(meta_indexer, total_location_count);
     REGISTER_GAUGE_METRIC(meta_indexer, total_cache_usage);
 
     // data storage metrics
@@ -533,7 +533,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, local_key_count);
-    REGISTER_GAUGE_METRIC(cache_manager_instance, local_location_count);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, location_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_queue_max_size);
@@ -712,15 +712,15 @@ void KmonitorMetricsReporter::ReportInterval() {
         }
 
         double total_key_count_v;
-        double total_local_location_count_v;
+        double total_location_count_v;
         double total_cache_usage_v;
         GET_METRICS_(p, meta_indexer, total_key_count, total_key_count_v);
-        GET_METRICS_(p, meta_indexer, total_local_location_count, total_local_location_count_v);
+        GET_METRICS_(p, meta_indexer, total_location_count, total_location_count_v);
         GET_METRICS_(p, meta_indexer, total_cache_usage, total_cache_usage_v);
 
         const kmonitor::MetricsTags tags;
         REPORT_METRICS(meta_indexer, total_key_count, total_key_count_v);
-        REPORT_METRICS(meta_indexer, total_local_location_count, total_local_location_count_v);
+        REPORT_METRICS(meta_indexer, total_location_count, total_location_count_v);
         REPORT_METRICS(meta_indexer, total_cache_usage, total_cache_usage_v);
     } while (false);
 
@@ -1138,11 +1138,11 @@ void KmonitorMetricsReporter::ReportInterval() {
                     GET_METRICS_(p, cache_manager_instance, key_count, key_count_v);
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
                     double local_key_count_v;
-                    double local_location_count_v;
+                    double location_count_v;
                     GET_METRICS_(p, cache_manager_instance, local_key_count, local_key_count_v);
-                    GET_METRICS_(p, cache_manager_instance, local_location_count, local_location_count_v);
+                    GET_METRICS_(p, cache_manager_instance, location_count, location_count_v);
                     REPORT_METRICS(cache_manager_instance, local_key_count, local_key_count_v);
-                    REPORT_METRICS(cache_manager_instance, local_location_count, local_location_count_v);
+                    REPORT_METRICS(cache_manager_instance, location_count, location_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
                     double meta_cache_usage_v;

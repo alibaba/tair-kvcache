@@ -50,6 +50,10 @@ def main():
         current._cache_config._meta_indexer_config._batch_key_size = args.batch_key_size
     if hasattr(args, "meta_storage_backend_config"):
         current._cache_config._meta_indexer_config._meta_storage_backend_config = args.meta_storage_backend_config
+    if hasattr(args, "search_cache_capacity"):
+        current._cache_config._meta_indexer_config._legacy_search_cache_capacity = args.search_cache_capacity
+    if hasattr(args, "search_cache_shard_bits"):
+        current._cache_config._meta_indexer_config._legacy_search_cache_shard_bits = args.search_cache_shard_bits
     if hasattr(args, "extra_info") and args.extra_info:
         existing = {}
         if current._extra_info:

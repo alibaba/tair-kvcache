@@ -74,6 +74,8 @@ def create_instance_group(args) -> InstanceGroup:
                                             mutex_shard_num=args.mutex_shard_num,
                                             batch_key_size=args.batch_key_size,
                                             meta_storage_backend_config=args.meta_storage_backend_config)
+    meta_indexer_config._legacy_search_cache_capacity = args.search_cache_capacity
+    meta_indexer_config._legacy_search_cache_shard_bits = args.search_cache_shard_bits
     cache_config = CacheConfig(data_storage_strategy=args.data_storage_strategy,
                                reclaim_strategy=reclaim_strategy,
                                meta_indexer_config=meta_indexer_config)

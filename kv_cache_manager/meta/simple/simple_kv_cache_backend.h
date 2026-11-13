@@ -164,7 +164,6 @@ public:
                                  const PropertyMap &properties,
                                  bool replace) noexcept override;
     size_t GetLocalKeyCount() const noexcept override;
-    size_t GetLocalLocationCount() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
 
 private:

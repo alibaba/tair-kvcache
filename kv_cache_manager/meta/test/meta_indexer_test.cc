@@ -1196,6 +1196,7 @@ TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemant
     EXPECT_EQ(EC_PARTIAL_OK, result.ec);
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOSPC}), result.error_codes);
     EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
 
     CacheLocationMapVector stored_locations;
     const auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, stored_locations);
@@ -1385,6 +1386,88 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
     DoMultiThreadTest();
 }
 
+TEST_F(MetaIndexerTest, TestLogicalLocationCountTracksSuccessfulChanges) {
+    ASSERT_EQ(EC_OK, InitIndexer(R"({"max_key_count":100,"mutex_shard_num":8,"batch_key_size":2,
+                                  "meta_storage_backend_config":{"storage_type":"local"}})"));
+    CacheLocationMapVector seed{{{"a", MakeLocation("a", "uri_a")}, {"b", MakeLocation("b", "uri_b")}}};
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {1}, seed, properties).ec);
+    EXPECT_EQ(2u, meta_indexer_->GetLocationCount());
+    seed = {{{"a", MakeLocation("a", "new_uri")}}};
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {1}, seed, properties).ec);
+    EXPECT_EQ(1u, meta_indexer_->GetLocationCount());
+
+    const auto upsert = [](const std::vector<ErrorCode> &,
+                           const LocationIdVector &ids,
+                           size_t,
+                           CacheLocationVector &locations,
+                           PropertyMap &) {
+        std::vector<ErrorCode> errors(ids.size(), EC_OK);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] == "rejected") {
+                errors[i] = EC_BADARGS;
+            } else {
+                locations[i] = MakeLocation(ids[i], "uri");
+            }
+        }
+        return LocationModifierResult{MA_OK, std::move(errors)};
+    };
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ASSERT_EQ(
+            EC_OK,
+            meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), {1}, {{"a", "c", "rejected"}}, upsert)
+                .ec);
+        EXPECT_EQ(2u, meta_indexer_->GetLocationCount());
+    }
+    meta_indexer_->max_key_count_ = meta_indexer_->GetKeyCount();
+    const LocationResult rejected =
+        meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), {2}, {{"new"}}, upsert);
+    EXPECT_NE(EC_OK, rejected.ec);
+    EXPECT_EQ(2u, meta_indexer_->GetLocationCount());
+
+    const auto erase =
+        [](const std::vector<ErrorCode> &, const LocationIdVector &ids, size_t, CacheLocationVector &, PropertyMap &) {
+            return LocationModifierResult{MA_DELETE, std::vector<ErrorCode>(ids.size(), EC_OK)};
+        };
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ASSERT_EQ(
+            EC_OK,
+            meta_indexer_
+                ->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {1}, {{"c", "missing"}}, erase, true)
+                .ec);
+        EXPECT_EQ(1u, meta_indexer_->GetLocationCount());
+    }
+    const auto add = [](const LocationIdVector &, ErrorCode, size_t, PropertyMap &, CacheLocationMap &locations) {
+        EXPECT_TRUE(locations.emplace("a", MakeLocation("a", "changed")).second);
+        EXPECT_TRUE(locations.emplace("extra", MakeLocation("extra", "uri")).second);
+        return std::make_pair(MA_OK, EC_OK);
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteBlock(request_context_.get(), {1}, add).ec);
+    EXPECT_EQ(2u, meta_indexer_->GetLocationCount());
+    const auto remove = [](const LocationIdVector &, ErrorCode, size_t, PropertyMap &, CacheLocationMap &) {
+        return std::make_pair(MA_DELETE, EC_OK);
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteBlock(request_context_.get(), {1}, remove).ec);
+    EXPECT_EQ(0u, meta_indexer_->GetLocationCount());
+    seed = {{{"a", MakeLocation("a", "uri")}, {"b", MakeLocation("b", "uri")}}};
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {1}, seed, properties).ec);
+    ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {1}).ec);
+    EXPECT_EQ(0u, meta_indexer_->GetLocationCount());
+}
+
+TEST_F(MetaIndexerTest, TestLegacyMetadataEstimatesLogicalLocationCount) {
+    ASSERT_EQ(EC_OK, InitIndexer(R"({"max_key_count":100,"mutex_shard_num":8,
+                                  "meta_storage_backend_config":{"storage_type":"dummy"}})"));
+    PropertyMap metadata{{METADATA_PROPERTY_KEY_COUNT, "3"}};
+    ASSERT_EQ(EC_OK, meta_indexer_->backend_manager_->PutMetaData(metadata));
+    ASSERT_EQ(EC_OK, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
+    metadata[METADATA_PROPERTY_LOCATION_COUNT] = "7";
+    ASSERT_EQ(EC_OK, meta_indexer_->backend_manager_->PutMetaData(metadata));
+    ASSERT_EQ(EC_OK, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(7u, meta_indexer_->GetLocationCount());
+}
+
 TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
     const std::string configStr = R"({
         "max_key_count" : 100,
@@ -1410,6 +1493,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
 
     // persist
     meta_indexer_->key_count_.store(3);
+    meta_indexer_->location_count_.store(5);
     const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900};
     ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
@@ -1423,6 +1507,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->Init(/* instance_id */ "test_instance_01", meta_indexer_config));
 
         ASSERT_EQ(3, meta_indexer_->GetKeyCount());
+        ASSERT_EQ(5u, meta_indexer_->GetLocationCount());
         for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }

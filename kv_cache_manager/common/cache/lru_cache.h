@@ -105,7 +105,6 @@ struct LRUHandle : public Cache::Handle {
     // Return true if there are external refs, false otherwise.
     bool HasRefs() const { return refs > 0; }
 
-    size_t GetValueCount() const noexcept { return helper->value_count_cb ? helper->value_count_cb(value) : 0; }
 
     bool InCache() const { return m_flags & M_IN_CACHE; }
     bool IsHighPri() const { return im_flags & IM_IS_HIGH_PRI; }
@@ -222,11 +221,6 @@ public:
     int GetLengthBits() const { return length_bits_; }
 
     size_t GetOccupancyCount() const { return elems_; }
-    size_t GetValueCount() const { return value_count_; }
-    void UpdateValueCount(size_t before, size_t after) {
-        assert(value_count_ >= before);
-        value_count_ = value_count_ - before + after;
-    }
 
     MemoryAllocator *GetAllocator() const { return allocator_; }
     size_t GetMemoryUsage(bool inserting) const;
@@ -249,7 +243,6 @@ private:
 
     // Number of elements currently in the table.
     uint32_t elems_;
-    size_t value_count_ = 0;
 
     // Set from max_upper_hash_bits (see constructor).
     const int max_length_bits_;
@@ -344,9 +337,6 @@ public: // Function definitions expected as parameter to ShardedCache
 
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     void ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count);
-    bool ApplyToHandleNoTouch(
-        LRUHandle *handle,
-        const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback);
     bool Ref(LRUHandle *handle);
     bool Erase(const std::string_view &key, uint32_t hash);
     bool Exists(const std::string_view &key, uint32_t hash);
@@ -364,7 +354,6 @@ public: // Function definitions expected as parameter to ShardedCache
     size_t GetUsage() const;
     size_t GetPinnedUsage() const;
     size_t GetOccupancyCount() const;
-    size_t GetValueCount() const;
     size_t GetTableAddressCount() const;
 
     void ApplyToSomeEntries(
@@ -427,9 +416,6 @@ private:
     // to last_reference_list for deferred cleanup outside the lock.
     ErrorCode DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list);
 
-    void ApplyToEntryUnsafe(
-        LRUHandle *entry,
-        const std::function<ssize_t(Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *)> &callback);
 
     void LRU_Remove(LRUHandle *e);
     void LRU_Insert(LRUHandle *e);

@@ -147,7 +147,7 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                                    write_stats.dropped_metadata_count,
                                    meta_indexer->GetMemUsage(),
                                    meta_indexer->GetLocalKeyCount(),
-                                   meta_indexer->GetLocalLocationCount()};
+                                   meta_indexer->GetLocationCount()};
             }
             int64_t capacity = instance_group->quota().capacity();
             group_usage_ratio_map[instance_group_name] =
