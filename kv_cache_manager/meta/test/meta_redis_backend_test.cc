@@ -71,6 +71,45 @@ TEST_F(MetaRedisBackendTest, TestInit) {
     }
 }
 
+TEST_F(MetaRedisBackendTest, GetLocationsForOneBlockUsesOneHgetall) {
+    CacheLocation expected_location;
+    expected_location.set_id("location_0");
+    expected_location.set_status(CacheLocationStatus::CLS_SERVING);
+    expected_location.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    expected_location.set_spec_size(4096);
+    expected_location.set_create_time(123456);
+    const std::string serialized_location = expected_location.ToJsonString();
+
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([serialized_location]() {
+        StandardUri uri;
+        auto client = std::make_unique<MockRedisClient>(uri);
+        EXPECT_CALL(*client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*client, Reconnect()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> replies;
+        replies.emplace_back(MakeFakeReplyArrayString({"L#location_0", serialized_location}));
+        EXPECT_CALL(
+            *client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("HGETALL"), StrEq("kvcache:instance_instance_0:cache_42")))))
+            .Times(1)
+            .WillOnce(Return(ByMove(std::move(replies))));
+        return client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    CacheLocationMapVector locations;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetLocations(nullptr, {42}, locations));
+    ASSERT_EQ(1, locations.size());
+    ASSERT_EQ(1, locations[0].size());
+    const auto location = locations[0].at("location_0");
+    ASSERT_NE(nullptr, location);
+    EXPECT_EQ(serialized_location, location->ToJsonString());
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
 TEST_F(MetaRedisBackendTest, TestDeleteMetadataIsIdempotent) {
     EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri uri;
