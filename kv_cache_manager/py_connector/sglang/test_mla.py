@@ -317,8 +317,10 @@ class TestMlaDataPath(unittest.TestCase):
                 "locations": [
                     {
                         "location_specs": [
-                            # A rank-1 spec exists but is not the one MLA KV
-                            # lives in; reading it would return other data.
+                            # A spec this rank does not own.  An MLA instance
+                            # registers no tp_1 spec any more, but the read path
+                            # has to pick its own spec out of whatever the
+                            # Manager returns, so a stray one must not be read.
                             {"name": "tp_1", "uri": "uri-rank1"},
                             {"name": "tp_0", "uri": "uri-rank0"},
                         ]
@@ -326,8 +328,7 @@ class TestMlaDataPath(unittest.TestCase):
                 ]
             }
             result = connector.batch_get_v1(["block-0"], torch.arange(PAGE_SIZE))
-            # Every rank reads the spec rank 0 wrote; there is no tp_{rank}
-            # spec for MLA.
+            # Every rank reads the spec rank 0 wrote, never its own tp_{rank}.
             self.assertEqual(connector.location_spec_name, "tp_0")
 
         self.assertEqual(result, [True])
