@@ -95,6 +95,7 @@ cc_library(
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/util",
+        "//kv_cache_manager/client/src/internal/util:host_registration",
         "//kv_cache_manager/common",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/data_storage:common_define",

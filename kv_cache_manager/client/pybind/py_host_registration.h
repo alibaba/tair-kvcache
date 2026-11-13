@@ -6,34 +6,34 @@
 #include <vector>
 
 #include "kv_cache_manager/client/include/common.h"
+#include "kv_cache_manager/client/src/internal/util/host_registration.h"
 
 namespace kv_cache_manager {
 
-// Host registrations handed to the multi-segment channel: an entry left at its
-// defaults registers nothing and is dropped, a partially filled entry is an error
-// (dropping it would hand the backend fewer segments than the caller passed), a
-// complete one is kept in submission order. The index in the message is the
-// entry's position in the caller's list.
+// The list channel: an unset entry is dropped (a None in the caller's list becomes
+// one; C++ has no such value), a partially filled entry raises with its position --
+// dropping it would hand the backend fewer segments than the caller passed.
 inline std::vector<SharedMemoryRegistration>
 NormalizeHostRegistrations(const std::vector<SharedMemoryRegistration> &entries) {
     std::vector<SharedMemoryRegistration> registrations;
     registrations.reserve(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto &entry = entries[i];
-        if (entry.base == nullptr && entry.size == 0 && entry.fd == -1) {
+        const HostRegistrationState state = ClassifyHostRegistration(entry);
+        if (state == HostRegistrationState::Disabled) {
             continue;
         }
-        std::string missing_fields;
-        if (entry.base == nullptr) {
-            missing_fields += " base";
-        }
-        if (entry.size == 0) {
-            missing_fields += " size";
-        }
-        if (entry.fd < 0) {
-            missing_fields += " fd";
-        }
-        if (!missing_fields.empty()) {
+        if (state == HostRegistrationState::Partial) {
+            std::string missing_fields;
+            if (entry.base == nullptr) {
+                missing_fields += " base";
+            }
+            if (entry.size == 0) {
+                missing_fields += " size";
+            }
+            if (entry.fd < 0) {
+                missing_fields += " fd";
+            }
             throw std::invalid_argument("regist_spans[" + std::to_string(i) + "] is incomplete, missing:" +
                                         missing_fields);
         }

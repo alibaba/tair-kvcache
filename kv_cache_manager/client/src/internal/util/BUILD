@@ -10,3 +10,11 @@ cc_library(
         "//kv_cache_manager/common",
     ],
 )
+
+cc_library(
+    name = "host_registration",
+    hdrs = ["host_registration.h"],
+    deps = [
+        "//kv_cache_manager/client:common",
+    ],
+)
