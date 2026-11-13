@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
+#include <dlfcn.h>
 #include <functional>
 #include <mutex>
-#include <stdexcept>
+#include <pthread.h>
 #include <thread>
 #include <utility>
 
@@ -18,6 +20,7 @@
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "stub.h"
 
 namespace kv_cache_manager {
 
@@ -597,29 +600,48 @@ TEST_F(MetaAsyncRedisBackendTest, TestFailedOpenWaitsForSiblingThenCleansAndCanR
 TEST_F(MetaAsyncRedisBackendTest, TestReadPoolFailureCleansSuccessfulConsumerConnections) {
     config_->SetStorageUri("redis://host:6379/?async_queue_count=2&client_min_pool_size=1");
     ASSERT_EQ(EC_OK, backend_->Init("read_pool_failure_instance", config_));
-    for (const bool throw_on_create : {false, true}) {
-        SCOPED_TRACE(throw_on_create ? "exception" : "nullptr");
-        std::atomic<int> created{0};
-        std::atomic<int> destroyed{0};
-        EXPECT_CALL(*backend_, CreateRedisClient())
-            .WillRepeatedly(Invoke([&, throw_on_create]() -> std::shared_ptr<RedisClient> {
-                if (created.fetch_add(1) == 2) {
-                    if (throw_on_create) {
-                        throw std::runtime_error("client allocation failed");
-                    }
-                    return nullptr;
-                }
-                return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
-            }));
+    std::atomic<int> created{0};
+    std::atomic<int> destroyed{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() -> std::shared_ptr<RedisClient> {
+        if (created.fetch_add(1) == 2) {
+            return nullptr;
+        }
+        return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+    }));
+    EXPECT_EQ(EC_ERROR, backend_->Open());
+    EXPECT_EQ(3, created.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    Mock::VerifyAndClearExpectations(backend_.get());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadStartupFailureCleansResourcesAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    SetupMockRedisClients();
+    ASSERT_EQ(EC_OK, backend_->Init("thread_start_failure_instance", config_));
+    static size_t thread_starts = 0;
+    thread_starts = 0;
+    auto create_thread = reinterpret_cast<decltype(&pthread_create)>(dlsym(RTLD_NEXT, "pthread_create"));
+    ASSERT_NE(nullptr, create_thread);
+    {
+        Stub stub;
+        stub.set(
+            create_thread, +[](pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) {
+                ++thread_starts;
+                return EAGAIN;
+            });
         EXPECT_EQ(EC_ERROR, backend_->Open());
-        EXPECT_EQ(3, created.load());
-        EXPECT_EQ(2, destroyed.load());
-        EXPECT_FALSE(backend_->is_running_.load());
-        EXPECT_TRUE(backend_->consumer_clients_.empty());
-        EXPECT_TRUE(backend_->consumer_threads_.empty());
-        EXPECT_EQ(nullptr, backend_->read_client_pool_);
-        Mock::VerifyAndClearExpectations(backend_.get());
     }
+    EXPECT_EQ(1, thread_starts);
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    EXPECT_EQ(EC_OK, backend_->Open());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestDoubleClose) {

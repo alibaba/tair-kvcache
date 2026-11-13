@@ -6,6 +6,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:bounded_parallel",
         "//kv_cache_manager/common:unittest",
+        "@cpp_stub",
     ],
 )
 
@@ -17,6 +18,7 @@ cc_test(
         "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:unittest",
+        "@havenask//aios/autil:thread",
     ],
 )
 

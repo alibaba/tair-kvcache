@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cinttypes>
 #include <deque>
-#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -5086,29 +5085,20 @@ ErrorCode CacheManager::DoRecoverOnce() {
     }
     const auto begin = std::chrono::steady_clock::now();
     std::atomic<size_t> completed{0};
-    const bool workers_ok = RunBoundedParallel(instance_ids.size(), concurrency, [&](size_t index) {
+    const auto workers_ec = RunBoundedParallel(instance_ids.size(), concurrency, [&](size_t index) {
         const auto &instance_id = instance_ids[index];
-        try {
-            RequestContext instance_context("cache_manager_recover_trace/" + instance_id);
-            std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
-            // Recheck under the removal fence; never re-register a stale snapshot.
-            const auto instance_info = registry_manager_->GetInstanceInfo(&instance_context, instance_id);
-            if (instance_info) {
-                const auto ec = TryCreateMetaSearcher(&instance_context, instance_id);
-                if (ec != EC_OK) {
-                    ++error_count;
-                    KVCM_LOG_WARN(
-                        "CacheManager recover instance failed, ec[%d] instance_id[%s]", ec, instance_id.c_str());
-                }
-            } else {
-                KVCM_LOG_INFO("CacheManager recover skipped removed instance[%s]", instance_id.c_str());
+        RequestContext instance_context("cache_manager_recover_trace/" + instance_id);
+        std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
+        // Recheck under the removal fence; never re-register a stale snapshot.
+        const auto instance_info = registry_manager_->GetInstanceInfo(&instance_context, instance_id);
+        if (instance_info) {
+            const auto ec = TryCreateMetaSearcher(&instance_context, instance_id);
+            if (ec != EC_OK) {
+                ++error_count;
+                KVCM_LOG_WARN("CacheManager recover instance failed, ec[%d] instance_id[%s]", ec, instance_id.c_str());
             }
-        } catch (const std::exception &e) {
-            ++error_count;
-            KVCM_LOG_ERROR("CacheManager recover instance[%s] threw: %s", instance_id.c_str(), e.what());
-        } catch (...) {
-            ++error_count;
-            KVCM_LOG_ERROR("CacheManager recover instance[%s] threw an unknown exception", instance_id.c_str());
+        } else {
+            KVCM_LOG_INFO("CacheManager recover skipped removed instance[%s]", instance_id.c_str());
         }
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
@@ -5119,12 +5109,14 @@ ErrorCode CacheManager::DoRecoverOnce() {
                       instance_id.c_str(),
                       static_cast<int64_t>(elapsed));
         // Keep recovering other instances after a failure.
-        return true;
+        return EC_OK;
     });
-    if (!workers_ok) {
+    if (workers_ec != EC_OK) {
         ++error_count;
-        KVCM_LOG_ERROR(
-            "CacheManager recovery workers failed, completed[%zu/%zu]", completed.load(), instance_ids.size());
+        KVCM_LOG_ERROR("CacheManager recovery workers failed, ec[%d], completed[%zu/%zu]",
+                       workers_ec,
+                       completed.load(),
+                       instance_ids.size());
     }
 
     for (const auto &pending : registry_manager_->ListRemovingInstanceInfos()) {

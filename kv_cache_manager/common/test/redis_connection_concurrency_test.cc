@@ -1,12 +1,12 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
+#include <autil/Thread.h>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <poll.h>
-#include <stdexcept>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -70,10 +70,12 @@ struct HandshakeGate {
 // Minimal PING endpoint; replies can be disabled to test handshake timeouts.
 class PingServer {
 public:
-    explicit PingServer(bool reply) : reply_(reply) {
+    explicit PingServer(bool reply) : reply_(reply) {}
+
+    bool Start() {
         listener_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (listener_ < 0) {
-            throw std::runtime_error("socket failed");
+            return false;
         }
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -81,20 +83,23 @@ public:
         if (bind(listener_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
             listen(listener_, 1) != 0) {
             close(listener_);
-            throw std::runtime_error("bind/listen failed");
+            listener_ = -1;
+            return false;
         }
         socklen_t length = sizeof(address);
         if (getsockname(listener_, reinterpret_cast<sockaddr *>(&address), &length) != 0) {
             close(listener_);
-            throw std::runtime_error("getsockname failed");
+            listener_ = -1;
+            return false;
         }
         port_ = ntohs(address.sin_port);
-        try {
-            worker_ = std::thread([this] { Run(); });
-        } catch (...) {
+        worker_ = autil::Thread::createThread([this] { Run(); });
+        if (!worker_) {
             close(listener_);
-            throw;
+            listener_ = -1;
+            return false;
         }
+        return true;
     }
 
     ~PingServer() {
@@ -103,8 +108,12 @@ public:
             stop_.store(true);
         }
         changed_.notify_all();
-        worker_.join();
-        close(listener_);
+        if (worker_) {
+            worker_->join();
+        }
+        if (listener_ >= 0) {
+            close(listener_);
+        }
     }
 
     int Port() const { return port_; }
@@ -140,7 +149,7 @@ private:
     std::atomic<bool> stop_{false};
     std::mutex mutex_;
     std::condition_variable changed_;
-    std::thread worker_;
+    autil::ThreadPtr worker_;
 };
 
 class RedisConnectionConcurrencyTest : public TESTBASE {
@@ -211,11 +220,9 @@ TEST_F(RedisConnectionConcurrencyTest, CoordinationConnectsWhileDefaultBudgetIsS
     EXPECT_EQ(1, default_calls);
 }
 
-TEST_F(RedisConnectionConcurrencyTest, FailureAndExceptionReleasePermits) {
+TEST_F(RedisConnectionConcurrencyTest, FailureReleasesPermits) {
     HandshakeRedisClient failed([] { return false; });
     EXPECT_FALSE(failed.Open());
-    HandshakeRedisClient throwing([]() -> bool { throw std::runtime_error("handshake failed"); });
-    EXPECT_THROW(throwing.Open(), std::runtime_error);
     HandshakeGate gate;
     std::thread first([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
     std::thread second([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
@@ -229,6 +236,7 @@ TEST_F(RedisConnectionConcurrencyTest, FailureAndExceptionReleasePermits) {
 
 TEST_F(RedisConnectionConcurrencyTest, RealHandshakeTimesOutWithoutPingReply) {
     PingServer server(false);
+    ASSERT_TRUE(server.Start());
     RedisClient client(
         StandardUri::FromUri("redis://127.0.0.1:" + std::to_string(server.Port()) + "/?retry_count=1&timeout_ms=40"));
     const auto begin = std::chrono::steady_clock::now();
@@ -238,6 +246,7 @@ TEST_F(RedisConnectionConcurrencyTest, RealHandshakeTimesOutWithoutPingReply) {
 
 TEST_F(RedisConnectionConcurrencyTest, RealHandshakeRestoresSteadyStateSocketTimeout) {
     PingServer server(true);
+    ASSERT_TRUE(server.Start());
     RedisClient client(
         StandardUri::FromUri("redis://127.0.0.1:" + std::to_string(server.Port()) + "/?retry_count=1&timeout_ms=1000"));
     ASSERT_TRUE(client.Open());

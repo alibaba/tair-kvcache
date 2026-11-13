@@ -1,10 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <autil/Thread.h>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/client_pool.h"
@@ -168,7 +168,7 @@ private:
     // Runtime state
     std::atomic<bool> is_running_{false};
     std::vector<std::unique_ptr<MpscWriteQueue>> queues_;
-    std::vector<std::thread> consumer_threads_;
+    std::vector<autil::ThreadPtr> consumer_threads_;
 
     // Per-consumer RedisClient (each consumer owns one)
     std::vector<std::shared_ptr<RedisClient>> consumer_clients_;

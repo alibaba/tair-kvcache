@@ -191,8 +191,8 @@ Server::Init()
 2. 两个 Manager 都采用“生命周期锁 → Instance 锁 → map 锁”的顺序。慢 `Init/Open` 不持全局 map 锁，
    同 ID 只初始化一次，完成后才发布。Extract/Restore 与同 ID 创建互斥；Cleanup 等待已进入的创建完成。
    跨 Manager 的清理仍由 CacheManager 的生命周期锁和 Server 串行回调保证顺序。
-3. backend 内部各任务创建独立 RedisClient，预先分配结果槽位。任一任务失败或抛出异常，其他 worker 观察到
-   失败标记后停止领取任务；已通过检查的 worker 仍可能启动任务。等待全部已启动任务结束后再清理成功连接。
+3. backend 内部各任务创建独立 RedisClient，预先分配结果槽位。任一建连任务返回失败，其他 worker 观察到
+   失败标记后停止领取任务；已通过检查的 worker 仍可能启动任务。等待全部已启动任务结束后清理成功连接并返回 `EC_ERROR`。
    consumer 只在所有连接和队列就绪后启动；启动线程部分失败也会
    停止、join 并回收已启动的 consumer。每个队列仍独占原连接，FIFO、Sync barrier 和 Instance 隔离不变。
 4. 进程级握手许可按该客户端的 `timeout_ms` 有界等待，超时沿原重试路径处理；许可不覆盖重试退避或普通命令。

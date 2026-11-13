@@ -1,13 +1,16 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <dlfcn.h>
 #include <future>
 #include <mutex>
-#include <stdexcept>
+#include <pthread.h>
 #include <thread>
 
 #include "kv_cache_manager/common/bounded_parallel.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "stub.h"
 
 namespace kv_cache_manager {
 
@@ -18,7 +21,7 @@ TEST(BoundedParallelTest, RunsEveryItemOnceAndBoundsConcurrentWork) {
     size_t active = 0;
     size_t peak = 0;
     std::vector<int> visits(20, 0);
-    bool result = false;
+    ErrorCode result = EC_UNKNOWN;
     std::thread runner([&] {
         result = RunBoundedParallel(visits.size(), 3, [&](size_t index) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -28,7 +31,7 @@ TEST(BoundedParallelTest, RunsEveryItemOnceAndBoundsConcurrentWork) {
             changed.wait(lock, [&] { return release; });
             ++visits[index];
             --active;
-            return true;
+            return EC_OK;
         });
     });
     bool overlapped = false;
@@ -40,7 +43,7 @@ TEST(BoundedParallelTest, RunsEveryItemOnceAndBoundsConcurrentWork) {
     }
     runner.join();
     EXPECT_TRUE(overlapped);
-    EXPECT_TRUE(result);
+    EXPECT_EQ(EC_OK, result);
     EXPECT_EQ(3, peak);
     EXPECT_EQ(std::vector<int>(visits.size(), 1), visits);
 }
@@ -51,7 +54,7 @@ TEST(BoundedParallelTest, FailureWaitsForOtherClaimedWork) {
     bool sibling_started = false;
     bool failure_ready = false;
     bool release_sibling = false;
-    std::promise<bool> completion;
+    std::promise<ErrorCode> completion;
     auto result = completion.get_future();
     std::thread runner([&] {
         const auto caller_id = std::this_thread::get_id();
@@ -61,12 +64,12 @@ TEST(BoundedParallelTest, FailureWaitsForOtherClaimedWork) {
                 changed.wait(lock, [&] { return sibling_started || release_sibling; });
                 failure_ready = true;
                 changed.notify_all();
-                return false;
+                return EC_ERROR;
             }
             sibling_started = true;
             changed.notify_all();
             changed.wait(lock, [&] { return release_sibling; });
-            return true;
+            return EC_OK;
         }));
     });
     bool saw_failure = false;
@@ -83,27 +86,40 @@ TEST(BoundedParallelTest, FailureWaitsForOtherClaimedWork) {
     runner.join();
     EXPECT_TRUE(saw_failure);
     EXPECT_EQ(std::future_status::timeout, status);
-    EXPECT_FALSE(result.get());
+    EXPECT_EQ(EC_ERROR, result.get());
 }
 
-TEST(BoundedParallelTest, ContainsTaskExceptionsAndSupportsNestedCalls) {
+TEST(BoundedParallelTest, ReportsErrorsAndSupportsNestedCalls) {
     size_t failed_calls = 0;
-    EXPECT_FALSE(RunBoundedParallel(10, 1, [&](size_t) {
-        ++failed_calls;
-        return false;
-    }));
+    EXPECT_EQ(EC_TIMEOUT, RunBoundedParallel(10, 1, [&](size_t) {
+                  ++failed_calls;
+                  return EC_TIMEOUT;
+              }));
     EXPECT_EQ(1, failed_calls);
-    EXPECT_FALSE(RunBoundedParallel(3, 1, [](size_t) -> bool { throw std::runtime_error("task failed"); }));
-    EXPECT_FALSE(RunBoundedParallel(1, 0, [](size_t) { return true; }));
-    EXPECT_TRUE(RunBoundedParallel(0, 0, [](size_t) { return false; }));
+    EXPECT_EQ(EC_BADARGS, RunBoundedParallel(1, 0, [](size_t) { return EC_OK; }));
+    EXPECT_EQ(EC_OK, RunBoundedParallel(0, 0, [](size_t) { return EC_ERROR; }));
     std::atomic<int> completed{0};
-    EXPECT_TRUE(RunBoundedParallel(4, 2, [&](size_t) {
-        return RunBoundedParallel(4, 2, [&](size_t) {
-            ++completed;
-            return true;
-        });
-    }));
+    EXPECT_EQ(EC_OK, RunBoundedParallel(4, 2, [&](size_t) {
+                  return RunBoundedParallel(4, 2, [&](size_t) {
+                      ++completed;
+                      return EC_OK;
+                  });
+              }));
     EXPECT_EQ(16, completed.load());
+}
+
+TEST(BoundedParallelTest, ThreadCreationFailureReturnsErrorWithoutRunningNewWork) {
+    auto create_thread = reinterpret_cast<decltype(&pthread_create)>(dlsym(RTLD_NEXT, "pthread_create"));
+    ASSERT_NE(nullptr, create_thread);
+    Stub stub;
+    stub.set(
+        create_thread, +[](pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) { return EAGAIN; });
+    size_t calls = 0;
+    EXPECT_EQ(EC_ERROR, RunBoundedParallel(3, 2, [&](size_t) {
+                  ++calls;
+                  return EC_OK;
+              }));
+    EXPECT_EQ(0, calls);
 }
 
 } // namespace kv_cache_manager

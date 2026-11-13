@@ -288,5 +288,6 @@ cc_library(
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/config",
+        "@havenask//aios/autil:thread",
     ],
 )

@@ -5,6 +5,10 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "bounded_parallel",
     hdrs = ["bounded_parallel.h"],
+    deps = [
+        ":common",
+        "@havenask//aios/autil:thread",
+    ],
 )
 
 version_info_cc(

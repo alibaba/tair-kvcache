@@ -11,7 +11,6 @@
 #include <optional>
 #include <set>
 #include <shared_mutex>
-#include <stdexcept>
 #include <thread>
 #include <tuple>
 
@@ -87,7 +86,6 @@ struct State {
     size_t calls = 0;
     bool released = false;
     bool fail_first = false;
-    bool throw_first = false;
     bool shared_context = false;
     std::set<RequestContext *> active_contexts;
     std::set<std::string> visited;
@@ -108,9 +106,6 @@ ErrorCode TryCreate(void *, RequestContext *context, const std::string &instance
     std::unique_lock<std::mutex> lock(state->mutex);
     const size_t call = ++state->calls;
     state->visited.insert(instance_id);
-    if (call == 1 && state->throw_first) {
-        throw std::runtime_error("injected instance recovery failure");
-    }
     if (call == 1 && state->fail_first) {
         return EC_ERROR;
     }
@@ -8504,27 +8499,22 @@ TEST_F(CacheManagerTest, TestParallelRecoverRetainsPartialFailureAndRetriesEvery
         registry_manager_->instance_infos_["another_instance"] = std::make_shared<InstanceInfo>(
             "test_quota_group", "default", "another_instance", 64, createLocationSpecInfos(), createModelDeployment());
     }
-    for (const bool throw_first : {false, true}) {
-        SCOPED_TRACE(throw_first ? "exception" : "error code");
-        parallel_recover_stub::State state;
-        state.fail_first = !throw_first;
-        state.throw_first = throw_first;
-        state.released = true;
-        parallel_recover_stub::state = &state;
-        Stub stub;
-        stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
-        EXPECT_EQ(EC_OK, cache_manager_->DoRecover());
-        EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
-        cache_manager_->StopRecoverRetryLoop();
-        EXPECT_EQ(2, state.calls);
-        EXPECT_EQ(2, state.visited.size());
+    parallel_recover_stub::State state;
+    state.fail_first = true;
+    state.released = true;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecover());
+    EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
+    cache_manager_->StopRecoverRetryLoop();
+    EXPECT_EQ(2, state.calls);
+    EXPECT_EQ(2, state.visited.size());
 
-        state.calls = 0;
-        state.fail_first = false;
-        state.throw_first = false;
-        EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
-        EXPECT_EQ(2, state.calls);
-    }
+    state.calls = 0;
+    state.fail_first = false;
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_EQ(2, state.calls);
 }
 
 TEST_F(CacheManagerTest, TestRecoverySnapshotDoesNotRegisterInstancesRemovedBeforeExecution) {

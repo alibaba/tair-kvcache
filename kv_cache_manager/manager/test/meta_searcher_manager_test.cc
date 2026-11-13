@@ -5,8 +5,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
-#include <utility>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -255,32 +253,24 @@ TEST_F(MetaSearcherManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
     EXPECT_EQ(2, indexers->init_count.load());
 }
 
-TEST_F(MetaSearcherManagerTest, SearcherCreationFailureReusesInitializedIndexerOnRetry) {
+TEST_F(MetaSearcherManagerTest, SearcherCleanupReusesInitializedIndexer) {
     auto indexers = UseControlledIndexerManager();
-    struct ThrowOnCopy {
-        explicit ThrowOnCopy(std::shared_ptr<MetaIndexerManager> manager) : manager(std::move(manager)) {}
-        ThrowOnCopy(const ThrowOnCopy &other) : manager(other.manager) {
-            if (manager->GetMetaIndexer("test_instance")) {
-                throw std::runtime_error("injected Searcher callback copy failure");
-            }
-        }
-        bool operator()(const CacheLocation &) const { return true; }
-        std::shared_ptr<MetaIndexerManager> manager;
-    };
-    CheckLocDataExistFunc check{ThrowOnCopy(indexers)};
-    RequestContext context("searcher_creation_failure");
-    // Move the callback into TryCreate; only its copy inside Searcher construction fails.
-    EXPECT_THROW(meta_searcher_manager_->TryCreateMetaSearcher(
-                     &context, "test_instance", std::move(check), dummy_submit_del_req),
-                 std::runtime_error);
+    auto original = CreateSearcher("test_instance");
+    ASSERT_NE(nullptr, original);
     auto indexer = indexers->GetMetaIndexer("test_instance");
     ASSERT_NE(nullptr, indexer);
     ASSERT_NE(nullptr, indexer->backend_manager_);
+    EXPECT_EQ(indexer, original->meta_indexer_);
+    EXPECT_EQ(1, indexers->init_count.load());
+
+    meta_searcher_manager_->DoCleanup();
     EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
     EXPECT_EQ(1, indexers->init_count.load());
 
     auto searcher = CreateSearcher("test_instance");
     ASSERT_NE(nullptr, searcher);
+    EXPECT_NE(original, searcher);
     EXPECT_EQ(indexer, searcher->meta_indexer_);
     EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
     EXPECT_EQ(1, indexers->init_count.load());
