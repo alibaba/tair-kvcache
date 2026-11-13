@@ -13,8 +13,8 @@ public:
     explicit DebugServiceImpl(std::shared_ptr<CacheManager> cache_manager) : cache_manager_(std::move(cache_manager)) {}
     ~DebugServiceImpl() = default;
 
-    void GetCacheMetaDetail(const proto::meta::GetCacheMetaDetailRequest *request,
-                            proto::meta::GetCacheMetaDetailResponse *response);
+    void GetCacheMetaDetail(const proto::debug::GetCacheMetaDetailRequest *request,
+                            proto::debug::GetCacheMetaDetailResponse *response);
 
     void InjectFault(const proto::debug::InjectFaultRequest *request, proto::debug::CommonResponse *response);
 

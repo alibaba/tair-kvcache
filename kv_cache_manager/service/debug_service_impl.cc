@@ -26,14 +26,14 @@
 
 namespace kv_cache_manager {
 
-void DebugServiceImpl::GetCacheMetaDetail(const proto::meta::GetCacheMetaDetailRequest *request,
-                                          proto::meta::GetCacheMetaDetailResponse *response) {
+void DebugServiceImpl::GetCacheMetaDetail(const proto::debug::GetCacheMetaDetailRequest *request,
+                                          proto::debug::GetCacheMetaDetailResponse *response) {
     RequestContext request_context(request->trace_id());
     auto *header = response->mutable_header();
     header->set_request_id(request_context.request_id());
     auto *status = header->mutable_status();
     if (request->instance_id().empty() || (request->block_keys().empty() && request->token_ids().empty())) {
-        status->set_code(proto::meta::INVALID_ARGUMENT);
+        status->set_code(proto::debug::INVALID_ARGUMENT);
         status->set_message("instance_id and block_keys or token_ids are required");
         return;
     }
@@ -54,7 +54,7 @@ void DebugServiceImpl::GetCacheMetaDetail(const proto::meta::GetCacheMetaDetailR
         ProtoConvert::CacheKeyMetaDetailToProto(detail, response->add_items());
     }
     if (ec != EC_OK) {
-        status->set_code(ToPbError<proto::meta::ErrorCode>(ec));
+        status->set_code(ToPbError<proto::debug::ErrorCode>(ec));
         status->set_message("Failed to get cache metadata detail: " + request_context.error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] GetCacheMetaDetail failed, ec: %d, returned %d items",
                        request->trace_id().c_str(),
@@ -62,7 +62,7 @@ void DebugServiceImpl::GetCacheMetaDetail(const proto::meta::GetCacheMetaDetailR
                        response->items_size());
         return;
     }
-    status->set_code(proto::meta::OK);
+    status->set_code(proto::debug::OK);
     status->set_message(item_error_count == 0 ? "Cache metadata detail retrieved successfully"
                                               : "Cache metadata detail retrieved with " +
                                                     std::to_string(item_error_count) + " item errors");

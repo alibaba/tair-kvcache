@@ -20,8 +20,8 @@ curl -X POST http://localhost:9382/api/getCacheMetaDetail \
 ```
 
 The equivalent gRPC method is `kv_cache_manager.proto.debug.DebugService/GetCacheMetaDetail`.
-The request and response messages are defined in `meta_service.proto`, but the RPC
-is exposed only by DebugService. Ordinary MetaService clients have no route for it.
+The request and response messages are defined in `debug_service.proto`. Ordinary
+MetaService clients have no route for this RPC.
 
 The response has one `items` entry per unmasked key, in request order. It includes
 raw properties and all locations without storage selection, data-file checks, or

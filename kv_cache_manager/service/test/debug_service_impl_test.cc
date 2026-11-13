@@ -41,20 +41,20 @@ TEST(DebugServiceImplTest, PreservesPerKeyDetailsWhenEveryLookupFails) {
     Stub stub;
     stub.set(ADDR(CacheManager, GetCacheMetaDetail), GetCacheMetaDetailAllFailedStub);
 
-    proto::meta::GetCacheMetaDetailRequest request;
+    proto::debug::GetCacheMetaDetailRequest request;
     request.set_trace_id("all_failed");
     request.set_instance_id("test_instance");
     request.add_block_keys(22);
-    proto::meta::GetCacheMetaDetailResponse response;
+    proto::debug::GetCacheMetaDetailResponse response;
 
     service.GetCacheMetaDetail(&request, &response);
 
-    EXPECT_EQ(proto::meta::INTERNAL_ERROR, response.header().status().code());
+    EXPECT_EQ(proto::debug::INTERNAL_ERROR, response.header().status().code());
     EXPECT_FALSE(response.header().request_id().empty());
     ASSERT_EQ(1, response.items_size());
     EXPECT_EQ(0, response.items(0).request_index());
     EXPECT_EQ(22, response.items(0).block_key());
-    EXPECT_EQ(proto::meta::INTERNAL_ERROR, response.items(0).status().code());
+    EXPECT_EQ(proto::debug::INTERNAL_ERROR, response.items(0).status().code());
 }
 
 } // namespace kv_cache_manager

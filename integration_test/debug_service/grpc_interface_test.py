@@ -3,9 +3,9 @@ import unittest
 import grpc
 
 from integration_test.testlib.test_base import TestBase
+from kv_cache_manager.protocol.protobuf.debug_service_pb2 import GetCacheMetaDetailRequest
 from kv_cache_manager.protocol.protobuf.debug_service_pb2_grpc import DebugServiceStub
 from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
-    GetCacheMetaDetailRequest,
     LocationSpecInfo,
     ModelDeployment,
     RegisterInstanceRequest,

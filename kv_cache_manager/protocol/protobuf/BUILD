@@ -68,7 +68,6 @@ cc_library(
 py_library(
     name = "meta_service_py_proto",
     srcs = [":meta_service_py"],
-    imports = ["."],
     visibility = ["//visibility:public"],
 )
 
@@ -81,8 +80,6 @@ py_library(
 py_library(
     name = "debug_service_py_proto",
     srcs = [":debug_service_py"],
-    imports = ["."],
-    deps = [":meta_service_py_proto"],
     visibility = ["//visibility:public"],
 )
 
@@ -103,7 +100,6 @@ generate_grpc_proto(
     name = "meta_service_py",
     create_grpc_proto = ":create_grpc_proto",
     proto = "meta_service.proto",
-    short_import_path = True,
 )
 
 generate_grpc_proto(
@@ -122,8 +118,6 @@ generate_grpc_proto(
     name = "debug_service_py",
     create_grpc_proto = ":create_grpc_proto",
     proto = "debug_service.proto",
-    proto_deps = ["meta_service.proto"],
-    short_import_path = True,
 )
 
 tf_proto_library_cc(
@@ -160,7 +154,6 @@ tf_proto_library_cc(
     ],
     cc_grpc_version = True,
     default_header = True,
-    protodeps = [":meta_service"],
 )
 
 tf_proto_library_cc(
