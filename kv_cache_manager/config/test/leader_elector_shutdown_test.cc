@@ -66,6 +66,19 @@ private:
     bool released_ = false;
 };
 
+// handler 卡在 barrier 上时，任何提前返回（ASSERT_* 失败）都必须放行 barrier，
+// 否则一次断言失败会让 handler 线程永久阻塞，整个测试目标挂到 CI 超时。
+class BarrierReleaseGuard {
+public:
+    explicit BarrierReleaseGuard(Barrier &barrier) : barrier_(barrier) {}
+    ~BarrierReleaseGuard() { barrier_.Release(); }
+    BarrierReleaseGuard(const BarrierReleaseGuard &) = delete;
+    BarrierReleaseGuard &operator=(const BarrierReleaseGuard &) = delete;
+
+private:
+    Barrier &barrier_;
+};
+
 template <typename Pred>
 bool WaitUntil(Pred pred, int64_t timeout_ms) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -120,6 +133,15 @@ protected:
         return WaitUntil([this] { return controller_.IsShutdownRequested(); }, kWaitTimeoutMs);
     }
 
+    // 等到状态机真正收敛到 LEADER。IsLeader() 只反映 lock_acquired_，抢锁成功即为真，
+    // 此时角色可能还停在 FOLLOWER/PROMOTING：删掉锁只会被当成一次普通失锁，选主线程
+    // 随即把锁抢回来，降级清理永远不会发生。
+    bool WaitForSettledLeader(const std::shared_ptr<LeaderElector> &elector) {
+        return WaitUntil(
+            [&elector] { return elector->IsLeader() && elector->GetRoleState() == RoleState::LEADER; },
+            kWaitTimeoutMs);
+    }
+
 protected:
     std::shared_ptr<CoordinationBackend> backend_;
     std::string lock_key_;
@@ -137,7 +159,7 @@ TEST_F(LeaderElectorShutdownTest, DirectedSignalOnElectorThreadsDoesNotMakeThemR
     elector->SetNoLongerLeaderHandler([&cleanups] { cleanups.fetch_add(1); });
     elector->SetLeadershipLostHandler([] {});
     ASSERT_TRUE(elector->Start());
-    ASSERT_TRUE(WaitUntil([&elector] { return elector->IsLeader(); }, kWaitTimeoutMs));
+    ASSERT_TRUE(WaitForSettledLeader(elector));
 
     auto leader_lock_thread = elector->leader_lock_thread_ptr_;
     auto lease_check_thread = elector->lease_check_thread_ptr_;
@@ -175,6 +197,7 @@ TEST_F(LeaderElectorShutdownTest, ShutdownWaitsForLeadershipLostHandlerHoldingTr
     ASSERT_TRUE(controller_.Start());
 
     Barrier gate_barrier;
+    BarrierReleaseGuard gate_guard(gate_barrier);
     std::atomic<int> gates{0};
     std::atomic<int> cleanups{0};
     auto elector = CreateElector();
@@ -186,7 +209,7 @@ TEST_F(LeaderElectorShutdownTest, ShutdownWaitsForLeadershipLostHandlerHoldingTr
         gates.fetch_add(1);
     });
     ASSERT_TRUE(elector->Start());
-    ASSERT_TRUE(WaitUntil([&elector] { return elector->IsLeader(); }, kWaitTimeoutMs));
+    ASSERT_TRUE(WaitForSettledLeader(elector));
 
     auto leader_lock_thread = elector->leader_lock_thread_ptr_;
     auto lease_check_thread = elector->lease_check_thread_ptr_;
@@ -223,6 +246,7 @@ TEST_F(LeaderElectorShutdownTest, ShutdownWaitsForRecoveryInProgress) {
     ASSERT_TRUE(controller_.Start());
 
     Barrier recovery_barrier;
+    BarrierReleaseGuard recovery_guard(recovery_barrier);
     std::atomic<int> recoveries{0};
     std::atomic<int> cleanups{0};
     auto elector = CreateElector();
@@ -261,6 +285,7 @@ TEST_F(LeaderElectorShutdownTest, ShutdownWaitsForDemotionCleanupInProgress) {
     ASSERT_TRUE(controller_.Start());
 
     Barrier cleanup_barrier;
+    BarrierReleaseGuard cleanup_guard(cleanup_barrier);
     std::atomic<int> cleanups{0};
     auto elector = CreateElector();
     elector->SetBecomeLeaderHandler([] {});
@@ -270,7 +295,7 @@ TEST_F(LeaderElectorShutdownTest, ShutdownWaitsForDemotionCleanupInProgress) {
     });
     elector->SetLeadershipLostHandler([] {});
     ASSERT_TRUE(elector->Start());
-    ASSERT_TRUE(WaitUntil([&elector] { return elector->IsLeader(); }, kWaitTimeoutMs));
+    ASSERT_TRUE(WaitForSettledLeader(elector));
 
     auto lease_check_thread = elector->lease_check_thread_ptr_;
 
