@@ -295,6 +295,57 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         remove_resp = self._client.remove_instance_group(remove_req)
         self.assertEqual(remove_resp["header"]["status"]["code"], "OK")
 
+    def test_dynamic_quota_config_and_runtime_are_separate(self):
+        group = self.make_sample_instance_group()
+        group["quota"] = {
+            "capacity": -1,
+            "quota_config": [
+                {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 0.5,
+                 "storage_names": ["missing_pool"]},
+                {"storage_type": "ST_TAIRMEMPOOL_SSD", "capacity": 160},
+            ],
+        }
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        result = self._client.get_instance_group({"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(result["quota"]["capacity"]))
+        self.assertEqual("auto", result["quota"]["quota_config"][0]["mode"])
+        self.assertEqual(0.5, result["quota"]["quota_config"][0]["ratio"])
+        runtime = result["runtime_quota"]
+        self.assertFalse(runtime.get("total_bytes_limit_enabled", False))
+        self.assertEqual(-1, int(runtime["reference_capacity"]))
+        types = {item["storage_type"]: item for item in runtime["storage_types"]}
+        self.assertEqual("missing_backend", types["ST_TAIRMEMPOOL"]["refresh_status"])
+        self.assertFalse(types["ST_TAIRMEMPOOL"].get("known", False))
+        self.assertEqual(160, int(types["ST_TAIRMEMPOOL_SSD"]["effective_capacity"]))
+        # GET -> whole-object UPDATE must preserve auto configuration and
+        # ignore the read-only runtime object supplied by the client.
+        result["user_data"] = "updated"
+        result["runtime_quota"]["reference_capacity"] = 999999
+        current_version = int(result["version"])
+        result["version"] = current_version + 1
+        self._client.update_instance_group({"trace_id": self._trace_id, "instance_group": result,
+                                            "current_version": current_version})
+        restored = self._client.get_instance_group(
+            {"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(restored["runtime_quota"]["reference_capacity"]))
+        self.assertEqual(0.5, restored["quota"]["quota_config"][0]["ratio"])
+        listed = self._client.list_instance_group({"trace_id": self._trace_id})["instance_group"]
+        self.assertTrue(any(item["name"] == group["name"] and "runtime_quota" in item for item in listed))
+
+    def test_new_group_defaults_to_unlimited_auto_and_rejects_invalid_ratio(self):
+        group = self.make_sample_instance_group()
+        del group["quota"]
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        result = self._client.get_instance_group({"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(-1, int(result["quota"]["capacity"]))
+        for ratio in (0, -0.1, 1.1):
+            group["name"] = "invalid_quota_group"
+            group["quota"] = {"capacity": -1, "quota_config": [
+                {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": ratio}]}
+            response = self._client.create_instance_group(
+                {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
+            self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+
     def test_register_get_list_remove_instance(self):
         ig = self.make_sample_instance_group()
         create_req = {"trace_id": self._trace_id, "instance_group": ig}

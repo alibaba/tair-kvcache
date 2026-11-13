@@ -44,6 +44,13 @@ public:
     std::vector<DataStorageCreateResult> scripted_results;
 };
 
+class CapacityBackend : public DummyBackend {
+public:
+    using DummyBackend::DummyBackend;
+    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot snapshot;
+};
+
 class RecordingBatchBackend : public RecordingCreateBackend {
 public:
     using RecordingCreateBackend::RecordingCreateBackend;
@@ -133,6 +140,44 @@ public:
     void TearDown() override {}
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
+
+TEST_F(DataStorageManagerTest, CapacitySnapshotsReadBackendCacheAndResetOnRemoval) {
+    DataStorageManager manager(metrics_registry_);
+    auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
+    manager.storage_map_["pool"] = backend;
+    EXPECT_EQ(-1, manager.GetCapacitySnapshots().at("pool").capacity);
+    backend->snapshot = {100, 1000, 100000, EC_OK};
+    auto snapshot = manager.GetCapacitySnapshots().at("pool");
+    EXPECT_EQ(100, snapshot.capacity);
+    EXPECT_EQ(1000, snapshot.last_success_time_s);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, snapshot.type);
+    backend->snapshot.refresh_code = EC_ERROR;
+    const auto failed = manager.GetCapacitySnapshots().at("pool");
+    EXPECT_EQ(100, failed.capacity);
+    EXPECT_EQ(EC_ERROR, failed.refresh_code);
+    EXPECT_EQ(snapshot.last_success_steady_us, failed.last_success_steady_us);
+    backend->snapshot = {0, 1001, 200000, EC_OK};
+    EXPECT_EQ(0, manager.GetCapacitySnapshots().at("pool").capacity);
+    EXPECT_EQ(EC_OK, manager.UnRegisterStorage("pool"));
+    EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
+    manager.storage_map_["pool"] = std::make_shared<CapacityBackend>(metrics_registry_);
+    EXPECT_EQ(-1, manager.GetCapacitySnapshots().at("pool").capacity);
+    EXPECT_EQ(EC_OK, manager.DoCleanup());
+    EXPECT_TRUE(manager.GetCapacitySnapshots().empty());
+}
+
+TEST_F(DataStorageManagerTest, CapacitySnapshotsDistinguishUnsupportedAndInvalidObservations) {
+    DataStorageManager manager(metrics_registry_);
+    manager.storage_map_["unsupported"] = std::make_shared<DummyBackend>(metrics_registry_);
+    auto backend = std::make_shared<CapacityBackend>(metrics_registry_);
+    backend->snapshot.refresh_code = EC_OK; // Invalid success with an unknown capacity.
+    manager.storage_map_["invalid"] = backend;
+    const auto snapshots = manager.GetCapacitySnapshots();
+    EXPECT_EQ(EC_UNIMPLEMENTED, snapshots.at("unsupported").refresh_code);
+    EXPECT_EQ(-1, snapshots.at("unsupported").capacity);
+    EXPECT_EQ(EC_ERROR, snapshots.at("invalid").refresh_code);
+    EXPECT_EQ(-1, snapshots.at("invalid").capacity);
+}
 
 TEST_F(DataStorageManagerTest, TestSimple) {
     DataStorageManager data_storage_manager(metrics_registry_);

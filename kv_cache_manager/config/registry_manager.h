@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/registry_storage_backend.h"
 
 namespace kv_cache_manager {
@@ -99,6 +100,7 @@ public:
     std::shared_ptr<const InstanceGroup> GetInstanceGroupConfig(const std::string &instance_group_name) const;
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
+    EffectiveGroupQuota ResolveQuota(const InstanceGroup &group) const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:

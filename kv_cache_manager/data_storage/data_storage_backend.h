@@ -16,6 +16,16 @@
 
 namespace kv_cache_manager {
 
+struct StorageCapacitySnapshot {
+    // -1 is unknown; a successful zero is authoritative.
+    int64_t capacity = -1;
+    int64_t last_success_time_s = 0;
+    int64_t last_success_steady_us = 0;
+    ErrorCode refresh_code = EC_ERROR;
+    std::string identity;
+    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+};
+
 struct DataStorageCreateRequest {
     std::vector<std::string> keys;
     size_t size_per_key;
@@ -103,6 +113,17 @@ public:
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
+    // Read a cached observation of total bytes for GetType(), never free bytes.
+    // Must perform no network/disk I/O and never wait for a background refresh.
+    // Backends own refresh scheduling and retain the last successful capacity
+    // and timestamps on errors. Before the first success return unknown, not zero.
+    virtual StorageCapacitySnapshot GetStorageCapacity() const {
+        StorageCapacitySnapshot snapshot;
+        snapshot.refresh_code = EC_UNIMPLEMENTED;
+        return snapshot;
+    }
+    // Aliases of the same physical pool and media must return the same identity.
+    virtual std::string GetCapacityIdentity() const { return config_.global_unique_name(); }
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
     virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }

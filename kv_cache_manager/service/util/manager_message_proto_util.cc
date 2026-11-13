@@ -456,6 +456,11 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
         auto *proto_quota_config = quota->add_quota_config();
         proto_quota_config->set_storage_type(static_cast<proto::admin::StorageType>(quota_config.storage_spec()));
         proto_quota_config->set_capacity(quota_config.capacity());
+        proto_quota_config->set_mode(quota_config.mode());
+        proto_quota_config->set_ratio(quota_config.ratio());
+        for (const auto &name : quota_config.storage_names()) {
+            proto_quota_config->add_storage_names(name);
+        }
     }
 
     // 处理cache_config
@@ -482,7 +487,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
     instance_group_info.set_max_instance_count(proto_instance_group->max_instance_count());
 
     InstanceGroupQuota quota;
-    quota.set_capacity(proto_instance_group->quota().capacity());
+    quota.set_capacity(proto_instance_group->has_quota() ? proto_instance_group->quota().capacity() : -1);
 
     // 处理quota_config - proto中是repeated字段
     std::vector<QuotaConfig> quota_configs;
@@ -493,6 +498,12 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
         DataStorageTypeFromProto(storage_type, data_storage_type);
         quota_config.set_storage_type(data_storage_type);
         quota_config.set_capacity(proto_quota_config.capacity());
+        quota_config.set_mode(proto_quota_config.mode().empty() ? "fixed" : proto_quota_config.mode());
+        quota_config.set_ratio(proto_quota_config.ratio_value_case() == proto::admin::QuotaConfig::kRatio
+                                   ? proto_quota_config.ratio()
+                                   : 1.0);
+        quota_config.set_storage_names(
+            {proto_quota_config.storage_names().begin(), proto_quota_config.storage_names().end()});
         quota_configs.push_back(quota_config);
     }
     quota.set_quota_config(quota_configs);

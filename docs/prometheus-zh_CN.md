@@ -1,5 +1,23 @@
 # Prometheus Metrics 端点
 
+## 动态 quota 水位
+
+`cache_manager_group.usage_ratio` 在正数总 quota 下仍用固定总上限作为分母；总 quota 为 `-1` 时改用各类型有效 quota 之和。对应 Prometheus 名称为 `kvcm_cache_manager_group_usage_ratio`。参考容量不参与总量准入或总字节回收。
+
+| 指标 | 标签 | 含义 |
+| --- | --- | --- |
+| `cache_manager_group.reference_capacity` | `instance_group` | 类型有效 quota 之和，未知或溢出为 -1 |
+| `cache_manager_group.total_bytes_limit_enabled` | `instance_group` | 0 表示 Group 总字节不限额 |
+| `cache_manager_group_storage.usage_bytes` | `instance_group, storage_type` | 该类型当前用量 |
+| `cache_manager_group_storage.effective_quota` | 同上 | 有效容量，未知为 -1，过期保留旧值 |
+| `cache_manager_group_storage.usage_ratio` | 同上 | 用量 / 有效 quota |
+| `cache_manager_group_storage.capacity_known` | 同上 | 是否已有成功容量或固定配置 |
+| `cache_manager_group_storage.capacity_usable` | 同上 | 容量是否可用于当前准入及回收判断 |
+| `cache_manager_group_storage.refresh_success` | 同上 | 自动容量最近查询成功或固定配置为 1，失败/未知/过期为 0 |
+| `cache_manager_group_storage.last_success_time_s` | 同上 | 最近成功刷新的 Unix 秒，未知为 0 |
+
+未知使用率为 NaN；真实零容量且有用量为 +Inf，空用量为 0。需结合容量值、known、usable 和刷新状态区分无容量与未知状态。`storage_type` 使用 `pace`、`pace_ssd` 等基础类型名称。后端自身 `data_storage.storage_usage_ratio` 保持原含义。详见[动态 quota](design/dynamic_backend_quota.md)。
+
 KVCacheManager 在 Admin HTTP 服务端口（默认 6492）上提供了兼容 Prometheus
 的指标抓取端点 `GET /metrics`。
 
@@ -195,6 +213,7 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率。follower 不输出该指标，降级后的下一次上报周期移除之前发布的序列。leader（或未配置角色信息的调用方）沿用后端返回值，包括默认值 0；若后端返回负值则跳过更新。健康状态及可写状态独立上报，连接异常仍可告警 |
+| `data_storage.total_capacity_bytes` | gauge | 后端反馈的总容量字节数，未应用 Group 的 quota 比例；标签同为 `type, unique_name`。未知或不支持为 -1，失败/过期保留最近成功值，成功的零容量为 0。follower 不输出；降级和卸载清理对应序列。TairMempool 的既有 ratio 保留 DRAM 口径，该总量不保证是其分母 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |

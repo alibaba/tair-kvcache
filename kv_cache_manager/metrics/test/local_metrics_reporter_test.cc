@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <future>
 #include <map>
@@ -491,6 +492,12 @@ public:
         return ratio_;
     }
     mutable int usage_queries_ = 0;
+    StorageCapacitySnapshot GetStorageCapacity() const override {
+        ++capacity_queries_;
+        return capacity;
+    }
+    StorageCapacitySnapshot capacity;
+    mutable int capacity_queries_ = 0;
     void SetUsageRatio(double ratio) { ratio_ = ratio; }
     bool Writable() override { return Available() && writable_; }
     void SetWritable(bool writable) { writable_ = writable; }
@@ -501,6 +508,48 @@ private:
 };
 } // namespace
 
+TEST_F(LocalMetricsReporterTest, StorageTotalCapacityPublishesCachedBytesAndDistinguishesUnknownFromZero) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(0.25);
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    manager->storage_map_["capacity_store"] = backend;
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "capacity_store"}};
+    const auto report = [&](double expected) {
+        reporter_->ReportInterval();
+        EXPECT_DOUBLE_EQ(expected, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
+        EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    };
+    report(-1); // No successful observation yet.
+    backend->capacity.refresh_code = EC_UNIMPLEMENTED;
+    report(-1);
+    backend->capacity = {1000, 1000, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    report(1000);
+    const auto output = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_NE(
+        std::string::npos,
+        output.find("kvcm_data_storage_total_capacity_bytes{type=\"file\",unique_name=\"capacity_store\"} 1000\n"));
+    backend->capacity.capacity = 2000;
+    report(2000); // Expansion.
+    backend->capacity.capacity = 600;
+    report(600); // Shrinkage.
+    backend->capacity.refresh_code = EC_ERROR;
+    backend->capacity.last_success_steady_us -= 31000000;
+    report(600); // Failed/stale refresh keeps the last successful observation visible.
+    backend->capacity = {0, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
+    report(0); // Authoritative empty capacity.
+    backend->capacity = {};
+    backend->capacity.capacity = 0;
+    report(-1); // An error with no successful timestamp is not an authoritative zero.
+    ASSERT_EQ(EC_OK, manager->UnRegisterStorage("capacity_store"));
+    const auto removed = metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes");
+    EXPECT_TRUE(!removed || removed->GetMetricsValues().empty());
+    manager->storage_map_["capacity_store"] = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
+}
 
 TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeValues) {
     auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
@@ -562,8 +611,10 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeV
         EXPECT_TRUE(v == 0.75 || v == 0.0) << "unexpected published usage ratio: " << v;
     }
     const std::string exported_text = PrometheusExporter::Expose(*metrics_registry_);
-    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
-    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
+    const std::string never_ok_ratio =
+        "kvcm_data_storage_storage_usage_ratio{type=\"file\",unique_name=\"never_ok_store\"} ";
+    EXPECT_EQ(std::string::npos, exported_text.find(never_ok_ratio + "1"));
+    EXPECT_EQ(std::string::npos, exported_text.find(never_ok_ratio + "-"));
 
     // Filtering a negative ratio must not suppress the backend health signal.
     // An unavailable backend still exports healthy_status 0; a healthy one
@@ -604,16 +655,21 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
     const MetricsTags tags{{"type", "file"}, {"unique_name", "role_store"}};
     const auto verify = [&](double expected_ratio) {
         const int previous_queries = backend->usage_queries_;
+        const int previous_capacity_queries = backend->capacity_queries_;
         role_samples = 0;
         reporter_->ReportInterval();
         EXPECT_EQ(1, role_samples);
         EXPECT_EQ(previous_queries + (leader ? 1 : 0), backend->usage_queries_);
+        EXPECT_EQ(previous_capacity_queries + (leader ? 1 : 0), backend->capacity_queries_);
         if (leader) {
             EXPECT_DOUBLE_EQ(expected_ratio,
                              metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+            EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("data_storage.total_capacity_bytes", tags).Get());
         } else {
             const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
             EXPECT_TRUE(!ratios || ratios->GetMetricsValues().empty());
+            const auto totals = metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes");
+            EXPECT_TRUE(!totals || totals->GetMetricsValues().empty());
         }
         EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0,
                          metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
@@ -628,6 +684,7 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
         };
         if (!leader) {
             EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_storage_usage_ratio"));
+            EXPECT_EQ(std::string::npos, output.find("kvcm_data_storage_total_capacity_bytes"));
         }
         expect_export("healthy_status", backend->Available() ? "1" : "0");
         expect_export("writable_status", backend->Writable() ? "1" : "0");
@@ -804,6 +861,67 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         EXPECT_DOUBLE_EQ(0., flush_time_v);
         EXPECT_DOUBLE_EQ(0., pipeline_err_v);
     }
+}
+
+TEST_F(LocalMetricsReporterTest, UnlimitedQuotaMetricsUseReferenceAndExposeUnknownCapacity) {
+    cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
+    cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>();
+    registry_manager_->storage_ = std::make_unique<RegistryLocalBackend>();
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Init({}));
+    RequestContext context("quota_metrics");
+    InstanceGroup group;
+    group.set_name("quota_group");
+    const auto dram = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const auto ssd = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+    group.set_quota(InstanceGroupQuota(-1, {QuotaConfig(50, dram), QuotaConfig(160, ssd)}));
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&context, group));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(
+                  &context, group.name(), "instance", 8, {LocationSpecInfo("tp0", 1024)}, {}));
+    ASSERT_EQ(
+        EC_OK,
+        cache_manager_->meta_indexer_manager_->CreateMetaIndexer("instance", std::make_shared<MetaIndexerConfig>()));
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("instance");
+    indexer->SetStorageUsageByType(dram, 20);
+    indexer->SetStorageUsageByType(ssd, 80);
+    const auto sample = [&]() {
+        auto recorder = std::make_shared<CacheManagerMetricsRecorder>(cache_manager_->meta_indexer_manager_,
+                                                                      cache_manager_->write_location_manager_,
+                                                                      registry_manager_,
+                                                                      cache_manager_->metrics_lifecycle());
+        cache_manager_->metrics_recorder_ = recorder;
+        recorder->Start();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (recorder->group_quota_metric_map().empty() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        recorder->Stop();
+        reporter_->ReportInterval();
+        return !recorder->group_quota_metric_map().empty();
+    };
+    ASSERT_TRUE(sample());
+    const MetricsTags tags{{"instance_group", group.name()}};
+    const MetricsTags dram_tags{{"instance_group", group.name()}, {"storage_type", "pace"}};
+    const MetricsTags ssd_tags{{"instance_group", group.name()}, {"storage_type", "pace_ssd"}};
+    EXPECT_DOUBLE_EQ(210, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
+    EXPECT_NEAR(100.0 / 210, metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get(), 1e-10);
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group.total_bytes_limit_enabled", tags).Get());
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("cache_manager_group_storage.usage_bytes", dram_tags).Get());
+    EXPECT_DOUBLE_EQ(0.4, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", dram_tags).Get());
+    EXPECT_DOUBLE_EQ(0.5, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get());
+    QuotaConfig unknown(0, ssd);
+    unknown.set_mode("auto");
+    registry_manager_->instance_group_configs_[group.name()]->set_quota(
+        InstanceGroupQuota(-1, {QuotaConfig(50, dram), unknown}));
+    ASSERT_TRUE(sample());
+    EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
+    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get()));
+    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get()));
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.capacity_known", ssd_tags).Get());
+    registry_manager_->instance_group_configs_[group.name()]->set_quota(
+        InstanceGroupQuota(-1, {QuotaConfig(50, dram)}));
+    ASSERT_TRUE(sample());
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("storage_type=\"pace_ssd\""));
 }
 
 TEST_F(LocalMetricsReporterTest, InstanceLocalMetadataMetricsTrackEntriesAndLifecycle) {

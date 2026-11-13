@@ -471,8 +471,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     }
     const auto delay = reclaim_strategy->delay_before_delete_ms();
     const auto read_water_level = [&]() {
-        return GetWaterLevelExceed(
-            request_context.get(), instance_group->name(), instance_group->quota(), reclaim_strategy, instance_infos);
+        return GetWaterLevelExceed(request_context.get(), *instance_group, reclaim_strategy, instance_infos);
     };
     const auto initial = read_water_level();
     if (!IsTriggerReclaiming(initial)) {

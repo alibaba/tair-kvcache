@@ -1,5 +1,15 @@
 # Prometheus Metrics Endpoint
 
+## Dynamic quota metrics
+
+`cache_manager_group.usage_ratio` keeps the fixed total limit as denominator when positive. With total quota `-1`, it uses the sum of effective per-type quotas. This reference capacity is observational and never enforces a total byte limit.
+
+Group gauges (`instance_group` label): `cache_manager_group.reference_capacity` (-1 if unknown or overflowing) and `cache_manager_group.total_bytes_limit_enabled` (0 for unlimited).
+
+Per-type gauges use prefix `cache_manager_group_storage.` and labels `instance_group, storage_type`: `usage_bytes`, `effective_quota`, `usage_ratio`, `capacity_known`, `capacity_usable`, `refresh_success`, and `last_success_time_s`. Storage types use base names such as `pace` and `pace_ssd`. Failed queries retain the last good capacity; expired data stays visible with usable=0. Unknown capacity is -1 with NaN usage ratio. Confirmed zero capacity has +Inf ratio when occupied, or 0 when empty; inspect capacity and known status to distinguish these states. Timestamps are Unix seconds (0 if unknown). Prometheus replaces dots with underscores and prefixes names with `kvcm_`.
+
+Backend `data_storage.storage_usage_ratio` keeps its existing meaning. See [dynamic quota behavior](design/dynamic_backend_quota.md) for refresh timing and failure handling.
+
 KVCacheManager exposes a Prometheus-compatible metrics scrape endpoint
 at `GET /metrics` on the Admin HTTP service port (default 6492).
 
@@ -207,6 +217,7 @@ errors in response bodies remain in `service.error_counter`.
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers omit this metric and remove previously published series on the next reporting interval after demotion. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
+| `data_storage.total_capacity_bytes` | gauge | Backend capacity in bytes before any Group quota ratio, with the same `type, unique_name` labels. Unknown/unsupported is -1; failed/stale refreshes retain the last successful value; confirmed zero is 0. Followers omit it; demotion/unload removes the corresponding series. TairMempool's existing usage ratio retains its DRAM semantics; this capacity is not necessarily its denominator |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |

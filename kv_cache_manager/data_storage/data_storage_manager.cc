@@ -25,6 +25,21 @@ namespace kv_cache_manager {
 DataStorageManager::DataStorageManager(std::shared_ptr<MetricsRegistry> metrics_registry)
     : metrics_registry_(std::move(metrics_registry)) {}
 
+std::map<std::string, StorageCapacitySnapshot> DataStorageManager::GetCapacitySnapshots() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    std::map<std::string, StorageCapacitySnapshot> snapshots;
+    for (const auto &[name, backend] : storage_map_) {
+        auto snapshot = backend->GetStorageCapacity();
+        if (snapshot.refresh_code == EC_OK && snapshot.capacity < 0) {
+            snapshot.refresh_code = EC_ERROR;
+        }
+        snapshot.type = backend->GetType();
+        snapshot.identity = backend->GetCapacityIdentity();
+        snapshots.emplace(name, std::move(snapshot));
+    }
+    return snapshots;
+}
+
 std::vector<std::string> DataStorageManager::GetAllStorageNames() const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     std::vector<std::string> all;

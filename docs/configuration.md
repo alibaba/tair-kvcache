@@ -1,5 +1,7 @@
 # KVCacheManager Service Configuration Manual
 
+动态 quota 的配置、容量口径与故障策略见[按后端容量计算分类型 quota](design/dynamic_backend_quota.md)。新建 Group 默认总 `quota.capacity=-1`，分类型自动使用关联后端容量的 100%；已有显式固定配置保持不变。`-1` 关闭总字节限制，汇总参考容量仅供监控。
+
 ## Commandline arguments
 
 Argument list:

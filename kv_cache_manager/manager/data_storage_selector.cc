@@ -286,7 +286,7 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     }
 
     // evaluate the total used byte size of this group
-    const auto quota = ig->quota();
+    const auto quota = registry_manager_->ResolveQuota(*ig).ForAdmission();
     const auto [ec1, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (ec1 != ErrorCode::EC_OK) {
         PREFIX_LOG(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec1));
@@ -294,7 +294,8 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
         return result;
     }
     const std::size_t group_used_byte_size = CalcGroupUsedSize(request_context, instance_infos);
-    if (quota.capacity() < 0 || group_used_byte_size >= static_cast<std::size_t>(quota.capacity())) {
+    if (quota.capacity() != -1 &&
+        (quota.capacity() < 0 || group_used_byte_size >= static_cast<std::size_t>(quota.capacity()))) {
         PREFIX_LOG(WARN,
                    "instance group: [%s], quota capacity: [%" PRId64 "], has been reached or exceeded: [%zu]",
                    instance_group.c_str(),
@@ -388,7 +389,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     using UsageArray = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
     UsageArray usage_by_type{};
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> quota_type_needed{};
-    const auto &quota = group->quota();
+    const auto effective_quota = registry_manager_->ResolveQuota(*group);
+    const auto quota = effective_quota.ForAdmission();
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
         if (type_idx < quota_type_needed.size()) {
@@ -427,17 +429,19 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     const bool group_quota_exceeded =
-        quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity());
+        quota.capacity() != -1 &&
+        (quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity()));
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> type_quota_exceeded{};
+    // Unlimited groups default associated types to auto. An arbitrary explicit
+    // target with no association must not inherit legacy unlimited-by-type admission.
+    type_quota_exceeded.fill(effective_quota.automatic_defaults);
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
         if (type_idx >= type_quota_exceeded.size()) {
             continue;
         }
-        if (storage_quota.capacity() < 0 ||
-            usage_by_type[type_idx] >= static_cast<std::uint64_t>(storage_quota.capacity())) {
-            type_quota_exceeded[type_idx] = true;
-        }
+        type_quota_exceeded[type_idx] = storage_quota.capacity() < 0 ||
+                                        usage_by_type[type_idx] >= static_cast<std::uint64_t>(storage_quota.capacity());
     }
 
     for (std::size_t i = 0; i < target_storage_names.size(); ++i) {
@@ -498,7 +502,10 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
 
         // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
         // from this admission path: persistence does not refresh these values and may add backend I/O.
-        group_used_byte_size += meta_indexer->GetStorageUsage();
+        const auto usage = meta_indexer->GetStorageUsage();
+        group_used_byte_size = usage > std::numeric_limits<std::size_t>::max() - group_used_byte_size
+                                   ? std::numeric_limits<std::size_t>::max()
+                                   : group_used_byte_size + usage;
     }
 
     return group_used_byte_size;
@@ -529,11 +536,17 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
             // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
             // from this admission path: persistence does not refresh these values and may add backend I/O.
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
-            total_sz += sz;
+            total_sz = sz > std::numeric_limits<std::uint64_t>::max() - total_sz
+                           ? std::numeric_limits<std::uint64_t>::max()
+                           : total_sz + sz;
         }
 
-        if (storage_quota.capacity() <= total_sz) {
-            out_storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
+        if (storage_quota.capacity() < 0 || static_cast<std::uint64_t>(storage_quota.capacity()) <= total_sz) {
+            out_storage_quota_avail_table.SetStorageQuotaAvailByType(ToBaseType(type), false);
+            if (ToBaseType(type) == DataStorageType::DATA_STORAGE_TYPE_HF3FS) {
+                out_storage_quota_avail_table.SetStorageQuotaAvailByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS,
+                                                                         false);
+            }
         }
     }
 }

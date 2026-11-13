@@ -30,6 +30,7 @@ public:
     std::vector<std::shared_ptr<DataStorageBackend>> GetAvailableStorages();
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
     std::vector<StorageConfig> ListStorageConfig();
+    std::map<std::string, StorageCapacitySnapshot> GetCapacitySnapshots() const;
 
     ErrorCode EnableStorage(const std::string &name);
     ErrorCode DisableStorage(const std::string &name);
@@ -96,7 +97,6 @@ private:
 
 private:
     mutable std::shared_mutex rw_lock_;
-    std::thread heartbeat_thread_;
     // stroage unique name -> storage_backend
     std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_map_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;

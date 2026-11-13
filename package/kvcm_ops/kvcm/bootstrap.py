@@ -25,7 +25,7 @@ LOGGER = logging.getLogger("kvcm_ops.bootstrap")
 
 DEFAULT_ADMIN_URL = "http://127.0.0.1:6492"
 DEFAULT_MAX_INSTANCE_COUNT = 512
-DEFAULT_QUOTA_CAPACITY = 1000000000
+DEFAULT_QUOTA_CAPACITY = -1
 DEFAULT_MAX_KEY_COUNT = 1000000000
 DEFAULT_MUTEX_SHARD_NUM = 131072
 DEFAULT_BATCH_KEY_SIZE = 1024
@@ -237,12 +237,14 @@ def _optional_string(value, field, default, env_name):
     return result
 
 
-def _integer(value, field, default, env_name, allow_zero=False):
+def _integer(value, field, default, env_name, allow_zero=False, allow_unlimited=False):
     if field not in value:
         return default
     result = value[field]
     if type(result) is not int:
         raise BootstrapError("{}.{} must be an integer".format(env_name, field))
+    if allow_unlimited and result == -1:
+        return result
     if result < 0 or (result == 0 and not allow_zero):
         comparator = "non-negative" if allow_zero else "positive"
         raise BootstrapError("{}.{} must be {}".format(env_name, field, comparator))
@@ -451,7 +453,8 @@ def parse_environment(environ=None):
     config.user_data = _optional_string(
         value, "user_data", config.instance_group_name, INSTANCE_GROUP_ENV)
     config.quota_capacity = _integer(
-        value, "quota_capacity", DEFAULT_QUOTA_CAPACITY, INSTANCE_GROUP_ENV)
+        value, "quota_capacity", DEFAULT_QUOTA_CAPACITY, INSTANCE_GROUP_ENV, allow_zero=True, allow_unlimited=True)
+    config.quota_capacity_explicit = "quota_capacity" in value
     config.max_instance_count = _integer(
         value, "max_instance_count", DEFAULT_MAX_INSTANCE_COUNT, INSTANCE_GROUP_ENV)
     config.max_key_count = _integer(
@@ -715,7 +718,7 @@ def ensure_storages(client, config, reconcile=True):
 def _build_new_instance_group(config):
     quota = InstanceGroupQuota(
         config.quota_capacity,
-        [StorageQuota(config.primary_storage_type, config.quota_capacity)],
+        [] if config.quota_capacity == -1 else [StorageQuota(config.primary_storage_type, config.quota_capacity)],
     )
     reclaim_strategy = ReclaimStrategy(
         storage_unique_name=config.primary_storage_name,
@@ -786,15 +789,15 @@ def _apply_managed_group_fields(current, config):
     updated["storage_candidates"] = [config.primary_storage_name]
     updated["event_report_storage_candidates"] = config.event_report_storage_names
     updated["max_instance_count"] = config.max_instance_count
-    updated["quota"] = {
-        "capacity": config.quota_capacity,
-        "quota_config": [
-            {
-                "storage_type": config.primary_storage_type,
-                "capacity": config.quota_capacity,
-            }
-        ],
-    }
+    # Upgrading a deployment must not turn its persisted fixed quota into
+    # automatic mode simply because the bootstrap default changed.
+    if config.quota_capacity_explicit or "quota" not in updated:
+        updated["quota"] = {
+            "capacity": config.quota_capacity,
+            "quota_config": [] if config.quota_capacity == -1 else [
+                {"storage_type": config.primary_storage_type, "capacity": config.quota_capacity}
+            ],
+        }
     cache_config = updated.setdefault("cache_config", {})
     cache_config["data_storage_strategy"] = config.data_storage_strategy
     reclaim_strategy = cache_config.setdefault("reclaim_strategy", {})
@@ -850,6 +853,9 @@ def _managed_group_view(group, config):
         normalized_quota.append({
             "storage_type": item.get("storage_type"),
             "capacity": _as_int(item.get("capacity")),
+            "mode": item.get("mode") or "fixed",
+            "ratio": item.get("ratio", 1.0),
+            "storage_names": sorted(item.get("storage_names", [])),
         })
     view = {
         "user_data": group.get("user_data"),

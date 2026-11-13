@@ -140,7 +140,7 @@ class EnvironmentParsingTest(unittest.TestCase):
             "KVCM_INSTANCE_GROUP": group_env(),
         })
 
-        self.assertEqual(1000000000, config.quota_capacity)
+        self.assertEqual(-1, config.quota_capacity)
         self.assertEqual(512, config.max_instance_count)
         self.assertEqual("POLICY_LRU", config.reclaim_policy)
         self.assertEqual(0.8, config.reclaim_used_percentage)
@@ -197,7 +197,7 @@ class EnvironmentParsingTest(unittest.TestCase):
                 "unique_name": L1P5_NAME, "heartbeat_timeout_ms": True}),
               "KVCM_INSTANCE_GROUP": group_env()}, "must be an integer"),
             ({"KVCM_L1P5_STORAGE": storage_env(L1P5_NAME),
-              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=0)}, "must be positive"),
+              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=-2)}, "must be non-negative"),
         )
         for environ, message in cases:
             with self.subTest(message=message):
@@ -468,7 +468,8 @@ class DesiredConfigurationTest(unittest.TestCase):
 
         self.assertEqual([PACE_NAME], group["storage_candidates"])
         self.assertEqual([L1P5_NAME, L2_NAME], group["event_report_storage_candidates"])
-        self.assertEqual("ST_TAIRMEMPOOL", group["quota"]["quota_config"][0]["storage_type"])
+        self.assertEqual(-1, group["quota"]["capacity"])
+        self.assertEqual([], group["quota"]["quota_config"])
         self.assertEqual(PACE_NAME, group["cache_config"]["reclaim_strategy"]["storage_unique_name"])
         self.assertEqual("CPS_PREFER_TAIR_MEMPOOL", group["cache_config"]["data_storage_strategy"])
 

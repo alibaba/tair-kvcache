@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/config/effective_quota.h"
 
 namespace kv_cache_manager {
 
@@ -38,6 +39,11 @@ public:
         size_t local_key_count = 0;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;
+    struct GroupQuotaMetric {
+        EffectiveGroupQuota quota;
+        std::map<DataStorageType, uint64_t> usage;
+    };
+    using GroupQuotaMetricMap = std::map<std::string, GroupQuotaMetric>;
     using GroupInstanceIdMetricMap = std::map<std::string, std::unordered_map<std::string, InstanceMetric>>;
 
     CacheManagerMetricsRecorder(std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
@@ -52,6 +58,7 @@ public:
     void RemoveGroup(const std::string &group_name);
     size_t write_location_expire_size() const;
     GroupUsageRatioMap group_usage_ratio_map() const;
+    GroupQuotaMetricMap group_quota_metric_map() const;
     GroupInstanceIdMetricMap group_instance_id_metric_map() const;
 
 private:
@@ -59,6 +66,7 @@ private:
 
     // instance_group_name -> usage_ratio
     GroupUsageRatioMap group_usage_ratio_map_;
+    GroupQuotaMetricMap group_quota_metric_map_;
     // instance_group_name -> instance_id -> InstanceMetric
     GroupInstanceIdMetricMap group_instance_id_metric_map_;
 

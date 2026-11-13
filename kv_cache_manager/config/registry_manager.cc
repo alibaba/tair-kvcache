@@ -6,6 +6,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -127,6 +128,12 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
     : registry_storage_uri_(registry_storage_uri), metrics_registry_(std::move(metrics_registry)) {}
 
 RegistryManager::~RegistryManager() { DoCleanup(); }
+
+EffectiveGroupQuota RegistryManager::ResolveQuota(const InstanceGroup &group) const {
+    const auto manager = data_storage_manager();
+    const auto snapshots = manager ? manager->GetCapacitySnapshots() : std::map<std::string, StorageCapacitySnapshot>{};
+    return ResolveEffectiveQuota(group, snapshots, TimestampUtil::GetSteadyTimeUs());
+}
 
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
