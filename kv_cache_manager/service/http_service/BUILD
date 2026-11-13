@@ -40,6 +40,7 @@ cc_library(
         "//kv_cache_manager/service/util:report_event_json_parser",
         "@com_google_protobuf//:protobuf",
         "@com_google_protobuf//:protobuf_headers",
+        "@rapidjson",
         "@yalantinglibs//:ylt",
     ],
 )

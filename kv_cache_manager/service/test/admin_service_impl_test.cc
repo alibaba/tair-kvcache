@@ -1,6 +1,8 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -139,14 +141,17 @@ public:
     }
 
     // 在 meta 中为 block_key 直接登记一个位于 hot_01 的 SERVING 源 location
-    void SeedServingSource(int64_t block_key) {
+    void SeedServingSource(int64_t block_key, std::optional<std::string> checksum = std::nullopt) {
         auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
         auto rc = std::make_shared<RequestContext>("seed");
         std::string uri = "dummy://hot_01/blk_" + StringUtil::Uint64ToHex(block_key) + "?size=16";
-        auto loc = std::make_shared<CacheLocation>(
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+        std::vector<LocationSpec> specs{LocationSpec("tp0", uri)};
+        if (checksum.has_value()) {
+            specs.front().set_checksum(*checksum);
+        }
+        auto loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::move(specs));
         std::vector<std::string> ids;
         ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
         ASSERT_EQ(1u, ids.size());
@@ -199,6 +204,37 @@ public:
     std::shared_ptr<AdminServiceImpl> admin_;
     const std::string kInstance = "test_instance";
 };
+
+TEST_F(AdminServiceImplTest, TestGetCacheMetaChecksumIsOptIn) {
+    constexpr int64_t kBlockKey = 901;
+    SeedServingSource(kBlockKey, "0");
+
+    proto::admin::GetCacheMetaRequest request;
+    request.set_trace_id("checksum-opt-in");
+    request.set_instance_id(kInstance);
+    request.add_block_keys(kBlockKey);
+    request.mutable_block_mask()->set_offset(0);
+    request.set_detail_level(1);
+
+    auto call = [&](bool include_checksums) {
+        request.set_include_checksums(include_checksums);
+        proto::admin::GetCacheMetaResponse response;
+        RequestContext request_context(include_checksums ? "checksum-visible" : "checksum-hidden");
+        admin_->GetCacheMeta(&request_context, &request, &response);
+        EXPECT_EQ(proto::admin::OK, response.header().status().code());
+        return response;
+    };
+
+    const auto hidden = call(false);
+    ASSERT_EQ(1, hidden.locations_size());
+    ASSERT_EQ(1, hidden.locations(0).location_specs_size());
+    EXPECT_EQ("", hidden.locations(0).location_specs(0).checksum());
+
+    const auto included = call(true);
+    ASSERT_EQ(1, included.locations_size());
+    ASSERT_EQ(1, included.locations(0).location_specs_size());
+    EXPECT_EQ("0", included.locations(0).location_specs(0).checksum());
+}
 
 TEST_F(AdminServiceImplTest, TestInvalidArgs) {
     auto rc = std::make_shared<RequestContext>("t");
@@ -278,6 +314,9 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopyDeduplicatesBeforeConcurre
 
 TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
     SetDefaultCopyConcurrency(1);
+    auto config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    config->set_migration_async_copy_max_concurrency(17);
+    config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
     SeedServingSource(111);
     SeedServingSource(112);
     SeedServingSource(113);
@@ -345,10 +384,20 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     reclaimer_req.instance_group_name = "default";
     reclaimer_req.instance_id = kInstance;
     reclaimer_req.block_key = 142;
-    reclaimer_req.src_location_id = "reclaimer_src_142";
     reclaimer_req.src_storage_name = "hot_01";
     reclaimer_req.dst_storage_name = "cold_01";
-    reclaimer_req.src_specs = {LocationSpec("tp0", "dummy://hot_01/reclaimer_142?size=16")};
+    // Use the actual sampled location, including its identity snapshot.
+    // Invented IDs/specs are correctly rejected before competing for a slot.
+    MetaSearcher searcher(cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance));
+    RequestContext sample_context("reclaimer_sample");
+    std::vector<CacheLocationMap> sampled;
+    ASSERT_EQ(EC_OK, searcher.BatchGetLocation(&sample_context, {142}, {}, sampled));
+    ASSERT_EQ(1u, sampled.size());
+    ASSERT_EQ(1u, sampled.front().size());
+    const auto &source = *sampled.front().begin()->second;
+    reclaimer_req.src_location_id = source.id();
+    reclaimer_req.src_create_time = source.create_time();
+    reclaimer_req.src_specs = source.location_specs();
 
     std::vector<ErrorCode> reclaimer_results;
     std::atomic<int> ready{0};

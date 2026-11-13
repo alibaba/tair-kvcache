@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -43,6 +44,9 @@ public:
     size_t GetIndexerSize();
 
     std::map<std::string, std::shared_ptr<MetaIndexer>> GetIndexers() const;
+    using StorageBackendConfigs = std::map<std::string, std::pair<std::string, std::string>>;
+    // Copy only configuration, without retaining indexers or waiting for recovery.
+    std::optional<StorageBackendConfigs> TryGetStorageBackendConfigs() const;
 
     void DoCleanup();
 

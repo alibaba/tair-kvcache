@@ -63,8 +63,8 @@ public:
         : name_(std::make_shared<const std::string>(name)), uri_(uri) {}
     LocationSpec(SharedLocationSpecName name, std::string uri) : name_(std::move(name)), uri_(std::move(uri)) {}
 
-    LocationSpec(const LocationSpec &) = default;
-    LocationSpec &operator=(const LocationSpec &) = default;
+    LocationSpec(const LocationSpec &other);
+    LocationSpec &operator=(const LocationSpec &other);
     LocationSpec(LocationSpec &&other) noexcept;
     LocationSpec &operator=(LocationSpec &&other) noexcept;
 
@@ -73,6 +73,11 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "name", name());
         Put(writer, "uri", uri_);
+        if (has_checksum()) {
+            const auto value = checksum();
+            writer.Key("checksum");
+            writer.String(value.data(), value.size());
+        }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
@@ -80,7 +85,7 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name, std::string(""));
         set_name(std::move(name));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
-        return true;
+        return ParseChecksum(rapid_value);
     }
 
     bool FromRapidValueInterned(const rapidjson::Value &rapid_value, LocationSpecNameInterner &interner);
@@ -91,14 +96,42 @@ public:
     void set_name_view(std::string_view name) { set_name(std::string(name)); }
     void set_uri(const std::string &uri) { uri_ = uri; }
     void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
+    void set_checksum(std::string_view checksum);
+    void clear_checksum() noexcept {
+        checksum_.reset();
+        checksum_size_ = 0;
+    }
 
     inline const std::string &name() const { return *name_; }
     inline const SharedLocationSpecName &name_handle() const { return name_; }
     inline const std::string &uri() const { return uri_; }
+    // The view remains valid until this spec is modified or destroyed.
+    [[nodiscard]] std::string_view checksum() const noexcept {
+        return checksum_ ? std::string_view(checksum_.get(), checksum_size_) : std::string_view("");
+    }
+    [[nodiscard]] bool has_checksum() const noexcept { return checksum_ != nullptr; }
 
 private:
+    bool ParseChecksum(const rapidjson::Value &rapid_value) {
+        clear_checksum();
+        const auto it = rapid_value.FindMember("checksum");
+        if (it != rapid_value.MemberEnd()) {
+            if (!it->value.IsString()) {
+                return false;
+            }
+            set_checksum(std::string_view(it->value.GetString(), it->value.GetStringLength()));
+        }
+        return true;
+    }
+
     SharedLocationSpecName name_; // 对应LocationSpecInfo中的name
     std::string uri_;  // URI
+    // A spec is an independently stored TP/PP/attention payload, so its
+    // checksum cannot be shared by the enclosing CacheLocation.
+    // Empty input is normalized to absent and never allocates a buffer.
+    // Keep the length so embedded NUL bytes survive copies and serialization.
+    std::unique_ptr<char[]> checksum_;
+    size_t checksum_size_ = 0;
 };
 
 enum CacheLocationStatus : int32_t {
@@ -223,6 +256,16 @@ public:
     [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
         return (packed_sizes_ & kValidatedTotalSizeMask) != kUnknownValidatedTotalSize;
     }
+    bool set_location_spec_checksum(std::string_view location_spec_name, std::string_view checksum) {
+        const auto it = std::find_if(location_specs_.begin(),
+                                     location_specs_.end(),
+                                     [location_spec_name](const auto &s) { return s.name() == location_spec_name; });
+        if (it == location_specs_.end()) {
+            return false;
+        }
+        it->set_checksum(checksum);
+        return true;
+    }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
@@ -253,6 +296,9 @@ public:
         usage += location_specs_.capacity() * sizeof(LocationSpec);
         for (const auto &spec : location_specs_) {
             usage += spec.name().size() + EstimateStringPayloadCharge(spec.uri());
+            if (spec.has_checksum()) {
+                usage += spec.checksum().size() + 1;
+            }
         }
         return usage;
     }

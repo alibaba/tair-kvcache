@@ -22,6 +22,11 @@ enum class MigrationMarkClearPolicy {
     CLEAR_ON_FULL_BLOCK_COVERED = 1, // target CacheLocation 覆盖完整 block 后清标
 };
 
+enum class MigrationCopyExecutionMode {
+    SYNC = 0,
+    ASYNC_REQUIRED = 1,
+};
+
 // Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage。
 class MigrationCopyMethod : public Jsonizable {
 public:
@@ -123,6 +128,18 @@ private:
 class MigrationConfig : public Jsonizable {
 public:
     static constexpr int64_t kDefaultCopyMaxConcurrency = 1;
+    static constexpr int64_t kDefaultAsyncCopyMaxConcurrency = 1024;
+    static constexpr uint64_t kDefaultCopyMaxInflightBytes = 1ULL * 1024 * 1024 * 1024 * 1024;
+    static constexpr int64_t kDefaultCopyOperationDeadlineMs = 10 * 60 * 1000;
+    static constexpr int64_t kDefaultCopyPollInitialIntervalMs = 20;
+    static constexpr int64_t kDefaultCopyPollMaxIntervalMs = 1000;
+    static constexpr int64_t kDefaultCopyConnectTimeoutMs = 1000;
+    static constexpr int64_t kDefaultCopySubmitTimeoutMs = 3000;
+    static constexpr int64_t kDefaultCopyQueryTimeoutMs = 3000;
+    // Keep one control-plane request from consuming most of the operation
+    // deadline. This guarantees at least sixteen timeout windows for a C1
+    // coordinator; shared-backend concurrency still needs a deployment gate.
+    static constexpr int64_t kMinCopyHttpTimeoutWindowsPerDeadline = 16;
 
     MigrationConfig() = default;
     ~MigrationConfig() override;
@@ -130,7 +147,20 @@ public:
     // A source/target pair identifies one migration route and must be unique within this config.
     const std::vector<std::shared_ptr<MigrationStrategy>> &strategies() const { return strategies_; }
     int64_t copy_max_concurrency() const { return copy_max_concurrency_; }
+    int64_t async_copy_max_concurrency() const { return async_copy_max_concurrency_; }
+    int64_t effective_copy_max_concurrency() const {
+        return copy_execution_mode_ == MigrationCopyExecutionMode::ASYNC_REQUIRED ? async_copy_max_concurrency_
+                                                                                : copy_max_concurrency_;
+    }
     MigrationMarkClearPolicy mark_clear_policy() const { return mark_clear_policy_; }
+    MigrationCopyExecutionMode copy_execution_mode() const { return copy_execution_mode_; }
+    uint64_t copy_max_inflight_bytes() const { return copy_max_inflight_bytes_; }
+    int64_t copy_operation_deadline_ms() const { return copy_operation_deadline_ms_; }
+    int64_t copy_poll_initial_interval_ms() const { return copy_poll_initial_interval_ms_; }
+    int64_t copy_poll_max_interval_ms() const { return copy_poll_max_interval_ms_; }
+    int64_t copy_connect_timeout_ms() const { return copy_connect_timeout_ms_; }
+    int64_t copy_submit_timeout_ms() const { return copy_submit_timeout_ms_; }
+    int64_t copy_query_timeout_ms() const { return copy_query_timeout_ms_; }
 
     void set_strategies(const std::vector<std::shared_ptr<MigrationStrategy>> &strategies) {
         strategies_ = strategies;
@@ -138,9 +168,18 @@ public:
     void set_copy_max_concurrency(int64_t copy_max_concurrency) {
         copy_max_concurrency_ = copy_max_concurrency;
     }
+    void set_async_copy_max_concurrency(int64_t value) { async_copy_max_concurrency_ = value; }
     void set_mark_clear_policy(MigrationMarkClearPolicy mark_clear_policy) {
         mark_clear_policy_ = mark_clear_policy;
     }
+    void set_copy_execution_mode(MigrationCopyExecutionMode value) { copy_execution_mode_ = value; }
+    void set_copy_max_inflight_bytes(uint64_t value) { copy_max_inflight_bytes_ = value; }
+    void set_copy_operation_deadline_ms(int64_t value) { copy_operation_deadline_ms_ = value; }
+    void set_copy_poll_initial_interval_ms(int64_t value) { copy_poll_initial_interval_ms_ = value; }
+    void set_copy_poll_max_interval_ms(int64_t value) { copy_poll_max_interval_ms_ = value; }
+    void set_copy_connect_timeout_ms(int64_t value) { copy_connect_timeout_ms_ = value; }
+    void set_copy_submit_timeout_ms(int64_t value) { copy_submit_timeout_ms_ = value; }
+    void set_copy_query_timeout_ms(int64_t value) { copy_query_timeout_ms_ = value; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
@@ -149,7 +188,16 @@ public:
 private:
     std::vector<std::shared_ptr<MigrationStrategy>> strategies_;
     int64_t copy_max_concurrency_ = kDefaultCopyMaxConcurrency;
+    int64_t async_copy_max_concurrency_ = kDefaultAsyncCopyMaxConcurrency;
     MigrationMarkClearPolicy mark_clear_policy_ = MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    MigrationCopyExecutionMode copy_execution_mode_ = MigrationCopyExecutionMode::SYNC;
+    uint64_t copy_max_inflight_bytes_ = kDefaultCopyMaxInflightBytes;
+    int64_t copy_operation_deadline_ms_ = kDefaultCopyOperationDeadlineMs;
+    int64_t copy_poll_initial_interval_ms_ = kDefaultCopyPollInitialIntervalMs;
+    int64_t copy_poll_max_interval_ms_ = kDefaultCopyPollMaxIntervalMs;
+    int64_t copy_connect_timeout_ms_ = kDefaultCopyConnectTimeoutMs;
+    int64_t copy_submit_timeout_ms_ = kDefaultCopySubmitTimeoutMs;
+    int64_t copy_query_timeout_ms_ = kDefaultCopyQueryTimeoutMs;
 };
 
 } // namespace kv_cache_manager

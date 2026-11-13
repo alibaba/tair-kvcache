@@ -91,7 +91,15 @@ A unified transfer library supports KVCache transfer for multiple inference engi
 
 ## Tair KVCache HiSim
 
-[HiSim](hisim/README.md) is a high-performance CPU-based simulation system for LLM inference. It enables fast, low-cost, and high-fidelity prediction of key performance metrics (such as TTFT, TPOT, and throughput) across different models, target hardware, inference engines, and configurations—by replaying real-world inference workload traces without requiring actual GPU resources. Currently supports SGLang v0.5.6.post2 with Qwen3 Dense series models on H20 GPUs, achieving prediction errors below 5%.
+> [!IMPORTANT]
+> **The legacy HiSim simulator under `hisim/` is no longer maintained.** For continued use and future updates, please use:
+>
+> - **SGLang:** [SGLang Simulator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator), available in the official SGLang repository.
+> - **vLLM:** [vLLM Simulator](https://github.com/kunluninsight/vllm/tree/simulator/tools/vllm-simulator), temporarily available on the `simulator` branch pending upstream integration. Follow [vLLM PR #61747](https://github.com/vllm-project/vllm/pull/61747) for integration status and the upstream destination.
+>
+> See the linked READMEs for installation, supported versions, and usage.
+
+[HiSim](hisim/README.md) is a high-performance CPU-based simulation system for LLM inference. It enables fast, low-cost, and high-fidelity prediction of key performance metrics (such as TTFT, TPOT, and throughput) across different models, target hardware, inference engines, and configurations—by replaying real-world inference workload traces without requiring actual GPU resources. The legacy implementation supported SGLang v0.5.6.post2 with Qwen3 Dense series models on H20 GPUs, achieving prediction errors below 5%.
 
 # Contact Us
 - If you have technical questions or feature requirements related to this project, feel free to submit issues.

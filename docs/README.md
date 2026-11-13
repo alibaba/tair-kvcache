@@ -2,9 +2,11 @@
 
 ### 设计文档
 
+- [Checksum 元数据存储](design/checksum_metadata.md) - 接收调用方计算的 checksum，按 block/spec 持久化与查询，支持 v6d 自有 CRC
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
 - [分层存储设计](design/tiered_storage.md) - 多层缓存读写、Copy / Mark 迁移、回收协同，以及完整配置与 Admin 操作示例
+- [StartWriteCache 按存储类型补写副本](design/start_write_storage_replica.md) - 请求级副本目标、与 min-replica/Mark 的关系、实现范围及验证记录
 - [Client SDK I/O 契约](design/client_sdk_io_contract.md) - deadline 语义、buffer 生命周期、各后端取消能力矩阵
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
@@ -12,6 +14,7 @@
 - [退出信号处理与优雅关闭](design/graceful_shutdown_signal_handling.md) - 退出信号全局阻塞、控制线程只通知主线程执行、关闭时序与顺序不变量、重复信号强退兜底及信号回归测试
 - [KVCM 环境变量启动与自动初始化](design/kvcm_env_startup_bootstrap.md) - 环境变量配置、Storage/Instance Group 映射及参数变化后的更新行为
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
+- [KVCM × PACE CopyGA 异步化设计](design/async_copyga.md) - 缓存异步迁移的执行流程、并发与容量控制、数据一致性及异常处理
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
 - [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到

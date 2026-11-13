@@ -5,11 +5,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -87,6 +89,12 @@ public:
         int64_t global;
     };
 
+    struct StorageReplicaRequirement {
+        DataStorageType storage_type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
+        int32_t min_location_count{0};
+        std::vector<DataStorageType> excluded_storage_types{};
+    };
+
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                  std::shared_ptr<RegistryManager> registry_manager,
                  std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
@@ -144,6 +152,13 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
 
+    std::pair<ErrorCode, CacheMetaDetailVec> GetCacheMetaDetail(RequestContext *request_context,
+                                                                const std::string &instance_id,
+                                                                const KeyVector &keys,
+                                                                const TokenIdsVector &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t detail_level /*reserved*/);
+
     std::pair<ErrorCode, CacheLocationViewVecWrapper>
     GetCacheLocation(RequestContext *request_context,
                      const std::string &instance_id,
@@ -180,19 +195,46 @@ public:
                                                       const TokenIdsVector &tokens,
                                                       int32_t sw_size);
 
-    std::pair<ErrorCode, StartWriteCacheInfo> StartWriteCache(RequestContext *request_context,
-                                                              const std::string &instance_id,
-                                                              const KeyVector &keys,
-                                                              const TokenIdsVector &tokens,
-                                                              const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds,
-                                                              int32_t min_replica_count = 1);
-    ErrorCode
-    FinishWriteCache(RequestContext *request_context,
-                     const std::string &instance_id,
-                     const std::string &write_session_id,
-                     const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+    std::pair<ErrorCode, StartWriteCacheInfo>
+    StartWriteCache(RequestContext *request_context,
+                    const std::string &instance_id,
+                    const KeyVector &keys,
+                    const TokenIdsVector &tokens,
+                    const std::vector<std::string> &location_spec_group_names,
+                    int64_t write_timeout_seconds,
+                    int32_t min_replica_count = 0,
+                    std::optional<StorageReplicaRequirement> storage_replica_requirement = std::nullopt);
+    struct FinishWriteCacheOptions {
+        std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
+        struct ChecksumBatch {
+            std::string location_spec_name;
+            std::vector<std::string> checksums;
+        };
+        // Each batch is parallel to the compact keys captured by StartWrite.
+        // An empty batch list or individual checksum means no checksum update.
+        // Failed positions and positions whose location
+        // omits that spec are ignored.
+        std::vector<ChecksumBatch> checksum_batches;
+
+        static FinishWriteCacheOptions
+        WithWriteLocationInfo(std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+            FinishWriteCacheOptions options;
+            options.write_location_info_internal = std::move(write_location_info_internal);
+            return options;
+        }
+
+        static FinishWriteCacheOptions WithChecksumBatches(std::vector<ChecksumBatch> checksum_batches) {
+            FinishWriteCacheOptions options;
+            options.checksum_batches = std::move(checksum_batches);
+            return options;
+        }
+    };
+
+    ErrorCode FinishWriteCache(RequestContext *request_context,
+                               const std::string &instance_id,
+                               const std::string &write_session_id,
+                               const BlockMask &success_block_mask,
+                               FinishWriteCacheOptions options = FinishWriteCacheOptions{});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,
@@ -283,7 +325,9 @@ private:
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask,
                                int32_t min_replica_count,
-                               std::vector<std::string> &new_keys_tiered_targets);
+                               std::vector<std::string> &new_keys_tiered_targets,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -293,13 +337,17 @@ private:
                                              std::vector<std::string_view> &new_location_spec_group_names,
                                              BlockMask &block_mask,
                                              int32_t min_replica_count,
-                                             std::vector<std::string> &new_keys_tiered_targets);
+                                             std::vector<std::string> &new_keys_tiered_targets,
+                                             std::optional<DataStorageType> target_storage_type = std::nullopt,
+                                             const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
-                               CacheLocationVector &new_locations);
+                               CacheLocationVector &new_locations,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
     // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
     // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。

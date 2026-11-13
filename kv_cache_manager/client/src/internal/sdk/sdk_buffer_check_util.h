@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -30,6 +31,7 @@ struct IovDevice {
 
 class SdkBufferCheckUtil {
 public:
+    static size_t CrcSampleBytes(size_t first_iov_size) { return std::min(min_cal_byte_size_, first_iov_size / 2); }
     static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers);
     static std::vector<int64_t> GetBlocksHash(
         const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, GpuStream_t stream);
@@ -39,12 +41,23 @@ public:
                                               IovDevice *iovs_h_to_save,
                                               size_t max_iov_num,
                                               GpuStream_t stream);
+    static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers,
+                                              IovDevice *iovs_d,
+                                              uint32_t *crcs_d,
+                                              IovDevice *iovs_h_to_save,
+                                              size_t max_iov_num,
+                                              GpuStream_t stream,
+                                              bool *caller_read_pending);
 
     static std::vector<uint32_t> GetIovsCrc(const std::vector<IovDevice> &iovs_h);
     static std::vector<uint32_t>
     GetIovsCrc(const std::vector<IovDevice> &iovs_h, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream);
     static std::vector<uint32_t>
     GetIovsCrc(const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream);
+    // The caller tracking completion provides the pool's pinned IOV table and an idle stream.
+    static std::vector<uint32_t> GetIovsCrc(const IovDevice *iovs_h_ptr, size_t iovs_size,
+                                            IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream,
+                                            bool *caller_read_pending);
 
 private:
     static size_t min_cal_byte_size_;

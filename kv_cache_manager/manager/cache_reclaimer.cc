@@ -1871,7 +1871,7 @@ void CacheReclaimer::TryMigrateOnGroup(
         std::vector<std::int64_t> batch;
     };
     std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
-    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const auto configured_copy_concurrency = cache_config->effective_migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
     // active Copy 与已排队/运行的异步 Prepare 一起用于提前剪枝，避免慢 Create 期间每轮 cron

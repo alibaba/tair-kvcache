@@ -558,3 +558,18 @@ TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {
         ASSERT_EQ("redis://dotted-wins", config.GetRegistryStorageUri());
     }
 }
+
+TEST_F(ServerConfigTest, RedisHealthProbeSwitch) {
+    ServerConfig config;
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "true"}}));
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "false"}}));
+    EXPECT_FALSE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "false"}}));
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    for (const auto &invalid : {"", "1", "TRUE", "invalid"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", invalid}}));
+    }
+}

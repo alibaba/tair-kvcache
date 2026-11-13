@@ -470,8 +470,8 @@ TEST_F(SdkWrapperMultiStorageTest, TestMixedStorageWithInvalidSdk) {
     BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer()};
 
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_GETSDK_ERROR, sdk_wrapper.Put(remote_uris, local_buffers, actual_remote_uris));
-    ASSERT_EQ(ER_GETSDK_ERROR, sdk_wrapper.Get(remote_uris, local_buffers));
+    ASSERT_EQ(ER_SDK_ERROR_BUFFER_SAFE, sdk_wrapper.Put(remote_uris, local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_SDK_ERROR_BUFFER_SAFE, sdk_wrapper.Get(remote_uris, local_buffers));
 }
 
 TEST_F(SdkWrapperMultiStorageTest, TestGroupBySdk) {
@@ -621,6 +621,40 @@ bool WaitForTrue(const std::function<bool()> &cond, int max_retry = 300) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
+}
+
+TEST_F(SdkWrapperTest, TransferFailuresAreSafeBeforeDispatchAndAfterCompletedPut) {
+    client_config_->sdk_wrapper_config()->set_thread_num(1);
+    client_config_->sdk_wrapper_config()->set_queue_size(1);
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    SdkWrapper wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(wrapper, ctrl, client_config_, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    std::promise<void> started, release;
+    auto blocker = wrapper.wait_task_thread_pool_->async([&] {
+        started.set_value();
+        release.get_future().wait_for(std::chrono::seconds(5));
+    });
+    started.get_future().wait();
+    auto queued = wrapper.wait_task_thread_pool_->async([] {});
+    EXPECT_TRUE(wrapper.wait_task_thread_pool_->isFull());
+
+    const std::vector<DataStorageUri> uris{DataStorageUri("file://nfs_test/test?blkid=0&size=1024")};
+    const BlockBuffers buffers{BlockBuffer()};
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, wrapper.Get(uris, buffers));
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, wrapper.Put(uris, buffers, actual));
+    release.set_value();
+    blocker.get();
+    queued.get();
+    EXPECT_EQ(0, ctrl->get_call_count.load());
+    EXPECT_EQ(0, ctrl->put_call_count.load());
+
+    // After admission, the backend completes but returns no actual URI.
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, wrapper.Put(uris, buffers, actual));
+    EXPECT_EQ(1, ctrl->put_call_count.load());
 }
 
 // 验证准入修复：排队超过静态预算的任务不得再发起 I/O。

@@ -200,12 +200,14 @@ public:
 
         // initially we have 2 backends, both opened and available
         const auto sb0 = std::make_shared<NfsBackend>(metrics_registry_);
+        sb0->config_.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
         sb0->config_.set_global_unique_name("nfs_storage_00");
         sb0->is_open_ = true;
         sb0->is_available_ = true;
         avail_backends_g.emplace_back(sb0);
 
         const auto sb1 = std::make_shared<Hf3fsBackend>(metrics_registry_);
+        sb1->config_.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         sb1->config_.set_global_unique_name("3fs_storage_01");
         sb1->is_open_ = true;
         sb1->is_available_ = true;
@@ -299,6 +301,120 @@ TEST_F(DataStorageSelectorTest, TestSelectTairMempoolSsdByExactType) {
     selected =
         DataStorageSelector::Select(request_context_.get(), {dram}, CachePreferStrategy::CPS_PREFER_TAIR_MEMPOOL_SSD);
     ASSERT_EQ(dram, selected);
+}
+
+TEST_F(DataStorageSelectorTest, TestExplicitTypeOverridesPreferenceWithoutFallback) {
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    auto legacy =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    ASSERT_EQ(EC_OK, legacy.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, legacy.type);
+    auto selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ("nfs_storage_00", selected.name);
+
+    auto missing = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    EXPECT_EQ(EC_NOENT, missing.ec);
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    auto excluded = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+        request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    EXPECT_EQ(EC_NOENT, excluded.ec);
+}
+
+TEST_F(DataStorageSelectorTest, TestReplicaRequirementsDistinguishConfiguredVcnsFromHf3fs) {
+    // Model VCNS's configured identity while retaining the shared HF3FS protocol.
+    auto vcns = std::make_shared<Hf3fsBackend>(metrics_registry_);
+    vcns->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, "vcns_01", nullptr);
+    vcns->is_open_ = true;
+    vcns->is_available_ = true;
+    avail_backends_g.push_back(vcns);
+    instance_group_g->set_storage_candidates({"vcns_01", "3fs_storage_01", "nfs_storage_00"});
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    const auto select = [&](std::optional<DataStorageType> target, std::vector<DataStorageType> excluded = {}) {
+        return data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context_.get(), "default_test_group", target, excluded);
+    };
+    auto explicit_vcns = select(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+    ASSERT_EQ(EC_OK, explicit_vcns.ec);
+    EXPECT_EQ("vcns_01", explicit_vcns.name);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, explicit_vcns.type);
+    EXPECT_EQ("3fs_storage_01", select(DataStorageType::DATA_STORAGE_TYPE_HF3FS).name);
+    EXPECT_EQ("3fs_storage_01", select(std::nullopt, {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS}).name);
+    EXPECT_EQ("vcns_01", select(std::nullopt, {DataStorageType::DATA_STORAGE_TYPE_HF3FS}).name);
+    EXPECT_EQ(
+        EC_NOENT,
+        select(std::nullopt, {DataStorageType::DATA_STORAGE_TYPE_HF3FS, DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS})
+            .ec);
+    EXPECT_EQ("vcns_01", select(std::nullopt).name); // Legacy ALWAYS_3FS still accepts VCNS.
+
+    auto quota = instance_group_g->quota();
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_HF3FS)});
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_NOENT, select(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS).ec);
+    quota.set_quota_config({});
+    instance_group_g->set_quota(quota);
+    instance_group_g->set_storage_candidates({"3fs_storage_01", "nfs_storage_00"});
+    EXPECT_EQ(EC_NOENT, select(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS).ec);
+}
+
+TEST_F(DataStorageSelectorTest, TestExplicitTypeKeepsQuotaAndWritableChecks) {
+    const auto select = [this]() {
+        return data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context_.get(), "default_test_group", DataStorageType::DATA_STORAGE_TYPE_NFS);
+    };
+    InstanceGroupQuota quota;
+    quota.set_capacity(1024);
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    quota.set_capacity(0);
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_ERROR, select().ec);
+    quota.set_capacity(1024);
+    quota.set_quota_config({});
+    instance_group_g->set_quota(quota);
+
+    class ReadOnlyNfs : public NfsBackend {
+    public:
+        using NfsBackend::NfsBackend;
+        bool Writable() override { return false; }
+    };
+    auto readonly = std::make_shared<ReadOnlyNfs>(metrics_registry_);
+    readonly->config_.set_global_unique_name("nfs_storage_00");
+    readonly->is_open_ = true;
+    readonly->is_available_ = true;
+    avail_backends_g[0] = readonly;
+    EXPECT_TRUE(readonly->Available());
+    EXPECT_EQ(EC_NOENT, select().ec);
+}
+
+TEST_F(DataStorageSelectorTest, TestExcludedTypesKeepPreferenceAndAdmission) {
+    const std::vector<DataStorageType> excluded{DataStorageType::DATA_STORAGE_TYPE_HF3FS};
+    const auto select = [&]() {
+        return data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context_.get(), "default_test_group", std::nullopt, excluded);
+    };
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    auto selected = select();
+    ASSERT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, selected.type);
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    // No exclusion retains the original ALWAYS behavior.
+    EXPECT_EQ(
+        DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group").type);
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    auto quota = instance_group_g->quota();
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    quota.set_quota_config({});
+    instance_group_g->set_quota(quota);
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    EXPECT_EQ(EC_NOENT, select().ec);
 }
 
 TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendAbnormal00) {

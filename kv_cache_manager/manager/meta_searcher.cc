@@ -78,6 +78,98 @@ void ApplyStorageUsageChange(MetaIndexer *meta_indexer,
     }
 }
 
+// Keep unique batches on the original delete path. Repeated inputs are
+// grouped by key and non-empty location id before calling that path once.
+struct LocationDeleteBatch {
+    struct Target {
+        size_t input_key_index;
+        size_t input_location_index;
+        size_t key_index = 0;
+        size_t location_index = 0;
+    };
+
+    KeyVector keys;
+    std::vector<Target> targets;
+};
+
+LocationDeleteBatch BuildLocationDeleteBatch(const KeyVector &input_keys, const LocationIdsPerKey &ids) {
+    LocationDeleteBatch batch;
+    KeyVector sorted_keys(input_keys);
+    std::sort(sorted_keys.begin(), sorted_keys.end());
+    bool repeated = std::adjacent_find(sorted_keys.begin(), sorted_keys.end()) != sorted_keys.end();
+    std::vector<std::string_view> sorted_ids;
+    for (const auto &row : ids) {
+        if (repeated) {
+            break;
+        }
+        if (row.size() < 2) {
+            continue;
+        }
+        sorted_ids.clear();
+        for (const auto &id : row) {
+            if (!id.empty()) {
+                sorted_ids.push_back(id);
+            }
+        }
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        repeated = std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) != sorted_ids.end();
+    }
+    if (!repeated) {
+        return batch;
+    }
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        for (size_t j = 0; j < ids[i].size(); ++j) {
+            batch.targets.push_back({i, j});
+        }
+    }
+    std::sort(batch.targets.begin(),
+              batch.targets.end(),
+              [&](const LocationDeleteBatch::Target &lhs, const LocationDeleteBatch::Target &rhs) {
+                  return std::tie(input_keys[lhs.input_key_index], ids[lhs.input_key_index][lhs.input_location_index]) <
+                         std::tie(input_keys[rhs.input_key_index], ids[rhs.input_key_index][rhs.input_location_index]);
+              });
+    std::string_view previous_id;
+    size_t location_index = 0;
+    for (auto &target : batch.targets) {
+        const auto key = input_keys[target.input_key_index];
+        const auto &id = ids[target.input_key_index][target.input_location_index];
+        if (batch.keys.empty() || batch.keys.back() != key) {
+            batch.keys.push_back(key);
+            location_index = 0;
+        } else if (id.empty() || id != previous_id) {
+            // Empty ids retain their original per-slot semantics.
+            ++location_index;
+        }
+        target.key_index = batch.keys.size() - 1;
+        target.location_index = location_index;
+        previous_id = id;
+    }
+    return batch;
+}
+
+ErrorCode RejectLocationDeleteBatch(const LocationIdsPerKey &input_ids,
+                                    std::vector<std::vector<ErrorCode>> &out_results) {
+    out_results.resize(input_ids.size());
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        out_results[i].assign(input_ids[i].size(), EC_BADARGS);
+    }
+    return EC_BADARGS;
+}
+
+void RestoreLocationDeleteResults(const LocationDeleteBatch &batch,
+                                  const LocationIdsPerKey &input_ids,
+                                  const std::vector<std::vector<ErrorCode>> &results,
+                                  std::vector<std::vector<ErrorCode>> &out_results) {
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        out_results[i].resize(input_ids[i].size());
+    }
+    for (const auto &target : batch.targets) {
+        out_results[target.input_key_index][target.input_location_index] =
+            results[target.key_index][target.location_index];
+    }
+}
+
 struct StorageUsageChange {
     std::uint64_t old_size = 0;
     std::uint64_t new_size = 0;
@@ -112,7 +204,8 @@ ValidateConsistentSnapshotVersion(size_t spec_count, SpecAccessor spec_at, std::
         }
         total_size += spec_size;
         const size_t version_param_count =
-            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam) +
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kLegacySnapshotVersionParam);
         if (version_param_count == 0) {
             if (has_snapshot_version) {
                 return EC_BADARGS;
@@ -182,7 +275,11 @@ void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs,
         if (existing == merged_specs.end()) {
             merged_specs.push_back(spec);
         } else {
-            *existing = spec;
+            LocationSpec replacement = spec;
+            if (existing->has_checksum() && !replacement.has_checksum()) {
+                replacement.set_checksum(existing->checksum());
+            }
+            *existing = std::move(replacement);
         }
     }
     std::sort(merged_specs.begin(), merged_specs.end(), [](const auto &lhs, const auto &rhs) {
@@ -777,6 +874,10 @@ ErrorCode ClassifySpecGroups(RequestContext *request_context,
             full_groups.push_back(&group);
         } else if (category == state_category) {
             state_groups.push_back(&group);
+        } else if (state_category == 'L') {
+            // Mamba evaluates only F/L groups. Other categories do not
+            // constrain its prefix or checkpoint, even when registered.
+            continue;
         } else {
             const std::string error_msg = "expected F/" + std::string(1, state_category) +
                                           " location spec groups, unexpected group: " + group_name;
@@ -2166,6 +2267,33 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
     return EC_OK;
 }
 
+ErrorCode MetaSearcher::BatchGetRawMeta(RequestContext *request_context,
+                                        const KeyVector &keys,
+                                        CacheLocationMapVector &out_location_maps,
+                                        PropertyMapVector &out_properties,
+                                        std::vector<ErrorCode> &out_error_codes) {
+    out_location_maps.clear();
+    out_properties.clear();
+    out_error_codes.clear();
+
+    if (keys.empty()) {
+        return EC_OK;
+    }
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    auto result = meta_indexer_->Get(request_context, keys, out_location_maps, out_properties);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    out_error_codes = std::move(result.error_codes);
+    for (size_t idx = 0; idx < keys.size() && idx < out_error_codes.size(); idx++) {
+        if (out_error_codes[idx] != ErrorCode::EC_OK && out_error_codes[idx] != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN(
+                "get raw meta failed, key[%lu](%lu), error_code: %d", idx, keys[idx], out_error_codes[idx]);
+        }
+    }
+    return EC_OK;
+}
+
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,
@@ -2888,6 +3016,9 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_cont
                 std::vector<LocationSpec> specs;
                 specs.reserve(1);
                 specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, 0));
+                if (existing_location->location_specs().front().has_checksum() && !specs.front().has_checksum()) {
+                    specs.front().set_checksum(existing_location->location_specs().front().checksum());
+                }
                 new_location->set_location_specs(std::move(specs));
             } else {
                 new_location = std::make_shared<CacheLocation>(*existing_location);
@@ -3366,6 +3497,12 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
             // COW: copy the location, modify the copy, replace the pointer
             auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
             new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
+            for (const auto &spec_checksum : batch_tasks[key_index][loc_index].spec_checksums) {
+                // Empty batch entries are placeholders, not checksum updates.
+                if (!spec_checksum.checksum.empty()) {
+                    new_loc->set_location_spec_checksum(spec_checksum.location_spec_name, spec_checksum.checksum);
+                }
+            }
             locs[loc_index] = std::move(new_loc);
         }
         if (!updated) {
@@ -3485,10 +3622,28 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
         }
     }
 
+    auto batch = BuildLocationDeleteBatch(keys, location_ids_per_key);
+    if (!batch.targets.empty()) {
+        std::vector<std::vector<LocationCADTask>> unique_tasks(batch.keys.size());
+        for (const auto &target : batch.targets) {
+            const auto &task = batch_tasks[target.input_key_index][target.input_location_index];
+            auto &tasks = unique_tasks[target.key_index];
+            if (target.location_index == tasks.size()) {
+                tasks.push_back(task);
+            } else if (tasks[target.location_index].expect_status != task.expect_status) {
+                return RejectLocationDeleteBatch(location_ids_per_key, out_batch_results);
+            }
+        }
+        std::vector<std::vector<ErrorCode>> results;
+        const auto ec = BatchCADLocationStatus(request_context, batch.keys, unique_tasks, results);
+        RestoreLocationDeleteResults(batch, location_ids_per_key, results, out_batch_results);
+        return ec;
+    }
+
     // Per-key CAD modifier: each slot is gated by a status match. Matching
     // OK slots stay EC_OK (delete will be dispatched, payload size captured
-    // for usage replay); mismatches yield EC_MISMATCH; NOENT is EC_OK
-    // (idempotent); hard errors surface verbatim.
+    // for usage replay); mismatches yield EC_MISMATCH; missing locations
+    // retain EC_NOENT; hard errors surface verbatim.
     auto modifier = [&keys, &batch_tasks, &locs_sz](const std::vector<ErrorCode> &get_ecs,
                                                     const LocationIdVector &loc_ids,
                                                     size_t key_index,
@@ -3579,6 +3734,38 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
     }
     out_per_location_ec.clear();
     out_per_location_ec.resize(keys.size());
+
+    auto batch = BuildLocationDeleteBatch(keys, location_ids_per_key);
+    if (!batch.targets.empty()) {
+        LocationIdsPerKey unique_ids(batch.keys.size());
+        std::vector<std::vector<std::string>> unique_values(check_expected_values ? batch.keys.size() : 0);
+        for (const auto &target : batch.targets) {
+            const auto &id = location_ids_per_key[target.input_key_index][target.input_location_index];
+            auto &ids = unique_ids[target.key_index];
+            if (target.location_index == ids.size()) {
+                ids.push_back(id);
+                if (check_expected_values) {
+                    unique_values[target.key_index].push_back(
+                        expected_location_values[target.input_key_index][target.input_location_index]);
+                }
+            } else if (check_expected_values &&
+                       unique_values[target.key_index][target.location_index] !=
+                           expected_location_values[target.input_key_index][target.input_location_index]) {
+                return RejectLocationDeleteBatch(location_ids_per_key, out_per_location_ec);
+            }
+        }
+        std::vector<std::vector<ErrorCode>> results;
+        const auto ec = BatchDeleteLocations(request_context,
+                                             batch.keys,
+                                             unique_ids,
+                                             results,
+                                             unique_values,
+                                             adjust_storage_usage,
+                                             adjust_reclaimed_key_count,
+                                             maintenance_no_touch);
+        RestoreLocationDeleteResults(batch, location_ids_per_key, results, out_per_location_ec);
+        return ec;
+    }
 
     std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> locs_sz(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {

@@ -177,6 +177,9 @@ kvcm.metrics.env_tag_mappings=
 # 若启用的metrics reporter有周期性report任务，指定该任务的唤醒间隔；默认20000
 kvcm.metrics.report_interval_ms
 
+# 是否启用元数据和选主 Redis 主动健康探测，默认true；关闭时不创建两类探测线程
+kvcm.metrics.redis_health_probe_enabled=true
+
 # 是否开启Prometheus metrics端点（GET /metrics），默认true
 kvcm.metrics.enable_prometheus=true
 

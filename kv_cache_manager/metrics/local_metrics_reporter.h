@@ -17,8 +17,17 @@ public:
     std::shared_ptr<MetricsRegistry> GetMetricsRegistry() override;
 
 protected:
+    // Publishes kvcm_is_leader. Does nothing until
+    // a role snapshot is provided; callers must hold the metrics lifecycle
+    // lock and guarantee cache_manager_ is non-null.
+    void PublishNodeStatus(std::optional<bool> is_leader);
+
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+
+    // Reused by KMonitor so both outputs share one capacity eligibility sample per interval,
+    // including when demotion has already removed the storage manager.
+    bool report_storage_usage_ = true;
 
     // for intervallic reporting
     KVCM_DECLARE_METRICS_COLLECTOR_(MetaIndexerAccumulative);

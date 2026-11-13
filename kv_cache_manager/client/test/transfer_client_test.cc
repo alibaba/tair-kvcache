@@ -212,16 +212,39 @@ TEST_F(TransferClientTest, TestSaveKvCaches) {
 TEST_F(TransferClientTest, TestEmptyLocations) {
     auto client = TransferClient::Create(client_config_, init_params_);
     ASSERT_NE(client, nullptr);
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    // With no payload the optional hash check must not acquire a GPU cell.
+    static_cast<TransferClientImpl *>(client.get())->is_check_buffer_ = true;
+#endif
 
     UriStrVec uri_str_vec = {};
     BlockBuffers block_buffers = {};
 
-    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(uri_str_vec, block_buffers));
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, client->LoadKvCaches(uri_str_vec, block_buffers));
 
     auto save_result = client->SaveKvCaches(uri_str_vec, block_buffers);
-    EXPECT_EQ(ER_INVALID_PARAMS, save_result.first);
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, save_result.first);
     EXPECT_TRUE(save_result.second.empty());
 }
+
+#if defined(USING_CUDA) || defined(USING_MUSA)
+TEST_F(TransferClientTest, BufferCheckSkipsUnreadableFragmentsBeforeSubmission) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    auto *impl = static_cast<TransferClientImpl *>(client.get());
+    impl->is_check_buffer_ = true;
+    impl->max_check_iov_num_ = 2;
+    const UriStrVec missing_host{"file://missing-host/0"};
+    char bytes[8]{};
+    BlockBuffers buffers(1);
+    buffers[0].iovs = {{MemoryType::GPU, nullptr, sizeof(bytes), true}};
+    EXPECT_EQ(client->SaveKvCaches(missing_host, buffers).first, ER_SDK_ERROR_BUFFER_SAFE);
+    buffers[0].iovs = {{MemoryType::CPU, bytes, sizeof(bytes), false}};
+    EXPECT_EQ(client->SaveKvCaches(missing_host, buffers).first, ER_SDK_ERROR_BUFFER_SAFE);
+    buffers[0].iovs = {{MemoryType::GPU, bytes, sizeof(bytes), false}, {MemoryType::GPU, bytes, 0, false}};
+    EXPECT_EQ(client->SaveKvCaches(missing_host, buffers).first, ER_SDK_ERROR_BUFFER_SAFE);
+}
+#endif
 
 TEST_F(TransferClientTest, TestManyLocations) {
     auto client = TransferClient::Create(client_config_, init_params_);
@@ -255,7 +278,10 @@ TEST_F(TransferClientTest, TestMismatchedLocationsAndBuffers) {
     BlockBuffer buffer1;
     BlockBuffers block_buffers = {buffer1};
 
-    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(locations_, block_buffers));
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, client->LoadKvCaches(locations_, block_buffers));
+    const auto result = client->SaveKvCaches(locations_, block_buffers);
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, result.first);
+    EXPECT_TRUE(result.second.empty());
 }
 
 TEST_F(TransferClientTest, TestBlockBufferUsage) {

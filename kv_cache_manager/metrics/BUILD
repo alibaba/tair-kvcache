@@ -66,10 +66,26 @@ cc_library(
         ":metrics_lifecycle",
         ":metrics_registry",
         ":metrics_collector",
+        ":node_status_metrics",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/manager:cache_manager",
         "@havenask//aios/kmonitor:kmonitor_client_cpp",
+    ],
+)
+
+
+cc_library(
+    name = "node_status_metrics",
+    srcs = [
+        "node_status_metrics.cc",
+    ],
+    hdrs = [
+        "node_status_metrics.h",
+    ],
+    deps = [
+        ":metrics_registry",
+        "//kv_cache_manager/config:leader_elector_base",
     ],
 )
 
@@ -111,5 +127,19 @@ cc_library(
         ":metrics_registry",
         ":metrics_reporter",
         "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
+    name = "redis_health_metrics",
+    srcs = ["redis_health_metrics.cc"],
+    hdrs = ["redis_health_metrics.h"],
+    deps = [
+        ":metrics_lifecycle",
+        ":metrics_registry",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/meta:meta_indexer_manager",
+        "@hiredis",
     ],
 )

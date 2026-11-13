@@ -1,6 +1,24 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "ServerRedisHealthMetricsTest",
+    srcs = ["server_redis_health_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/metrics:redis_health_metrics",
+        "//kv_cache_manager/service",
+    ],
+)
+
+
+cc_test(
     name = "ServiceImplBaseTest",
     srcs = ["service_impl_base_test.cc"],
     copts = ["-fno-access-control"],
@@ -59,6 +77,20 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/service:meta_service_impl",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "DebugServiceImplTest",
+    srcs = ["debug_service_impl_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:debug_service_impl",
         "@cpp_stub",
     ],
 )
@@ -172,7 +204,10 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    # Let cpp_stub patch the function entry used by the code under test.
+    linkstatic = True,
     deps = [
+        "@cpp_stub",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
@@ -197,5 +232,37 @@ cc_test(
         "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/service:admin_service_impl",
+    ],
+)
+
+cc_test(
+    name = "ServerNodeStatusMetricsTest",
+    srcs = ["server_node_status_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "ServerStorageUsageMetricsTest",
+    srcs = ["server_storage_usage_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
     ],
 )

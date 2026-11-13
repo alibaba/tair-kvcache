@@ -38,6 +38,21 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
                                                        IovDevice *iovs_h_to_save,
                                                        size_t max_iov_num,
                                                        GpuStream_t stream) {
+    return GetBlocksHash(block_buffers, iovs_d, crcs_d, iovs_h_to_save, max_iov_num, stream, nullptr);
+}
+
+std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block_buffers,
+                                                       IovDevice *iovs_d,
+                                                       uint32_t *crcs_d,
+                                                       IovDevice *iovs_h_to_save,
+                                                       size_t max_iov_num,
+                                                       GpuStream_t stream,
+                                                       bool *caller_read_pending) {
+    if (caller_read_pending) {
+        *caller_read_pending = false;
+        // A previous failed fence may still own the cell. Do not overwrite its IOV table.
+        CHECK_CUDA_ERROR_RETURN(cudaStreamQuery(stream), {}, "skipping SDK buffer check on busy stream");
+    }
     size_t iov_num = block_buffers.front().iovs.size();
     size_t iovs_size = 0;
     for (const auto &block_buffer : block_buffers) {
@@ -51,7 +66,8 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
             iovs_size++;
         }
     }
-    auto crcs = GetIovsCrc(iovs_h_to_save, iovs_size, iovs_d, crcs_d, stream);
+    auto crcs = GetIovsCrc(iovs_h_to_save, iovs_size, iovs_d, crcs_d, stream, caller_read_pending);
+    if (crcs.empty()) return {};
     std::vector<int64_t> result;
     result.reserve(iovs_size / iov_num);
     for (size_t offset = 0; offset < crcs.size(); offset += iov_num) {
@@ -83,6 +99,13 @@ SdkBufferCheckPool::SdkBufferCheckPool(size_t cell_num) { cells_.resize(cell_num
 
 SdkBufferCheckPool::~SdkBufferCheckPool() {
     for (const auto &cell : cells_) {
+        if (cell.gpu_stream) {
+            const auto error = cudaStreamSynchronize(cell.gpu_stream);
+            if (error != cudaSuccess) {
+                CHECK_CUDA_ERROR(error, "retaining unfinished SDK buffer check cell");
+                continue;
+            }
+        }
         if (cell.h_iovs) {
             CHECK_CUDA_ERROR(cudaFreeHost(cell.h_iovs), "cuda free iovs_h_mem[%p] failed", cell.h_iovs);
         }

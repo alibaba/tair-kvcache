@@ -172,6 +172,9 @@ message ReportEventResponse {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Caller-computed opaque checksum of this spec's independently stored
+    // payload. Non-empty values are stored unchanged; empty means omitted.
+    string checksum = 3;
 }
 
 message CacheLocation {
@@ -339,6 +342,9 @@ message GetCacheLocationRequest {
     BlockMask block_mask = 6; // 按前缀mask或者bool矩阵mask
     int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
+    // Opt in to stored checksum values on returned locations. False avoids the
+    // value copy and protobuf-binary encoding; JSON may still print defaults.
+    bool include_checksums = 9;
 }
 
 message CacheLocationVector {
@@ -367,6 +373,7 @@ message GetCacheLocationsByBackendRequest {
     int32 sw_size = 7;
     repeated string location_spec_names = 8;
     repeated BackendLocationSelector backend_selectors = 9;
+    bool include_checksums = 10;
 }
 
 message GetCacheLocationsByBackendResponse {
@@ -400,12 +407,23 @@ message GetCacheMetaRequest {
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
     int32 detail_level = 6;   // 返回数据的详细级别，越大获取的信息越多，暂定为数字
+    // Opt in to checksum fields on returned locations.
+    bool include_checksums = 7;
 }
 
 message GetCacheMetaResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
     repeated string metas = 3;            // 与请求key一一对应
+}
+
+message StorageReplicaRequirement {
+    // 与非空 excluded_storage_types 二选一；指定模式的显式目标优先于 Mark。
+    StorageType storage_type = 1;
+    // Location 写入门槛，必须为正数；不保证跨后端分布或可读副本数量。
+    int32 min_location_count = 2;
+    // 排除类型不参与计数和本次新分配；其余类型合计计数，并保留范围内的 Mark 引导。
+    repeated StorageType excluded_storage_types = 3;
 }
 
 // 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
@@ -423,6 +441,9 @@ message StartWriteCacheRequest {
     int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
     int32 min_replica_count = 7; // 可用副本数 >= min_replica_count 才跳过写入，0 或未设置视为 1
+    // 按指定或排除类型统计 Location 数量，与非 0 的 min_replica_count 互斥。
+    // 每次每个待写 key 至多分配一份；排除模式允许 Mark 在数量已达标时触发补写。
+    StorageReplicaRequirement storage_replica_requirement = 8;
 }
 
 message StartWriteCacheResponse {
@@ -430,6 +451,14 @@ message StartWriteCacheResponse {
     string write_session_id = 2;
     BlockMask block_mask = 3;
     repeated CacheLocation locations = 4;
+}
+
+message LocationSpecChecksumBatch {
+    string location_spec_name = 1;
+    // Parallel to the compact keys captured by this StartWrite session. Failed
+    // positions retain a placeholder; positions without this spec are ignored.
+    // Empty strings mean no checksum update, including successful positions.
+    repeated string checksums = 2;
 }
 
 // 写入为简单起见, 先设计为原子性接口, 全成功或全失败
@@ -442,7 +471,14 @@ message FinishWriteCacheRequest {
     string instance_id = 2;
     string write_session_id = 3;
     BlockMask success_blocks = 4;
-    repeated CacheLocation locations = 5;
+    // Kept for rolling upgrades. Legacy/new clients may still populate it for
+    // old servers; current servers do not use it for checksum alignment.
+    repeated CacheLocation locations = 5 [deprecated = true];
+    // Optional values grouped by independently stored location spec. Values may
+    // be caller-computed; the server stores them without interpreting the
+    // algorithm. Duplicate/empty spec names or malformed batch sizes are rejected
+    // without consuming the write session.
+    repeated LocationSpecChecksumBatch checksum_batches = 6;
 }
 
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况

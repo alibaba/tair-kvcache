@@ -137,6 +137,9 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
                       ec);
         return ec;
     }
+    if (metrics_registry_) {
+        metrics_registry_->RemoveByTagFilter({{"unique_name", name}});
+    }
     storage_map_.erase(iter);
     return ec;
 }
@@ -156,11 +159,28 @@ ErrorCode DataStorageManager::DoCleanup() {
                           ec);
             result = ec;
         }
+        // The backend is unloaded even if Close failed. Detach all of its
+        // metric handles before permitting any new publication or registration.
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"unique_name", pair.first}});
+        }
     }
     storage_map_.clear();
 
     KVCM_LOG_INFO("data storage manager cleanup completed");
     return result;
+}
+
+bool DataStorageManager::PublishMetricsIfCurrent(const std::string &name,
+                                                const std::shared_ptr<DataStorageBackend> &backend,
+                                                const std::function<void()> &publish) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const auto it = storage_map_.find(name);
+    if (!backend || it == storage_map_.end() || it->second != backend) {
+        return false;
+    }
+    publish();
+    return true;
 }
 
 std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(const DataStorageType &type) {
@@ -315,6 +335,92 @@ std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
     }
     auto storage_backend = iter->second;
     return storage_backend->Copy(src_uris, dst_uris, trace_id);
+}
+
+bool DataStorageManager::SupportsAsyncCopy(const std::string &unique_name) const {
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end()) {
+            return false;
+        }
+        storage_backend = iter->second;
+    }
+    return storage_backend != nullptr && storage_backend->SupportsAsyncCopy();
+}
+
+AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_context,
+                                                    const std::string &unique_name,
+                                                    const std::vector<DataStorageUri> &src_uris,
+                                                    const std::vector<DataStorageUri> &dst_uris,
+                                                    const std::string &operation_id,
+                                                    const AsyncCopyOptions &options,
+                                                    AsyncCopyCompletion completion) {
+    SPAN_TRACER(request_context);
+    AsyncCopySubmitResult rejected;
+    rejected.operation_id = operation_id;
+    if (src_uris.size() != dst_uris.size() || src_uris.empty() || !completion) {
+        rejected.status = EC_BADARGS;
+        rejected.detail = "invalid asynchronous copy input";
+        return rejected;
+    }
+
+    // CopyAsync only hands work to the local coordinator. Keep this short
+    // handoff serialized with Close, without retaining the lock in completion.
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || !iter->second) {
+            rejected.status = EC_NOENT;
+            rejected.detail = "storage does not exist";
+            return rejected;
+        }
+        storage_backend = iter->second;
+        if (!storage_backend->Available()) {
+            rejected.status = EC_NOENT;
+            rejected.detail = "storage is unavailable";
+            return rejected;
+        }
+    }
+
+    if (!storage_backend->SupportsAsyncCopy()) {
+        rejected.status = EC_UNIMPLEMENTED;
+        rejected.detail = "storage backend does not support asynchronous copy";
+        return rejected;
+    }
+    const std::string trace_id = request_context ? request_context->trace_id() : std::string();
+    // Keep the backend alive until the exactly-once completion callback.  The
+    // local shared_ptr above only protects the submit call itself; without the
+    // capture an unregister could destroy the coordinator while PACE is still
+    // executing the operation.
+    auto completion_with_backend_lease =
+        [storage_backend, completion = std::move(completion)](AsyncCopyBatchResult result) mutable {
+            completion(std::move(result));
+        };
+    return storage_backend->CopyAsync(src_uris,
+                                      dst_uris,
+                                      operation_id,
+                                      trace_id,
+                                      options,
+                                      std::move(completion_with_backend_lease));
+}
+
+ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id) {
+    if (operation_id.empty()) {
+        return EC_BADARGS;
+    }
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || !iter->second) {
+            return EC_NOENT;
+        }
+        storage_backend = iter->second;
+    }
+    return storage_backend->RequestCancelAsyncCopy(operation_id);
 }
 
 std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,

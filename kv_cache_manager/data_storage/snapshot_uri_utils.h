@@ -50,6 +50,7 @@ public:
     inline static constexpr const char *kSnapshotVersionParam = "s_v";
     inline static constexpr size_t kSnapshotVersionHexLength = 8;
     inline static constexpr const char *kLegacySnapshotVersionParam = "s_version";
+    inline static constexpr size_t kLegacySnapshotVersionHexLength = 32;
 
     static bool IsValidLocationIdComponent(const std::string &value) {
         return !value.empty() && value.find('#') == std::string::npos;
@@ -81,15 +82,7 @@ public:
     }
 
     static bool IsValidSnapshotVersionToken(const std::string &version) {
-        if (version.size() != kSnapshotVersionHexLength) {
-            return false;
-        }
-        for (const unsigned char ch : version) {
-            if (!IsAsciiHexDigit(ch)) {
-                return false;
-            }
-        }
-        return true;
+        return IsValidHexVersion(version, kSnapshotVersionHexLength);
     }
 
     // GetHostCacheState only needs to know whether an EventReport URI is
@@ -97,8 +90,9 @@ public:
     // DataStorageUri parse would copy every URI component and allocate one
     // std::map node per query parameter for every (key, spec) visited. Scan the
     // immutable URI in place instead. An empty out_version means legacy
-    // metadata without s_v; malformed or duplicate s_v parameters
-    // fail closed.
+    // metadata without a version. Persisted s_v (8 hex digits) and s_version
+    // (32 hex digits) are readable; malformed, duplicate or mixed version
+    // parameters fail closed. Writers still emit only s_v.
     //
     // The returned view borrows uri_text and must not outlive it.
     static bool InspectSnapshotUriForVisibility(std::string_view uri_text,
@@ -147,6 +141,7 @@ public:
         }
 
         bool found_version = false;
+        std::string_view version;
         size_t begin = query_begin + 1;
         while (begin <= uri_text.size()) {
             size_t end = uri_text.find('&', begin);
@@ -156,18 +151,18 @@ public:
             const size_t equals = uri_text.find('=', begin);
             const size_t key_end = equals != std::string_view::npos && equals < end ? equals : end;
             constexpr std::string_view version_key{kSnapshotVersionParam};
-            if (key_end - begin == std::string_view(kLegacySnapshotVersionParam).size() &&
-                uri_text.compare(begin, std::string_view(kLegacySnapshotVersionParam).size(),
-                                 kLegacySnapshotVersionParam) == 0) {
-                return false;
-            }
-            if (key_end - begin == version_key.size() &&
-                uri_text.compare(begin, version_key.size(), version_key) == 0) {
+            constexpr std::string_view legacy_version_key{kLegacySnapshotVersionParam};
+            const std::string_view key = uri_text.substr(begin, key_end - begin);
+            if (key == version_key || key == legacy_version_key) {
                 if (found_version || equals == std::string_view::npos || equals >= end) {
                     return false;
                 }
+                version = uri_text.substr(equals + 1, end - equals - 1);
+                if (!IsValidHexVersion(
+                        version, key == version_key ? kSnapshotVersionHexLength : kLegacySnapshotVersionHexLength)) {
+                    return false;
+                }
                 found_version = true;
-                out_version = uri_text.substr(equals + 1, end - equals - 1);
             }
             if (end == uri_text.size()) {
                 break;
@@ -175,17 +170,7 @@ public:
             begin = end + 1;
         }
 
-        if (!found_version) {
-            return true;
-        }
-        if (out_version.size() != kSnapshotVersionHexLength) {
-            return false;
-        }
-        for (const unsigned char ch : out_version) {
-            if (!IsAsciiHexDigit(ch)) {
-                return false;
-            }
-        }
+        out_version = version;
         return true;
     }
 
@@ -323,17 +308,19 @@ public:
     // DataStorageUri stores query parameters in a map, so duplicate keys from
     // the original text are no longer observable here. Raw metadata and
     // protocol input must use the string overload below, which enforces that
-    // s_v occurs exactly once.
+    // exactly one of s_v and s_version occurs exactly once.
     static bool ParseSnapshotUriInfo(const DataStorageUri &uri, SnapshotUriInfo &out) {
         out.version.clear();
         if (!uri.Valid()) {
             return false;
         }
-        if (uri.HasParam(kLegacySnapshotVersionParam)) {
+        const bool has_version = uri.HasParam(kSnapshotVersionParam);
+        const bool has_legacy_version = uri.HasParam(kLegacySnapshotVersionParam);
+        if (has_version == has_legacy_version) {
             return false;
         }
-        const std::string version = uri.GetParam(kSnapshotVersionParam);
-        if (!IsValidSnapshotVersionToken(version)) {
+        const std::string version = uri.GetParam(has_version ? kSnapshotVersionParam : kLegacySnapshotVersionParam);
+        if (!IsValidHexVersion(version, has_version ? kSnapshotVersionHexLength : kLegacySnapshotVersionHexLength)) {
             return false;
         }
         out.version = version;
@@ -342,8 +329,8 @@ public:
 
     static bool ParseSnapshotUriInfo(const std::string &uri_text, SnapshotUriInfo &out) {
         out.version.clear();
-        if (CountUriParam(uri_text, kSnapshotVersionParam) != 1 ||
-            CountUriParam(uri_text, kLegacySnapshotVersionParam) != 0) {
+        if (CountUriParam(uri_text, kSnapshotVersionParam) + CountUriParam(uri_text, kLegacySnapshotVersionParam) !=
+            1) {
             return false;
         }
         return ParseSnapshotUriInfo(DataStorageUri(uri_text), out);
@@ -436,6 +423,18 @@ public:
     }
 
 private:
+    static bool IsValidHexVersion(std::string_view version, size_t length) noexcept {
+        if (version.size() != length) {
+            return false;
+        }
+        for (const unsigned char ch : version) {
+            if (!IsAsciiHexDigit(ch)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static bool ParseDecimalUint64(std::string_view text, std::uint64_t limit, std::uint64_t &out) noexcept {
         if (text.empty()) {
             return false;

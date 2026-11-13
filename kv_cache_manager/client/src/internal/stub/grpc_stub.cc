@@ -5,6 +5,8 @@
 #include <chrono>
 #include <grpcpp/grpcpp.h>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
@@ -62,6 +64,8 @@
 #define GET_AND_CHECK_STUB_WITH_TYPE() GET_AND_CHECK_STUB_BASE({})
 
 namespace {
+
+kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::ErrorCode service_error);
 
 kv_cache_manager::Locations GenLocations(
     const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations) {
@@ -379,9 +383,26 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds,
-                          int32_t min_replica_count) {
+                          int32_t min_replica_count,
+                          std::optional<StorageReplicaRequirement> storage_replica_requirement) {
     if (min_replica_count < 0) {
         return {ER_INVALID_PARAMS, {}};
+    }
+    if (storage_replica_requirement) {
+        const auto &requirement = *storage_replica_requirement;
+        const auto type = static_cast<proto::meta::StorageType>(requirement.storage_type);
+        const bool has_type = type != proto::meta::ST_UNSPECIFIED;
+        if (min_replica_count != 0 || requirement.min_location_count <= 0 ||
+            has_type == !requirement.excluded_storage_types.empty() || !proto::meta::StorageType_IsValid(type) ||
+            type == proto::meta::ST_EVENT_REPORT_L1P5 || type == proto::meta::ST_EVENT_REPORT_L2 ||
+            std::any_of(requirement.excluded_storage_types.begin(),
+                        requirement.excluded_storage_types.end(),
+                        [](StorageType excluded) {
+                            const auto value = static_cast<proto::meta::StorageType>(excluded);
+                            return value == proto::meta::ST_UNSPECIFIED || !proto::meta::StorageType_IsValid(value);
+                        })) {
+            return {ER_INVALID_PARAMS, {}};
+        }
     }
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;
@@ -392,6 +413,14 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
     }
     request.set_write_timeout_seconds(write_timeout_seconds);
     request.set_min_replica_count(min_replica_count);
+    if (storage_replica_requirement) {
+        auto *requirement = request.mutable_storage_replica_requirement();
+        requirement->set_storage_type(static_cast<proto::meta::StorageType>(storage_replica_requirement->storage_type));
+        requirement->set_min_location_count(storage_replica_requirement->min_location_count);
+        for (const auto type : storage_replica_requirement->excluded_storage_types) {
+            requirement->add_excluded_storage_types(static_cast<proto::meta::StorageType>(type));
+        }
+    }
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);
