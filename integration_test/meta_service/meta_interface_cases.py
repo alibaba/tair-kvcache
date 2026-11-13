@@ -486,27 +486,30 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
             "write_timeout_seconds": 30,
         }
         invalid = [
-            {},
-            {"storage_type": "ST_NFS"},
-            {"storage_type": "ST_NFS", "min_location_count": -1},
-            {"storage_type": "ST_UNSPECIFIED", "min_location_count": 1},
-            {"storage_type": "ST_EVENT_REPORT_L1P5", "min_location_count": 1},
-            {"storage_type": "ST_EVENT_REPORT_L2", "min_location_count": 1},
-            {"storage_type": 263, "min_location_count": 1},
-            {"excluded_storage_types": [], "min_location_count": 1},
-            {"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 0},
-            {"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": -1},
-            {"excluded_storage_types": ["ST_UNSPECIFIED"], "min_location_count": 1},
-            {"excluded_storage_types": [263], "min_location_count": 1},
-            {"storage_type": "ST_NFS", "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
-            {"storage_type": 263, "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+            ({}, "min_location_count"),
+            ({"storage_type": "ST_NFS"}, "min_location_count"),
+            ({"storage_type": "ST_NFS", "min_location_count": -1}, "min_location_count"),
+            ({"storage_type": "ST_UNSPECIFIED", "min_location_count": 1}, "is required"),
+            ({"storage_type": "ST_EVENT_REPORT_L1P5", "min_location_count": 1}, "cannot target EventReport"),
+            ({"storage_type": "ST_EVENT_REPORT_L2", "min_location_count": 1}, "cannot target EventReport"),
+            ({"storage_type": 263, "min_location_count": 1}, "storage_type"),
+            ({"excluded_storage_types": [], "min_location_count": 1}, "is required"),
+            ({"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 0}, "min_location_count"),
+            ({"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": -1}, "min_location_count"),
+            ({"excluded_storage_types": ["ST_UNSPECIFIED"], "min_location_count": 1}, "excluded_storage_types"),
+            ({"excluded_storage_types": [263], "min_location_count": 1}, "excluded_storage_types"),
+            ({"storage_type": "ST_NFS", "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+             "mutually exclusive"),
+            ({"storage_type": 263, "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+             "storage_type"),
         ]
-        for requirement in invalid:
+        for requirement, message in invalid:
             with self.subTest(requirement=requirement):
                 response = self._client.start_write_cache({
                     **request, "storage_replica_requirement": requirement,
                 }, check_response=False)
                 self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+                self.assertIn(message, response["header"]["status"]["message"])
         for old_count in (1, 2):
             response = self._client.start_write_cache({
                 **request,
@@ -516,6 +519,7 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                 },
             }, check_response=False)
             self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+            self.assertIn("requires min_replica_count=0", response["header"]["status"]["message"])
 
     def test_excluded_storage_replica_threshold_and_mask(self):
         self._client.register_instance({

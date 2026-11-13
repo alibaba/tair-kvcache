@@ -277,8 +277,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         })
         self.assertEqual([], skipped.get("locations", []), skipped)
 
-        # The HTTP codec ignores an unknown enum name; message presence must
-        # still select validation rather than silently falling back to legacy.
+        # StartWriteCache rejects unknown names in the new requirement fields.
         invalid = self._client.start_write_cache({
             **request,
             "storage_replica_requirement": {"storage_type": "ST_NFS_TYPO", "min_location_count": 1},
@@ -290,6 +289,70 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             "storage_replica_requirement": {"excluded_storage_types": ["ST_NFS_TYPO"], "min_location_count": 1},
         }, check_response=False)
         self.assertEqual("INVALID_ARGUMENT", invalid_exclusion["header"]["status"]["code"])
+
+    def test_storage_replica_requirement_http_enum_validation(self):
+        self._client.register_instance({
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+        })
+        request = {
+            "instance_id": self._instance_id,
+            "block_keys": [83020],
+            "write_timeout_seconds": 30,
+        }
+        for field_names in (
+            ("storage_replica_requirement", "storage_type", "excluded_storage_types", "min_location_count"),
+            ("storageReplicaRequirement", "storageType", "excludedStorageTypes", "minLocationCount"),
+        ):
+            requirement_name, type_name, excluded_name, count_name = field_names
+            for fields, error_field in (
+                ({excluded_name: ["ST_EVENT_REPORT_L1_5", "ST_EVENT_REPORT_L2"]}, "excluded_storage_types"),
+                ({excluded_name: ["ST_EVENT_REPORT_L2", "263"]}, "excluded_storage_types"),
+                ({type_name: "ST_NFS_TYPO", excluded_name: ["ST_EVENT_REPORT_L2"]}, "storage_type"),
+                ({type_name: "263", excluded_name: ["ST_EVENT_REPORT_L2"]}, "storage_type"),
+            ):
+                with self.subTest(field_names=field_names, fields=fields):
+                    response = self._client.start_write_cache({
+                        **request, requirement_name: {count_name: 1, **fields},
+                    }, check_response=False)
+                    self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+                    self.assertIn(error_field, response["header"]["status"]["message"])
+                    self.assertEqual([], response.get("locations", []), response)
+
+        # Rejected requests must not allocate. Legal enum encodings, nulls,
+        # duplicate exclusions and field aliases keep their existing meaning.
+        valid = [
+            {"excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2"]},
+            {"storage_type": "ST_UNSPECIFIED", "excluded_storage_types": [7, 8, 8]},
+            {"storage_type": 0, "excluded_storage_types": ["7", "8"]},
+            {"storage_type": "0", "excluded_storage_types": ["ST_EVENT_REPORT_L2"]},
+            {"storage_type": None, "excluded_storage_types": [8], "unknown_field": "ignored"},
+            {"storage_type": "ST_NFS", "excluded_storage_types": None},
+            {"storage_type": "4", "excluded_storage_types": []},
+            {"storage_type": 4.0},
+            {"storage_type": 0.0, "excluded_storage_types": [7.0, 8.0]},
+        ]
+        for index, requirement in enumerate(valid):
+            response = self._client.start_write_cache({
+                **request, "storage_replica_requirement": {"min_location_count": 1, **requirement},
+            })
+            self.assertEqual(1 if index == 0 else 0, len(response.get("locations", [])), response)
+            if index == 0:
+                self._client.finish_write_cache({
+                    "instance_id": self._instance_id,
+                    "write_session_id": response["write_session_id"],
+                    "success_blocks": {"bool_masks": {"values": [True]}},
+                })
+        response = self._client.start_write_cache({
+            **request,
+            "storageReplicaRequirement": {
+                "storageType": "ST_UNSPECIFIED", "excludedStorageTypes": ["7", "8"], "minLocationCount": 1,
+            },
+        })
+        self.assertEqual([], response.get("locations", []), response)
 
     def test_storage_replica_requirement_quota_error_codes(self):
         for name, total_quota, type_quota, expected in (

@@ -2450,30 +2450,35 @@ TEST_F(StorageReplicaIdentityTest, UnresolvedIdentityDoesNotGuessHf3fsOrVcns) {
 
 TEST_F(CacheManagerTest, TestStorageReplicaRequirementValidation) {
     using Requirement = CacheManager::StorageReplicaRequirement;
-    const std::vector<Requirement> invalid{
-        {},
-        {DataStorageType::DATA_STORAGE_TYPE_DUMMY, 0},
-        {DataStorageType::DATA_STORAGE_TYPE_DUMMY, -1},
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 1},
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1},
-        {DataStorageType::COUNT, 1},
-        {static_cast<DataStorageType>(255), 1},
-        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {}},
-        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
-        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN}},
-        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::COUNT}},
-        {DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
+    const std::vector<std::pair<Requirement, std::string>> invalid{
+        {{}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 0}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, -1}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 1}, "cannot target EventReport"},
+        {{DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1}, "cannot target EventReport"},
+        {{DataStorageType::COUNT, 1}, "storage_type is unknown"},
+        {{static_cast<DataStorageType>(255), 1}, "storage_type is unknown"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {}}, "is required"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
+         "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN}},
+         "excluded_storage_types contains an unspecified or unknown type"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::COUNT}},
+         "excluded_storage_types contains an unspecified or unknown type"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
+         "mutually exclusive"},
     };
-    for (const auto &requirement : invalid) {
-        EXPECT_EQ(
-            EC_BADARGS,
-            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement)
-                .first);
+    for (const auto &[requirement, message] : invalid) {
+        RequestContext context("replica-validation");
+        EXPECT_EQ(EC_BADARGS,
+                  cache_manager_->StartWriteCache(&context, "test_instance", {42}, {}, {}, 600, 0, requirement).first);
+        EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find(message));
     }
     for (int32_t old_count : {-1, 1, 2}) {
+        RequestContext context("replica-old-count-validation");
         EXPECT_EQ(EC_BADARGS,
                   cache_manager_
-                      ->StartWriteCache(request_context_.get(),
+                      ->StartWriteCache(&context,
                                         "test_instance",
                                         {42},
                                         {},
@@ -2482,7 +2487,33 @@ TEST_F(CacheManagerTest, TestStorageReplicaRequirementValidation) {
                                         old_count,
                                         Requirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1})
                       .first);
+        EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find("requires min_replica_count=0"));
     }
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementRepeatedExclusions) {
+    CacheManager::StorageReplicaRequirement requirement{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+        1,
+        std::vector<DataStorageType>(4096, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    auto [skip_ec, skipped] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skipped.locations().cache_locations_view().empty());
+
+    // Validate the entire input even after every legal type has been seen.
+    for (size_t type = 1; type < static_cast<size_t>(DataStorageType::COUNT); ++type) {
+        requirement.excluded_storage_types.push_back(static_cast<DataStorageType>(type));
+    }
+    requirement.excluded_storage_types.push_back(DataStorageType::COUNT);
+    RequestContext context("replica-invalid-exclusion-tail");
+    EXPECT_EQ(EC_BADARGS,
+              cache_manager_->StartWriteCache(&context, "test_instance", {43}, {}, {}, 600, 0, requirement).first);
+    EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find("excluded_storage_types"));
 }
 
 TEST_F(CacheManagerTest, TestStorageReplicaRequirementPreservesSpecGroups) {

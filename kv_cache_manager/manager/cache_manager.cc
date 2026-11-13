@@ -1411,20 +1411,42 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     std::optional<DataStorageType> target_storage_type;
-    static const std::vector<DataStorageType> empty_excluded_types;
-    const auto &excluded_storage_types =
-        storage_replica_requirement ? storage_replica_requirement->excluded_storage_types : empty_excluded_types;
+    std::vector<DataStorageType> excluded_storage_types;
     if (storage_replica_requirement) {
         const auto &requirement = *storage_replica_requirement;
+        const auto invalid_requirement = [&](const char *message) {
+            request_context->error_tracer()->AddErrorMsg(message);
+            return std::make_pair(EC_BADARGS, StartWriteCacheInfo{});
+        };
+        if (min_replica_count != 0) {
+            return invalid_requirement("storage_replica_requirement requires min_replica_count=0");
+        }
+        if (requirement.min_location_count <= 0) {
+            return invalid_requirement("storage_replica_requirement.min_location_count must be positive");
+        }
         const bool has_type = requirement.storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        if (min_replica_count != 0 || requirement.min_location_count <= 0 ||
-            has_type == !excluded_storage_types.empty() || requirement.storage_type >= DataStorageType::COUNT ||
-            IsEventReportStorageType(requirement.storage_type) ||
-            std::any_of(excluded_storage_types.begin(), excluded_storage_types.end(), [](DataStorageType type) {
-                return type <= DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || type >= DataStorageType::COUNT;
-            })) {
-            request_context->error_tracer()->AddErrorMsg("invalid or conflicting storage_replica_requirement");
-            return {EC_BADARGS, StartWriteCacheInfo{}};
+        if (has_type && !requirement.excluded_storage_types.empty()) {
+            return invalid_requirement("storage_type and excluded_storage_types are mutually exclusive");
+        }
+        if (!has_type && requirement.excluded_storage_types.empty()) {
+            return invalid_requirement("storage_type or nonempty excluded_storage_types is required");
+        }
+        if (requirement.storage_type >= DataStorageType::COUNT) {
+            return invalid_requirement("storage_replica_requirement.storage_type is unknown");
+        }
+        if (IsEventReportStorageType(requirement.storage_type)) {
+            return invalid_requirement("storage_replica_requirement.storage_type cannot target EventReport");
+        }
+        // Validate every input item, but bound all downstream membership scans by the enum size.
+        std::array<bool, static_cast<size_t>(DataStorageType::COUNT)> seen_types{};
+        for (const auto type : requirement.excluded_storage_types) {
+            if (type <= DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || type >= DataStorageType::COUNT) {
+                return invalid_requirement("excluded_storage_types contains an unspecified or unknown type");
+            }
+            if (!seen_types[static_cast<size_t>(type)]) {
+                seen_types[static_cast<size_t>(type)] = true;
+                excluded_storage_types.push_back(type);
+            }
         }
         if (has_type) {
             target_storage_type = requirement.storage_type;

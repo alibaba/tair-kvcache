@@ -39,7 +39,7 @@ message StartWriteCacheRequest {
 
 使用 message 的存在性区分新旧模式，不把旧字段移入 oneof，也不改旧 proto 字段的默认值。`storage_type` 与非空 `excluded_storage_types` 必须且只能设置一种；`min_location_count` 是两种模式共用的数量门槛。不引入通用写入策略对象。
 
-保留 message 避免缺省类型意外进入旧模式。HTTP 的整个 `storage_replica_requirement: null` 按未设置处理，与空对象 `{}` 不同。[HTTP JSON 解析器](../../kv_cache_manager/service/util/fast_proto_json_codec.cc) 沿用忽略未知枚举名称的行为：指定模式拼错类型或排除列表全部为未知名称时，解析后没有合法模式，因此拒绝；若列表中同时有已知和未知名称，仅已知项会保留。调用方须使用正确的枚举名或数值，不能将该接口的校验视为 JSON 原文的严格校验。本次不修改公共 JSON 解析器；解析后可见的未知枚举数值，以及排除列表中的 `ST_UNSPECIFIED` 均拒绝。
+保留 message 避免缺省类型意外进入旧模式。HTTP 的整个 `storage_replica_requirement: null` 按未设置处理，与空对象 `{}` 不同。`StartWriteCache` 的 HTTP 入口仅对新 message 内的 `storage_type` 和 `excluded_storage_types` 核对 JSON 原文：未知枚举名称、数值或带引号的未知数值均返回 `INVALID_ARGUMENT`，不能静默缩小排除范围，也不能把拼错的指定类型当作排除模式。合法名称、数字及数字字符串、snake_case 和 camelCase 字段名继续支持；排除模式可显式传 `ST_UNSPECIFIED`／0，字段 `null` 仍按未设置处理。公共 [HTTP JSON 解析器](../../kv_cache_manager/service/util/fast_proto_json_codec.cc) 和其他字段的解析行为不变。
 
 HTTP 请求示例：
 
@@ -67,7 +67,7 @@ HTTP 请求示例：
 }
 ```
 
-排除类型同时约束计数与本次新分配。重复的排除项不改变结果。只有被排除类型的副本不会满足数量门槛；没有 EventReport、只有一份有效 SSD 也可以满足上述请求。排除条件不持久化、不删除已有副本，也不限制独立 Copy。
+排除类型同时约束计数与本次新分配。重复的排除项不改变结果；Manager 入口逐项校验并去重，使后续计数、Mark 和候选过滤的查找范围最多为合法类型数，不随重复项数量增长。只有被排除类型的副本不会满足数量门槛；没有 EventReport、只有一份有效 SSD 也可以满足上述请求。排除条件不持久化、不删除已有副本，也不限制独立 Copy。
 
 仅在新 message 存在时增加以下校验；参数错误使用现有 `EC_BADARGS / INVALID_ARGUMENT`。此处以已有入口检查通过为前提；HTTP/gRPC 对未注册实例的前置检查仍可先返回 `INSTANCE_NOT_EXIST`，不调整错误优先级：
 
@@ -78,12 +78,12 @@ HTTP 请求示例：
 | 新 message 存在，包括空对象 | 校验类型和数量；空对象不视为“未设置” |
 | 指定类型与非空排除列表同时设置，或两者均未设置 | 拒绝；空列表不能单独启用排除模式 |
 | 指定类型为未知枚举或 EventReport 类型 | 拒绝；EventReport 不支持通过 Create 主动分配位置 |
-| 排除列表含 `ST_UNSPECIFIED` 或未知枚举数值 | 拒绝；EventReport 类型可以作为排除项 |
+| 排除列表含 `ST_UNSPECIFIED` 或未知枚举名称／数值 | 拒绝；EventReport 类型可以作为排除项 |
 | 新数量未设置（解析为 0）或小于等于 0 | 拒绝，不将缺省数量解释为 1 |
 | 新 message 存在，旧顶层数量非 0 | 拒绝；显式传旧值 1 也算冲突 |
 | 新 message 合法，旧顶层数量为 0／未设置 | 使用新模式 |
 
-旧字段是普通 proto3 scalar，无法区分“未设置”和“显式设置 0”，两者都表示未启用旧模式。Manager 直调也要校验新参数，避免只在 HTTP/gRPC 入口限制；不借此统一旧入口对负数等输入的处理。
+旧字段是普通 proto3 scalar，无法区分“未设置”和“显式设置 0”，两者都表示未启用旧模式。Manager 直调也要校验新参数，避免只在 HTTP/gRPC 入口限制；校验错误信息区分数量、模式冲突、缺少模式、非法类型和旧参数冲突，不增加错误码，不借此统一旧入口对负数等输入的处理。
 
 为配合新增参数，将 [Manager 声明](../../kv_cache_manager/manager/cache_manager.h) 中旧 `min_replica_count` 的默认实参从 1 改为 0，与 proto 和 SDK 对齐。现有代码只在值大于 1 时进入 min-replica 分支，因此未带新参数时，省略、显式 0、显式 1 的原有行为均不变。新参数追加在旧参数之后，Manager 直调启用新模式时须显式传旧参数 0，即 `StartWriteCache(..., write_timeout_seconds, 0, requirement)`；修改默认实参不会让位置参数自动省略。不要将显式 1 自动归一化为 0，否则会绕过冲突校验。
 

@@ -733,7 +733,7 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         storage_replica_requirement.emplace(CacheManager::StorageReplicaRequirement{});
         const auto &requirement = request->storage_replica_requirement();
         ProtoConvert::DataStorageTypeFromProto(requirement.storage_type(), storage_replica_requirement->storage_type);
-        // Preserve invalid explicit values so they cannot turn into a valid exclusion-only request.
+        // Preserve invalid explicit enum numbers so they cannot become a valid exclusion-only request.
         if (!proto::meta::StorageType_IsValid(requirement.storage_type())) {
             storage_replica_requirement->storage_type = DataStorageType::COUNT;
         }

@@ -101,7 +101,7 @@ curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \
 }
 ```
 
-顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为。指定类型与非空排除列表必须二选一；排除模式的 `storage_type` 不传或为 `ST_UNSPECIFIED`。空对象、两种模式同时设置、未知枚举数值、排除列表中的 `ST_UNSPECIFIED`、指定 EventReport 写入以及非正数量均返回 `INVALID_ARGUMENT`。重复排除项不改变含义。HTTP 沿用忽略未知枚举名称的解析规则，混合列表仅保留可识别项，须使用正确枚举名或数值；不提供对 JSON 原文的严格校验。
+顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为。指定类型与非空排除列表必须二选一；排除模式的 `storage_type` 不传或为 `ST_UNSPECIFIED`。空对象、两种模式同时设置、未知枚举名称或数值、排除列表中的 `ST_UNSPECIFIED`、指定 EventReport 写入以及非正数量均返回 `INVALID_ARGUMENT`，错误信息说明具体原因。重复排除项在校验后去重，不改变含义。HTTP 仅对新参数中的两个类型字段核对原文，混合列表中任一未知名称（包括带引号的未知数值）都会拒绝，不会静默缩小排除范围；合法的名称、数字、数字字符串及 camelCase 字段名继续支持。其他字段的解析规则不变。
 
 指定模式仅统计目标类型的有效 Location，不足时每个 key 本次最多分配一份；客户端仍须写入返回的 URI 并调用 Finish Write Cache。数量是补写门槛，不保证并发上限、不同后端分布或可读副本数下限。显式类型覆盖 Group 的 PREFER/ALWAYS 偏好和本次 StartWrite 的 Mark 引导，但仍受 `storage_candidates`、可写性及配额限制。
 
