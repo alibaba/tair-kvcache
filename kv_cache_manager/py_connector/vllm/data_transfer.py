@@ -19,45 +19,28 @@ data path, so the connector competes with the engine for exactly zero HBM.
 """
 
 import threading
-import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, List, Optional
 
 import torch
 
 # kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
 from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
 
-from kv_cache_manager.py_connector.common.tp_coordinator import (
-    CoordinateMsgSerializer,
-    TpCoordinatorClient,
-    CoordinateMessage,
-    SendBlockFinishedEvent,
-    LoadBlockFinishedEvent,
-)
+from kv_cache_manager.py_connector.common.tp_coordinator import TpCoordinatorClient
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
+from kv_cache_manager.py_connector.vllm.transfer_backend import (
+    BlockVerdicts,
+    MultiResult,
+    get_device_module,
+)
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
     TransferGroup,
 )
-from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
-
-
-def _get_device_module(device: Optional[torch.device] = None) -> Any:
-    """Return the torch device module matching the runtime device."""
-    if device is not None and hasattr(torch, "get_device_module"):
-        return torch.get_device_module(device)
-    try:
-        if hasattr(torch, "musa") and torch.musa.is_available():
-            import torch_musa  # noqa: F401
-
-            return torch.musa
-    except Exception:
-        pass
-    return torch.cuda
 
 
 class _StagingPool:
@@ -142,34 +125,6 @@ class _StagingPool:
         return self._cpu[start * b : (start + n) * b]
 
 
-class MultiResult:
-    """Collect the per-block success flags of several async tasks and fire a
-    callback once every task has reported. Each result is a list[bool] aligned
-    with the manager blocks the task handled (in submission order)."""
-
-    def __init__(self, size: int, callback: Callable[[List[Any]], None]) -> None:
-        self._size = size
-        self._results: List[Optional[Sequence[Any]]] = [None] * size
-        self._lock = threading.Lock()
-        self._finished_num = 0
-        self._callback = callback
-
-    def submit_result(self, idx: int, result: Sequence[Any]) -> None:
-        with self._lock:
-            assert self._results[idx] is None
-            self._results[idx] = result
-            self._finished_num += 1
-            if self._finished_num == self._size:
-                # Flatten in submission order. Every slot is filled by the
-                # count check (submission asserts the slot was None), so the
-                # per-part guard only documents the invariant for readers.
-                flat = []
-                for part in self._results:
-                    assert part is not None
-                    flat.extend(part)
-                self._callback(flat)
-
-
 def _effective_pool_blocks(
     configured: int, need: int, block_bytes: int, max_bytes: int
 ) -> int:
@@ -185,7 +140,7 @@ def _effective_pool_blocks(
     return max(need, min(configured, by_bytes))
 
 
-class DataTransferManager:
+class DataTransferManager(BlockVerdicts):
     def __init__(
         self,
         kvcache_info: KVCacheInfo,
@@ -194,13 +149,21 @@ class DataTransferManager:
         coordinator_client: TpCoordinatorClient,
         extra_config: TairKvCacheConnectorExtraConfig,
     ) -> None:
+        super().__init__(coordinator_client)
         self._info = kvcache_info
         self._manager_block_size = manager_block_size
         self._transfer_client = transfer_client
-        self._coordinator_client = coordinator_client
         self._extra_config = extra_config
         self._device = kvcache_info.device
-        self._device_mod = _get_device_module(self._device)
+        self._device_mod = get_device_module(self._device)
+        # The Triton kernels are this package's only Triton consumer. Importing
+        # them here rather than at module scope keeps the module (and therefore
+        # the connector) importable on a host without Triton, while a GPU host
+        # that lost the kernel still fails at engine start instead of at the
+        # first transfer.
+        from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
+
+        self._kernel = batch_gather_scatter_helper
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
 
@@ -262,10 +225,13 @@ class DataTransferManager:
             max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker
         )
 
-    def submit_task(
-        self, func: Callable[..., Any], *args: Any, **kwargs: Any
-    ) -> Future:
+    def submit(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         return self._io_executor.submit(func, *args, **kwargs)
+
+    def shutdown(self) -> None:
+        # wait=False: queued transfers finish on their own, so teardown never
+        # blocks engine exit.
+        self._io_executor.shutdown(wait=False)
 
     # ------------------------------------------------------------------ #
     # BlockBuffer helper
@@ -316,7 +282,7 @@ class DataTransferManager:
         """
         n = len(remote_uris)
         # Single exit: whatever happens below, the task reports, otherwise the
-        # MultiResult callback never fires (submit_task drops the future, so an
+        # MultiResult callback never fires (submit drops the future, so an
         # escaping exception is silently swallowed) and the save session hangs.
         ok_mask = [False] * n
         try:
@@ -346,108 +312,6 @@ class DataTransferManager:
             )
             ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
-
-    def _save_dispositions(
-        self,
-        group: TransferGroup,
-        remote_uris: List[Optional[str]],
-        block_ids: Optional[List[int]],
-        n: int,
-    ) -> Tuple[Set[int], Set[int]]:
-        """Split the task's blocks into (abstained, failed); the rest transfer.
-
-        A state group abstains for a manager block exactly when vLLM's block
-        table points at the null block *and* the manager allocated no URI for
-        the group's spec. The two must agree, because the scheduler derived the
-        announced spec coverage from that very block table. Either disagreement
-        fails the block:
-
-        * location but no state -- writing the null block's bytes would publish
-          a state the model never produced;
-        * state but no location -- the state cannot be published at all.
-
-        Attention KV is never sparse, so a missing location simply fails.
-        """
-        if isinstance(group, AttentionTransferGroup):
-            failed = {i for i in range(n) if remote_uris[i] is None}
-            if failed:
-                logger.warning(
-                    "save group %s: %d/%d attention blocks have no "
-                    "location, failing them",
-                    group.spec_name,
-                    len(failed),
-                    n,
-                )
-            return set(), failed
-        skipped, failed = set(), set()
-        for i in range(n):
-            is_null = block_ids[i] == 0  # ty: ignore[not-subscriptable]
-            has_uri = remote_uris[i] is not None
-            if is_null and not has_uri:
-                skipped.add(i)
-            elif is_null:
-                failed.add(i)
-                logger.warning(
-                    "save group %s: block %d has a location but no "
-                    "materialized state; failing it instead of "
-                    "publishing bytes the model never produced",
-                    group.spec_name,
-                    i,
-                )
-            elif not has_uri:
-                failed.add(i)
-                logger.warning(
-                    "save group %s: block %d has a materialized "
-                    "state but no location to write it to; failing it",
-                    group.spec_name,
-                    i,
-                )
-        if skipped:
-            logger.debug(
-                "save group %s: %d/%d blocks carry no state (not published)",
-                group.spec_name,
-                len(skipped),
-                n,
-            )
-        return skipped, failed
-
-    @staticmethod
-    def _load_skipped_blocks(
-        group: TransferGroup,
-        remote_uris: List[Optional[str]],
-        block_ids: Optional[List[int]],
-        n: int,
-    ) -> Set[int]:
-        """Blocks this group has nothing to load into.
-
-        Asymmetric with the save side on purpose: on load, a null target means
-        vLLM does not *need* this group's data for that block (in mamba "align"
-        mode only the block ending the reused prefix needs its state), so the
-        block is skipped whatever the manager published. The reverse -- a real
-        target with nothing published -- is a genuine failure: the request would
-        run on an unwritten state.
-        """
-        if isinstance(group, AttentionTransferGroup):
-            missing = sum(uri is None for uri in remote_uris)
-            if missing:
-                logger.warning(
-                    "load group %s: %d/%d attention blocks have no "
-                    "location, failing them",
-                    group.spec_name,
-                    missing,
-                    n,
-                )
-            return set()
-        # State tasks always carry block ids (see _iter_task_chunks).
-        skipped = {i for i in range(n) if block_ids[i] == 0}  # ty: ignore[not-subscriptable]
-        if skipped:
-            logger.debug(
-                "load group %s: %d/%d blocks need no state",
-                group.spec_name,
-                len(skipped),
-                n,
-            )
-        return skipped
 
     def _save_valid_blocks(
         self,
@@ -484,7 +348,7 @@ class DataTransferManager:
                         self._manager_block_size,
                         group.per_token_dim,
                     )
-                    batch_gather_scatter_helper.batch_gather_kv_caches(
+                    self._kernel.batch_gather_kv_caches(
                         group.kvcache_ptr_tensor_gpu,
                         view,
                         # Attention tasks always carry token indices.
@@ -534,45 +398,6 @@ class DataTransferManager:
             raise
         finally:
             pool.release(start, len(valid))
-
-    def create_save_done_callback(
-        self,
-        req_id: str,
-        tp_rank: int,
-        write_session_id: str,
-        num_blocks: int,
-    ) -> Callable[[List[Optional[bool]]], None]:
-        """block success = AND across all groups that had data for the block.
-
-        Task results are ordered group0[blocks], group1[blocks], ... so a
-        block's verdict is the stride-AND ``flat[i % num_blocks]``. ``None``
-        entries mean "this group holds no data for this block by design" (see
-        save_task) and are skipped: they neither pass nor fail the block. A
-        block whose every group is None was never written at all and must not
-        be published.
-        """
-
-        def cb(flat: List[Optional[bool]]) -> None:
-            is_success = [None] * num_blocks
-            for i, ok in enumerate(flat):
-                if ok is None:
-                    continue
-                b = i % num_blocks
-                is_success[b] = ok if is_success[b] is None else (is_success[b] and ok)
-            # No group wrote anything for the block -> nothing to publish.
-            is_success = [bool(ok) for ok in is_success]
-            msg = CoordinateMessage(
-                time.time(),
-                SendBlockFinishedEvent(
-                    request_id=req_id,
-                    tp_rank=tp_rank,
-                    write_session_id=write_session_id,
-                    is_success_list=is_success,
-                ),
-            )
-            self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
-
-        return cb
 
     # ------------------------------------------------------------------ #
     # Load
@@ -657,7 +482,7 @@ class DataTransferManager:
                             self._manager_block_size,
                             group.per_token_dim,
                         )
-                        batch_gather_scatter_helper.batch_scatter_kv_caches(
+                        self._kernel.batch_scatter_kv_caches(
                             group.kvcache_ptr_tensor_gpu,
                             view,
                             # Attention tasks always carry token indices
@@ -700,66 +525,3 @@ class DataTransferManager:
             raise
         finally:
             pool.release(start, len(valid))
-
-    def create_load_done_callback(
-        self,
-        req_id: str,
-        tp_rank: int,
-        epoch: int,
-        block_ids: List[int],
-        num_blocks: int,
-        report_failures: bool = True,
-    ) -> Callable[[List[Optional[bool]]], None]:
-        """A manager block is loaded only if every group that had data for it
-        succeeded.
-
-        ``None`` entries mean "this group has no data for this block by design"
-        (mamba "align" interior blocks, see load_task) and are skipped, exactly
-        as in the save callback.
-
-        block_ids is the block table used to report vLLM-visible invalid block
-        ids. vLLM's invalid-block recovery unpacks a single-group block table
-        (https://github.com/vllm-project/vllm/blob/releases/v0.26.0/vllm/v1/core/sched/scheduler.py#L2693,
-        "TODO (davidb): add support for hybrid memory allocator"); for a
-        multi-group (hybrid) model the unpack raises ValueError and crashes
-        the scheduler, so hybrid connectors pass report_failures=False: the
-        failure is logged, vLLM keeps the partially loaded KV, and the request
-        may produce corrupt output -- the contained alternative to an
-        engine-wide crash. See start_load_kv for the full trade-off."""
-
-        def cb(flat: List[Optional[bool]]) -> None:
-            merged = [None] * num_blocks
-            for i, ok in enumerate(flat):
-                if ok is None:
-                    continue
-                b = i % num_blocks
-                merged[b] = ok if merged[b] is None else (merged[b] and ok)
-            # A block no group loaded anything for was not restored.
-            merged = [bool(ok) for ok in merged]
-            failed = []
-            if report_failures:
-                failed = [
-                    block_ids[i]
-                    for i in range(min(num_blocks, len(block_ids)))
-                    if not merged[i]
-                ]
-            elif not all(merged):
-                logger.warning(
-                    "load failed for %d/%d blocks of req %s (hybrid: "
-                    "not reporting invalid block ids)",
-                    merged.count(False),
-                    num_blocks,
-                    req_id,
-                )
-            msg = CoordinateMessage(
-                time.time(),
-                LoadBlockFinishedEvent(
-                    request_id=req_id,
-                    tp_rank=tp_rank,
-                    epoch=epoch,
-                    failed_block_idxs=failed,
-                ),
-            )
-            self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
-
-        return cb

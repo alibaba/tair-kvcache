@@ -87,7 +87,7 @@ class VerifyingConnector(TairKvCacheConnector):
     _device_mod = _worker_attr("_device_mod")
     _device = _worker_attr("_device")
     _kv_caches = _worker_attr("_kv_caches")
-    _data_transfer = _worker_attr("_data_transfer")
+    _backend = _worker_attr("_backend")
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -137,7 +137,7 @@ class VerifyingConnector(TairKvCacheConnector):
         # req_id -> (manager_block_idxes, block_ids_per_group)
         self._pending_loaded: dict[str, tuple[list, list]] = {}
 
-        orig_factory = self._data_transfer.create_load_done_callback
+        orig_factory = self._backend.create_load_done_callback
 
         def tracking_factory(req_id, *args, **kwargs):
             orig_cb = orig_factory(req_id, *args, **kwargs)
@@ -153,7 +153,7 @@ class VerifyingConnector(TairKvCacheConnector):
 
             return cb
 
-        self._data_transfer.create_load_done_callback = tracking_factory
+        self._backend.create_load_done_callback = tracking_factory
         logger.warning(
             "VerifyingConnector enabled, capture_dir=%s tp_rank=%s groups=%s "
             "vllm_bs=%s manager_bs=%s",
