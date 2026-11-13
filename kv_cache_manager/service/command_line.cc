@@ -8,12 +8,10 @@
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/crash_handler.h"
+#include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/server_config.h"
 namespace kv_cache_manager {
-
-static std::mutex G_CMD_LOCK;
-static CommandLine *G_CMD_LIST = nullptr;
 
 void CommandArgs::ParseCmdLine(int argc, char *const argv[]) {
     int opt;
@@ -87,25 +85,7 @@ void CommandArgs::PrintUsage(char *prog_name) {
 }
 
 int CommandLine::Run(int argc, const char *argv[]) {
-    // TODO
-    // 1. parse args
-    // 2. set env
-    // 3. init Config
-    // 4. daemon
-    // 5. singal
-    // 6. init logger
-    // 7. make server by factory
-    // 8. pidfile
-    // 9. wait
-    // 10. clear resource
-
     fprintf(stdout, "Start run command %p.\n", this);
-
-    {
-        std::unique_lock<std::mutex> lock(G_CMD_LOCK);
-        next_ = G_CMD_LIST;
-        G_CMD_LIST = this;
-    }
 
     CommandArgs args;
     args.ParseCmdLine(argc, const_cast<char **>(argv));
@@ -114,6 +94,13 @@ int CommandLine::Run(int argc, const char *argv[]) {
     bool ret = config.Parse(args.GetConfigFile(), args.GetEnviron());
     if (!ret) {
         fprintf(stderr, "Parse config failed.\n");
+        return -1;
+    }
+
+    // 必须早于 daemon()、logger 与 Server：之后创建的线程都继承这个阻塞掩码，
+    // 退出信号因此不会在任何业务线程里执行 handler，只由控制线程统一消费。
+    if (!ShutdownController::BlockExitSignals()) {
+        fprintf(stderr, "Block exit signals failed.\n");
         return -1;
     }
 
@@ -126,28 +113,47 @@ int CommandLine::Run(int argc, const char *argv[]) {
     UpdateLogLevel(config.GetLogLevel());
     LoggerBroker::InitLogLevelFromEnv();
 
-    RegisterSignal();
+    if (!InstallSignalPolicy()) {
+        fprintf(stderr, "Install signal policy failed.\n");
+        LoggerBroker::DestroyLogger();
+        return -1;
+    }
 
-    server_.reset(new Server);
-    if (!server_->Init(config)) {
-        fprintf(stderr, "Server init failed.\n");
-        return -1;
+    int exit_code = 0;
+    if (controller_.IsShutdownRequested()) {
+        // 阻塞掩码生效前收到的信号一直 pending，Start() 之后立刻被消费；
+        // 此时不再启动 Server，避免在已请求退出时还跑一遍冗长的 recovery。
+        KVCM_LOG_INFO("shutdown requested before server start, skip starting server.");
+    } else {
+        server_.reset(new Server);
+        if (!server_->Init(config)) {
+            fprintf(stderr, "Server init failed.\n");
+            exit_code = -1;
+        } else if (!server_->Start()) {
+            fprintf(stderr, "Server start failed.\n");
+            exit_code = -1;
+        }
     }
-    if (!server_->Start()) {
-        fprintf(stderr, "Server start failed.\n");
-        server_->Stop();
-        server_->Wait();
-        return -1;
+
+    if (exit_code == 0) {
+        controller_.WaitForShutdownRequest();
     }
-    server_->Wait();
-    server_.reset();
-    LoggerBroker::DestroyLogger();
-    return 0;
+
+    return Finish(exit_code);
 }
 
-void CommandLine::Terminate() {
-    // TODO
-    server_->Stop();
+int CommandLine::Finish(int exit_code) {
+    if (server_) {
+        server_->Stop();
+        server_->Wait();
+    }
+    // 控制线程要活到 manager 销毁之后：server_.reset() 里的析构会 join 各后台线程，
+    // 是关闭流程中最可能阻塞的一段，「再收一个退出信号就强退」的兜底必须覆盖它。
+    server_.reset();
+    // 不变量：控制线程必须在 logger 销毁之前完成 join，它在强制退出路径上还要打日志。
+    controller_.Stop();
+    LoggerBroker::DestroyLogger();
+    return exit_code;
 }
 
 bool CommandLine::StartDaemon() {
@@ -163,22 +169,6 @@ bool CommandLine::StartDaemon() {
     return true;
 }
 
-void __sign_handler__(int sig) {
-    std::unique_lock<std::mutex> lock(G_CMD_LOCK);
-    switch (sig) {
-    case SIGUSR1:
-    case SIGUSR2:
-    case SIGTERM:
-    case SIGINT: {
-        fprintf(stdout, "received singnal %d, try stop server.", sig);
-        for (CommandLine *p = G_CMD_LIST; p; p = p->GetNext()) {
-            p->Terminate();
-        }
-        break;
-    }
-    }
-}
-
 void CommandLine::InitLogger(const std::string &log_config_file) { LoggerBroker::InitLogger(log_config_file, false); }
 
 void CommandLine::UpdateLogLevel(uint32_t log_level) {
@@ -188,13 +178,12 @@ void CommandLine::UpdateLogLevel(uint32_t log_level) {
     LoggerBroker::SetLogLevel(log_level);
 }
 
-void CommandLine::RegisterSignal() {
+bool CommandLine::InstallSignalPolicy() {
+    // 崩溃信号仍由 CrashHandler 独立处理，SIGPIPE 继续忽略；
+    // 四个退出信号不再注册 handler，统一由 ShutdownController 消费。
     CrashHandler::Install();
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGUSR1, __sign_handler__);
-    signal(SIGUSR2, __sign_handler__);
-    signal(SIGTERM, __sign_handler__);
-    signal(SIGINT, __sign_handler__);
+    return controller_.Start();
 }
 
 } // namespace kv_cache_manager

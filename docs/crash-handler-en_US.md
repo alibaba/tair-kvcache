@@ -1,9 +1,9 @@
 # Crash Stack Trace
 
 KVCacheManager installs an async-signal-safe crash handler in
-`CommandLine::RegisterSignal` by default. When the process is about to
-be terminated by one of the following signals it dumps a readable stack
-trace **in addition to** the kernel coredump:
+`CommandLine::InstallSignalPolicy` by default. When the process is
+about to be terminated by one of the following signals it dumps a
+readable stack trace **in addition to** the kernel coredump:
 
 `SIGSEGV` / `SIGABRT` / `SIGBUS` / `SIGFPE` / `SIGILL`
 

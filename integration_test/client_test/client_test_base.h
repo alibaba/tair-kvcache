@@ -24,7 +24,7 @@ public:
         controller_.StartServiceInSubProcess(workspace_path_);
     }
 
-    static void TearDownTestSuite() { controller_.StopService(); }
+    static void TearDownTestSuite() { EXPECT_TRUE(controller_.StopService()); }
     std::string GetCurrentTestName() const {
         const ::testing::TestInfo *const test_info = ::testing::UnitTest::GetInstance()->current_test_info();
         return std::string(test_info->test_case_name()) + "_" + test_info->name();

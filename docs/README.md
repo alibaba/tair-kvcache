@@ -11,6 +11,7 @@
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
+- [退出信号处理与优雅关闭](design/graceful_shutdown_signal_handling.md) - 退出信号全局阻塞、控制线程只通知主线程执行、关闭时序与顺序不变量、重复信号强退兜底及信号回归测试
 - [KVCM 环境变量启动与自动初始化](design/kvcm_env_startup_bootstrap.md) - 环境变量配置、Storage/Instance Group 映射及参数变化后的更新行为
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
 - [KVCM × PACE CopyGA 异步化设计](design/async_copyga.md) - 缓存异步迁移的执行流程、并发与容量控制、数据一致性及异常处理
