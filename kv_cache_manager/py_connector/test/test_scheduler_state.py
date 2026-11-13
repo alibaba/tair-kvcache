@@ -28,6 +28,7 @@ from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta,
     StateGroupMeta,
+    build_spec_groups,
     parse_groups,
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
@@ -314,15 +315,22 @@ def hybrid_locations(coverage, tp_size=1, num_attn=1, num_state=1):
 class TestSpecGroups(unittest.TestCase):
     """Registration must advertise the two spec groups a hybrid model needs to
     express per-block state sparsity -- and must stay silent for models that
-    have no sparsity (byte-identical requests, old-manager compatible)."""
+    have no sparsity (byte-identical requests, old-manager compatible).
+
+    Registration is worker-only (the scheduler's config is a folded view), so
+    the builder is exercised directly instead of through the scheduler role.
+    """
 
     def test_full_attention_declares_no_groups(self):
         conn = make_connector_scheduler(num_groups=1, tp_size=2)
-        self.assertEqual(conn._spec_groups(), [])
+        self.assertEqual(build_spec_groups(conn._group_metas, conn._tp_size), [])
 
     def test_hybrid_declares_attn_and_full(self):
         conn = make_connector_scheduler(num_groups=1, num_state_groups=2, tp_size=2)
-        groups = {g["name"]: g["spec_names"] for g in conn._spec_groups()}
+        groups = {
+            g["name"]: g["spec_names"]
+            for g in build_spec_groups(conn._group_metas, conn._tp_size)
+        }
         self.assertEqual(sorted(groups), ["attn", "full"])
         # attn: the attention spec of every rank; full: every group of every rank.
         self.assertEqual(groups["attn"], ["tp0_g0", "tp1_g0"])
@@ -540,7 +548,11 @@ class TestParseGroups(unittest.TestCase):
         return SimpleNamespace(kv_cache_groups=groups)
 
     def _parse(self, groups, mbs):
-        return parse_groups(self._kv_cache_config(groups), mbs)
+        # calculate_kv_scales is a mandatory keyword (the gate refuses a
+        # runtime-calibrated scale layout); plain tests run with it off.
+        return parse_groups(
+            self._kv_cache_config(groups), mbs, calculate_kv_scales=False
+        )
 
     def _attn_group(
         self, layers, block_size=16, page_size_bytes=32768, page_size_padded=None
@@ -609,11 +621,30 @@ class TestParseGroups(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "compress_ratio"):
             self._parse([self._mla_group(["l0"], compress_ratio=2)], 16)
 
-    def test_mla_fp8_ds_layout_rejected(self):
-        # DeepSeek V3.2 "fp8_ds_mla": custom packed 656 B/token layout, not
-        # head_size * dtype_size.
-        with self.assertRaisesRegex(NotImplementedError, "fp8_ds_mla"):
-            self._parse([self._mla_group(["l0"], cache_dtype_str="fp8_ds_mla")], 16)
+    def test_mla_fp8_ds_layout_accepted(self):
+        # DeepSeek V3.2 "fp8_ds_mla": a packed 656 B/token layout whose fp8
+        # scale lives inside each row, so the bytes round-trip verbatim.
+        # (M1: refused before this change; the packed spec is sized from its
+        # own page algebra instead of head_size * dtype_size.)
+        mbs = 32
+        metas = self._parse(
+            [
+                self._mla_group(
+                    ["l0"],
+                    block_size=64,
+                    page_size_bytes=64 * 656,
+                    cache_dtype_str="fp8_ds_mla",
+                    kv_quant_mode=1,
+                )
+            ],
+            mbs,
+        )
+        self.assertEqual(len(metas), 1)
+        m = metas[0]
+        self.assertEqual(m.block_size, 64)
+        self.assertEqual(m.page_bytes, 41984)
+        # per_token = 41984 // 64 = 656 bytes.
+        self.assertEqual(m.per_block_bytes, 656 * mbs)
 
     def test_mla_quantized_kv_rejected(self):
         # Quantized MLA KV: scales live outside the paged tensor, so a byte
@@ -772,7 +803,11 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn = make_connector_scheduler(manager_block_size=self.MBS)
         conn._group_metas = [
             AttentionGroupMeta(
-                group_idx=1, layer_names=["a0"], block_size=self.MBS, per_block_bytes=0
+                group_idx=1,
+                layer_names=["a0"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
             )
         ]
         conn._num_groups = 1
@@ -794,7 +829,11 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn = make_connector_scheduler(manager_block_size=self.MBS)
         conn._group_metas = [
             AttentionGroupMeta(
-                group_idx=1, layer_names=["a0"], block_size=self.MBS, per_block_bytes=0
+                group_idx=1,
+                layer_names=["a0"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
             ),
             StateGroupMeta(
                 group_idx=2,
@@ -852,7 +891,11 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn = make_connector(manager_block_size=self.MBS)
         conn._group_metas = [
             AttentionGroupMeta(
-                group_idx=1, layer_names=["a0"], block_size=self.MBS, per_block_bytes=0
+                group_idx=1,
+                layer_names=["a0"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
             )
         ]
         conn._num_groups = 1
