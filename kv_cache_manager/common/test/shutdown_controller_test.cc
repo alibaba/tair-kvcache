@@ -74,7 +74,7 @@ protected:
     void TearDown() override {}
 };
 
-// AC-1: 掩码在创建线程之前设置，之后创建的线程一律继承。
+// 掩码在创建线程之前设置，之后创建的线程一律继承。
 TEST_F(ShutdownControllerTest, NewThreadsInheritBlockedExitSignals) {
     std::promise<sigset_t> promise;
     std::thread worker([&promise] {
@@ -91,7 +91,7 @@ TEST_F(ShutdownControllerTest, NewThreadsInheritBlockedExitSignals) {
     }
 }
 
-// AC-1: 退出信号不再安装任何 handler，信号上下文不执行加锁、日志与清理。
+// 退出信号不再安装任何 handler，信号上下文不执行加锁、日志与清理。
 TEST_F(ShutdownControllerTest, NoExitSignalHandlerIsInstalled) {
     ShutdownController controller;
     ASSERT_TRUE(controller.Start());
@@ -105,7 +105,7 @@ TEST_F(ShutdownControllerTest, NoExitSignalHandlerIsInstalled) {
     controller.Stop();
 }
 
-// AC-1 + AC-4: 定向投递到工作线程的退出信号不会让该线程进入关闭路径；
+// 定向投递到工作线程的退出信号不会让该线程进入关闭路径；
 // 运维实际发送的进程级信号（kill -TERM <pid>）由控制线程统一消费。
 //
 // 说明：POSIX 下 pthread_kill 到某个已阻塞该信号的线程，信号只挂在该线程自己的
@@ -150,7 +150,7 @@ TEST_F(ShutdownControllerTest, SignalDirectedAtWorkerThreadDoesNotEnterShutdownP
     }
 }
 
-// AC-3: 优雅关闭进行中再次收到退出信号 → 立即以 128+sig 终止。
+// 优雅关闭进行中再次收到退出信号 → 立即以 128+sig 终止。
 TEST_F(ShutdownControllerTest, RepeatedExitSignalForcesImmediateExit) {
     for (int sig : kExitSignals) {
         pid_t pid = fork();
@@ -183,7 +183,7 @@ TEST_F(ShutdownControllerTest, RepeatedExitSignalForcesImmediateExit) {
     }
 }
 
-// AC-5: Start()/Stop() 幂等，Stop() 在无信号时也能在超时上限内返回。
+// Start()/Stop() 幂等，Stop() 在无信号时也能在超时上限内返回。
 TEST_F(ShutdownControllerTest, StartAndStopAreIdempotent) {
     ShutdownController controller;
     EXPECT_TRUE(controller.Start());
