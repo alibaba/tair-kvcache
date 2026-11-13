@@ -1,12 +1,82 @@
 #include "kv_cache_manager/common/redis_client.h"
 
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <unordered_set>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "unistd.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+// Keep coordination handshakes independent of metadata recovery.
+class RedisConnectLimiter {
+public:
+    explicit RedisConnectLimiter(int32_t limit) : limit_(limit) {}
+
+    static RedisConnectLimiter &Instance(RedisClient::ConnectionType connection_type) {
+        if (connection_type == RedisClient::ConnectionType::kCoordination) {
+            static RedisConnectLimiter limiter(4);
+            return limiter;
+        }
+        static RedisConnectLimiter limiter(GetDefaultLimit());
+        return limiter;
+    }
+
+    class Permit {
+    public:
+        Permit(RedisConnectLimiter &limiter, int64_t timeout_ms) : limiter_(limiter) {
+            std::unique_lock<std::mutex> lock(limiter_.mutex_);
+            acquired_ = limiter_.available_.wait_for(
+                lock, std::chrono::milliseconds(timeout_ms), [&] { return limiter_.active_ < limiter_.limit_; });
+            if (acquired_) {
+                ++limiter_.active_;
+            }
+        }
+
+        ~Permit() {
+            if (!acquired_) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(limiter_.mutex_);
+            --limiter_.active_;
+            limiter_.available_.notify_one();
+        }
+
+        Permit(const Permit &) = delete;
+        Permit &operator=(const Permit &) = delete;
+        explicit operator bool() const { return acquired_; }
+
+    private:
+        RedisConnectLimiter &limiter_;
+        bool acquired_ = false;
+    };
+
+private:
+    static int32_t GetDefaultLimit() {
+        constexpr int32_t kDefaultLimit = 64;
+        const int32_t limit =
+            EnvUtil::GetEnv("kvcm.redis_client.max_concurrent_connects",
+                            EnvUtil::GetEnv("kvcm_redis_client_max_concurrent_connects", kDefaultLimit));
+        if (limit <= 0 || limit > 4096) {
+            KVCM_LOG_WARN("invalid Redis connection concurrency[%d], using default[%d]", limit, kDefaultLimit);
+            return kDefaultLimit;
+        }
+        return limit;
+    }
+
+    std::mutex mutex_;
+    std::condition_variable available_;
+    int32_t limit_;
+    int32_t active_ = 0;
+};
+
+} // namespace
 
 #define KVCM_REDIS_LOG_INFO(format, ...)                                                                               \
     KVCM_LOG_INFO("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
@@ -16,8 +86,11 @@ namespace kv_cache_manager {
     KVCM_LOG_ERROR(                                                                                                    \
         "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
 
-RedisClient::RedisClient(const StandardUri &storage_uri)
-    : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
+RedisClient::RedisClient(const StandardUri &storage_uri, ConnectionType connection_type)
+    : connection_type_(connection_type)
+    , user_info_(storage_uri.GetUserInfo())
+    , host_(storage_uri.GetHostName())
+    , port_(storage_uri.GetPort()) {
     int64_t tmp_db = 0;
     storage_uri.GetParamAs("db", tmp_db);
     if (tmp_db >= 0) {
@@ -101,6 +174,15 @@ bool RedisClient::GetReplyStrOrNil(const redisReply *reply, std::string &out_str
 }
 
 bool RedisClient::Connect() {
+    RedisConnectLimiter::Permit permit(RedisConnectLimiter::Instance(connection_type_), timeout_ms_);
+    if (!permit) {
+        KVCM_REDIS_LOG_WARN("timed out waiting for Redis connection concurrency permit");
+        return false;
+    }
+    return DoConnect();
+}
+
+bool RedisClient::DoConnect() {
     Disconnect();
 
     struct timeval timeout;
@@ -109,6 +191,11 @@ bool RedisClient::Connect() {
     context_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
     if (!IsContextOk()) {
         KVCM_REDIS_LOG_WARN("fail to connect to redis");
+        return false;
+    }
+    // Apply the connection timeout to PING/AUTH/SELECT I/O as well.
+    if (redisSetTimeout(context_, timeout) != REDIS_OK) {
+        KVCM_REDIS_LOG_WARN("fail to set redis I/O timeout");
         return false;
     }
 
@@ -148,6 +235,14 @@ bool RedisClient::Connect() {
             KVCM_REDIS_LOG_WARN("fail to select redis db[%ld]", db_);
             return false;
         }
+    }
+
+    // Leave normal commands without an I/O timeout, as before.
+    const timeval no_timeout{0, 0};
+    if (redisSetTimeout(context_, no_timeout) != REDIS_OK) {
+        KVCM_REDIS_LOG_WARN("fail to restore redis command I/O timeout");
+        Disconnect();
+        return false;
     }
 
     KVCM_REDIS_LOG_INFO("connect to redis db[%ld] timeout_ms[%ld] retry_count[%ld]", db_, timeout_ms_, retry_count_);

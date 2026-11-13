@@ -2,6 +2,15 @@ load("//bazel:version.bzl", "version_info_cc")
 
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "bounded_parallel",
+    hdrs = ["bounded_parallel.h"],
+    deps = [
+        ":common",
+        "@havenask//aios/autil:thread",
+    ],
+)
+
 version_info_cc(
     name = "build_version",
 )
@@ -270,6 +279,7 @@ cc_library(
     ],
     deps = [
         ":common",
+        ":env_util",
         ":standard_uri",
         "@hiredis",
     ],
@@ -361,8 +371,8 @@ cc_library(
         ":logger",
         ":service_discovery",
         ":service_discovery_url",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         ":static_service_discovery",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         "//stub_source/kv_cache_manager/common:vipserver_service_discovery",
     ],
 )

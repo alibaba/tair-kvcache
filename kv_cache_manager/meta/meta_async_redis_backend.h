@@ -1,10 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <autil/Thread.h>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/client_pool.h"
@@ -156,6 +156,7 @@ private:
 
     // Async config
     int32_t queue_count_ = 8;
+    int32_t open_concurrency_ = 8;
     int64_t max_batch_size_ = 102400;
     int64_t batch_wait_timeout_us_ = 1000000;
     int64_t queue_max_size_ = 102400;
@@ -167,7 +168,7 @@ private:
     // Runtime state
     std::atomic<bool> is_running_{false};
     std::vector<std::unique_ptr<MpscWriteQueue>> queues_;
-    std::vector<std::thread> consumer_threads_;
+    std::vector<autil::ThreadPtr> consumer_threads_;
 
     // Per-consumer RedisClient (each consumer owns one)
     std::vector<std::shared_ptr<RedisClient>> consumer_clients_;

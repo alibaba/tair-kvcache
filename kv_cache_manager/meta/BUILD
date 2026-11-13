@@ -281,10 +281,13 @@ cc_library(
         ":mpsc_write_queue",
         ":utils",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:bounded_parallel",
         "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/config",
+        "@havenask//aios/autil:thread",
     ],
 )

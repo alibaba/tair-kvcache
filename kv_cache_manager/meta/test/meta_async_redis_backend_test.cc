@@ -1,10 +1,15 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
+#include <dlfcn.h>
+#include <functional>
 #include <mutex>
+#include <pthread.h>
 #include <thread>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_base.h"
@@ -15,12 +20,27 @@
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "stub.h"
 
 namespace kv_cache_manager {
 
 class MockMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
 public:
     MOCK_METHOD(std::shared_ptr<RedisClient>, CreateRedisClient, (), (const));
+};
+
+class TrackingOpenRedisClient : public RedisClient {
+public:
+    TrackingOpenRedisClient(std::function<bool()> open, std::atomic<int> &destroyed)
+        : RedisClient(StandardUri{}), open_(std::move(open)), destroyed_(destroyed) {}
+    ~TrackingOpenRedisClient() override { ++destroyed_; }
+
+protected:
+    bool Reconnect() override { return open_(); }
+
+private:
+    std::function<bool()> open_;
+    std::atomic<int> &destroyed_;
 };
 
 class TrackingCacheLocation : public CacheLocation {
@@ -160,6 +180,15 @@ TEST_F(MetaAsyncRedisBackendTest, TestInitParams) {
     ASSERT_EQ(1000, backend_->batch_wait_timeout_us_);
     ASSERT_EQ(1000, backend_->queue_max_size_);
     ASSERT_EQ(2000, backend_->drain_timeout_ms_);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestOpenConcurrencyEnvironmentAliasAndDottedPriority) {
+    ScopedEnv alias("kvcm_meta_async_redis_open_concurrency", "3");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    EXPECT_EQ(3, backend_->open_concurrency_);
+    ScopedEnv dotted("kvcm.meta_async_redis.open_concurrency", "2");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    EXPECT_EQ(2, backend_->open_concurrency_);
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesUsesReadOnlyTimestampQuery) {
@@ -462,15 +491,157 @@ TEST_F(MetaAsyncRedisBackendTest, TestOpenAndClose) {
     ASSERT_TRUE(backend_->read_client_pool_ == nullptr);
 }
 
-TEST_F(MetaAsyncRedisBackendTest, TestOpenFailsOnClientCreation) {
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillOnce(Invoke([]() {
-        StandardUri empty_uri;
-        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        EXPECT_CALL(*mock, Reconnect()).WillRepeatedly(Return(false));
-        return mock;
+TEST_F(MetaAsyncRedisBackendTest, TestOpenOverlapsConnectionsWithinConfiguredBound) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "2");
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=6");
+    ASSERT_EQ(EC_OK, backend_->Init("parallel_instance", config_));
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool release = false;
+    size_t active = 0;
+    size_t peak = 0;
+    size_t calls = 0;
+    std::atomic<int> destroyed{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        return std::make_shared<TrackingOpenRedisClient>(
+            [&] {
+                std::unique_lock<std::mutex> lock(mutex);
+                ++active;
+                ++calls;
+                peak = std::max(peak, active);
+                changed.notify_all();
+                const bool released = changed.wait_for(lock, std::chrono::seconds(5), [&] { return release; });
+                --active;
+                return released;
+            },
+            destroyed);
     }));
-    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
-    ASSERT_EQ(EC_ERROR, backend_->Open());
+    ErrorCode result = EC_UNKNOWN;
+    std::thread opener([&] { result = backend_->Open(); });
+    bool overlapped = false;
+    bool premature_ready = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        overlapped = changed.wait_for(lock, std::chrono::seconds(5), [&] { return active == 2; });
+        premature_ready = backend_->is_running_.load();
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(overlapped);
+    EXPECT_FALSE(premature_ready);
+    EXPECT_EQ(EC_OK, result);
+    EXPECT_EQ(2, peak);
+    EXPECT_EQ(6, calls);
+    EXPECT_EQ(6, backend_->consumer_threads_.size());
+    EXPECT_EQ(EC_OK, backend_->Close());
+    EXPECT_EQ(6, destroyed.load());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestFailedOpenWaitsForSiblingThenCleansAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "2");
+    ASSERT_EQ(EC_OK, backend_->Init("failure_instance", config_));
+    std::mutex mutex;
+    std::condition_variable changed;
+    int entered = 0;
+    bool failure = false;
+    bool release = false;
+    std::atomic<int> created{0};
+    std::atomic<int> destroyed{0};
+    std::atomic<bool> returned{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        const int id = created.fetch_add(1);
+        return std::make_shared<TrackingOpenRedisClient>(
+            [&, id] {
+                std::unique_lock<std::mutex> lock(mutex);
+                ++entered;
+                changed.notify_all();
+                if (id == 0) {
+                    changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered == 2; });
+                    failure = true;
+                    changed.notify_all();
+                    return false;
+                }
+                return changed.wait_for(lock, std::chrono::seconds(5), [&] { return release; });
+            },
+            destroyed);
+    }));
+    ErrorCode result = EC_UNKNOWN;
+    std::thread opener([&] {
+        result = backend_->Open();
+        returned.store(true);
+    });
+    bool saw_failure = false;
+    bool premature_return = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        saw_failure = changed.wait_for(lock, std::chrono::seconds(5), [&] { return failure; });
+        premature_return = returned.load();
+        EXPECT_FALSE(backend_->is_running_.load());
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(saw_failure);
+    EXPECT_FALSE(premature_return);
+    EXPECT_EQ(EC_ERROR, result);
+    EXPECT_EQ(2, created.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    Mock::VerifyAndClearExpectations(backend_.get());
+    SetupMockRedisClients();
+    EXPECT_EQ(EC_OK, backend_->Open());
+    EXPECT_TRUE(backend_->is_running_.load());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestReadPoolFailureCleansSuccessfulConsumerConnections) {
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=2&client_min_pool_size=1");
+    ASSERT_EQ(EC_OK, backend_->Init("read_pool_failure_instance", config_));
+    std::atomic<int> created{0};
+    std::atomic<int> destroyed{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() -> std::shared_ptr<RedisClient> {
+        if (created.fetch_add(1) == 2) {
+            return nullptr;
+        }
+        return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+    }));
+    EXPECT_EQ(EC_ERROR, backend_->Open());
+    EXPECT_EQ(3, created.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    Mock::VerifyAndClearExpectations(backend_.get());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadStartupFailureCleansResourcesAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    SetupMockRedisClients();
+    ASSERT_EQ(EC_OK, backend_->Init("thread_start_failure_instance", config_));
+    static size_t thread_starts = 0;
+    thread_starts = 0;
+    auto create_thread = reinterpret_cast<decltype(&pthread_create)>(dlsym(RTLD_NEXT, "pthread_create"));
+    ASSERT_NE(nullptr, create_thread);
+    {
+        Stub stub;
+        stub.set(
+            create_thread, +[](pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) {
+                ++thread_starts;
+                return EAGAIN;
+            });
+        EXPECT_EQ(EC_ERROR, backend_->Open());
+    }
+    EXPECT_EQ(1, thread_starts);
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    EXPECT_EQ(EC_OK, backend_->Open());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestDoubleClose) {

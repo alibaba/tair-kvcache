@@ -506,6 +506,8 @@ private:
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理
     OnInstanceRemovedFn on_instance_removed_;
+    // 无需清理 - serialize recovery and cleanup; stop retry before locking.
+    std::mutex recover_run_mutex_;
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};

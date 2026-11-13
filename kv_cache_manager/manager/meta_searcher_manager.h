@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -24,10 +25,12 @@ public:
     std::shared_ptr<MetaSearcher> GetMetaSearcher(const std::string &instance_id) const;
     std::shared_ptr<MetaSearcher> ExtractMetaSearcher(const std::string &instance_id);
     void RestoreRetiringMetaSearcher(const std::string &instance_id, std::shared_ptr<MetaSearcher> searcher);
+    // Callers drain creation and instance management before cleanup.
     void DoCleanup();
 
 private:
     std::shared_ptr<MetaSearcher> GetMetaSearcherUnsafe(const std::string &instance_id) const;
+    std::shared_ptr<std::mutex> GetInstanceMutex(const std::string &instance_id);
 
     // 需要清理 - 释放所有meta searcher
     std::unordered_map<std::string, std::shared_ptr<MetaSearcher>> meta_searcher_map_;
@@ -36,6 +39,9 @@ private:
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
     mutable std::shared_mutex mutex_;
+    // Lock order: instance -> map; initialize outside the map lock.
+    // Operations retain the mutex; the next lookup removes expired entries.
+    std::unordered_map<std::string, std::weak_ptr<std::mutex>> instance_mutexes_;
 };
 
 } // namespace kv_cache_manager

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <mutex>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -59,45 +60,43 @@ bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
 ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
                                                 const std::shared_ptr<MetaIndexerConfig> &config,
                                                 const std::vector<double> &boundaries) {
-    auto indexer = GetMetaIndexer(instance_id);
-    if (indexer) {
+    if (GetMetaIndexer(instance_id)) {
         return ErrorCode::EC_EXIST;
+    }
+    auto indexer = std::make_shared<MetaIndexer>();
+    indexer->SetQueryExecutor(query_executor_);
+    auto ec = InitMetaIndexer(indexer, instance_id, config);
+    if (ec != ErrorCode::EC_OK) {
+        KVCM_LOG_ERROR("Init meta indexer failed, instance_id: %s", instance_id.c_str());
+        return ec;
+    }
+
+    // Per-instance boundaries override defaults configured before creation.
+    const std::vector<double> &resolved = boundaries.empty() ? revisit_boundaries_ : boundaries;
+
+    if (metrics_registry_ && !resolved.empty()) {
+        auto histogram = std::make_shared<RevisitIntervalHistogram>();
+        if (histogram->Init(metrics_registry_, resolved, instance_id)) {
+            indexer->SetRevisitHistogram(histogram);
+            KVCM_LOG_INFO("Created revisit interval histogram for instance_id: %s with %zu boundaries",
+                          instance_id.c_str(),
+                          resolved.size());
+        } else {
+            KVCM_LOG_WARN("Failed to create revisit interval histogram for instance_id: %s", instance_id.c_str());
+        }
     }
     {
         std::scoped_lock write_guard(mutex_);
-        // double checkout
-        auto indexer = GetMetaIndexerUnsafe(instance_id);
-        if (indexer) {
-            return ErrorCode::EC_EXIST;
-        }
-        indexer = std::make_shared<MetaIndexer>();
-        indexer->SetQueryExecutor(query_executor_);
-        auto ec = indexer->Init(instance_id, config);
-        if (ec != ErrorCode::EC_OK) {
-            KVCM_LOG_ERROR("Init meta indexer failed, instance_id: %s", instance_id.c_str());
-            return ec;
-        }
-
-        // Resolve boundaries: per-instance override > global default
-        const std::vector<double> &resolved = boundaries.empty() ? revisit_boundaries_ : boundaries;
-
-        // Create and inject per-instance revisit interval histogram
-        if (metrics_registry_ && !resolved.empty()) {
-            auto histogram = std::make_shared<RevisitIntervalHistogram>();
-            if (histogram->Init(metrics_registry_, resolved, instance_id)) {
-                indexer->SetRevisitHistogram(histogram);
-                KVCM_LOG_INFO("Created revisit interval histogram for instance_id: %s with %zu boundaries",
-                              instance_id.c_str(),
-                              resolved.size());
-            } else {
-                KVCM_LOG_WARN("Failed to create revisit interval histogram for instance_id: %s", instance_id.c_str());
-            }
-        }
-
         meta_indexers_[instance_id] = indexer;
     }
     KVCM_LOG_INFO("Create meta indexer success, instance_id: %s", instance_id.c_str());
     return ErrorCode::EC_OK;
+}
+
+ErrorCode MetaIndexerManager::InitMetaIndexer(const std::shared_ptr<MetaIndexer> &indexer,
+                                              const std::string &instance_id,
+                                              const std::shared_ptr<MetaIndexerConfig> &config) {
+    return indexer->Init(instance_id, config);
 }
 
 std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexer(const std::string &instance_id) const {

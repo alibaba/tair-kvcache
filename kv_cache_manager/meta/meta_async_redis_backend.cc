@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "kv_cache_manager/common/bounded_parallel.h"
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
@@ -76,6 +78,15 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
     parse_config_param("async_enqueue_timeout_ms", enqueue_timeout_ms_);
     parse_config_param("async_sync_timeout_ms", sync_timeout_ms_);
     parse_config_param("async_drain_ms", drain_timeout_ms_);
+    constexpr int32_t kDefaultOpenConcurrency = 8;
+    open_concurrency_ =
+        EnvUtil::GetEnv("kvcm.meta_async_redis.open_concurrency",
+                        EnvUtil::GetEnv("kvcm_meta_async_redis_open_concurrency", kDefaultOpenConcurrency));
+    if (open_concurrency_ <= 0 || open_concurrency_ > 64) {
+        KVCM_LOG_WARN(
+            "invalid async Redis open concurrency[%d], using default[%d]", open_concurrency_, kDefaultOpenConcurrency);
+        open_concurrency_ = kDefaultOpenConcurrency;
+    }
 
     constexpr int32_t kMaxQueueCount = 2048;
     if (queue_count_ <= 0 || queue_count_ > kMaxQueueCount || max_batch_size_ <= 0 || batch_wait_timeout_us_ <= 0 ||
@@ -109,17 +120,30 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaAsyncRedisBackend::Open() noexcept {
+    if (is_running_.load(std::memory_order_acquire)) {
+        return EC_OK;
+    }
     consumer_clients_.resize(queue_count_);
-    for (int i = 0; i < queue_count_; ++i) {
+    const auto open_ec = RunBoundedParallel(queue_count_, open_concurrency_, [this](size_t i) {
         auto client = CreateRedisClient();
         if (!client || !client->Open()) {
-            KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%d], instance[%s]",
+            KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%zu], instance[%s]",
                            i,
                            instance_id_.c_str());
-            CleanupResources();
             return EC_ERROR;
         }
+        // Preallocated slots let workers publish their own clients without locking.
         consumer_clients_[i] = std::move(client);
+        return EC_OK;
+    });
+    if (open_ec != EC_OK) {
+        KVCM_LOG_ERROR("async redis backend open failed during consumer connection startup, instance[%s], "
+                       "open concurrency[%d], ec[%d]",
+                       instance_id_.c_str(),
+                       open_concurrency_,
+                       open_ec);
+        CleanupResources();
+        return EC_ERROR;
     }
 
     constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
@@ -157,19 +181,26 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
     for (int i = 0; i < queue_count_; ++i) {
         queues_[i] = std::make_unique<MpscWriteQueue>();
     }
-
-    is_running_.store(true, std::memory_order_release);
     consumer_threads_.reserve(queue_count_);
+    is_running_.store(true, std::memory_order_release);
     for (int i = 0; i < queue_count_; ++i) {
-        consumer_threads_.emplace_back(&MetaAsyncRedisBackend::ConsumerLoop, this, i);
+        auto consumer = autil::Thread::createThread([this, i] { ConsumerLoop(i); }, "kvcm_consumer");
+        if (!consumer) {
+            KVCM_LOG_ERROR(
+                "async redis backend consumer startup failed, instance[%s], consumer[%d]", instance_id_.c_str(), i);
+            [[maybe_unused]] const auto ec = Close();
+            return EC_ERROR;
+        }
+        consumer_threads_.push_back(std::move(consumer));
     }
 
     KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
-                  "read client pool size min[%d], max[%d]",
+                  "read client pool size min[%d], max[%d], open concurrency[%d]",
                   instance_id_.c_str(),
                   queue_count_,
                   client_min_pool_size,
-                  client_max_pool_size);
+                  client_max_pool_size,
+                  open_concurrency_);
     return EC_OK;
 }
 
@@ -185,9 +216,7 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
     }
 
     for (auto &t : consumer_threads_) {
-        if (t.joinable()) {
-            t.join();
-        }
+        t->join();
     }
     consumer_threads_.clear();
 

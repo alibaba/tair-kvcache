@@ -175,8 +175,8 @@ cc_test(
         "redis",
     ],
     deps = [
-        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/meta:meta_redis_backend",
     ],
 )
@@ -194,8 +194,8 @@ cc_test(
     ],
     deps = [
         ":meta_indexer_testlib",
-        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_test_environment",
     ],
 )
 
@@ -242,10 +242,12 @@ cc_test(
     data = [],
     deps = [
         ":meta_storage_backend_testlib",
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/common/test:redis_client_testlib",
         "//kv_cache_manager/meta:meta_async_redis_backend",
         "//kv_cache_manager/meta:utils",
+        "@cpp_stub",
     ],
 )
 
@@ -279,8 +281,8 @@ cc_test(
         "redis",
     ],
     deps = [
-        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:common",
         "//kv_cache_manager/meta:meta_storage_backend",

@@ -22,6 +22,8 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
                                                                          const std::string &instance_id,
                                                                          CheckLocDataExistFunc check_loc_data_exist,
                                                                          SubmitDelReqFunc submit_del_req) {
+    auto instance_mutex = GetInstanceMutex(instance_id);
+    std::unique_lock instance_guard(*instance_mutex);
     auto meta_searcher = GetMetaSearcher(instance_id);
     if (meta_searcher) {
         return meta_searcher;
@@ -54,31 +56,38 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
     // Empty vector means "use server-level default" — resolved inside CreateMetaIndexer.
     const auto &group_boundaries = group_ptr->revisit_interval_buckets();
 
-    {
-        std::scoped_lock write_guard(mutex_);
-        // double check
-        meta_searcher = GetMetaSearcherUnsafe(instance_id);
-        if (meta_searcher != nullptr) {
+    ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config(), group_boundaries);
+    if (ec == ErrorCode::EC_OK || ec == ErrorCode::EC_EXIST) {
+        auto indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+        if (indexer) {
+            // Searcher creation may have failed after the indexer was published.
+            meta_searcher = std::make_shared<MetaSearcher>(indexer, check_loc_data_exist, submit_del_req);
+            std::scoped_lock write_guard(mutex_);
+            meta_searcher_map_.emplace(instance_id, meta_searcher);
             return meta_searcher;
-        }
-        ec = meta_indexer_manager_->CreateMetaIndexer(
-            instance_id, cache_config->meta_indexer_config(), group_boundaries);
-        if (ec == ErrorCode::EC_OK) {
-            if (auto pair = meta_searcher_map_.emplace(
-                    instance_id,
-                    std::make_shared<MetaSearcher>(
-                        meta_indexer_manager_->GetMetaIndexer(instance_id), check_loc_data_exist, submit_del_req));
-                pair.second) {
-                return pair.first->second;
-            }
-        } else if (ec == ErrorCode::EC_EXIST) {
-            KVCM_LOG_ERROR("meta indexer exist! IMPOSSIBLE!");
-            assert(false);
         }
     }
     request_context->error_tracer()->AddErrorMsg("create meta indexer failed");
     KVCM_LOG_ERROR("create meta searcher fail, error code [%d]", ec);
     return nullptr;
+}
+
+std::shared_ptr<std::mutex> MetaSearcherManager::GetInstanceMutex(const std::string &instance_id) {
+    std::scoped_lock write_guard(mutex_);
+    for (auto it = instance_mutexes_.begin(); it != instance_mutexes_.end();) {
+        if (it->second.expired()) {
+            it = instance_mutexes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto &weak_mutex = instance_mutexes_[instance_id];
+    auto instance_mutex = weak_mutex.lock();
+    if (!instance_mutex) {
+        instance_mutex = std::make_shared<std::mutex>();
+        weak_mutex = instance_mutex;
+    }
+    return instance_mutex;
 }
 
 std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcher(const std::string &instance_id) const {
@@ -87,6 +96,8 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcher(const std::st
 }
 
 std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std::string &instance_id) {
+    auto instance_mutex = GetInstanceMutex(instance_id);
+    std::unique_lock instance_guard(*instance_mutex);
     decltype(meta_searcher_map_)::node_type node;
     {
         std::scoped_lock write_guard(mutex_);
@@ -100,6 +111,8 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std
 
 void MetaSearcherManager::RestoreRetiringMetaSearcher(const std::string &instance_id,
                                                       std::shared_ptr<MetaSearcher> searcher) {
+    auto instance_mutex = GetInstanceMutex(instance_id);
+    std::unique_lock instance_guard(*instance_mutex);
     std::scoped_lock write_guard(mutex_);
     retiring_meta_searcher_map_.emplace(instance_id, std::move(searcher));
 }
@@ -108,6 +121,7 @@ void MetaSearcherManager::DoCleanup() {
     std::scoped_lock write_guard(mutex_);
     meta_searcher_map_.clear();
     retiring_meta_searcher_map_.clear();
+    instance_mutexes_.clear();
 }
 
 std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcherUnsafe(const std::string &instance_id) const {
