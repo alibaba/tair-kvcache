@@ -90,11 +90,24 @@ curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \
 }
 ```
 
-此时顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为；空对象、未知类型、`ST_UNSPECIFIED`、EventReport 类型以及非正数量均返回 `INVALID_ARGUMENT`。
+也可排除 EventReport，使其余存储类型（包括 DRAM 和 SSD）合计满足数量门槛：
 
-服务端仅统计目标类型的有效 Location，不足时每个 key 本次最多分配一份；客户端仍须写入返回的 URI 并调用 Finish Write Cache。数量是补写门槛，不保证并发上限、不同后端分布或可读副本数下限。显式类型覆盖 Group 的 PREFER/ALWAYS 偏好和本次 StartWrite 的 Mark 引导，但仍受 `storage_candidates`、可写性及配额限制。
+```json
+{
+  "storage_replica_requirement": {
+    "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2"],
+    "min_location_count": 1
+  }
+}
+```
 
-在前置检查通过且需要分配时，目标类型无可写候选或类型配额已满，沿用既有映射返回 `INSTANCE_NOT_EXIST`；Group 总配额已满或分配失败返回 `INTERNAL_ERROR`。若全部候选不可用，可能在计数前就返回 `INTERNAL_ERROR`。不会跨类型回退或把分配失败当作跳过成功。详细计数、Mark 和失败语义见[设计说明](../design/start_write_storage_replica.md)。
+顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为。指定类型与非空排除列表必须二选一；排除模式的 `storage_type` 不传或为 `ST_UNSPECIFIED`。空对象、两种模式同时设置、未知枚举数值、排除列表中的 `ST_UNSPECIFIED`、指定 EventReport 写入以及非正数量均返回 `INVALID_ARGUMENT`。重复排除项不改变含义。HTTP 沿用忽略未知枚举名称的解析规则，混合列表仅保留可识别项，须使用正确枚举名或数值；不提供对 JSON 原文的严格校验。
+
+指定模式仅统计目标类型的有效 Location，不足时每个 key 本次最多分配一份；客户端仍须写入返回的 URI 并调用 Finish Write Cache。数量是补写门槛，不保证并发上限、不同后端分布或可读副本数下限。显式类型覆盖 Group 的 PREFER/ALWAYS 偏好和本次 StartWrite 的 Mark 引导，但仍受 `storage_candidates`、可写性及配额限制。
+
+排除模式只统计未被排除类型的 Location；普通补写从过滤后的候选执行原 Group 策略，不写入被排除类型。范围内可执行且尚未覆盖的 Mark 优先引导到具体后端，即使数量已达标也可补写；Mark 沿用迁移准入路径，可以指向普通候选名单外的后端。目标类型被排除时忽略本次 Mark 引导并保留 Mark，暂时不可用时沿用原退路。Finish 清标规则不变。已有 SSD 满足数量要求时，不会仅因 DRAM 副本被回收而补回 DRAM。
+
+在前置检查通过且需要普通分配时，指定类型无可写候选、类型配额已满或排除后无符合 Group 策略的候选，沿用既有映射返回 `INSTANCE_NOT_EXIST`；Group 总配额已满或分配失败返回 `INTERNAL_ERROR`。若全部候选不可用，可能在计数前就返回 `INTERNAL_ERROR`。指定模式不跨类型回退，排除模式不回退到排除类型，均不把分配失败当作跳过成功。详细计数、Mark 和失败语义见[设计说明](../design/start_write_storage_replica.md)。
 
 ## Finish Write Cache
 ```bash

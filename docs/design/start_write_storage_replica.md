@@ -6,14 +6,16 @@
 
 同一个 Instance 的同一个 BlockKey 可以有多个 Location。现有 `min_replica_count` 按符合条件的 Location 总数决定是否跳过写入，不能表达“某种存储上至少需要一份”。当一个 key 已有 100 个 EventReport Location、但没有 TairMempool Location 时，总数门槛可能使共享存储补写被跳过。
 
-本方案增加一个请求级参数，指定存储类型及期望 Location 数量。数量不足时，`StartWriteCache` 返回该类型上的新写入 URI，由客户端完成写入并调用 `FinishWriteCache`。目标数达到后跳过写入。
+本方案增加一个请求级参数，支持指定一种存储类型，或排除一组存储类型后统计期望 Location 数量。数量不足时，`StartWriteCache` 返回符合类型范围的新写入 URI，由客户端完成写入并调用 `FinishWriteCache`。
+
+日常使用可排除 EventReport，使 DRAM、SSD 等其余类型合计达到数量门槛，并保留 Mark 引导分层。数据迁到 SSD、DRAM 副本被回收后，SSD 仍参与计数，不会仅因 DRAM 缺失而补回热层。指定类型模式用于确实需要在某一层补写的场景，继续以显式目标为准。
 
 范围限定为：
 
-- 按现有 `StorageType` 精确匹配；同类型的多个后端合计计数。`ST_TAIRMEMPOOL` 与 `ST_TAIRMEMPOOL_SSD` 分别计数。
-- 一个请求指定一种存储类型；新参数与旧的顶层 `min_replica_count` 互斥。
+- 指定模式按现有 `StorageType` 精确匹配；`ST_TAIRMEMPOOL` 与 `ST_TAIRMEMPOOL_SSD` 分别计数。排除模式对所有未被排除的类型合计计数；两种模式都允许跨同类型后端计数。
+- 一个请求指定一种类型或排除一组类型，两者互斥；新参数与非 0 的旧顶层 `min_replica_count` 互斥。
 - 每次为每个待写 key 分配一个 Location；目标大于 1 时通过后续调用逐步补足。数量只计 Location，不保证分布在不同后端、节点或故障域。
-- 显式请求目标优先于分层迁移 Mark；期望数是写入门槛，允许并发时超过目标。
+- 指定模式的显式目标优先于 Mark；排除模式中，范围内尚未满足且可执行的 Mark 优先引导写入，即使数量已满足也可补写。期望数是写入门槛，允许因 Mark 或并发超过目标。
 - 新参数只作用于本次请求，不持久化为 Instance 策略，也不触发后台自动补副本。
 
 实现以新增参数是否存在作为行为边界：未设置时保持现有路径，不顺带修改公共计数规则、读路径、迁移、回收或客户端数据传输。
@@ -26,6 +28,7 @@
 message StorageReplicaRequirement {
     StorageType storage_type = 1;
     int32 min_location_count = 2;
+    repeated StorageType excluded_storage_types = 3;
 }
 
 message StartWriteCacheRequest {
@@ -34,9 +37,9 @@ message StartWriteCacheRequest {
 }
 ```
 
-使用 message 的存在性区分新旧模式，不把旧字段移入 oneof，也不改旧 proto 字段的默认值。嵌套数量命名为 `min_location_count`，与旧顶层 `min_replica_count` 区分，并明确计数单位。新 message 的两个成员只描述本次写入目标，不引入通用写入策略对象。
+使用 message 的存在性区分新旧模式，不把旧字段移入 oneof，也不改旧 proto 字段的默认值。`storage_type` 与非空 `excluded_storage_types` 必须且只能设置一种；`min_location_count` 是两种模式共用的数量门槛。不引入通用写入策略对象。
 
-保留 message 也能避免类型拼写错误意外进入旧模式：[HTTP JSON 解析器](../../kv_cache_manager/service/util/fast_proto_json_codec.cc) 会忽略未知枚举名称，令该成员保持 `ST_UNSPECIFIED`，但外层 message 仍存在，因此新模式校验会拒绝请求。不能仅根据枚举是否非零判断是否启用新模式。HTTP 的整个 `storage_replica_requirement: null` 则按未设置处理，与空对象 `{}` 不同。
+保留 message 避免缺省类型意外进入旧模式。HTTP 的整个 `storage_replica_requirement: null` 按未设置处理，与空对象 `{}` 不同。[HTTP JSON 解析器](../../kv_cache_manager/service/util/fast_proto_json_codec.cc) 沿用忽略未知枚举名称的行为：指定模式拼错类型或排除列表全部为未知名称时，解析后没有合法模式，因此拒绝；若列表中同时有已知和未知名称，仅已知项会保留。调用方须使用正确的枚举名或数值，不能将该接口的校验视为 JSON 原文的严格校验。本次不修改公共 JSON 解析器；解析后可见的未知枚举数值，以及排除列表中的 `ST_UNSPECIFIED` 均拒绝。
 
 HTTP 请求示例：
 
@@ -53,6 +56,19 @@ HTTP 请求示例：
 }
 ```
 
+排除模式请求示例（`storage_type` 不设置或为 `ST_UNSPECIFIED`）：
+
+```json
+{
+  "storage_replica_requirement": {
+    "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2"],
+    "min_location_count": 1
+  }
+}
+```
+
+排除类型同时约束计数与本次新分配。重复的排除项不改变结果。只有被排除类型的副本不会满足数量门槛；没有 EventReport、只有一份有效 SSD 也可以满足上述请求。排除条件不持久化、不删除已有副本，也不限制独立 Copy。
+
 仅在新 message 存在时增加以下校验；参数错误使用现有 `EC_BADARGS / INVALID_ARGUMENT`。此处以已有入口检查通过为前提；HTTP/gRPC 对未注册实例的前置检查仍可先返回 `INSTANCE_NOT_EXIST`，不调整错误优先级：
 
 | 输入 | 处理 |
@@ -60,7 +76,9 @@ HTTP 请求示例：
 | 未设置新 message | 完全沿用旧参数校验和写入行为 |
 | HTTP 中新 message 为 `null` | 按未设置处理，走旧模式 |
 | 新 message 存在，包括空对象 | 校验类型和数量；空对象不视为“未设置” |
-| 新类型为 `ST_UNSPECIFIED`、未知枚举或 EventReport 类型 | 拒绝；EventReport 不支持通过 Create 主动分配位置 |
+| 指定类型与非空排除列表同时设置，或两者均未设置 | 拒绝；空列表不能单独启用排除模式 |
+| 指定类型为未知枚举或 EventReport 类型 | 拒绝；EventReport 不支持通过 Create 主动分配位置 |
+| 排除列表含 `ST_UNSPECIFIED` 或未知枚举数值 | 拒绝；EventReport 类型可以作为排除项 |
 | 新数量未设置（解析为 0）或小于等于 0 | 拒绝，不将缺省数量解释为 1 |
 | 新 message 存在，旧顶层数量非 0 | 拒绝；显式传旧值 1 也算冲突 |
 | 新 message 合法，旧顶层数量为 0／未设置 | 使用新模式 |
@@ -77,7 +95,7 @@ HTTP 请求示例：
 
 | 条件 | 新模式规则 |
 |---|---|
-| 存储类型 | 必须等于请求类型；其他类型不参与计数及本次存在性检查 |
+| 存储类型 | 指定模式只计匹配类型；排除模式只计不在排除列表中的类型；范围外类型不参与计数及本次存在性检查 |
 | 状态 | 沿用 `ExistsForWriteWithMinCount`：直接排除 `NOT_FOUND`，其余状态继续按已有可用性、存在性和 spec 条件判断；不新增状态白名单 |
 | 可用性及数据存在性 | 复用当前选择策略及 `GetCheckLocDataExistFunc`，不改它们的公共实现 |
 | specs | 沿用现有 min-replica 规则：指定非空 spec group 时，按名称检查单个 Location 是否覆盖该组；未指定时不额外检查 spec 覆盖 |
@@ -96,42 +114,44 @@ HTTP 请求示例：
 
 **N 是补写判断的门槛，不是可读副本数的下限。** `WRITING` 尚未完成，`DELETING` 也可能在删除完成前继续计数并阻止本次补写；本参数不改变回收行为、不保护最后 N 份数据，也不承诺持续维持 N 份。
 
-**新模式与原 min-replica 共用有效 Location 的判断规则，唯一新增的计数条件是存储类型匹配。** 状态、spec group 解析及缺省值、可用性、数据存在性和逐 Location 计数均沿用原逻辑；不单独定义一套“新模式有效性”规则。旧默认写入、旧 min-replica 的当前处理保持原样，不修改公共 `ExistsForWrite*` 的行为。
+**两种新模式与原 min-replica 共用有效 Location 的判断规则，新增的计数条件仅为类型范围。** 状态、spec group 解析及缺省值、可用性、数据存在性和逐 Location 计数均沿用原逻辑；不单独定义一套“新模式有效性”规则。旧默认写入、旧 min-replica 的当前处理保持原样，不修改公共 `ExistsForWrite*` 的行为。
 
 ## 4. 最小实现路径
 
-**开发时优先扩展现有 `FilterWriteCacheWithMinReplica` 调用链，直接复用计数和后续写入流程。** 对计数部分，旧模式传入原 Location map，新模式传入按目标类型筛选的 map，随后调用同一个 `ExistsForWriteWithMinCount`；不要复制状态、spec 覆盖或有效性判断代码。
+**开发时优先扩展现有 `FilterWriteCacheWithMinReplica` 调用链，直接复用计数和后续写入流程。** 对计数部分，旧模式传入原 Location map，新模式传入按请求类型范围筛选的 map，随后调用同一个 `ExistsForWriteWithMinCount`；不要复制状态、spec 覆盖或有效性判断代码。
 
-新增行为集中在新参数校验与透传、计数前的类型筛选、分配时的目标类型选择，以及新模式跳过 StartWrite 的 Mark 目标覆盖。其余复用 [CacheManager](../../kv_cache_manager/manager/cache_manager.cc) 的 `StartWriteCache 申请位置 → 客户端写数据 → FinishWriteCache 确认结果` 流程，不增加新的 Manager、元数据字段或后台任务。
+新增行为集中在参数校验与透传、计数前的类型筛选、普通分配的候选类型筛选，以及 Mark 的模式区分和排除检查。其余复用 [CacheManager](../../kv_cache_manager/manager/cache_manager.cc) 的 `StartWriteCache 申请位置 → 客户端写数据 → FinishWriteCache 确认结果` 流程，不增加新的 Manager、元数据字段或后台任务。
 
 复用不要求抽取通用策略框架、扩展公共 `SelectLocationPolicy` 接口或重构旧默认写入路径；若实现中遇到原逻辑问题，单独记录，不作为本需求的前置修复。
 
 1. `MetaServiceImpl` 解析新 message，转换存储类型并透传到 `CacheManager::StartWriteCache`。HTTP/gRPC 共用这一路径。
 2. `FilterWriteCache` 在原有 `min_replica_count > 1` 分流前识别新模式，将 `storage_replica_requirement.min_location_count` 作为门槛传入现有 `FilterWriteCacheWithMinReplica`。旧顶层参数 0 只用于表达未启用旧模式，不能将它当作新门槛。目标为 1 时同样走新模式，不能退回普通“有任意副本就跳过”的路径。
 3. 在该函数内仅对新模式按类型筛选 Location，构造临时 `CacheLocationMap`，复用 [ExistsForWriteWithMinCount](../../kv_cache_manager/manager/select_location_policy.cc) 完成计数、状态判断、spec 覆盖和已有可用性检查，不在调用前增加状态过滤。临时 map 只复制共享指针，不复制 Location 数据。两种模式共用现有的请求 spec group 解析和缺省值；旧调用仍传原 map。
-4. 新模式跳过 StartWrite 阶段的 Mark 目标解析和覆盖；继续复用已有 `block_mask`、待写 key 和 spec group 的组织逻辑，不再复制一套完整过滤流程。
-5. 数量不足的 key 进入 `GenWriteLocation`，向后端选择入口传入目标类型，使用已有 `GenWriteLocationOnStorage` 分配地址。
+4. 指定模式跳过 StartWrite 的 Mark 引导；排除模式复用原 min-replica 的 Mark 联合判断，只过滤本次目标类型被排除的 Mark，不因此清除元数据中的 Mark。继续复用已有 `block_mask`、待写 key 和 spec group 的组织逻辑。
+5. 数量不足或有可执行且未满足的 Mark 的 key 进入 `GenWriteLocation`；Mark 目标沿用具体后端分配路径，普通分配入口传入目标类型或排除列表，复用已有 `GenWriteLocationOnStorage`。
 6. 后续 `BatchAddLocation → WRITING → write session → FinishWriteCache` 原样执行，复用失败回滚、超时清理、用量记录和响应结构。
 
 ### 4.1 后端选择只增加一个有明确用途的过滤条件
 
 为 [SelectCacheWriteDataStorageBackend](../../kv_cache_manager/manager/data_storage_selector.cc) 追加可选目标类型；未指定时保留原来的 `Select(candidates, preference)` 路径。指定时，在现有候选构造后调用已有 `SelectByType(candidates, target_type, false)`，不允许跨类型回退。
 
+排除模式在原有候选构造后移除排除类型，再调用原 `Select(candidates, preference)`。排除列表默认空，旧调用不受影响。原 Group 的 PREFER 回退仅在剩余候选内进行；若 ALWAYS 要求的类型已被排除，则返回原有无候选错误，不绕过排除条件或改写 Group 策略。
+
 仍然执行 Group `storage_candidates`、后端可写性、总配额和类型配额检查；同类型多个后端沿用当前候选顺序。显式类型取代本次请求的 Group 写入偏好，包括 `CPS_PREFER_*` 和 `CPS_ALWAYS_*`；即使 Group 配置了另一类型的 ALWAYS，本次仍按请求类型选择，但必须满足候选范围和配额等条件。不修改 Group 配置，不扩展通用策略枚举或后端能力注册机制。
 
 `SelectByType` 返回第一个类型匹配的候选，不根据已有 Location 做后端分散。候选及可用状态不变时，多次调用补到 N 份通常仍选择同一后端；本参数不提供 N 个独立存储后端的保证。
 
-后端分配选择只在存在待写 key 时执行：在元数据查询、选择策略生成及有效性检查成功，且全部 key 计数已达标的前提下，直接走现有“无新写入”的返回流程，不执行新分配的配额及 Writable 检查。例如目标后端仍 `Available()`、已有数据有效，但已只读或配额已满时，可以正常跳过。若 Group 中已注册候选全部不可用，`genSelectLocationPolicy` 可能先返回空，计数前就报错；本次不绕过这一已有检查。
+后端分配选择只在存在待写 key 时执行：在元数据查询、选择策略生成及有效性检查成功，全部 key 计数已达标且没有可执行的 Mark 需要补写时，走现有“无新写入”的返回流程，不执行普通新分配的配额及 Writable 检查。排除模式仍先沿用 Mark 的准入检查。例如后端仍 `Available()`、已有数据有效，但已只读或配额已满，且没有其他 Mark 引导时，可以正常跳过。若 Group 中已注册候选全部不可用，`genSelectLocationPolicy` 可能先返回空，计数前就报错；本次不绕过这一已有检查。
 
 全部跳过时仍沿用现有 session 和响应流程：`locations` 为空、`block_mask` 标记已跳过的 key，`write_session_id` 仍可非空。不能仅凭 session ID 判断本次是否分配了新 Location。
 
-不改用迁移专用的 `CheckExplicitWriteTargets`：该入口允许目标不在 `storage_candidates` 中，本需求继续遵守普通写入的候选范围。
+普通数量补写不改用迁移专用的 `CheckExplicitWriteTargets`，继续遵守 `storage_candidates`。排除模式的 Mark 引导保留其原有迁移准入路径，目标可以位于普通候选名单之外，但类型不能被本次请求排除。不把两种候选范围统一，以免改变既有迁移行为。
 
 #### 分配失败：沿用既有错误处理
 
 普通写入和旧 min-replica 在需要分配新 Location 时，也会经过相同的后端选择和错误转换。“无可写后端却返回 INSTANCE_NOT_EXIST”是既有问题，不属于本功能新增的缺陷，也不作为本需求的前置修复。
 
-**保持分配失败时报错，不返回“成功但本次跳过”，也不换到其他类型。** 旧模式可能因 EventReport 副本已足够而成功跳过；启用新模式后，目标类型缺副本且无法分配时，整个 StartWriteCache 请求会失败，不返回部分成功结果。接入方需要按缓存补写的业务重要性处理这个差异。
+**选定目标后的分配失败继续报错，不返回“成功但本次跳过”。** 指定模式不跨类型回退；排除模式只在未被排除的普通候选内执行原策略。Mark 的前置准入失败仍按 §4.2 退回数量判断，不等于选定目标后 Create 失败再换后端。旧模式可能因 EventReport 副本已足够而成功跳过；新模式缺副本且无法分配时，整个 StartWriteCache 请求失败，不返回部分成功结果。
 
 下表记录新模式复用的既有失败行为，用于接口说明及兼容性验证，不要求借此修正错误码语义。分配阶段各行均假设输入、实例、元数据查询和此前检查成功；更早的错误优先返回。对外状态指 HTTP/gRPC 响应体的 `header.status.code`，不是传输层状态码；映射沿用 [ToPbError](../../kv_cache_manager/common/error_code.h)。
 
@@ -151,15 +171,31 @@ HTTP 请求示例：
 
 ### 4.2 与分层 Mark 的关系
 
-新模式下，StartWrite 仅依据显式目标决定是否补写；即使显式目标已满足而另一层 Mark 未满足，也跳过本次补写，保留 Mark。
+指定模式维持显式目标优先：StartWrite 只依据指定类型与数量决定补写，即使另一层 Mark 未满足也不额外补写。例如 Mark 指向 SSD、请求要求 DRAM 至少 1 份，仍按 DRAM 目标处理并保留 Mark；不增加同类型时优先选 Mark 后端的优化。
 
-例如 Mark 指向 SSD，但请求要求 DRAM 至少 1 份且尚未满足，本次返回 DRAM 地址。不能因 Mark 改写目标，也不在 StartWrite 中删除或改写 Mark。
+排除模式复用旧 min-replica 与 Mark 的联合判断：
 
-`FinishWriteCache` 沿用当前规则：仅本次成功 Location 所在的具体 storage 与 Mark 目标一致时，才按已有清标策略处理；目标不同则保留。类型相同但具体后端不同也不等于满足 Mark。不扩展 `MigrationManager`，不增加 session 标志或新的清标策略。
+```text
+需要数量补写 = 范围内符合原计数规则的 Location 数 < N
+需要 Mark 补写 = Mark 有效、目标通过原准入检查、类型未被排除，且目标覆盖不足
+本次需要写入 = 需要数量补写 或 需要 Mark 补写
+```
 
-若一个 Instance 的所有写入都带新参数，Mark 将不能再引导这些请求去指定后端补写。新模式仍可能恰好选择 Mark 的目标后端，并在 Finish 时满足已有清标条件；若没有这种写入，则需后续未带新参数的写入或独立 Copy 来满足目标，否则等待 Mark 失效（默认有效期 24 小时）。Mark 本身不会自动产生 Copy。启用方不能继续依赖新模式请求完成 Mark 引导的迁移，需要核对其现有迁移方式。
+两项都需要时只写一份到 Mark 后端；只有数量不足时按 Group 策略选择未被排除的普通候选。Mark 覆盖检查继续使用具体后端上 SERVING/WRITING 的联合 specs，不改成副本计数的单 Location 覆盖规则。
 
-**本 PR 对上述兼容性影响只补充文档说明，不修改既有 Mark 的迁移、过期和 Finish 清标逻辑。** 新模式按显式目标选择，未带新参数的请求继续按原流程处理 Mark；不增加“Mark 与显式类型相同时优先选 Mark 后端”的选址优化。上述适用范围同步说明于 [分层存储文档](tiered_storage.md)，不将 Mark 相关改进纳入本次实现。
+| 排除 EventReport、N=1 时已有副本 | Mark | 本次行为 |
+|---|---|---|
+| 只有 EventReport | 无 | 按 Group 策略补一份 |
+| 只有 EventReport | SSD，目标可写且未覆盖 | 写 SSD，同时推进数量目标 |
+| DRAM | SSD，目标可写且未覆盖 | 即使数量足够，仍写 SSD |
+| SSD，DRAM 已回收 | 无或 SSD 目标已覆盖 | 跳过，不补回 DRAM |
+| DRAM | SSD 暂时不可用或配额已满 | 原 Mark 准入退回数量判断；数量已够则跳过，保留 Mark |
+
+若 Mark 目标类型被排除，仅忽略本次引导，不因此清标；数量不足仍尝试允许范围内的普通后端。目标注销、Mark 过期等原有条件清理保持原样。前置准入通过后分配失败沿用错误与回滚，不新增同请求内重选机制。
+
+`FinishWriteCache` 沿用当前规则：仅本次成功 Location 所在的具体 storage 与 Mark 目标一致时，才按已有清标策略处理；类型相同但具体后端不同不等于满足 Mark。数量已达标本身也不触发清标。不扩展 `MigrationManager`，不增加 session 标志或新的清标策略。
+
+日常请求应使用排除模式与分层协同；若所有请求都指定 DRAM，仍不能依靠 Mark 引导它们去 SSD，且 DRAM 被回收后会再次补写。Mark 本身不会自动派生 Copy。两种模式均不改变独立 Copy、源副本回收和 Mark 的有效期，适用范围同步说明于 [分层存储文档](tiered_storage.md)。
 
 ### 4.3 并发语义
 

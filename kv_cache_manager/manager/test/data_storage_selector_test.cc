@@ -352,6 +352,33 @@ TEST_F(DataStorageSelectorTest, TestExplicitTypeKeepsQuotaAndWritableChecks) {
     EXPECT_EQ(EC_NOENT, select().ec);
 }
 
+TEST_F(DataStorageSelectorTest, TestExcludedTypesKeepPreferenceAndAdmission) {
+    const std::vector<DataStorageType> excluded{DataStorageType::DATA_STORAGE_TYPE_HF3FS};
+    const auto select = [&]() {
+        return data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context_.get(), "default_test_group", std::nullopt, excluded);
+    };
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    auto selected = select();
+    ASSERT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, selected.type);
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    // No exclusion retains the original ALWAYS behavior.
+    EXPECT_EQ(
+        DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group").type);
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    auto quota = instance_group_g->quota();
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    instance_group_g->set_quota(quota);
+    EXPECT_EQ(EC_NOENT, select().ec);
+    quota.set_quota_config({});
+    instance_group_g->set_quota(quota);
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    EXPECT_EQ(EC_NOENT, select().ec);
+}
+
 TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendAbnormal00) {
     // should work with null data storage manager
     data_storage_manager_g.reset();

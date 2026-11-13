@@ -195,6 +195,15 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         return events
 
     def test_storage_replica_requirement_with_event_report_locations(self):
+        self._check_storage_replica_with_event_report_locations({"storage_type": "ST_NFS", "min_location_count": 1})
+
+    def test_excluded_storage_replica_with_event_report_locations(self):
+        self._check_storage_replica_with_event_report_locations({
+            "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2"],
+            "min_location_count": 1,
+        })
+
+    def _check_storage_replica_with_event_report_locations(self, requirement):
         storage_name = "event_report_storage_replica"
         nfs_name = "nfs_storage_replica"
         group_name = "storage_replica_group"
@@ -237,7 +246,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         self.assertEqual([], legacy.get("locations", []), legacy)
         response = self._client.start_write_cache({
             **request,
-            "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+            "storage_replica_requirement": requirement,
         })
         self.assertEqual(1, len(response.get("locations", [])), response)
         payload = bytes(range(256)) * 4
@@ -264,7 +273,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             self.assertEqual(payload, Path(urlsplit(spec["uri"]).path).read_bytes())
         skipped = self._client.start_write_cache({
             **request,
-            "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+            "storage_replica_requirement": requirement,
         })
         self.assertEqual([], skipped.get("locations", []), skipped)
 
@@ -275,6 +284,12 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             "storage_replica_requirement": {"storage_type": "ST_NFS_TYPO", "min_location_count": 1},
         }, check_response=False)
         self.assertEqual("INVALID_ARGUMENT", invalid["header"]["status"]["code"])
+
+        invalid_exclusion = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"excluded_storage_types": ["ST_NFS_TYPO"], "min_location_count": 1},
+        }, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", invalid_exclusion["header"]["status"]["code"])
 
     def test_storage_replica_requirement_quota_error_codes(self):
         for name, total_quota, type_quota, expected in (

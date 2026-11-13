@@ -208,6 +208,35 @@ TEST_F(MetaClientTest, TestStartWriteStorageReplicaRequirement) {
         client
             ->StartWrite("target-write", {42}, {}, {}, 60, 0, StorageReplicaRequirement{StorageType::ST_TAIRMEMPOOL, 2})
             .first);
+    EXPECT_CALL(*mock_stub,
+                StartWriteCache("exclude-write",
+                                "test_instance",
+                                _,
+                                _,
+                                _,
+                                60,
+                                0,
+                                ::testing::Truly([](const std::optional<StorageReplicaRequirement> &requirement) {
+                                    return requirement && requirement->storage_type == StorageType::ST_UNSPECIFIED &&
+                                           requirement->min_location_count == 1 &&
+                                           requirement->excluded_storage_types ==
+                                               std::vector<StorageType>{StorageType::ST_EVENT_REPORT_L1P5,
+                                                                        StorageType::ST_EVENT_REPORT_L2};
+                                })))
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, WriteLocation{})));
+    EXPECT_EQ(ER_OK,
+              client
+                  ->StartWrite(
+                      "exclude-write",
+                      {42},
+                      {},
+                      {},
+                      60,
+                      0,
+                      StorageReplicaRequirement{StorageType::ST_UNSPECIFIED,
+                                                1,
+                                                {StorageType::ST_EVENT_REPORT_L1P5, StorageType::ST_EVENT_REPORT_L2}})
+                  .first);
 }
 
 TEST_F(MetaClientTest, TestCreateWithLeaderMode) {

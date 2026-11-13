@@ -149,7 +149,8 @@ public:
     [[nodiscard]] DataStorageSelectResult
     SelectCacheWriteDataStorageBackend(RequestContext *request_context,
                                        const std::string &instance_group,
-                                       std::optional<DataStorageType> target_type = std::nullopt) const noexcept;
+                                       std::optional<DataStorageType> target_type = std::nullopt,
+                                       const std::vector<DataStorageType> &excluded_storage_types = {}) const noexcept;
 
     /**
      * @brief Check whether explicitly named write targets may accept new

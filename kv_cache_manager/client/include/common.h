@@ -112,6 +112,7 @@ enum class BackendSelectStrategy : int32_t {
 struct StorageReplicaRequirement {
     StorageType storage_type{StorageType::ST_UNSPECIFIED};
     int32_t min_location_count{0};
+    std::vector<StorageType> excluded_storage_types{};
 };
 
 struct BackendLocation {

@@ -493,6 +493,13 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
             {"storage_type": "ST_EVENT_REPORT_L1P5", "min_location_count": 1},
             {"storage_type": "ST_EVENT_REPORT_L2", "min_location_count": 1},
             {"storage_type": 263, "min_location_count": 1},
+            {"excluded_storage_types": [], "min_location_count": 1},
+            {"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 0},
+            {"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": -1},
+            {"excluded_storage_types": ["ST_UNSPECIFIED"], "min_location_count": 1},
+            {"excluded_storage_types": [263], "min_location_count": 1},
+            {"storage_type": "ST_NFS", "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+            {"storage_type": 263, "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
         ]
         for requirement in invalid:
             with self.subTest(requirement=requirement):
@@ -509,6 +516,54 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                 },
             }, check_response=False)
             self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+
+    def test_excluded_storage_replica_threshold_and_mask(self):
+        self._client.register_instance({
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+            "location_spec_groups": [{"name": "all", "spec_names": ["tp0"]}],
+        })
+        requirement = {
+            "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2", "ST_EVENT_REPORT_L2"],
+            "min_location_count": 1,
+        }
+        request = {
+            "instance_id": self._instance_id,
+            "block_keys": [83011, 83012],
+            "write_timeout_seconds": 30,
+            "storage_replica_requirement": requirement,
+        }
+        write = self._client.start_write_cache(request)
+        self.assertEqual(2, len(write.get("locations", [])), write)
+        self.assertTrue(all(loc["type"] == "ST_NFS" for loc in write["locations"]))
+        self._client.finish_write_cache({
+            "instance_id": self._instance_id,
+            "write_session_id": write["write_session_id"],
+            "success_blocks": {"bool_masks": {"values": [True, True]}},
+        })
+        mixed = self._client.start_write_cache({**request, "block_keys": [83011, 83013, 83012]})
+        self.assertEqual(1, len(mixed.get("locations", [])), mixed)
+        self.assertEqual([True, False, True], mixed["block_mask"]["bool_masks"]["values"])
+        skipped = self._client.start_write_cache(request)
+        self.assertEqual([], skipped.get("locations", []), skipped)
+
+        no_candidate = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"excluded_storage_types": ["ST_NFS"], "min_location_count": 1},
+        }, check_response=False)
+        self.assertEqual("INSTANCE_NOT_EXIST", no_candidate["header"]["status"]["code"])
+        conflict = self._client.start_write_cache({**request, "min_replica_count": 1}, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", conflict["header"]["status"]["code"])
+
+        token_request = {key: value for key, value in request.items() if key != "block_keys"}
+        token_request.update(token_ids=list(range(128)), location_spec_group_names=["all"])
+        token_write = self._client.start_write_cache(token_request)
+        self.assertEqual(1, len(token_write.get("locations", [])), token_write)
+        token_skip = self._client.start_write_cache(token_request)
+        self.assertEqual([], token_skip.get("locations", []), token_skip)
 
     def test_register_instance(self):
         # case: instance_id duplicated

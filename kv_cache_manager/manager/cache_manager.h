@@ -92,6 +92,7 @@ public:
     struct StorageReplicaRequirement {
         DataStorageType storage_type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
         int32_t min_location_count{0};
+        std::vector<DataStorageType> excluded_storage_types{};
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -318,7 +319,8 @@ private:
                                BlockMask &block_mask,
                                int32_t min_replica_count,
                                std::vector<std::string> &new_keys_tiered_targets,
-                               std::optional<DataStorageType> target_storage_type = std::nullopt);
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -329,14 +331,16 @@ private:
                                              BlockMask &block_mask,
                                              int32_t min_replica_count,
                                              std::vector<std::string> &new_keys_tiered_targets,
-                                             std::optional<DataStorageType> target_storage_type = std::nullopt);
+                                             std::optional<DataStorageType> target_storage_type = std::nullopt,
+                                             const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
                                CacheLocationVector &new_locations,
-                               std::optional<DataStorageType> target_storage_type = std::nullopt);
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
     // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
     // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。

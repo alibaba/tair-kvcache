@@ -201,6 +201,34 @@ TEST_F(MetaServiceImplTest, InvalidStorageReplicaRequirementIsRejectedBeforeInst
     }
 }
 
+TEST_F(MetaServiceImplTest, InvalidExcludedStorageTypesFailBeforeInstanceLookup) {
+    service_->EnableLeaderOnlyRequests();
+    RequestContext context("invalid-excluded-storage");
+    proto::meta::StartWriteCacheRequest request;
+    request.set_instance_id("not-registered");
+    request.add_block_keys(1);
+    request.set_write_timeout_seconds(60);
+    auto *requirement = request.mutable_storage_replica_requirement();
+    requirement->set_min_location_count(1);
+    for (int value : {0, 263}) {
+        requirement->clear_excluded_storage_types();
+        requirement->add_excluded_storage_types(static_cast<proto::meta::StorageType>(value));
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+    requirement->clear_excluded_storage_types();
+    requirement->add_excluded_storage_types(proto::meta::ST_EVENT_REPORT_L2);
+    // An unknown explicit enum must not disappear during conversion and turn
+    // a conflicting request into a valid exclusion-only request.
+    for (int value : {static_cast<int>(proto::meta::ST_NFS), 263}) {
+        requirement->set_storage_type(static_cast<proto::meta::StorageType>(value));
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+}
+
 TEST_F(MetaServiceImplTest, FinishWriteCacheErrorMetrics) {
     Stub stub;
     stub.set(ADDR(CacheManager, FinishWriteCache), FinishWriteCacheForMetrics);

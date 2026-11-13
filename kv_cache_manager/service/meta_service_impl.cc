@@ -733,7 +733,16 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         storage_replica_requirement.emplace(CacheManager::StorageReplicaRequirement{});
         const auto &requirement = request->storage_replica_requirement();
         ProtoConvert::DataStorageTypeFromProto(requirement.storage_type(), storage_replica_requirement->storage_type);
+        // Preserve invalid explicit values so they cannot turn into a valid exclusion-only request.
+        if (!proto::meta::StorageType_IsValid(requirement.storage_type())) {
+            storage_replica_requirement->storage_type = DataStorageType::COUNT;
+        }
         storage_replica_requirement->min_location_count = requirement.min_location_count();
+        for (const auto proto_type : requirement.excluded_storage_types()) {
+            DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+            ProtoConvert::DataStorageTypeFromProto(static_cast<proto::meta::StorageType>(proto_type), type);
+            storage_replica_requirement->excluded_storage_types.push_back(type);
+        }
     }
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
