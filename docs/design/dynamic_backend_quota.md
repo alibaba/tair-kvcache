@@ -28,6 +28,8 @@
 
 `DataStorageBackend::GetStorageCapacity()` 读取指定介质**总字节数**的内存快照，包含最近成功容量、成功时间和最近刷新结果。接口禁止网络/磁盘 I/O，不触发同步刷新，不等待首次采集或正在执行的刷新。后端负责异步采集及保留最近成功值；首次未知立即返回未知，未实现时立即返回 `EC_UNIMPLEMENTED`，不能以成功零值代替。`DataStorageManager` 只汇集各后端快照，不保存第二份容量缓存，也不创建采集线程。
 
+`SupportsStorageCapacity()` 单独声明后端是否实现容量查询，默认 `false`，与 Meta 连通性、首次采样和刷新结果无关。Create/Update Group 会拒绝已注册但未实现容量查询的后端使用 auto，包括总量 `-1` 隐式产生的 auto；错误中给出存储名称并提示改用 fixed。Group 总量仍可配置 `-1`，同时为这些类型显式配置固定 quota。尚未注册的后端在恢复期间保持未知，不能将未知当作成功零容量；已持久化配置的恢复不因容量故障被阻塞。支持容量查询的后端在冷启动或 Meta 故障时仍可配置 auto，运行时继续执行未知/过期保护。
+
 TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
 
 Provider 的心跳或连接异常不能视为确认缩容：运行中但不健康、连接可疑/失败或错误状态会使整个容量样本失败，沿用最近成功值及过期策略，避免异常节点被过滤后发布部分容量甚至零容量。明确删除状态及成功完整快照中消失的节点仍正常减少容量。拓扑中的不健康 provider 仍可能持有有效 GA，不能仅凭健康状态判定数据不存在；memnode 刷新失败后，旧拓扑也不再用于否定新节点上的 location，直到下一次成功刷新。
@@ -66,7 +68,7 @@ TairMempool 复用原有探活/节点同步循环，每轮读取一次 memnode�
 
 ## 消费与观测
 
-`RegistryManager::ResolveQuota` 统一解析快照。普通写入和显式迁移目标使用 `ForAdmission()`；回收和迁移源水位使用 `ForReclaim()`。未知/过期容量在两条路径分别转换为拒绝分配、跳过容量回收，不修改展示值。沿用原有水位准入，不新增并发字节 reservation。
+`RegistryManager::ResolveQuota` 复用其持有的 DataStorageManager 收集快照，转调 `ResolveEffectiveQuota` 纯函数；解析算法位于 `config/effective_quota`，RegistryManager 不保存动态额度或维护刷新线程。普通写入和显式迁移目标使用 `ForAdmission()`；回收和迁移源水位使用 `ForReclaim()`。未知/过期容量在两条路径分别转换为拒绝分配、跳过容量回收，不修改展示值。沿用原有水位准入，不新增并发字节 reservation。
 
 每次解析使用调用方持有的同一份 InstanceGroup 配置快照，比例和后端范围不会分别读取不同配置版本，避免更新时拼接“旧比例 + 新后端”而制造一次不存在的缩容。
 

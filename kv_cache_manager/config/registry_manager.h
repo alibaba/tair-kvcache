@@ -101,6 +101,7 @@ public:
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
     EffectiveGroupQuota ResolveQuota(const InstanceGroup &group) const;
+    bool ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:

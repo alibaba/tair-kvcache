@@ -135,6 +135,30 @@ EffectiveGroupQuota RegistryManager::ResolveQuota(const InstanceGroup &group) co
     return ResolveEffectiveQuota(group, snapshots, TimestampUtil::GetSteadyTimeUs());
 }
 
+bool RegistryManager::ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const {
+    const auto manager = data_storage_manager();
+    if (!manager) {
+        return true; // Missing backends remain unknown during recovery.
+    }
+    const auto effective = ResolveQuota(group);
+    const auto associated = GetQuotaStorageNames(group);
+    for (const auto &[type, value] : effective.types) {
+        if (!value.config.automatic()) {
+            continue;
+        }
+        const auto &scope = value.config.storage_names();
+        const auto names = scope.empty() ? associated : std::set<std::string>(scope.begin(), scope.end());
+        for (const auto &name : names) {
+            const auto backend = manager->GetDataStorageBackend(name);
+            if (backend && ToBaseType(backend->GetType()) == type && !backend->SupportsStorageCapacity()) {
+                invalid_fields += "{quota: storage '" + name + "' does not support automatic capacity; use fixed quota}";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
     storage_ = RegistryStorageBackendFactory::CreateAndInitStorageBackend(registry_storage_uri_);
@@ -238,6 +262,11 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
 ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_EXIST, "create instance group failed: instance group already existed");
@@ -255,6 +284,11 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                int64_t current_version) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {

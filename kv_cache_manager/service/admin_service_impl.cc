@@ -337,6 +337,9 @@ void AdminServiceImpl::CreateInstanceGroup(RequestContext *request_context,
     if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
     }
+    if (!registry_manager_->ValidateAutomaticQuota(instance_group_req, invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
+    }
     ErrorCode ec_info = registry_manager_->CreateInstanceGroup(request_context, instance_group_req);
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -369,6 +372,9 @@ void AdminServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
     }
     if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
+    }
+    if (!registry_manager_->ValidateAutomaticQuota(instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
     }
     ErrorCode ec_info =

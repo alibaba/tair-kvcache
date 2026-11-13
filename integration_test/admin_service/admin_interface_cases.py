@@ -346,6 +346,32 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                 {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
             self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
 
+    def test_unsupported_capacity_rejects_auto_create_and_update_but_allows_fixed(self):
+        storage = self.make_sample_storage()
+        self._client.add_storage({"trace_id": self._trace_id, "storage": storage})
+        group = self.make_sample_instance_group()
+        group["storage_candidates"] = [storage["global_unique_name"]]
+        for quota in ({"capacity": -1}, {"capacity": -1, "quota_config": [
+                {"storage_type": "ST_NFS", "mode": "auto"}]}):
+            group["quota"] = quota
+            response = self._client.create_instance_group(
+                {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
+            self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+            self.assertIn(storage["global_unique_name"], response["header"]["status"]["message"])
+            self.assertIn("fixed", response["header"]["status"]["message"])
+        group["quota"] = {"capacity": -1, "quota_config": [
+            {"storage_type": "ST_NFS", "capacity": 1000}]}
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        group["version"] = 2
+        group["quota"]["quota_config"][0]["mode"] = "auto"
+        response = self._client.update_instance_group(
+            {"trace_id": self._trace_id, "instance_group": group, "current_version": 1}, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+        stored = self._client.get_instance_group(
+            {"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual(1, int(stored["version"]))
+        self.assertEqual("fixed", stored["quota"]["quota_config"][0]["mode"])
+
     def test_register_get_list_remove_instance(self):
         ig = self.make_sample_instance_group()
         create_req = {"trace_id": self._trace_id, "instance_group": ig}

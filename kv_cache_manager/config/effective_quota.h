@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 
 #include "kv_cache_manager/config/instance_group.h"
@@ -30,6 +31,7 @@ struct EffectiveGroupQuota {
     InstanceGroupQuota ForReclaim() const;
 };
 
+std::set<std::string> GetQuotaStorageNames(const InstanceGroup &group);
 EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
                                           const std::map<std::string, StorageCapacitySnapshot> &snapshots,
                                           int64_t now_steady_us);

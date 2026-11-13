@@ -1,9 +1,5 @@
 # KVCacheManager AdminService API curl Examples
 
-Instance Group quota supports `mode: "auto"` with `ratio` (default 1.0) and optional `storage_names` per storage type. Omitted mode keeps legacy fixed bytes. Total `quota.capacity=-1` means **unlimited total bytes**; `0` retains its existing meaning. New groups without quota default to unlimited total bytes and automatic per-type quotas.
-
-Get/List Instance Group responses include read-only `runtime_quota`: `total_bytes_limit_enabled`, `reference_capacity`, and `storage_types` (mode, ratio, effective/backend capacity, known, usable, refresh status, last successful Unix timestamp). **Reference capacity is a monitoring denominator, not a total limit.** Unknown capacity is `-1`; failed queries retain the last successful value and report their status. Runtime fields are never persisted or used as input configuration. See [dynamic quota](../design/dynamic_backend_quota.md) for backend scope, stale-data handling and examples.
-
 ## Basic Usage
 1. Add Account
 2. Add Storage
@@ -125,6 +121,8 @@ curl -g -vvv -X POST http://localhost:6492/api/listStorage \
 ```
 
 ## Create Instance Group
+
+Per-type quota supports `mode: "auto"` with `ratio` (default 1.0) and optional `storage_names`. Omitted mode keeps fixed bytes. Total `quota.capacity=-1` disables the Group total byte limit; `0` retains its existing meaning. Omitted quota defaults to unlimited total bytes and automatic per-type quotas. Create/Update rejects auto quotas, including these defaults, for registered backends without capacity support; configure fixed per-type quotas for those backends. Temporary capacity-query failures do not make a supported backend unsupported. See [dynamic quota](../design/dynamic_backend_quota.md) for scope and failure handling.
 
 `reclaim_strategy.instance_reclaim_budget_policy` 可选 `GROUP_LRU`（默认，跨 Instance 按访问时间逐出）、`USAGE_PROPORTIONAL`（用量比例预算加跨轮轮转）和 `FIXED_PER_INSTANCE`（旧固定预算）。已有显式配置不会被新默认值覆盖。Group LRU 仅支持 `POLICY_LRU` 或 `POLICY_UNSPECIFIED`；升级、旧客户端零值和回滚约束见[配置指南](../configuration.md)。以下示例显式选择容量比例模式。
 
@@ -303,6 +301,9 @@ curl -g -vvv -X POST http://localhost:6492/api/removeInstanceGroup \
 ```
 
 ## Get Instance Group
+
+Get/List responses include read-only `runtime_quota`: `total_bytes_limit_enabled`, `reference_capacity`, and `storage_types` (mode, ratio, effective/backend capacity, known, usable, refresh status, last successful Unix timestamp). Reference capacity is a monitoring denominator. Unknown capacity is `-1`; failed refreshes retain the last successful value. Runtime fields are never persisted or used as input configuration.
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/getInstanceGroup \
   -H "Content-Type: application/json" \

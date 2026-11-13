@@ -45,11 +45,7 @@ double QuotaUsageRatio(uint64_t usage, int64_t capacity) {
     return static_cast<double>(usage) / capacity;
 }
 
-EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
-                                          const std::map<std::string, StorageCapacitySnapshot> &snapshots,
-                                          int64_t now_steady_us) {
-    EffectiveGroupQuota result;
-    result.configured_capacity = group.quota().capacity();
+std::set<std::string> GetQuotaStorageNames(const InstanceGroup &group) {
     std::set<std::string> associated(group.storage_candidates().begin(), group.storage_candidates().end());
     if (group.cache_config()) {
         for (const auto &strategy : group.cache_config()->migration_strategies()) {
@@ -60,6 +56,15 @@ EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
         }
     }
     associated.erase("");
+    return associated;
+}
+
+EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
+                                          const std::map<std::string, StorageCapacitySnapshot> &snapshots,
+                                          int64_t now_steady_us) {
+    EffectiveGroupQuota result;
+    result.configured_capacity = group.quota().capacity();
+    const auto associated = GetQuotaStorageNames(group);
     auto configs = group.quota().quota_config();
     // Unlimited mode defaults every associated type to auto 100%, including
     // types without an override when another type has a fixed/custom quota.

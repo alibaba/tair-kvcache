@@ -113,6 +113,8 @@ public:
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
+    // Static backend capability, independent of startup, health, or refresh results.
+    virtual bool SupportsStorageCapacity() const { return false; }
     // Read a cached observation of total bytes for GetType(), never free bytes.
     // Must perform no network/disk I/O and never wait for a background refresh.
     // Backends own refresh scheduling and retain the last successful capacity
