@@ -23,6 +23,7 @@ _QUERY_PORT_OFFSET = 1
 #: not start with ``_ROSTER_MARK`` is not a roster.
 _QUERY_LOADS = b"loads"
 _QUERY_ROSTER = b"roster"
+_QUERY_SAVES = b"saves:"
 _ROSTER_MARK = b"roster:"
 _UNSUPPORTED = b"?"
 
@@ -190,7 +191,19 @@ class TpCoordinatorServer:
         self._finished_loading_lock = threading.Lock()
         self._finished_saving = []
         self._finished_saving_lock = threading.Lock()
+        # Rank 0 publishes a request only after its own ledger has retired every
+        # save session and seen FinishRequest. Each other rank consumes its own
+        # queue once; unlike the load history, these are not broadcast forever.
+        self._finished_saving_by_rank: Dict[int, List[str]] = {
+            rank: [] for rank in range(tp_world_size)
+        }
         self._on_finished_callback = on_finished_callback
+
+    def publish_finished_saving(self, request_ids: Set[str]) -> None:
+        """Queues rank-0 request retirements for every other worker to consume."""
+        with self._finished_saving_lock:
+            for rank in range(1, self._tp_world_size):
+                self._finished_saving_by_rank[rank].extend(request_ids)
 
     def coordinator_routine(self) -> None:
         context = zmq.Context()
@@ -218,6 +231,16 @@ class TpCoordinatorServer:
                     if command == _QUERY_ROSTER:
                         with self._storage_configs_lock:
                             payload = _ROSTER_MARK + self._storage_configs.encode()
+                    elif command.startswith(_QUERY_SAVES):
+                        try:
+                            rank = int(command[len(_QUERY_SAVES) :])
+                            queue = self._finished_saving_by_rank[rank]
+                        except (ValueError, KeyError):
+                            payload = _UNSUPPORTED
+                        else:
+                            with self._finished_saving_lock:
+                                payload = "\n".join(queue).encode()
+                                queue.clear()
                     elif command == _QUERY_LOADS:
                         with self._loading_history_lock:
                             payload = "\n".join(self._loading_history).encode()
@@ -468,6 +491,13 @@ class TpCoordinatorClient:
         """
         payload = self._ask(_QUERY_LOADS, timeout_ms)
         if payload is None:
+            return set()
+        return {line for line in payload.decode().split("\n") if line}
+
+    def finished_saves(self, rank: int, timeout_ms: int = 1000) -> Set[str]:
+        """Consumes the request retirements queued for this rank only."""
+        payload = self._ask(_QUERY_SAVES + str(rank).encode(), timeout_ms)
+        if payload is None or payload == _UNSUPPORTED:
             return set()
         return {line for line in payload.decode().split("\n") if line}
 

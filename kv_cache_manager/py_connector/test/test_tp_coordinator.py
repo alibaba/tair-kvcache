@@ -496,6 +496,40 @@ class TestTpCoordinatorRosterChannel(unittest.TestCase):
             _shutdown(stale)
 
 
+class TestTpCoordinatorSaveRetirementChannel(unittest.TestCase):
+    """A request-level retirement is a consumable item for every other rank."""
+
+    def setUp(self):
+        self.port = _find_free_port()
+        self.server = TpCoordinatorServer("127.0.0.1", self.port, 32, lambda *a: None)
+        _wait_for_server(self.port)
+        self.client = TpCoordinatorClient("127.0.0.1", self.port)
+
+    def tearDown(self):
+        self.server._coordinator_running = False
+        _shutdown(self.client)
+
+    def test_every_rank_consumes_every_retirement_exactly_once(self):
+        self.server.publish_finished_saving({"req-a"})
+        self.server.publish_finished_saving({"req-b"})
+
+        for rank in range(1, 32):
+            self.assertEqual(
+                self.client.finished_saves(rank, timeout_ms=500),
+                {"req-a", "req-b"},
+            )
+
+        for rank in range(1, 32):
+            self.assertEqual(self.client.finished_saves(rank, timeout_ms=500), set())
+
+        # A new completion is queued after the old ones were consumed; the old
+        # history must not be broadcast again, and the new item must not be lost.
+        self.server.publish_finished_saving({"req-c"})
+        self.assertEqual(self.client.finished_saves(7, timeout_ms=500), {"req-c"})
+        self.assertEqual(self.client.finished_saves(7, timeout_ms=500), set())
+        self.assertEqual(self.client.finished_saves(0, timeout_ms=500), set())
+
+
 class TestTpCoordinatorEventRegistry(unittest.TestCase):
     def test_every_event_type_is_in_the_serializer_mapping(self):
         """A type missing from the mapping is dropped in silence.
