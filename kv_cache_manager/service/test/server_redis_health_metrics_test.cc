@@ -94,7 +94,9 @@ TEST_F(ServerRedisHealthMetricsTest, CoordinationFailureReportsInEveryPhaseDespi
         EXPECT_FALSE(server_.leader_elector_->IsLeader()); // the probe cannot acquire/revoke a lease
     }
     // The ordinary reporter is still blocked, yet all four samples were published.
-    EXPECT_FALSE(server_.stop_.load());
+    // Server::Stop() is now call_once over a std::once_flag, which has no readable state, so
+    // "the server was not stopped" is checked through the report thread that Stop() shuts down.
+    EXPECT_TRUE(server_.metrics_report_thread_->is_running_);
 }
 
 TEST_F(ServerRedisHealthMetricsTest, DisabledProbeCreatesNoProbeObjectsOrThreads) {
