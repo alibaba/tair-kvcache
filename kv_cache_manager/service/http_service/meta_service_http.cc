@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 
+#include <charconv>
 #include <memory>
 #include <string>
 #include <utility>
@@ -11,10 +12,67 @@
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
+#include "rapidjson/document.h"
 
 namespace kv_cache_manager {
 
 #define __NOTHING__ std::nullopt
+
+namespace {
+// Generic protobuf JSON parsing ignores unknown enum names. Keep that behavior
+// for other fields, but never silently narrow a replica requirement's scope.
+const char *ValidateReplicaTypeJson(std::string_view json) {
+    rapidjson::Document document;
+    document.Parse(json.data(), json.size());
+    if (document.HasParseError() || !document.IsObject()) {
+        return "invalid JSON for storage_replica_requirement";
+    }
+    const auto valid_type_name = [](const rapidjson::Value &value) {
+        if (!value.IsString()) {
+            // Non-string values are preserved or rejected by protobuf parsing;
+            // their enum validity is checked by the existing Manager path.
+            return true;
+        }
+        proto::meta::StorageType type;
+        if (proto::meta::StorageType_Parse(std::string(value.GetString(), value.GetStringLength()), &type)) {
+            return true;
+        }
+        int number = 0;
+        const char *begin = value.GetString();
+        const char *end = begin + value.GetStringLength();
+        const auto parsed = std::from_chars(begin, end, number);
+        return parsed.ec == std::errc() && parsed.ptr == end && proto::meta::StorageType_IsValid(number);
+    };
+    for (const auto &member : document.GetObject()) {
+        const std::string_view name(member.name.GetString(), member.name.GetStringLength());
+        if ((name != "storage_replica_requirement" && name != "storageReplicaRequirement") ||
+            !member.value.IsObject()) {
+            continue;
+        }
+        for (const auto &field : member.value.GetObject()) {
+            const std::string_view field_name(field.name.GetString(), field.name.GetStringLength());
+            if (field.value.IsNull()) {
+                continue;
+            }
+            if (field_name == "storage_type" || field_name == "storageType") {
+                if (!valid_type_name(field.value)) {
+                    return "storage_replica_requirement.storage_type must be a known StorageType name or number";
+                }
+            } else if (field_name == "excluded_storage_types" || field_name == "excludedStorageTypes") {
+                if (!field.value.IsArray()) {
+                    return "storage_replica_requirement.excluded_storage_types must be an array";
+                }
+                for (const auto &value : field.value.GetArray()) {
+                    if (!valid_type_name(value)) {
+                        return "excluded_storage_types contains an unknown StorageType name or number";
+                    }
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+} // namespace
 
 MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
@@ -39,7 +97,14 @@ void MetaServiceHttp::RegisterHandler() {
                                            GetCacheLocationsByBackend,
                                            GetCacheLocationsByBackend,
                                            GetCacheLocationsByBackend);
-    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, startWriteCache, StartWriteCache, StartWriteCache, StartWriteCache);
+    RegisterPostHandler("/api/startWriteCache", [this](auto &req, auto &res) -> async_simple::coro::Lazy<void> {
+        auto handler =
+            GetHandler<MetaServiceHttp, proto::meta::StartWriteCacheRequest, proto::meta::StartWriteCacheResponse>(
+                [&req](MetaServiceHttp *service, auto *connection, auto *request, auto *response) {
+                    return service->StartWriteCache(connection, request, response, req.get_body());
+                });
+        co_await handler(req, res);
+    });
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, finishWriteCache, FinishWriteCache, Common, FinishWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
@@ -124,8 +189,18 @@ CoroHttpService::CachedJsonResponse MetaServiceHttp::GetCacheMeta(coro_http::cor
 
 CoroHttpService::CachedJsonResponse MetaServiceHttp::StartWriteCache(coro_http::coro_http_connection *http_conn,
                                                                      proto::meta::StartWriteCacheRequest *request,
-                                                                     proto::meta::StartWriteCacheResponse *response) {
+                                                                     proto::meta::StartWriteCacheResponse *response,
+                                                                     std::string_view json_body) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(StartWriteCache, __NOTHING__);
+    if (request->has_storage_replica_requirement()) {
+        if (const auto *error = ValidateReplicaTypeJson(json_body)) {
+            auto *status = response->mutable_header()->mutable_status();
+            status->set_code(proto::meta::INVALID_ARGUMENT);
+            status->set_message(error);
+            request_context->set_status_code(status->code());
+            return __NOTHING__;
+        }
+    }
     KVCM_LOG_DEBUG("[traceId: %s] StartWriteCache request details: %s",
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());

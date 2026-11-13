@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string_view>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
@@ -44,7 +45,8 @@ public:
                                                   proto::meta::GetCacheLocationsByBackendResponse *response);
     CachedJsonResponse StartWriteCache(coro_http::coro_http_connection *http_conn,
                                        proto::meta::StartWriteCacheRequest *request,
-                                       proto::meta::StartWriteCacheResponse *response);
+                                       proto::meta::StartWriteCacheResponse *response,
+                                       std::string_view json_body);
 
     CachedJsonResponse FinishWriteCache(coro_http::coro_http_connection *http_conn,
                                         proto::meta::FinishWriteCacheRequest *request,

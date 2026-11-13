@@ -79,6 +79,38 @@ curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \
 }'
 ```
 
+若希望在指定存储类型保留副本，可在 Start Write Cache 请求中增加：
+
+```json
+{
+  "storage_replica_requirement": {
+    "storage_type": "ST_TAIRMEMPOOL",
+    "min_location_count": 1
+  }
+}
+```
+
+也可排除 EventReport，使其余存储类型（包括 DRAM 和 SSD）合计满足数量门槛：
+
+```json
+{
+  "storage_replica_requirement": {
+    "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2"],
+    "min_location_count": 1
+  }
+}
+```
+
+顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为。指定类型与非空排除列表必须二选一；排除模式的 `storage_type` 不传或为 `ST_UNSPECIFIED`。空对象、两种模式同时设置、未知枚举名称或数值、排除列表中的 `ST_UNSPECIFIED`、指定 EventReport 写入以及非正数量均返回 `INVALID_ARGUMENT`，错误信息说明具体原因。重复排除项在校验后去重，不改变含义。HTTP 仅对新参数中的两个类型字段核对原文，混合列表中任一未知名称（包括带引号的未知数值）都会拒绝，不会静默缩小排除范围；合法的名称、数字、数字字符串及 camelCase 字段名继续支持。其他字段的解析规则不变。
+
+指定模式仅统计目标类型的有效 Location，不足时每个 key 本次最多分配一份；客户端仍须写入返回的 URI 并调用 Finish Write Cache。数量是补写门槛，不保证并发上限、不同后端分布或可读副本数下限。显式类型覆盖 Group 的 PREFER/ALWAYS 偏好和本次 StartWrite 的 Mark 引导，但仍受 `storage_candidates`、可写性及配额限制。
+
+类型约束按后端注册配置识别，`ST_VCNS_3FS` 与普通 `ST_3FS` 分别处理。VCNS 返回的 Location 仍可使用原有 `ST_3FS` 协议类型；服务端根据其 URI 对应的后端识别配置类型并计数，不要求响应的 `type` 与请求类型字面相等。
+
+排除模式只统计未被排除类型的 Location；普通补写从过滤后的候选执行原 Group 策略，不写入被排除类型。范围内可执行且尚未覆盖的 Mark 优先引导到具体后端，即使数量已达标也可补写；Mark 沿用迁移准入路径，可以指向普通候选名单外的后端。目标类型被排除时忽略本次 Mark 引导并保留 Mark，暂时不可用时沿用原退路。Finish 清标规则不变。已有 SSD 满足数量要求时，不会仅因 DRAM 副本被回收而补回 DRAM。
+
+在前置检查通过且需要普通分配时，指定类型无可写候选、类型配额已满或排除后无符合 Group 策略的候选，沿用既有映射返回 `INSTANCE_NOT_EXIST`；Group 总配额已满或分配失败返回 `INTERNAL_ERROR`。若全部候选不可用，可能在计数前就返回 `INTERNAL_ERROR`。指定模式不跨类型回退，排除模式不回退到排除类型，均不把分配失败当作跳过成功。详细计数、Mark 和失败语义见[设计说明](../design/start_write_storage_replica.md)。
+
 ## Finish Write Cache
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/finishWriteCache \

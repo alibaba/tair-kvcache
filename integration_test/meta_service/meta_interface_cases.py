@@ -388,6 +388,187 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
             actual.append(specs[spec_name].get("checksum", ""))
         self.assertEqual(expected, actual)
 
+    def test_storage_replica_requirement_threshold_and_presence(self):
+        self._client.register_instance({
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+            "location_spec_groups": [{"name": "all", "spec_names": ["tp0"]}],
+        })
+        request = {
+            "trace_id": self._trace_id,
+            "instance_id": self._instance_id,
+            "block_keys": [83001],
+            "write_timeout_seconds": 30,
+            "storage_replica_requirement": {
+                "storage_type": "ST_NFS",
+                "min_location_count": 2,
+            },
+        }
+        writes = [self._client.start_write_cache(request) for _ in range(2)]
+        for response in writes:
+            self.assertTrue(response.get("write_session_id"), response)
+            self.assertEqual(1, len(response.get("locations", [])), response)
+            self.assertEqual("ST_NFS", response["locations"][0]["type"])
+        self.assertNotEqual(writes[0]["write_session_id"], writes[1]["write_session_id"])
+
+        # Visible WRITING Locations already satisfy the threshold.
+        skipped = self._client.start_write_cache(request)
+        self.assertEqual([], skipped.get("locations", []), skipped)
+        self.assertEqual(1, skipped["block_mask"]["offset"])
+        for response in writes:
+            self._client.finish_write_cache({
+                "trace_id": self._trace_id,
+                "instance_id": self._instance_id,
+                "write_session_id": response["write_session_id"],
+                "success_blocks": {"bool_masks": {"values": [True]}},
+            })
+        read = self._client.get_cache_location({
+            "trace_id": self._trace_id,
+            "instance_id": self._instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [83001],
+            "block_mask": {"offset": 0},
+        })
+        self.assertIn(read.get("locations"), [write["locations"] for write in writes])
+
+        # JSON null and absence both retain ordinary write behavior.
+        for fields in ({}, {"storage_replica_requirement": None},
+                       {"min_replica_count": 1}):
+            legacy = {key: value for key, value in request.items()
+                      if key != "storage_replica_requirement"}
+            response = self._client.start_write_cache({**legacy, **fields})
+            self.assertEqual([], response.get("locations", []), response)
+
+        legacy_more = self._client.start_write_cache({
+            **legacy, "min_replica_count": 3, "storage_replica_requirement": None,
+        })
+        self.assertEqual(1, len(legacy_more.get("locations", [])), legacy_more)
+        self._client.finish_write_cache({
+            "instance_id": self._instance_id,
+            "write_session_id": legacy_more["write_session_id"],
+            "success_blocks": {"bool_masks": {"values": [False]}},
+        })
+
+        token_request = {
+            "instance_id": self._instance_id,
+            "token_ids": list(range(128)),
+            "location_spec_group_names": ["all"],
+            "write_timeout_seconds": 30,
+            "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+        }
+        token_write = self._client.start_write_cache(token_request)
+        self.assertEqual(1, len(token_write.get("locations", [])), token_write)
+        token_skip = self._client.start_write_cache(token_request)
+        self.assertEqual([], token_skip.get("locations", []), token_skip)
+
+        # An existing NFS replica does not satisfy a missing TairMempool target.
+        request["storage_replica_requirement"]["storage_type"] = "ST_TAIRMEMPOOL"
+        response = self._client.start_write_cache(request, check_response=False)
+        self.assertEqual("INSTANCE_NOT_EXIST", response["header"]["status"]["code"])
+
+    def test_storage_replica_requirement_validation(self):
+        self._client.register_instance({
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+        })
+        request = {
+            "trace_id": self._trace_id,
+            "instance_id": self._instance_id,
+            "block_keys": [83001],
+            "write_timeout_seconds": 30,
+        }
+        invalid = [
+            ({}, "min_location_count"),
+            ({"storage_type": "ST_NFS"}, "min_location_count"),
+            ({"storage_type": "ST_NFS", "min_location_count": -1}, "min_location_count"),
+            ({"storage_type": "ST_UNSPECIFIED", "min_location_count": 1}, "is required"),
+            ({"storage_type": "ST_EVENT_REPORT_L1P5", "min_location_count": 1}, "cannot target EventReport"),
+            ({"storage_type": "ST_EVENT_REPORT_L2", "min_location_count": 1}, "cannot target EventReport"),
+            ({"storage_type": 263, "min_location_count": 1}, "storage_type"),
+            ({"excluded_storage_types": [], "min_location_count": 1}, "is required"),
+            ({"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 0}, "min_location_count"),
+            ({"excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": -1}, "min_location_count"),
+            ({"excluded_storage_types": ["ST_UNSPECIFIED"], "min_location_count": 1}, "excluded_storage_types"),
+            ({"excluded_storage_types": [263], "min_location_count": 1}, "excluded_storage_types"),
+            ({"storage_type": "ST_NFS", "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+             "mutually exclusive"),
+            ({"storage_type": 263, "excluded_storage_types": ["ST_EVENT_REPORT_L2"], "min_location_count": 1},
+             "storage_type"),
+        ]
+        for requirement, message in invalid:
+            with self.subTest(requirement=requirement):
+                response = self._client.start_write_cache({
+                    **request, "storage_replica_requirement": requirement,
+                }, check_response=False)
+                self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+                self.assertIn(message, response["header"]["status"]["message"])
+        for old_count in (1, 2):
+            response = self._client.start_write_cache({
+                **request,
+                "min_replica_count": old_count,
+                "storage_replica_requirement": {
+                    "storage_type": "ST_NFS", "min_location_count": 1,
+                },
+            }, check_response=False)
+            self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+            self.assertIn("requires min_replica_count=0", response["header"]["status"]["message"])
+
+    def test_excluded_storage_replica_threshold_and_mask(self):
+        self._client.register_instance({
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+            "location_spec_groups": [{"name": "all", "spec_names": ["tp0"]}],
+        })
+        requirement = {
+            "excluded_storage_types": ["ST_EVENT_REPORT_L1P5", "ST_EVENT_REPORT_L2", "ST_EVENT_REPORT_L2"],
+            "min_location_count": 1,
+        }
+        request = {
+            "instance_id": self._instance_id,
+            "block_keys": [83011, 83012],
+            "write_timeout_seconds": 30,
+            "storage_replica_requirement": requirement,
+        }
+        write = self._client.start_write_cache(request)
+        self.assertEqual(2, len(write.get("locations", [])), write)
+        self.assertTrue(all(loc["type"] == "ST_NFS" for loc in write["locations"]))
+        self._client.finish_write_cache({
+            "instance_id": self._instance_id,
+            "write_session_id": write["write_session_id"],
+            "success_blocks": {"bool_masks": {"values": [True, True]}},
+        })
+        mixed = self._client.start_write_cache({**request, "block_keys": [83011, 83013, 83012]})
+        self.assertEqual(1, len(mixed.get("locations", [])), mixed)
+        self.assertEqual([True, False, True], mixed["block_mask"]["bool_masks"]["values"])
+        skipped = self._client.start_write_cache(request)
+        self.assertEqual([], skipped.get("locations", []), skipped)
+
+        no_candidate = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"excluded_storage_types": ["ST_NFS"], "min_location_count": 1},
+        }, check_response=False)
+        self.assertEqual("INSTANCE_NOT_EXIST", no_candidate["header"]["status"]["code"])
+        conflict = self._client.start_write_cache({**request, "min_replica_count": 1}, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", conflict["header"]["status"]["code"])
+
+        token_request = {key: value for key, value in request.items() if key != "block_keys"}
+        token_request.update(token_ids=list(range(128)), location_spec_group_names=["all"])
+        token_write = self._client.start_write_cache(token_request)
+        self.assertEqual(1, len(token_write.get("locations", [])), token_write)
+        token_skip = self._client.start_write_cache(token_request)
+        self.assertEqual([], token_skip.get("locations", []), token_skip)
+
     def test_register_instance(self):
         # case: instance_id duplicated
         # First register an instance

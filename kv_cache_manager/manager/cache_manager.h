@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -86,6 +87,12 @@ public:
         std::string host_ip_port;
         int64_t local;
         int64_t global;
+    };
+
+    struct StorageReplicaRequirement {
+        DataStorageType storage_type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
+        int32_t min_location_count{0};
+        std::vector<DataStorageType> excluded_storage_types{};
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -188,13 +195,15 @@ public:
                                                       const TokenIdsVector &tokens,
                                                       int32_t sw_size);
 
-    std::pair<ErrorCode, StartWriteCacheInfo> StartWriteCache(RequestContext *request_context,
-                                                              const std::string &instance_id,
-                                                              const KeyVector &keys,
-                                                              const TokenIdsVector &tokens,
-                                                              const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds,
-                                                              int32_t min_replica_count = 1);
+    std::pair<ErrorCode, StartWriteCacheInfo>
+    StartWriteCache(RequestContext *request_context,
+                    const std::string &instance_id,
+                    const KeyVector &keys,
+                    const TokenIdsVector &tokens,
+                    const std::vector<std::string> &location_spec_group_names,
+                    int64_t write_timeout_seconds,
+                    int32_t min_replica_count = 0,
+                    std::optional<StorageReplicaRequirement> storage_replica_requirement = std::nullopt);
     struct FinishWriteCacheOptions {
         std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
         struct ChecksumBatch {
@@ -316,7 +325,9 @@ private:
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask,
                                int32_t min_replica_count,
-                               std::vector<std::string> &new_keys_tiered_targets);
+                               std::vector<std::string> &new_keys_tiered_targets,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -326,13 +337,17 @@ private:
                                              std::vector<std::string_view> &new_location_spec_group_names,
                                              BlockMask &block_mask,
                                              int32_t min_replica_count,
-                                             std::vector<std::string> &new_keys_tiered_targets);
+                                             std::vector<std::string> &new_keys_tiered_targets,
+                                             std::optional<DataStorageType> target_storage_type = std::nullopt,
+                                             const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
-                               CacheLocationVector &new_locations);
+                               CacheLocationVector &new_locations,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
     // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
     // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。

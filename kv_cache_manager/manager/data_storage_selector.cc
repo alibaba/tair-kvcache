@@ -1,5 +1,6 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -237,9 +238,11 @@ DataStorageSelector::Select(RequestContext const *request_context,
 
 void DataStorageSelector::DoCleanup() {}
 
-DataStorageSelectResult
-DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
-                                                        const std::string &instance_group) const noexcept {
+DataStorageSelectResult DataStorageSelector::SelectCacheWriteDataStorageBackend(
+    RequestContext *request_context,
+    const std::string &instance_group,
+    std::optional<DataStorageType> target_type,
+    const std::vector<DataStorageType> &excluded_storage_types) const noexcept {
     SPAN_TRACER(request_context);
     DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
     if (!request_context) {
@@ -334,9 +337,23 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     // 0. calculate the candidate list
     std::vector<std::shared_ptr<DataStorageBackend>> candidates;
     GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_table, candidates);
+    if (target_type || !excluded_storage_types.empty()) {
+        candidates.erase(std::remove_if(candidates.begin(),
+                                        candidates.end(),
+                                        [&](const auto &backend) {
+                                            // VCNS shares the HF3FS protocol type, but has its own configured identity.
+                                            const auto type = backend->GetStorageConfig().type();
+                                            return (target_type && type != *target_type) ||
+                                                   std::find(excluded_storage_types.begin(),
+                                                             excluded_storage_types.end(),
+                                                             type) != excluded_storage_types.end();
+                                        }),
+                         candidates.end());
+    }
 
     // 1. select backend according to the specified preference
-    const auto chosen_backend = Select(request_context, candidates, preference);
+    const auto chosen_backend = target_type ? (candidates.empty() ? nullptr : candidates.front())
+                                            : Select(request_context, candidates, preference);
 
     if (chosen_backend == nullptr) {
         PREFIX_LOG(WARN, "unable to select a data storage backend, instance group: %s", instance_group.c_str());

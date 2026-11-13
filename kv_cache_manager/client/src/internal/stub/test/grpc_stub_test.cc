@@ -1035,6 +1035,45 @@ TEST(GrpcStubMetadataProtocolTest, SendsReplicaBackendAndHostArgumentsAndKeepsMi
     const std::vector<int64_t> keys{1, 2, 3};
     EXPECT_EQ(ER_OK, stub.StartWriteCache("write", "instance", keys, {}, {}, 600, 3).first);
     EXPECT_EQ(service.write.min_replica_count(), 3);
+    EXPECT_FALSE(service.write.has_storage_replica_requirement());
+    const StorageReplicaRequirement requirement{StorageType::ST_TAIRMEMPOOL, 2};
+    ASSERT_EQ(ER_OK, stub.StartWriteCache("target-write", "instance", keys, {}, {}, 600, 0, requirement).first);
+    ASSERT_TRUE(service.write.has_storage_replica_requirement());
+    EXPECT_EQ(0, service.write.min_replica_count());
+    EXPECT_EQ(proto::meta::ST_TAIRMEMPOOL, service.write.storage_replica_requirement().storage_type());
+    EXPECT_EQ(2, service.write.storage_replica_requirement().min_location_count());
+    EXPECT_EQ(0, service.write.storage_replica_requirement().excluded_storage_types_size());
+    const StorageReplicaRequirement excluded{
+        StorageType::ST_UNSPECIFIED, 1, {StorageType::ST_EVENT_REPORT_L1P5, StorageType::ST_EVENT_REPORT_L2}};
+    ASSERT_EQ(ER_OK, stub.StartWriteCache("exclude-write", "instance", keys, {}, {}, 600, 0, excluded).first);
+    EXPECT_EQ(proto::meta::ST_UNSPECIFIED, service.write.storage_replica_requirement().storage_type());
+    EXPECT_EQ(1, service.write.storage_replica_requirement().min_location_count());
+    ASSERT_EQ(2, service.write.storage_replica_requirement().excluded_storage_types_size());
+    EXPECT_EQ(proto::meta::ST_EVENT_REPORT_L1P5, service.write.storage_replica_requirement().excluded_storage_types(0));
+    EXPECT_EQ(proto::meta::ST_EVENT_REPORT_L2, service.write.storage_replica_requirement().excluded_storage_types(1));
+    for (const auto &invalid :
+         std::vector<StorageReplicaRequirement>{{StorageType::ST_UNSPECIFIED, 1, {}},
+                                                {StorageType::ST_UNSPECIFIED, 0, {StorageType::ST_EVENT_REPORT_L2}},
+                                                {StorageType::ST_UNSPECIFIED, 1, {StorageType::ST_UNSPECIFIED}},
+                                                {StorageType::ST_UNSPECIFIED, 1, {static_cast<StorageType>(263)}},
+                                                {StorageType::ST_TAIRMEMPOOL, 1, {StorageType::ST_EVENT_REPORT_L2}}}) {
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  stub.StartWriteCache("invalid-exclude", "instance", keys, {}, {}, 600, 0, invalid).first);
+    }
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              stub.StartWriteCache("exclude-conflict", "instance", keys, {}, {}, 600, 1, excluded).first);
+    for (int old_count : {1, 2}) {
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  stub.StartWriteCache("conflict", "instance", keys, {}, {}, 600, old_count, requirement).first);
+    }
+    for (const auto &invalid : std::vector<StorageReplicaRequirement>{{},
+                                                                      {StorageType::ST_TAIRMEMPOOL, 0},
+                                                                      {StorageType::ST_TAIRMEMPOOL, -1},
+                                                                      {StorageType::ST_EVENT_REPORT_L1P5, 1},
+                                                                      {StorageType::ST_EVENT_REPORT_L2, 1},
+                                                                      {static_cast<StorageType>(263), 1}}) {
+        EXPECT_EQ(ER_INVALID_PARAMS, stub.StartWriteCache("invalid", "instance", keys, {}, {}, 600, 0, invalid).first);
+    }
     const auto [location_ec, locations] = stub.GetCacheLocationsByBackend(
         "backend", "instance", keys, {}, BlockMaskOffset{1}, {},
         StorageType::ST_NFS, BackendSelectStrategy::LSS_WEIGHTED_RANDOM);

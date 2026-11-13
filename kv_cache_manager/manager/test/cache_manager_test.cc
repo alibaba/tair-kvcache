@@ -2039,6 +2039,595 @@ TEST_F(CacheManagerTest, TestStartWriteCacheWithMinReplica) {
     }
 }
 
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementCountsOnlyTargetType) {
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    group->set_storage_candidates({"nfs_01", "hot_01", "cold_01"});
+    group->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    for (int i = 0; i < 100; ++i) {
+        const std::string host = "192.168.10." + std::to_string(i + 1) + ":8080";
+        ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+        auto [ec, response] = CallReportEvent(MakeSnapshotRequest(host, {{42, "replica"}}), "storage_replica_seed");
+        ASSERT_EQ(EC_OK, ec);
+    }
+    auto [legacy_ec, legacy] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 2);
+    ASSERT_EQ(EC_OK, legacy_ec);
+    EXPECT_TRUE(legacy.locations().cache_locations_view().empty());
+
+    const CacheManager::StorageReplicaRequirement requirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 2};
+    std::vector<std::string> sessions;
+    for (int i = 0; i < 2; ++i) {
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+        ASSERT_EQ(EC_OK, ec);
+        const auto &locations = info.locations().cache_locations_view();
+        ASSERT_EQ(1u, locations.size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, locations[0].type());
+        EXPECT_EQ("hot_01", DataStorageUri(locations[0].location_specs()[0].uri()).GetHostName());
+        sessions.push_back(info.write_session_id());
+    }
+    // Registered WRITING locations satisfy the threshold before Finish.
+    auto [writing_ec, writing] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, writing_ec);
+    EXPECT_TRUE(writing.locations().cache_locations_view().empty());
+    for (const auto &session : sessions) {
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session, BlockMaskOffset{1}));
+    }
+    // Once satisfied, exhausted allocation quota must not reject this request.
+    auto quota = group->quota();
+    quota.set_capacity(0);
+    group->set_quota(quota);
+    auto [done_ec, done] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, done_ec);
+    EXPECT_TRUE(done.locations().cache_locations_view().empty());
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    std::vector<CacheLocationMap> maps;
+    ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {42}, BlockMaskOffset{0}, maps));
+    ASSERT_EQ(1u, maps.size());
+    EXPECT_EQ(102u, maps[0].size());
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementPreservesStatesAndBatchMask) {
+    registry_manager_->instance_group_configs_.at("default")->set_storage_candidates({"hot_01", "cold_01"});
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    const std::vector<CacheLocationStatus> states{CLS_WRITING, CLS_NOT_FOUND, CLS_NEW, CLS_DELETING, CLS_SERVING};
+    const CacheManager::KeyVector keys{900, 901, 902, 903, 904, 905};
+    for (size_t i = 0; i < states.size(); ++i) {
+        for (const auto &storage : {"hot_01", "cold_01"}) {
+            auto loc = std::make_shared<CacheLocation>(
+                DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                1,
+                std::vector<LocationSpec>{LocationSpec("tp0", std::string("dummy://") + storage + "/state?size=1")});
+            std::vector<std::string> ids;
+            ASSERT_EQ(EC_OK, BatchAddLocationForTest(searcher, request_context_.get(), {keys[i + 1]}, {loc}, ids));
+            if (states[i] != CLS_WRITING) {
+                std::vector<std::vector<ErrorCode>> results;
+                ASSERT_EQ(
+                    EC_OK,
+                    searcher->BatchCASLocationStatus(request_context_.get(),
+                                                     {keys[i + 1]},
+                                                     {{MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, states[i]}}},
+                                                     results));
+                ASSERT_EQ(EC_OK, results.at(0).at(0));
+            }
+        }
+    }
+    // Count both same-type backends. Preserve legacy state decisions and the
+    // non-suffix write mask, without changing the shared predicate.
+    for (const auto target :
+         {std::optional<DataStorageType>{}, std::optional<DataStorageType>{DataStorageType::DATA_STORAGE_TYPE_DUMMY}}) {
+        CacheManager::KeyVector new_keys;
+        std::vector<std::string_view> new_groups;
+        std::vector<std::string> new_targets;
+        BlockMask mask;
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FilterWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   searcher.get(),
+                                                   keys,
+                                                   new_keys,
+                                                   {},
+                                                   new_groups,
+                                                   mask,
+                                                   2,
+                                                   new_targets,
+                                                   target));
+        EXPECT_EQ((CacheManager::KeyVector{900, 902}), new_keys);
+        ASSERT_TRUE(std::holds_alternative<BlockMaskVector>(mask));
+        EXPECT_EQ((BlockMaskVector{false, true, false, true, true, true}), std::get<BlockMaskVector>(mask));
+    }
+
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "storage_replica_other",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto [ec, info] = cache_manager_->StartWriteCache(
+        request_context_.get(),
+        "storage_replica_other",
+        {901},
+        {},
+        {},
+        600,
+        0,
+        CacheManager::StorageReplicaRequirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1});
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_EQ(1u, info.locations().cache_locations_view().size());
+}
+
+TEST_F(CacheManagerTest, TestExcludedStorageReplicasCountAcrossTypes) {
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    group->set_storage_candidates({"nfs_01", "hot_01"});
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    for (auto type : {DataStorageType::DATA_STORAGE_TYPE_NFS, DataStorageType::DATA_STORAGE_TYPE_DUMMY}) {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, Requirement{type, 1});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset{1}));
+    }
+    Requirement requirement{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+        2,
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_TRUE(info.locations().cache_locations_view().empty());
+
+    // Excluding an existing NFS copy requires one more Dummy copy, and also
+    // excludes NFS from allocation despite its first position in the candidate list.
+    requirement.excluded_storage_types.push_back(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    auto [write_ec, write] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, write_ec);
+    ASSERT_EQ(1u, write.locations().cache_locations_view().size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, write.locations().cache_locations_view()[0].type());
+    auto [skip_ec, skip] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skip.locations().cache_locations_view().empty());
+}
+
+TEST_F(CacheManagerTest, TestExcludedStorageReplicasHonorMarkOutsideCandidates) {
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    group->set_storage_candidates({"nfs_01"});
+    auto [seed_ec, seed] = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600);
+    ASSERT_EQ(EC_OK, seed_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", seed.write_session_id(), BlockMaskOffset{1}));
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    const std::string host = "192.168.10.42:8080";
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeSnapshotRequest(host, {{43, "replica"}}), "excluded_mark_seed").first);
+    EnableTieredMigrationStrategy("default", "nfs_01", "hot_01");
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("test_instance", {42, 43}, "hot_01"));
+    const CacheManager::StorageReplicaRequirement requirement{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+        1,
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42, 43}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &locations = info.locations().cache_locations_view();
+    ASSERT_EQ(2u, locations.size());
+    for (const auto &loc : locations) {
+        EXPECT_EQ("hot_01", DataStorageUri(loc.location_specs()[0].uri()).GetHostName());
+    }
+    // Both the already-satisfied key and the EventReport-only key use the Mark
+    // target, which is intentionally outside ordinary storage_candidates.
+    auto [writing_ec, writing] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42, 43}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, writing_ec);
+    EXPECT_TRUE(writing.locations().cache_locations_view().empty());
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset{2}));
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->BatchGetTieredWriteTargets("test_instance", {42, 43}, marks));
+    ASSERT_EQ(2u, marks.size());
+    EXPECT_FALSE(marks[0].HasValidMark());
+    EXPECT_FALSE(marks[1].HasValidMark());
+
+    // Once the source is gone, the destination alone still satisfies the count.
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    std::vector<CacheLocationMap> maps;
+    ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {42}, BlockMaskOffset{0}, maps));
+    for (const auto &[id, loc] : maps.at(0)) {
+        if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_NFS) {
+            std::vector<std::vector<ErrorCode>> results;
+            ASSERT_EQ(
+                EC_OK,
+                searcher->BatchCASLocationStatus(request_context_.get(),
+                                                 {42},
+                                                 {{MetaSearcher::LocationCASTask{id, CLS_SERVING, CLS_NOT_FOUND}}},
+                                                 results));
+            ASSERT_EQ(EC_OK, results.at(0).at(0));
+        }
+    }
+    auto [done_ec, done] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42, 43}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, done_ec);
+    EXPECT_TRUE(done.locations().cache_locations_view().empty());
+}
+
+TEST_F(CacheManagerTest, TestExcludedStorageReplicasKeepBlockedOrExcludedMark) {
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    group->set_storage_candidates({"nfs_01", "hot_01"});
+    auto [seed_ec, seed] = cache_manager_->StartWriteCache(request_context_.get(),
+                                                           "test_instance",
+                                                           {42},
+                                                           {},
+                                                           {},
+                                                           600,
+                                                           0,
+                                                           Requirement{DataStorageType::DATA_STORAGE_TYPE_NFS, 1});
+    ASSERT_EQ(EC_OK, seed_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", seed.write_session_id(), BlockMaskOffset{1}));
+    EnableTieredMigrationStrategy("default", "nfs_01", "hot_01");
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("test_instance", {42}, "hot_01"));
+
+    Requirement excluded{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_DUMMY}};
+    auto [skip_ec, skip] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, excluded);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skip.locations().cache_locations_view().empty());
+    excluded.min_location_count = 2;
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, excluded);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, info.locations().cache_locations_view()[0].type());
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset{1}));
+
+    auto quota = group->quota();
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_DUMMY)});
+    group->set_quota(quota);
+    Requirement blocked{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 2, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}};
+    auto [blocked_ec, blocked_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, blocked);
+    ASSERT_EQ(EC_OK, blocked_ec);
+    EXPECT_TRUE(blocked_info.locations().cache_locations_view().empty());
+    blocked.min_location_count = 3;
+    auto [fallback_ec, fallback] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, blocked);
+    ASSERT_EQ(EC_OK, fallback_ec);
+    ASSERT_EQ(1u, fallback.locations().cache_locations_view().size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, fallback.locations().cache_locations_view()[0].type());
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->BatchGetTieredWriteTargets("test_instance", {42}, marks));
+    ASSERT_EQ(1u, marks.size());
+    EXPECT_TRUE(marks[0].HasValidMark());
+    EXPECT_EQ("hot_01", marks[0].target);
+}
+
+class StorageReplicaIdentityTest : public CacheManagerTest {
+    class Hf3fsIdentityBackend : public MightExistInterceptor {
+    public:
+        Hf3fsIdentityBackend(std::shared_ptr<DataStorageBackend> delegate, DataStorageType configured_type)
+            : MightExistInterceptor(delegate, [](const auto &uris) { return std::vector<bool>(uris.size(), true); }) {
+            config_ = delegate->GetStorageConfig();
+            config_.set_type(configured_type);
+        }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_HF3FS; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+    };
+
+public:
+    void SetUp() override {
+        CacheManagerTest::SetUp();
+        auto dsm = registry_manager_->data_storage_manager();
+        for (const auto &[name, type] : std::vector<std::pair<std::string, DataStorageType>>{
+                 {"hot_01", DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS},
+                 {"cold_01", DataStorageType::DATA_STORAGE_TYPE_HF3FS}}) {
+            dsm->storage_map_[name] = std::make_shared<Hf3fsIdentityBackend>(dsm->storage_map_.at(name), type);
+        }
+        registry_manager_->instance_group_configs_.at("default")->set_storage_candidates({"hot_01", "cold_01"});
+    }
+};
+
+TEST_F(StorageReplicaIdentityTest, CountsConfiguredTypesWithoutChangingLocationProtocol) {
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    const std::vector<std::pair<Requirement, std::string>> cases{
+        {{DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 1}, "hot_01"},
+        {{DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1}, "cold_01"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 2, {DataStorageType::DATA_STORAGE_TYPE_HF3FS}}, "hot_01"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 2, {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS}}, "cold_01"},
+    };
+    for (const auto &[requirement, backend] : cases) {
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        const auto &location = info.locations().cache_locations_view()[0];
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, location.type());
+        EXPECT_EQ(backend, DataStorageUri(location.location_specs()[0].uri()).GetHostName());
+        auto [writing_ec, writing] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+        ASSERT_EQ(EC_OK, writing_ec);
+        EXPECT_TRUE(writing.locations().cache_locations_view().empty());
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset{1}));
+        auto [skip_ec, skip] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+        ASSERT_EQ(EC_OK, skip_ec);
+        EXPECT_TRUE(skip.locations().cache_locations_view().empty());
+    }
+    auto [old_ec, old] = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 4);
+    ASSERT_EQ(EC_OK, old_ec);
+    EXPECT_TRUE(old.locations().cache_locations_view().empty());
+    auto [legacy_ec, legacy] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {43}, {}, {}, 600);
+    ASSERT_EQ(EC_OK, legacy_ec);
+    ASSERT_EQ(1u, legacy.locations().cache_locations_view().size());
+    EXPECT_EQ("hot_01",
+              DataStorageUri(legacy.locations().cache_locations_view()[0].location_specs()[0].uri()).GetHostName());
+}
+
+TEST_F(StorageReplicaIdentityTest, MarkExclusionsUseConfiguredTypeAndPreserveFinishRules) {
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    registry_manager_->instance_group_configs_.at("default")->set_storage_candidates({"nfs_01"});
+    auto [seed_ec, seed] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42, 43}, {}, {}, 600);
+    ASSERT_EQ(EC_OK, seed_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", seed.write_session_id(), BlockMaskOffset{2}));
+    EnableTieredMigrationStrategy("default", "nfs_01", "hot_01");
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("test_instance", {42, 43}, "hot_01"));
+
+    Requirement exclude_vcns{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS}};
+    auto [skip_ec, skip] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, exclude_vcns);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skip.locations().cache_locations_view().empty());
+    exclude_vcns.min_location_count = 2;
+    auto [fallback_ec, fallback] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, exclude_vcns);
+    ASSERT_EQ(EC_OK, fallback_ec);
+    ASSERT_EQ(1u, fallback.locations().cache_locations_view().size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, fallback.locations().cache_locations_view()[0].type());
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", fallback.write_session_id(), BlockMaskOffset{1}));
+
+    const Requirement exclude_hf3fs{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_HF3FS}};
+    auto [mark_ec, mark] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {43}, {}, {}, 600, 0, exclude_hf3fs);
+    ASSERT_EQ(EC_OK, mark_ec);
+    ASSERT_EQ(1u, mark.locations().cache_locations_view().size());
+    EXPECT_EQ("hot_01",
+              DataStorageUri(mark.locations().cache_locations_view()[0].location_specs()[0].uri()).GetHostName());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, mark.locations().cache_locations_view()[0].type());
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", mark.write_session_id(), BlockMaskOffset{1}));
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->BatchGetTieredWriteTargets("test_instance", {42, 43}, marks));
+    ASSERT_EQ(2u, marks.size());
+    EXPECT_TRUE(marks[0].HasValidMark());
+    EXPECT_FALSE(marks[1].HasValidMark());
+}
+
+TEST_F(StorageReplicaIdentityTest, UnresolvedIdentityDoesNotGuessHf3fsOrVcns) {
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "hf3fs://removed_backend/block?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(searcher, request_context_.get(), {42}, {location}, ids));
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    const std::vector<Requirement> requirements{
+        {DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1},
+        {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 1},
+        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_HF3FS}},
+        {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS}},
+    };
+    for (const auto &requirement : requirements) {
+        CacheManager::KeyVector new_keys;
+        std::vector<std::string_view> groups;
+        std::vector<std::string> targets;
+        BlockMask mask;
+        const auto target = requirement.storage_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
+                                ? std::nullopt
+                                : std::optional<DataStorageType>{requirement.storage_type};
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FilterWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   searcher.get(),
+                                                   {42},
+                                                   new_keys,
+                                                   {},
+                                                   groups,
+                                                   mask,
+                                                   1,
+                                                   targets,
+                                                   target,
+                                                   requirement.excluded_storage_types));
+        EXPECT_EQ((CacheManager::KeyVector{42}), new_keys);
+    }
+    // An EventReport-only exclusion does not need to distinguish the two identities.
+    const Requirement exclude_events{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, exclude_events);
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_TRUE(info.locations().cache_locations_view().empty());
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementValidation) {
+    using Requirement = CacheManager::StorageReplicaRequirement;
+    const std::vector<std::pair<Requirement, std::string>> invalid{
+        {{}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 0}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, -1}, "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 1}, "cannot target EventReport"},
+        {{DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1}, "cannot target EventReport"},
+        {{DataStorageType::COUNT, 1}, "storage_type is unknown"},
+        {{static_cast<DataStorageType>(255), 1}, "storage_type is unknown"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {}}, "is required"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
+         "min_location_count must be positive"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN}},
+         "excluded_storage_types contains an unspecified or unknown type"},
+        {{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1, {DataStorageType::COUNT}},
+         "excluded_storage_types contains an unspecified or unknown type"},
+        {{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}},
+         "mutually exclusive"},
+    };
+    for (const auto &[requirement, message] : invalid) {
+        RequestContext context("replica-validation");
+        EXPECT_EQ(EC_BADARGS,
+                  cache_manager_->StartWriteCache(&context, "test_instance", {42}, {}, {}, 600, 0, requirement).first);
+        EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find(message));
+    }
+    for (int32_t old_count : {-1, 1, 2}) {
+        RequestContext context("replica-old-count-validation");
+        EXPECT_EQ(EC_BADARGS,
+                  cache_manager_
+                      ->StartWriteCache(&context,
+                                        "test_instance",
+                                        {42},
+                                        {},
+                                        {},
+                                        600,
+                                        old_count,
+                                        Requirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1})
+                      .first);
+        EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find("requires min_replica_count=0"));
+    }
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementRepeatedExclusions) {
+    CacheManager::StorageReplicaRequirement requirement{
+        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+        1,
+        std::vector<DataStorageType>(4096, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    auto [skip_ec, skipped] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skipped.locations().cache_locations_view().empty());
+
+    // Validate the entire input even after every legal type has been seen.
+    for (size_t type = 1; type < static_cast<size_t>(DataStorageType::COUNT); ++type) {
+        requirement.excluded_storage_types.push_back(static_cast<DataStorageType>(type));
+    }
+    requirement.excluded_storage_types.push_back(DataStorageType::COUNT);
+    RequestContext context("replica-invalid-exclusion-tail");
+    EXPECT_EQ(EC_BADARGS,
+              cache_manager_->StartWriteCache(&context, "test_instance", {43}, {}, {}, 600, 0, requirement).first);
+    EXPECT_NE(std::string::npos, context.error_tracer()->ToJsonString().find("excluded_storage_types"));
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementPreservesSpecGroups) {
+    registry_manager_->instance_group_configs_.at("default")->set_storage_candidates({"hot_01"});
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "storage_specs",
+                                     64,
+                                     {LocationSpecInfo("tp0_F", 512), LocationSpecInfo("tp0_L", 512)},
+                                     createModelDeployment(),
+                                     {LocationSpecGroup("F", {"tp0_F"}),
+                                      LocationSpecGroup("L", {"tp0_L"}),
+                                      LocationSpecGroup("FL", {"tp0_F", "tp0_L"})})
+                  .first);
+    const CacheManager::StorageReplicaRequirement requirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1};
+    auto [full_ec, full] =
+        cache_manager_->StartWriteCache(request_context_.get(), "storage_specs", {42}, {}, {"F"}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, full_ec);
+    ASSERT_EQ(1u, full.locations().cache_locations_view().size());
+    EXPECT_EQ(1, full.locations().cache_locations_view()[0].spec_size());
+    for (const std::vector<std::string> &groups : {std::vector<std::string>{}, std::vector<std::string>{""}}) {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "storage_specs", {42}, {}, groups, 600, 0, requirement);
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_TRUE(info.locations().cache_locations_view().empty());
+    }
+    auto [linear_ec, linear] =
+        cache_manager_->StartWriteCache(request_context_.get(), "storage_specs", {42}, {}, {"L"}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, linear_ec);
+    ASSERT_EQ(1u, linear.locations().cache_locations_view().size());
+    EXPECT_EQ("tp0_L", linear.locations().cache_locations_view()[0].location_specs()[0].name());
+    auto [both_ec, both] =
+        cache_manager_->StartWriteCache(request_context_.get(), "storage_specs", {42}, {}, {"FL"}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, both_ec);
+    ASSERT_EQ(1u, both.locations().cache_locations_view().size());
+    EXPECT_EQ(2, both.locations().cache_locations_view()[0].spec_size());
+}
+
+TEST_F(CacheManagerTest, TestStorageReplicaRequirementKeepsMarkAndFinishRules) {
+    auto [seed_ec, seed] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42, 43}, {}, {}, 600);
+    ASSERT_EQ(EC_OK, seed_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", seed.write_session_id(), BlockMaskOffset{2}));
+    EnableTieredMigrationStrategy();
+    registry_manager_->instance_group_configs_.at("default")->set_storage_candidates({"hot_01", "cold_01"});
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("test_instance", {42}, "cold_01"));
+    const CacheManager::StorageReplicaRequirement requirement{DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    EXPECT_EQ("hot_01",
+              DataStorageUri(info.locations().cache_locations_view()[0].location_specs()[0].uri()).GetHostName());
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset{1}));
+    auto [skip_ec, skip] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {42}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, skip_ec);
+    EXPECT_TRUE(skip.locations().cache_locations_view().empty());
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->BatchGetTieredWriteTargets("test_instance", {42}, marks));
+    ASSERT_EQ(1u, marks.size());
+    EXPECT_TRUE(marks[0].HasValidMark());
+    EXPECT_EQ("cold_01", marks[0].target);
+
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("test_instance", {43}, "hot_01"));
+    auto [same_ec, same] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {43}, {}, {}, 600, 0, requirement);
+    ASSERT_EQ(EC_OK, same_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", same.write_session_id(), BlockMaskOffset{1}));
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->BatchGetTieredWriteTargets("test_instance", {43}, marks));
+    ASSERT_EQ(1u, marks.size());
+    EXPECT_FALSE(marks[0].HasValidMark());
+}
+
 TEST_F(CacheManagerTest, TestStartWriteCacheWithLocationSpecGroup) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     std::vector<LocationSpecInfo> location_spec_infos = {
