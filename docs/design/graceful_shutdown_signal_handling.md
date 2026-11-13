@@ -123,8 +123,10 @@ graph TD
       → 主线程 WaitForShutdownRequest() 返回
       → Finish():
           Server::Stop()（std::call_once）
-            leader_elector_->Stop()（撤销资格 → 关门禁 → 排空 → 清理 → 释放锁）
-            → optimizer 订阅关闭 → gRPC Shutdown → HTTP Stop → Metrics 线程 Stop
+            两个 redis 健康探测 RequestStop()（先让探测循环退出，稍后再 join）
+            → leader_elector_->Stop()（撤销资格 → 关门禁 → 排空 → 清理 → 释放锁）
+            → optimizer 订阅关闭 → gRPC Shutdown → HTTP Stop
+            → role_state / metrics_report / redis_health / coordination_redis_health 四个 LoopThread 依次 Stop
           Server::Wait()（join HTTP 线程；gRPC Wait 立即返回）
           server_.reset()（销毁 service / manager，此时其依赖仍有效）
           controller_.Stop()（join 控制线程）
@@ -146,7 +148,7 @@ graph TD
 | `controller_.Stop()` 早于 `DestroyLogger()` | 控制线程在强制退出路径上还要打 WARN 日志 |
 | `Server::Stop()` 只执行一次完整关闭 | `std::call_once`：重复或并发的关闭请求（信号路径与启动失败路径同时触发）由其余调用者等待该次关闭完成后返回，不产生并发的组件 Stop / join |
 
-`Server::Stop()` 内部的组件关闭顺序、日志文案与 `Server::Wait()` / `Server::OnNoLongerLeader()` 在本次改造中均未变动，变的只是「谁来调用」。
+`Server::Stop()` 内部的组件关闭顺序与日志文案不属于本次改造范围（含 redis 健康探测的 `RequestStop()` 与四个 LoopThread 停止点），变的只是「谁来调用」与「只完整执行一次」。`Server::Wait()` / `Server::OnNoLongerLeader()` 同样未改动。
 
 ### 6.2 边界情况
 
@@ -200,6 +202,7 @@ memory backend 的测试 server 优雅关闭只需约 1.2ms，用「轮询日志
 - **Metrics 线程没有单独的定向投递用例**：新设计下退出信号全进程阻塞，任何线程都不可能成为信号落点并执行 handler；该不变量由掩码继承用例与 `/proc/<pid>/status` 核验覆盖（Metrics 线程在掩码生效之后才创建，必然继承）。
 - **`ForceExitSignal()` 实际不可观测**：写入后控制线程立即 `_exit()`，任何调用方都读不到该值，目前也无调用方。
 - **`Start()` 与 `Stop()` 并发时存在理论窗口**：`Start()` 先置已启动标志再创建线程，若与 `Stop()` 并发，`Stop()` 可能在线程对象赋值前就返回，随后赋值的 joinable 线程无人 join，析构会 `std::terminate`。当前只有主线程串行调用 `Start()` / `Stop()`，不可触发；后续可把标志更新移到线程对象赋值之后。
+- **`Server` 不再暴露可读的「已停止」标志**：`stop_` 布尔换成 `std::once_flag` 后，外部无法查询关闭是否已发生（这是有意的：可读标志会诱使调用方用「读标志 + 早退」代替等待）。需要判断 server 是否已停的测试改为观察关闭路径会停掉的 LoopThread，例如 `service/test/server_redis_health_metrics_test.cc` 读 `metrics_report_thread_->is_running_`。不要为了这类检查在 `Server` 上重新加布尔标志。
 - **`Stop()` 最多引入一个轮询周期（100ms）的关闭延迟**：这是有意的取舍，用它换取控制线程始终停在 `sigtimedwait` 上、能立刻捕获重复信号。
 
 ## 10. 相关文件
