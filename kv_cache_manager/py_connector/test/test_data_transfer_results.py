@@ -24,6 +24,12 @@ import torch
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager,
     MultiResult,
+    StagingShape,
+    group_meta_pinned_bytes,
+    group_meta_shape,
+    plan_staging_pools,
+    staging_shape,
+    total_pinned_bytes,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer
@@ -390,10 +396,6 @@ class TestAbstainedVerdicts(unittest.TestCase):
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStagingPool(unittest.TestCase):
     """_StagingPool: contiguous-run slot management with backpressure.
 
@@ -486,51 +488,526 @@ class TestStagingPool(unittest.TestCase):
 
 
 class TestPoolByteCap(unittest.TestCase):
-    """_effective_pool_blocks: per-group sizing under the pinned-RAM ceiling.
+    """_effective_pool_blocks: slots per staging arena under the pinned ceiling.
 
     Found by the final-validation e2e smoke: a fixed 1024-block count was
     tuned for full-attention blocks (~0.875 MiB each) but hybrid blocks are
     ~17.3 MiB, so four groups pinned ~68 GiB of host RAM and engine start
-    died in the pinned allocator. Pinned here: the count is derived per
-    group from the byte cap, and one full task batch always fits.
+    died in the pinned allocator. The count is derived from the byte cap, and
+    the cap is now a *hard* budget: it shrinks the pool (and the task batches
+    riding on it, see DataTransferManager.save_task_blocks) instead of being
+    silently breached by the old `max(need, ...)` floor.
     """
 
-    def _f(self, configured, need, block_bytes, max_bytes):
+    def _f(self, configured, slot_bytes, max_bytes):
         from kv_cache_manager.py_connector.vllm.data_transfer import (
             _effective_pool_blocks,
         )
 
-        return _effective_pool_blocks(configured, need, block_bytes, max_bytes)
+        return _effective_pool_blocks(configured, slot_bytes, max_bytes)
 
     def test_full_attention_blocks_keep_the_configured_count(self):
         # 1024 x 0.875 MiB ~= 896 MiB <= 1 GiB cap: unchanged sizing (the
         # validated origin/main concurrency of 8 full tasks in flight).
-        self.assertEqual(self._f(1024, 128, 917_504, 2**30), 1024)
+        self.assertEqual(self._f(1024, 917_504, 2**30), 1024)
 
-    def test_hybrid_blocks_cap_by_bytes(self):
-        # 17.3 MiB blocks: 1024 would pin ~17.3 GiB per group; a cap that
-        # allows more than one task batch caps to cap // block_bytes.
-        block_bytes = 17_301_504
-        self.assertEqual(
-            self._f(1024, 128, block_bytes, 8 * 2**30), 8 * 2**30 // block_bytes
+    def test_cap_decides_for_large_blocks(self):
+        # 17.3 MiB slots: 1024 would pin ~17.3 GiB, so the cap rules.
+        self.assertEqual(self._f(1024, 17_301_504, 2**30), 62)
+
+    def test_configured_count_is_an_upper_bound(self):
+        self.assertEqual(self._f(256, 917_504, 2**30), 256)
+
+    def test_slot_must_fit_the_cap(self):
+        # A cap that cannot pay for one slot is a startup error, not a floor:
+        # the old code pinned 128 such slots (= 2x the cap) and warned.
+        with self.assertRaises(ValueError) as cm:
+            self._f(1024, 17_301_504, 16 * 2**20)
+        self.assertIn("staging_pool_max_bytes_per_group", str(cm.exception))
+
+    def test_degenerate_inputs_rejected(self):
+        with self.assertRaises(ValueError):
+            self._f(0, 1024, 2**30)
+        with self.assertRaises(ValueError):
+            self._f(1024, 0, 2**30)
+
+
+# --------------------------------------------------------------------------- #
+# Staging arenas: shape keying, pinned totals, sharing
+#
+# The geometries below are the ones the research pinned down on real configs
+# (05 §2.1, data/pin/sa-c/c3_output.txt) and the Qwen3.5-4B e2e logs. The
+# numbers are the acceptance numbers of this PR: the arenas must collapse to
+# one shape per model family and the pinned total must land on the budget.
+# --------------------------------------------------------------------------- #
+MBS = 16  # manager block size of the gemma/gpt-oss/qwen e2e configurations
+QWEN35_MBS = 528  # Qwen3.5-4B: manager == vLLM scheduler block size
+KV_DTYPE = torch.bfloat16  # only ever compared, never interpreted
+
+
+def _attn_meta(idx: int, layers, page_bytes: int, block_size: int = MBS):
+    """An attention GroupMeta whose per_block_bytes is built the way
+    vllm_common.parse_groups builds it: per-token bytes * mbs * layers."""
+    from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
+
+    return AttentionGroupMeta(
+        group_idx=idx,
+        layer_names=[f"a{idx}_{i}" for i in range(layers)],
+        block_size=block_size,
+        per_block_bytes=(page_bytes // block_size) * block_size * layers,
+        page_bytes=page_bytes,
+    )
+
+
+def _state_meta(idx: int, layers, page_size_bytes: int, block_size: int):
+    from kv_cache_manager.py_connector.vllm.vllm_common import StateGroupMeta
+
+    return StateGroupMeta(
+        group_idx=idx,
+        layer_names=[f"s{idx}_{i}" for i in range(layers)],
+        block_size=block_size,
+        per_block_bytes=page_size_bytes * layers,
+        page_size_bytes=page_size_bytes,
+    )
+
+
+def _plan(metas, *, dtype=KV_DTYPE, configured_blocks=1024, cap=2**30):
+    return plan_staging_pools(
+        [group_meta_shape(m, dtype) for m in metas],
+        configured_blocks=configured_blocks,
+        max_bytes_per_pool=cap,
+    )
+
+
+class TestStagingShapes(unittest.TestCase):
+    """One bucket's staging shape, from the worker's and the planner's view."""
+
+    def test_attention_shape_is_per_token_of_one_layer(self):
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            AttentionTransferGroup,
         )
 
-    def test_hybrid_default_cap_floors_at_one_task_batch(self):
-        # With the 1 GiB default the byte cap alone would allow only 62
-        # blocks (< one 128-block task batch); the batch must still fit
-        # contiguously, so the effective size is the batch -- the same
-        # configuration the staging-removal campaign validated for hybrid.
-        self.assertEqual(self._f(1024, 128, 17_301_504, 2**30), 128)
+        group = AttentionTransferGroup(
+            group_idx=0,
+            spec_name="tp0_g0",
+            layer_names=["l0"] * 8,
+            block_size=528,
+            per_block_bytes=17_301_504,
+            layer_num=8,
+            kv_layout=KVLayout.MLA_3D,
+            kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+            num_kv_ptrs=8,
+            per_token_dim=1024,
+            kernel_block_size=528,
+            block_stride=0,
+            dtype=KV_DTYPE,
+        )
+        shape = staging_shape(group, QWEN35_MBS, KV_DTYPE)
+        self.assertEqual(shape.per_token_bytes, 4096)
+        self.assertEqual(shape.per_block_bytes, 17_301_504)
+        self.assertIs(shape.dtype, KV_DTYPE)
 
-    def test_one_task_batch_always_fits(self):
-        # Even when the byte cap is smaller than one task batch, the batch
-        # must still fit contiguously (contiguity invariant); the caller
-        # warns that the cap was exceeded.
-        self.assertEqual(self._f(1024, 128, 17_301_504, 128 * 1024), 128)
+    def test_worker_and_planner_views_agree(self):
+        """The e2e/kvperf gate recomputes the pinned total from GroupMetas; it
+        must see exactly the shape the worker built its arena from."""
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            AttentionTransferGroup,
+            StateTransferGroup,
+        )
 
-    def test_byte_cap_can_only_shrink_not_grow(self):
-        # A configured count below the byte cap is authoritative.
-        self.assertEqual(self._f(256, 128, 917_504, 2**30), 256)
+        meta = _state_meta(0, 8, 2_162_688, QWEN35_MBS)
+        group = StateTransferGroup(
+            group_idx=0,
+            spec_name="tp0_g0",
+            layer_names=list(meta.layer_names),
+            block_size=meta.block_size,
+            per_block_bytes=meta.per_block_bytes,
+            layer_num=8,
+            block_view_tensors=[],
+            page_size_bytes=meta.page_size_bytes,
+        )
+        self.assertEqual(
+            staging_shape(group, QWEN35_MBS, KV_DTYPE),
+            group_meta_shape(meta, KV_DTYPE),
+        )
+        attn_meta = _attn_meta(3, 8, 2_162_688, QWEN35_MBS)
+        attn_group = AttentionTransferGroup(
+            group_idx=3,
+            spec_name="tp0_g3",
+            layer_names=list(attn_meta.layer_names),
+            block_size=attn_meta.block_size,
+            per_block_bytes=attn_meta.per_block_bytes,
+            layer_num=8,
+            kv_layout=KVLayout.PACKED_4D,
+            kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+            num_kv_ptrs=8,
+            per_token_dim=1024,
+            kernel_block_size=attn_meta.block_size,
+            block_stride=0,
+            dtype=KV_DTYPE,
+        )
+        self.assertEqual(
+            staging_shape(attn_group, QWEN35_MBS, KV_DTYPE),
+            group_meta_shape(attn_meta, KV_DTYPE),
+        )
+
+
+class TestPinnedTotals(unittest.TestCase):
+    """GroupMeta list -> staging arenas -> pinned bytes, per research model.
+
+    Column `shapes` is the number of arenas (the old per-group pools are the
+    "before" column of the design's reconciliation table), `pinned` the exact
+    allocation the engine logs -- the e2e/kvperf gates compare against the very
+    same `total_pinned_bytes`/`plan_staging_pools` implementation.
+    """
+
+    MODELS = {
+        # model: (metas, shapes, pinned bytes, one-line reason)
+        "Qwen2.5-7B full attention": (
+            [_attn_meta(0, 28, 32_768)],
+            1,
+            1_024 * 917_504,
+            "single bucket: 1024 x 0.875 MiB, unchanged by this PR",
+        ),
+        "Qwen3.5-4B hybrid": (
+            [
+                _state_meta(0, 8, 2_162_688, QWEN35_MBS),
+                _state_meta(1, 8, 2_162_688, QWEN35_MBS),
+                _state_meta(2, 8, 2_162_688, QWEN35_MBS),
+                _attn_meta(3, 8, 2_162_688, QWEN35_MBS),
+            ],
+            1,
+            62 * 17_301_504,
+            "3 state + 1 attention buckets of one shape: 62 slots, 0.999 GiB",
+        ),
+        "gemma-3-4b-it": (
+            [_attn_meta(i, 5, 65_536) for i in range(5)]
+            + [_attn_meta(5, 4, 65_536), _attn_meta(6, 5, 65_536)],
+            1,
+            1_024 * 327_680,
+            "uneven SWA layer counts [5,5,5,5,5,4]+[5]: one arena",
+        ),
+        "gemma-3-12b-it": (
+            [_attn_meta(i, 8, 131_072) for i in range(6)],
+            1,
+            1_024 * 1_048_576,
+            "6 equal buckets",
+        ),
+        "gemma-3-27b-it": (
+            [_attn_meta(i, 9, 131_072) for i in range(4)]
+            + [_attn_meta(4, 8, 131_072), _attn_meta(5, 8, 131_072)]
+            + [_attn_meta(6, 10, 131_072)],
+            1,
+            819 * 1_310_720,
+            "three per_block tiers collapse onto the 10-layer full bucket",
+        ),
+        "gemma-2-9b-it": (
+            [_attn_meta(0, 21, 131_072), _attn_meta(1, 21, 131_072)],
+            1,
+            390 * 2_752_512,
+            "1:1 pair, 2.625 MiB blocks",
+        ),
+        "gpt-oss-20b": (
+            [_attn_meta(0, 12, 32_768), _attn_meta(1, 12, 32_768)],
+            1,
+            1_024 * 393_216,
+            "1:1 win128 pair",
+        ),
+        "gpt-oss-120b": (
+            [_attn_meta(0, 18, 32_768), _attn_meta(1, 18, 32_768)],
+            1,
+            1_024 * 589_824,
+            "1:1 win128 pair, larger",
+        ),
+    }
+
+    def test_reconciliation_table(self):
+        for name, (metas, shapes, pinned, why) in self.MODELS.items():
+            with self.subTest(model=name):
+                plans = _plan(metas)
+                self.assertEqual(len(plans), shapes, why)
+                self.assertEqual(total_pinned_bytes(plans), pinned, why)
+                # The one call an e2e/kvperf gate needs: GroupMeta list in,
+                # the logged pinned total out.
+                self.assertEqual(
+                    group_meta_pinned_bytes(
+                        metas,
+                        KV_DTYPE,
+                        configured_blocks=1024,
+                        max_bytes_per_pool=2**30,
+                    ),
+                    pinned,
+                    why,
+                )
+
+    def test_budgets_of_the_pr_acceptance(self):
+        # 04 §3.3 pinned gates: gemma-3-4b <= 0.4 GiB, Qwen3.5-4B <= 1 GiB.
+        self.assertLessEqual(
+            total_pinned_bytes(_plan(self.MODELS["gemma-3-4b-it"][0])), 0.4 * 2**30
+        )
+        self.assertLessEqual(
+            total_pinned_bytes(_plan(self.MODELS["Qwen3.5-4B hybrid"][0])), 2**30
+        )
+
+    def test_single_group_model_keeps_its_pool_parameters(self):
+        """Byte-equivalence argument (design D6): one bucket, a cap that pays
+        for the configured count -> same slots, same slot size, same task
+        batch as the per-group implementation."""
+        plans = _plan(self.MODELS["Qwen2.5-7B full attention"][0])
+        (plan,) = plans
+        self.assertEqual(plan.blocks, 1024)
+        self.assertEqual(plan.slot_bytes, 917_504)
+        self.assertEqual(plan.members, (0,))
+
+    def test_uneven_layer_counts_share_one_arena(self):
+        """M2 regression pin: keying by per_block would take two arenas here
+        (0.3125 vs 0.25 MiB blocks) and three for gemma-3-27b."""
+        four_b = self.MODELS["gemma-3-4b-it"][0]
+        self.assertEqual(len({m.per_block_bytes for m in four_b}), 2)
+        self.assertEqual(len(_plan(four_b)), 1)
+        twenty_seven = self.MODELS["gemma-3-27b-it"][0]
+        self.assertEqual(len({m.per_block_bytes for m in twenty_seven}), 3)
+        self.assertEqual(len(_plan(twenty_seven)), 1)
+
+    def test_dtype_is_part_of_the_key(self):
+        # Same per-token geometry, different element type: separate arenas (a
+        # typed view is per bucket, but the key must not merge row shapes the
+        # deployer thinks of as different).
+        plans = plan_staging_pools(
+            [
+                StagingShape(4096, torch.bfloat16, 327_680),
+                StagingShape(4096, torch.uint8, 327_680),
+            ],
+            configured_blocks=1024,
+            max_bytes_per_pool=2**30,
+        )
+        self.assertEqual(len(plans), 2)
+        self.assertEqual([plan.members for plan in plans], [(0,), (1,)])
+
+    def test_the_pool_shrinks_before_the_cap_is_breached(self):
+        """Qwen3.5's 1 GiB cap buys 62 of its 16.5 MiB slots; the task batches
+        must then be 62 blocks (D3), not the configured 128."""
+        (plan,) = _plan(self.MODELS["Qwen3.5-4B hybrid"][0])
+        self.assertEqual(plan.blocks, 62)
+        self.assertLessEqual(plan.pinned_bytes, 2**30)
+
+
+class TestSharedArena(unittest.TestCase):
+    """Several buckets on one arena: the run allocator must keep their byte
+    ranges disjoint, hand a small-block member exactly its dense prefix, and
+    still block (never fail) when the arena is exhausted.
+
+    Only the *slot* is shared; each member's batch is a dense prefix of the run
+    it borrowed, which is what keeps the kernel/SDK "one contiguous piece of
+    memory" assumption true (design D2)."""
+
+    def _pool(self, slot_bytes=64, slots=4):
+        from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
+
+        return _StagingPool(torch.device("cpu"), slot_bytes, slots)
+
+    def test_batches_of_two_members_never_overlap(self):
+        pool = self._pool()
+        big = pool.acquire(2)  # a full-slot member
+        small = pool.acquire(2)  # a half-slot member, same arena
+        self.assertNotEqual(big, small)
+        self.assertEqual(pool._runs, [])
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(pool.acquire, 1)
+            time.sleep(0.2)
+            self.assertFalse(fut.done(), "exhausted arena must block, not fail")
+            pool.release(small, 2)
+            third = fut.result(timeout=5)
+            self.assertEqual(third, small)  # the freed run, lowest start
+            pool.release(third, 1)
+        pool.release(big, 2)
+        self.assertEqual(pool._runs, [[0, 4]])  # every slot back, merged
+
+    @unittest.skipIf(
+        "torch" in vllm_stubs.STUBBED,
+        "needs a real torch tensor (stubbed in the open-source CI)",
+    )
+    def test_small_block_member_views_only_its_dense_prefix(self):
+        pool = self._pool(slot_bytes=64, slots=4)
+        pool._cpu.zero_()  # torch.empty hands out garbage; pin *writes* only
+        start = pool.acquire(3)
+        small = pool.cpu_view(start, 3, 32)
+        self.assertEqual(small.numel(), 96)  # 3 x 32, not 3 x 64
+        self.assertEqual(small.data_ptr(), pool._cpu.data_ptr() + start * 64)
+        small.fill_(7)
+        self.assertEqual(int(pool._cpu[start * 64]), 7)
+        # Only the borrowed run is written: the slot capacity the member did
+        # not claim and the arena's other slots stay untouched, so a
+        # neighbour's bytes can never be scribbled on.
+        base = start * 64
+        unused = pool._cpu[base + 3 * 32 : base + 3 * 64]
+        self.assertEqual(int(unused.abs().sum()), 0)
+        self.assertEqual(int(pool._cpu[3 * 64 :].abs().sum()), 0)
+
+    def test_oversized_block_size_is_refused(self):
+        pool = self._pool(slot_bytes=64)
+        with self.assertRaises(ValueError):
+            pool.cpu_view(0, 1, 128)
+
+
+class TestDataTransferManagerPools(unittest.TestCase):
+    """Init wiring: one arena per shape, task batches that fit it, and the
+    machine-parseable pinned total the e2e gate parses (04 §3.3).
+
+    Fixtures: one shape with three buckets (two attention with different layer
+    counts + one state bucket, all 16 B/token/layer) and one bucket of another
+    shape (8 B/token/layer)."""
+
+    MBS = 64
+
+    def _dtm(self, groups, **overrides):
+        from kv_cache_manager.py_connector.vllm.config import (
+            TairKvCacheConnectorExtraConfig,
+        )
+        from kv_cache_manager.py_connector.vllm.transfer_types import KVCacheInfo
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        extra = TairKvCacheConnectorExtraConfig(
+            manager_uri="http://127.0.0.1:1",
+            coordinator_base_port=1,
+            instance_group="test",
+            instance_id="test",
+            **overrides,
+        )
+        info = KVCacheInfo(
+            tp_rank=0,
+            world_size=1,
+            groups=groups,
+            device=torch.device("cpu"),
+            dtype=KV_DTYPE,
+        )
+        with mock.patch.object(dt, "_get_device_module", return_value=MagicMock()):
+            return DataTransferManager(info, self.MBS, MagicMock(), MagicMock(), extra)
+
+    def _groups(self):
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            AttentionTransferGroup,
+            StateTransferGroup,
+        )
+
+        def attn(idx, name, layers, per_block):
+            return AttentionTransferGroup(
+                group_idx=idx,
+                spec_name=name,
+                layer_names=[f"{name}_{i}" for i in range(layers)],
+                block_size=self.MBS,
+                per_block_bytes=per_block,
+                layer_num=layers,
+                kv_layout=KVLayout.PACKED_4D,
+                kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+                num_kv_ptrs=layers,
+                per_token_dim=8,
+                kernel_block_size=self.MBS,
+                block_stride=0,
+                dtype=KV_DTYPE,
+            )
+
+        # 16 B/token/layer (8 dims x 2 B) makes the three buckets of the first
+        # shape 4096/2048/1024-byte blocks; the fourth bucket is 8 B/token.
+        return [
+            attn(0, "tp0_g0", 4, 4096),
+            attn(1, "tp0_g1", 2, 2048),
+            StateTransferGroup(
+                group_idx=2,
+                spec_name="tp0_g2",
+                layer_names=["s0"],
+                block_size=self.MBS,
+                per_block_bytes=1024,
+                layer_num=1,
+                block_view_tensors=[],
+                page_size_bytes=1024,
+            ),
+            attn(3, "tp0_g3", 1, 512),
+        ]
+
+    def test_one_arena_per_shape(self):
+        groups = self._groups()
+        dtm = self._dtm(
+            groups,
+            staging_pool_blocks=16,
+            staging_pool_max_bytes_per_group=16_384,  # 4 x 4096 B slots
+        )
+        shared = dtm._pools["tp0_g0"]
+        # Same per-token geometry, different layer counts (and a state bucket):
+        # one arena, sized by the largest member block.
+        self.assertIs(dtm._pools["tp0_g1"], shared)
+        self.assertIs(dtm._pools["tp0_g2"], shared)
+        self.assertIsNot(dtm._pools["tp0_g3"], shared)
+        self.assertEqual(shared.block_bytes, 4096)
+        self.assertEqual(shared.max_blocks, 4)
+        # The other shape is capped by its own slot size: 16 KiB / 512 B.
+        self.assertEqual(dtm._pools["tp0_g3"].max_blocks, 16)
+
+    def test_task_batch_shrinks_to_the_pool(self):
+        groups = self._groups()
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=128,
+            block_per_load_task=128,
+            staging_pool_blocks=8,
+            staging_pool_max_bytes_per_group=3 * 4096,  # 3 slots, not 8
+        )
+        # The cap buys 3 slots; a task stages its whole batch as one contiguous
+        # run, so both directions shrink to it instead of breaching the cap.
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 3)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 3)
+        self.assertEqual(dtm.save_task_blocks(groups[3]), 8)  # other shape
+
+    def test_configured_batch_below_the_pool_is_untouched(self):
+        groups = self._groups()
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=2,
+            block_per_load_task=1,
+            staging_pool_blocks=8,
+            staging_pool_max_bytes_per_group=8 * 4096,  # a pool to spare
+        )
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 2)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 1)
+
+    def test_total_pinned_line_is_machine_parseable(self):
+        import re
+        from kv_cache_manager.py_connector.common.logger import logger
+
+        groups = self._groups()
+        configured = dict(
+            block_per_save_task=128,
+            block_per_load_task=128,
+            staging_pool_blocks=16,
+            staging_pool_max_bytes_per_group=16_384,
+        )
+        with self.assertLogs(logger, level="INFO") as logs:
+            dtm = self._dtm(groups, **configured)
+        (total_line,) = [line for line in logs.output if "total pinned" in line]
+        match = re.search(
+            r"total pinned = ([\d.]+) GiB across (\d+) shapes? / (\d+) groups?"
+            r" \((\d+) bytes\)",
+            total_line,
+        )
+        self.assertIsNotNone(match, total_line)
+        assert match is not None
+        self.assertEqual(int(match.group(2)), 2)
+        self.assertEqual(int(match.group(3)), len(groups))
+        # The logged total is the one the e2e/kvperf gates recompute from the
+        # same shapes with the same implementation.
+        expected = total_pinned_bytes(
+            plan_staging_pools(
+                [staging_shape(g, self.MBS, KV_DTYPE) for g in groups],
+                configured_blocks=configured["staging_pool_blocks"],
+                max_bytes_per_pool=configured["staging_pool_max_bytes_per_group"],
+            )
+        )
+        self.assertEqual(int(match.group(4)), expected)
+        self.assertEqual(
+            expected,
+            dtm._pools["tp0_g0"].max_blocks * dtm._pools["tp0_g0"].block_bytes
+            + dtm._pools["tp0_g3"].max_blocks * dtm._pools["tp0_g3"].block_bytes,
+        )
 
 
 class _FakeStagingBuffer:
@@ -570,7 +1047,9 @@ class _FakePool:
     def release(self, start: int, n: int) -> None:
         self.released = (start, n)
 
-    def cpu_view(self, start: int, n: int) -> _FakeStagingBuffer:
+    def cpu_view(
+        self, start: int, n: int, block_bytes: int | None = None
+    ) -> _FakeStagingBuffer:
         return self.buffer
 
 
@@ -741,3 +1220,7 @@ class TestAttentionTaskWiring(unittest.TestCase):
         self.assertEqual(
             self._capture("load_task", uint8, n=1)[1].dtypes, [torch.uint8]
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
