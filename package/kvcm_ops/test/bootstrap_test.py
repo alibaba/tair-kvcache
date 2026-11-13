@@ -417,7 +417,7 @@ class ErrorReportingTest(unittest.TestCase):
                 "cached,redis://user:{}@redis.example:6379/?cluster_name=test,true,invalid"
                 .format(secret)))
         with patch.dict("os.environ", environ, clear=True), \
-                self.assertLogs("kvcm_ops.bootstrap", level="ERROR") as logs:
+             self.assertLogs("kvcm_ops.bootstrap", level="ERROR") as logs:
             self.assertEqual(1, main([]))
         full_log = "\n".join(logs.output)
         self.assertIn("meta_storage_backend_config must use", full_log)
@@ -427,9 +427,9 @@ class ErrorReportingTest(unittest.TestCase):
     def test_bootstrap_command_uses_custom_admin_host(self):
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment",
                    return_value=parse_environment({})), \
-            patch("kvcm_ops.kvcm.bootstrap.AdminClient") as admin_client, \
-            patch("kvcm_ops.kvcm.bootstrap.bootstrap_once",
-                  return_value=BootstrapOutcome.COMPLETE):
+             patch("kvcm_ops.kvcm.bootstrap.AdminClient") as admin_client, \
+             patch("kvcm_ops.kvcm.bootstrap.bootstrap_once",
+                   return_value=BootstrapOutcome.COMPLETE):
             self.assertEqual(0, main(["--host", "http://127.0.0.1:6500"]))
         admin_client.assert_called_once_with("http://127.0.0.1:6500")
 
@@ -695,7 +695,7 @@ class BootstrapReconciliationTest(unittest.TestCase):
         config = parse_environment(environ)
 
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment", return_value=config), \
-                patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client):
+             patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client):
             status = main(["--reconcile"])
 
         self.assertEqual(3, status)
@@ -723,8 +723,8 @@ class BootstrapReconciliationTest(unittest.TestCase):
         config = parse_environment(environ)
 
         with patch("kvcm_ops.kvcm.bootstrap.parse_environment", return_value=config), \
-                patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client), \
-                self.assertLogs("kvcm_ops.bootstrap", level="WARNING") as logs:
+             patch("kvcm_ops.kvcm.bootstrap.AdminClient", return_value=client), \
+             self.assertLogs("kvcm_ops.bootstrap", level="WARNING") as logs:
             status = main(["--reconcile"])
 
         self.assertEqual(3, status)

@@ -155,8 +155,9 @@ void LocalMetricsReporter::ReportInterval() {
             // lifecycle lock. Cleanup may finish while they are in flight.
             const double healthy = storage_backend->Available() ? 1.0 : 0.0;
             const double writable = storage_backend->Writable() ? 1.0 : 0.0;
-            const double usage_ratio =
-                report_storage_usage_ ? storage_backend->GetStorageUsageRatio("trace_report_interval") : 0.0;
+            const double usage_ratio = report_storage_usage_
+                                           ? storage_backend->GetStorageUsageRatio("trace_report_interval")
+                                           : 0.0;
             const auto capacity =
                 report_storage_usage_ ? storage_backend->GetStorageCapacity() : StorageCapacitySnapshot{};
             data_storage_manager->PublishMetricsIfCurrent(unique_name, storage_backend, [&]() {
@@ -165,8 +166,7 @@ void LocalMetricsReporter::ReportInterval() {
                     // A follower may still have a backend awaiting cleanup.
                     // Omit its capacity without scanning historical series.
                     metrics_registry_->Remove(
-                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio),
-                        tags);
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio), tags);
                     metrics_registry_->Remove(
                         SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, total_capacity_bytes),
                         tags);

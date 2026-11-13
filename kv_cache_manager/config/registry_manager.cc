@@ -579,8 +579,9 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
-ErrorCode
-RegistryManager::UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
+ErrorCode RegistryManager::UpsertRegistryField(const std::string &key,
+                                               const std::string &id,
+                                               const Jsonizable *jsonizable) {
     const ErrorCode ec = storage_->UpsertField(key, id, jsonizable ? jsonizable->ToJsonString() : id);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Upsert %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);

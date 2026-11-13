@@ -18,7 +18,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
@@ -1064,8 +1063,9 @@ public:
         return result;
     }
 
-    MetaLocalBackend *
-    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
+    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
+                                                KeyType rejected_prefix = 0,
+                                                bool event_report_prefix = false) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -3580,9 +3580,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) {
-        promise->set_exception(std::current_exception());
-    }
+    } catch (...) { promise->set_exception(std::current_exception()); }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -7389,12 +7387,12 @@ std::vector<ErrorCode> limited_copy_results;
 // This dispatch fixture stubs metadata and does not exercise actual backend
 // submission. Model the BatchSubmit group gate separately from its candidate
 // input; the real gate/byte-credit path is covered in MigrationManagerTest.
-std::vector<ErrorCode>
-MigrationManager_BatchSubmitWithGroupLimit_stub(void *obj,
-                                                const std::string &trace_id,
-                                                std::vector<MigrationManager::MigrationRequest> requests,
-                                                MigrationManager::CopyConcurrencyLimit copy_limit,
-                                                bool lifecycle_lock_held) {
+std::vector<ErrorCode> MigrationManager_BatchSubmitWithGroupLimit_stub(
+    void *obj,
+    const std::string &trace_id,
+    std::vector<MigrationManager::MigrationRequest> requests,
+    MigrationManager::CopyConcurrencyLimit copy_limit,
+    bool lifecycle_lock_held) {
     MigrationManager_BatchSubmit_stub(obj, trace_id, requests, copy_limit, lifecycle_lock_held);
     auto *manager = static_cast<MigrationManager *>(obj);
     const auto active = manager->ActiveTaskCountForGroup(copy_limit.instance_group_name);

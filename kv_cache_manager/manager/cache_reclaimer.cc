@@ -409,9 +409,7 @@ void CacheReclaimer::RecordPendingLimitReject(const std::string &instance_group,
             MetricsTags{{"instance_group", instance_group}, {"storage_type", storage_type_scope}}) += 1;
     } catch (const std::exception &e) {
         KVCM_LOG_WARN("record tagged pending-limit metric failed: %s", e.what());
-    } catch (...) {
-        KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception");
-    }
+    } catch (...) { KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception"); }
 }
 
 void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {

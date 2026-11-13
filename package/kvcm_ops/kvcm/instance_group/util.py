@@ -385,7 +385,7 @@ class CacheConfig(JsonData):
         ]
         if _data_storage_strategy not in valid_strategies:
             raise RuntimeError(
-                f"data_storage_strategy {_data_storage_strategy} invalid, support {'|'.join(valid_strategies)}")
+                f"data_storage_strategy {_data_storage_strategy} invalid, support { '|'.join(valid_strategies) }")
         self._data_storage_strategy = _data_storage_strategy
         self._reclaim_strategy.check()
         self._meta_indexer_config.check()

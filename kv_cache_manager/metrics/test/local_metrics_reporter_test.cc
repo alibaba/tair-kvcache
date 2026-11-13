@@ -480,6 +480,7 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
     }
 }
 
+
 namespace {
 // NfsBackend with a controllable usage ratio, used to verify how
 // ReportInterval handles valid readings, default zero and negative values.
@@ -584,11 +585,9 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeV
     be->SetAvailable(false);
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.0, published_ratio());
-    EXPECT_DOUBLE_EQ(
-        0.0,
-        metrics_registry_
-            ->GetGauge("data_storage.healthy_status", MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}})
-            .Get());
+    EXPECT_DOUBLE_EQ(0.0,
+                     metrics_registry_->GetGauge("data_storage.healthy_status",
+                                                 MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}}).Get());
     be->SetUsageRatio(0.75);
     be->SetAvailable(true);
     reporter_->ReportInterval();
@@ -698,8 +697,8 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsAbsentAcrossRolesAndStorageState
             backend->SetAvailable(available);
             backend->SetWritable(writable);
             for (double ratio : {-1.0, 0.0, 0.75, 1.0}) {
-                SCOPED_TRACE(::testing::Message()
-                             << "available=" << available << " writable=" << writable << " ratio=" << ratio);
+                SCOPED_TRACE(::testing::Message() << "available=" << available << " writable=" << writable
+                                                 << " ratio=" << ratio);
                 // A real full reading must remain visible on the leader.
                 leader = true;
                 backend->SetUsageRatio(1.0);

@@ -284,8 +284,10 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         cache_config_info.migration_copy_poll_max_interval_ms());
     migration_config->mutable_copy_connect_timeout_ms()->set_value(
         cache_config_info.migration_copy_connect_timeout_ms());
-    migration_config->mutable_copy_submit_timeout_ms()->set_value(cache_config_info.migration_copy_submit_timeout_ms());
-    migration_config->mutable_copy_query_timeout_ms()->set_value(cache_config_info.migration_copy_query_timeout_ms());
+    migration_config->mutable_copy_submit_timeout_ms()->set_value(
+        cache_config_info.migration_copy_submit_timeout_ms());
+    migration_config->mutable_copy_query_timeout_ms()->set_value(
+        cache_config_info.migration_copy_query_timeout_ms());
     for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
         if (migration_strategy == nullptr) {
             continue;
@@ -348,8 +350,9 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     cache_config_info.set_migration_copy_execution_mode(
         static_cast<MigrationCopyExecutionMode>(proto_migration_config.copy_execution_mode()));
     cache_config_info.set_migration_copy_max_inflight_bytes(
-        proto_migration_config.has_copy_max_inflight_bytes() ? proto_migration_config.copy_max_inflight_bytes().value()
-                                                             : MigrationConfig::kDefaultCopyMaxInflightBytes);
+        proto_migration_config.has_copy_max_inflight_bytes()
+            ? proto_migration_config.copy_max_inflight_bytes().value()
+            : MigrationConfig::kDefaultCopyMaxInflightBytes);
     cache_config_info.set_migration_copy_operation_deadline_ms(
         proto_migration_config.has_copy_operation_deadline_ms()
             ? proto_migration_config.copy_operation_deadline_ms().value()
@@ -363,14 +366,17 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
             ? proto_migration_config.copy_poll_max_interval_ms().value()
             : MigrationConfig::kDefaultCopyPollMaxIntervalMs);
     cache_config_info.set_migration_copy_connect_timeout_ms(
-        proto_migration_config.has_copy_connect_timeout_ms() ? proto_migration_config.copy_connect_timeout_ms().value()
-                                                             : MigrationConfig::kDefaultCopyConnectTimeoutMs);
-    cache_config_info.set_migration_copy_submit_timeout_ms(proto_migration_config.has_copy_submit_timeout_ms()
-                                                               ? proto_migration_config.copy_submit_timeout_ms().value()
-                                                               : MigrationConfig::kDefaultCopySubmitTimeoutMs);
-    cache_config_info.set_migration_copy_query_timeout_ms(proto_migration_config.has_copy_query_timeout_ms()
-                                                              ? proto_migration_config.copy_query_timeout_ms().value()
-                                                              : MigrationConfig::kDefaultCopyQueryTimeoutMs);
+        proto_migration_config.has_copy_connect_timeout_ms()
+            ? proto_migration_config.copy_connect_timeout_ms().value()
+            : MigrationConfig::kDefaultCopyConnectTimeoutMs);
+    cache_config_info.set_migration_copy_submit_timeout_ms(
+        proto_migration_config.has_copy_submit_timeout_ms()
+            ? proto_migration_config.copy_submit_timeout_ms().value()
+            : MigrationConfig::kDefaultCopySubmitTimeoutMs);
+    cache_config_info.set_migration_copy_query_timeout_ms(
+        proto_migration_config.has_copy_query_timeout_ms()
+            ? proto_migration_config.copy_query_timeout_ms().value()
+            : MigrationConfig::kDefaultCopyQueryTimeoutMs);
 
     // 转换meta_indexer_config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();

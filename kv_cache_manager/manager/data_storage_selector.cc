@@ -379,7 +379,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
         PREFIX_LOG(WARN, "explicit target admission failed to read instance group: %s", instance_group.c_str());
         return results;
     }
-    const auto [instances_ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
+    const auto [instances_ec, instance_infos] =
+        registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (instances_ec != EC_OK) {
         PREFIX_LOG(WARN, "explicit target admission failed to list instances: %s", instance_group.c_str());
         return results;
@@ -398,8 +399,9 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     auto saturating_add = [](std::uint64_t &sum, const std::uint64_t value) {
-        sum = value > std::numeric_limits<std::uint64_t>::max() - sum ? std::numeric_limits<std::uint64_t>::max()
-                                                                      : sum + value;
+        sum = value > std::numeric_limits<std::uint64_t>::max() - sum
+                  ? std::numeric_limits<std::uint64_t>::max()
+                  : sum + value;
     };
     std::uint64_t group_used_bytes = 0;
     for (const auto &instance_info : instance_infos) {
