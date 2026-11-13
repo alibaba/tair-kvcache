@@ -169,17 +169,21 @@ public:
     int shm_fd() const { return shm_fd_; }
     size_t shm_size() const { return shm_size_; }
     void *client_base() const { return client_base_; }
+    const std::vector<SharedMemoryRegistration> &host_memory_spans() const { return host_memory_spans_; }
     const std::vector<GpuMemorySpan> &gpu_memory_spans() const { return gpu_memory_spans_; }
 
     void set_shm_fd(int fd) { shm_fd_ = fd; }
     void set_shm_size(size_t size) { shm_size_ = size; }
     void set_client_base(void *base) { client_base_ = base; }
+    void set_host_memory_spans(const std::vector<SharedMemoryRegistration> &spans) { host_memory_spans_ = spans; }
     void set_gpu_memory_spans(const std::vector<GpuMemorySpan> &spans) { gpu_memory_spans_ = spans; }
 
 private:
     int shm_fd_{-1};
     size_t shm_size_{0};
     void *client_base_{nullptr};
+    // Every registered host segment, in submission order; empty means none.
+    std::vector<SharedMemoryRegistration> host_memory_spans_;
     std::vector<GpuMemorySpan> gpu_memory_spans_;
 };
 

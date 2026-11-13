@@ -6,13 +6,31 @@ load("@python_abi//:abi.bzl", "python_abi")
 load("@python_platform//:platform.bzl", "python_platform")
 
 
+cc_library(
+    name = "py_host_registration",
+    hdrs = ["py_host_registration.h"],
+    deps = [
+        "//kv_cache_manager/client:common",
+    ],
+)
+
 pybind_extension(
     name = "kvcm_py_client",
     srcs = ["py_client_binding.cc"],
     deps = [
+        ":py_host_registration",
         "//kv_cache_manager/client:client",
     ],
     visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "PyHostRegistrationTest",
+    srcs = ["py_host_registration_test.cc"],
+    deps = [
+        ":py_host_registration",
+        "//kv_cache_manager/common:unittest",
+    ],
 )
 
 py_library(
