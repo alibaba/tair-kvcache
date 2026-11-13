@@ -187,8 +187,8 @@ ErrorCode DataStorageManager::DoCleanup() {
 }
 
 bool DataStorageManager::PublishMetricsIfCurrent(const std::string &name,
-                                                 const std::shared_ptr<DataStorageBackend> &backend,
-                                                 const std::function<void()> &publish) const {
+                                                const std::shared_ptr<DataStorageBackend> &backend,
+                                                const std::function<void()> &publish) const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const auto it = storage_map_.find(name);
     if (!backend || it == storage_map_.end() || it->second != backend) {
@@ -410,10 +410,16 @@ AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_cont
     // local shared_ptr above only protects the submit call itself; without the
     // capture an unregister could destroy the coordinator while PACE is still
     // executing the operation.
-    auto completion_with_backend_lease = [storage_backend, completion = std::move(completion)](
-                                             AsyncCopyBatchResult result) mutable { completion(std::move(result)); };
-    return storage_backend->CopyAsync(
-        src_uris, dst_uris, operation_id, trace_id, options, std::move(completion_with_backend_lease));
+    auto completion_with_backend_lease =
+        [storage_backend, completion = std::move(completion)](AsyncCopyBatchResult result) mutable {
+            completion(std::move(result));
+        };
+    return storage_backend->CopyAsync(src_uris,
+                                      dst_uris,
+                                      operation_id,
+                                      trace_id,
+                                      options,
+                                      std::move(completion_with_backend_lease));
 }
 
 ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id) {
@@ -477,8 +483,7 @@ void DataStorageManager::RecordWriteBytes(const std::string &unique_name, std::u
     auto iter = storage_map_.find(unique_name); // iter->second 指向 DataStorageBackend 对象
     if (iter == storage_map_.end() || iter->second == nullptr) {
         KVCM_LOG_WARN("RecordWriteBytes: storage [%s] not found, drop %llu bytes",
-                      unique_name.c_str(),
-                      static_cast<unsigned long long>(bytes));
+                      unique_name.c_str(), static_cast<unsigned long long>(bytes));
         return;
     }
     const auto collector = iter->second->GetMetricsCollector(); // 指向 DataStorageMetricsCollector 对象

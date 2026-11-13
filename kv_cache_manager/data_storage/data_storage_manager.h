@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -8,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdint>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
