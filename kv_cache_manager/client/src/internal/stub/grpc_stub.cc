@@ -5,6 +5,8 @@
 #include <chrono>
 #include <grpcpp/grpcpp.h>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
@@ -62,6 +64,8 @@
 #define GET_AND_CHECK_STUB_WITH_TYPE() GET_AND_CHECK_STUB_BASE({})
 
 namespace {
+
+kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::ErrorCode service_error);
 
 kv_cache_manager::Locations GenLocations(
     const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations) {
