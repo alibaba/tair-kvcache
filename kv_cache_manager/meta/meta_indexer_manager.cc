@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <mutex>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -13,7 +14,6 @@ namespace kv_cache_manager {
 
 void MetaIndexerManager::SetRevisitHistogramConfig(std::shared_ptr<MetricsRegistry> registry,
                                                    const std::vector<double> &boundaries) {
-    std::unique_lock lifecycle_guard(lifecycle_mutex_);
     metrics_registry_ = std::move(registry);
     revisit_boundaries_ = boundaries;
 }
@@ -29,7 +29,6 @@ bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
                        chunk_size);
         return false;
     }
-    std::unique_lock lifecycle_guard(lifecycle_mutex_);
     std::scoped_lock write_guard(mutex_);
     if (!meta_indexers_.empty()) {
         KVCM_LOG_ERROR("query executor must be configured before creating meta indexers");
@@ -61,9 +60,6 @@ bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
 ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
                                                 const std::shared_ptr<MetaIndexerConfig> &config,
                                                 const std::vector<double> &boundaries) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
-    auto instance_mutex = GetInstanceMutex(instance_id);
-    std::unique_lock instance_guard(*instance_mutex);
     if (GetMetaIndexer(instance_id)) {
         return ErrorCode::EC_EXIST;
     }
@@ -75,7 +71,7 @@ ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
         return ec;
     }
 
-    // Per-instance boundaries override defaults protected by lifecycle_mutex_.
+    // Per-instance boundaries override defaults configured before creation.
     const std::vector<double> &resolved = boundaries.empty() ? revisit_boundaries_ : boundaries;
 
     if (metrics_registry_ && !resolved.empty()) {
@@ -103,24 +99,6 @@ ErrorCode MetaIndexerManager::InitMetaIndexer(const std::shared_ptr<MetaIndexer>
     return indexer->Init(instance_id, config);
 }
 
-std::shared_ptr<std::mutex> MetaIndexerManager::GetInstanceMutex(const std::string &instance_id) {
-    std::scoped_lock write_guard(mutex_);
-    for (auto it = instance_mutexes_.begin(); it != instance_mutexes_.end();) {
-        if (it->second.expired()) {
-            it = instance_mutexes_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    auto &weak_mutex = instance_mutexes_[instance_id];
-    auto instance_mutex = weak_mutex.lock();
-    if (!instance_mutex) {
-        instance_mutex = std::make_shared<std::mutex>();
-        weak_mutex = instance_mutex;
-    }
-    return instance_mutex;
-}
-
 std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexer(const std::string &instance_id) const {
     std::shared_lock read_guard(mutex_);
     return GetMetaIndexerUnsafe(instance_id);
@@ -135,9 +113,6 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexerUnsafe(const std:
 }
 
 std::shared_ptr<MetaIndexer> MetaIndexerManager::ExtractMetaIndexer(const std::string &instance_id) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
-    auto instance_mutex = GetInstanceMutex(instance_id);
-    std::unique_lock instance_guard(*instance_mutex);
     decltype(meta_indexers_)::node_type node;
     {
         std::scoped_lock write_guard(mutex_);
@@ -147,9 +122,6 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager::ExtractMetaIndexer(const std::s
 }
 
 bool MetaIndexerManager::RestoreMetaIndexer(const std::string &instance_id, std::shared_ptr<MetaIndexer> indexer) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
-    auto instance_mutex = GetInstanceMutex(instance_id);
-    std::unique_lock instance_guard(*instance_mutex);
     std::scoped_lock write_guard(mutex_);
     return meta_indexers_.emplace(instance_id, std::move(indexer)).second;
 }
@@ -171,10 +143,8 @@ std::optional<MetaIndexerManager::StorageBackendConfigs> MetaIndexerManager::Try
     return configs;
 }
 void MetaIndexerManager::DoCleanup() {
-    std::unique_lock lifecycle_guard(lifecycle_mutex_);
     std::scoped_lock write_guard(mutex_);
     meta_indexers_.clear();
-    instance_mutexes_.clear();
 }
 
 size_t MetaIndexerManager::GetIndexerSize() {

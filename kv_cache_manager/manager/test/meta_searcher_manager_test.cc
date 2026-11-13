@@ -193,30 +193,6 @@ TEST_F(MetaSearcherManagerTest, SameInstanceInitializesOnceAndReturnsSameSearche
     EXPECT_EQ(1, indexers->init_count.load());
 }
 
-TEST_F(MetaSearcherManagerTest, CleanupWaitsForInFlightInitialization) {
-    auto indexers = UseControlledIndexerManager();
-    SearcherInitializationGate gate;
-    indexers->initialize = [&](const std::string &) {
-        gate.Enter();
-        return EC_OK;
-    };
-    auto create = std::async(std::launch::async, [&] { return CreateSearcher("test_instance"); });
-    const bool entered = gate.WaitForEntered(1);
-    std::promise<void> cleanup_started;
-    auto cleanup = std::async(std::launch::async, [&] {
-        cleanup_started.set_value();
-        meta_searcher_manager_->DoCleanup();
-    });
-    cleanup_started.get_future().wait();
-    const auto cleanup_status = cleanup.wait_for(std::chrono::milliseconds(50));
-    gate.Release();
-    EXPECT_TRUE(entered);
-    EXPECT_EQ(std::future_status::timeout, cleanup_status);
-    EXPECT_NE(nullptr, create.get());
-    cleanup.get();
-    EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
-}
-
 TEST_F(MetaSearcherManagerTest, ExtractWaitsForInFlightInitialization) {
     auto indexers = UseControlledIndexerManager();
     SearcherInitializationGate gate;
@@ -291,5 +267,4 @@ TEST_F(MetaSearcherManagerTest, RemovedInstancesDoNotAccumulateMutexEntries) {
         registry_manager_->instance_infos_.erase(id);
     }
     EXPECT_LE(meta_searcher_manager_->instance_mutexes_.size(), 1);
-    EXPECT_LE(indexers->instance_mutexes_.size(), 1);
 }

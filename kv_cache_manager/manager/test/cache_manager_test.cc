@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -120,6 +121,26 @@ ErrorCode TryCreate(void *, RequestContext *context, const std::string &instance
     --state->active;
     return EC_OK;
 }
+
+class BlockingIndexerManager : public MetaIndexerManager {
+public:
+    State gate;
+
+protected:
+    ErrorCode InitMetaIndexer(const std::shared_ptr<MetaIndexer> &indexer,
+                              const std::string &instance_id,
+                              const std::shared_ptr<MetaIndexerConfig> &config) override {
+        {
+            std::unique_lock lock(gate.mutex);
+            ++gate.calls;
+            ++gate.active;
+            gate.cv.notify_all();
+            gate.cv.wait(lock, [this] { return gate.released; });
+            --gate.active;
+        }
+        return MetaIndexerManager::InitMetaIndexer(indexer, instance_id, config);
+    }
+};
 } // namespace parallel_recover_stub
 
 namespace mark_query_read_error_stub {
@@ -8561,19 +8582,64 @@ TEST_F(CacheManagerTest, TestRecoverySnapshotDoesNotRegisterInstancesRemovedBefo
 
 TEST_F(CacheManagerTest, TestCleanupWaitsForForegroundRecoveryWorkers) {
     ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
-    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
-    parallel_recover_stub::State state;
-    parallel_recover_stub::state = &state;
-    Stub stub;
-    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
-    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
-    const bool blocked = state.WaitForActive(1);
-    auto cleanup = std::async(std::launch::async, [&] { return cache_manager_->DoCleanup(); });
-    EXPECT_EQ(std::future_status::timeout, cleanup.wait_for(std::chrono::milliseconds(30)));
-    state.Release();
+    auto indexers = std::make_shared<parallel_recover_stub::BlockingIndexerManager>();
+    CacheManager manager(metrics_registry_, registry_manager_);
+    manager.meta_indexer_manager_ = indexers;
+    manager.meta_searcher_manager_ = std::make_shared<MetaSearcherManager>(registry_manager_, indexers);
+    auto recovery = std::async(std::launch::async, [&] { return manager.DoRecoverOnce(); });
+    const bool blocked = indexers->gate.WaitForActive(1);
+    std::promise<void> cleanup_started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        cleanup_started.set_value();
+        return manager.DoCleanup();
+    });
+    const auto started_status = cleanup_started.get_future().wait_for(std::chrono::seconds(5));
+    const auto cleanup_status = cleanup.wait_for(std::chrono::milliseconds(30));
+    indexers->gate.Release();
     EXPECT_EQ(EC_OK, recovery.get());
     EXPECT_EQ(EC_OK, cleanup.get());
     EXPECT_TRUE(blocked);
+    EXPECT_EQ(std::future_status::ready, started_status);
+    EXPECT_EQ(std::future_status::timeout, cleanup_status);
+    EXPECT_EQ(1, indexers->gate.calls);
+    EXPECT_EQ(nullptr, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_EQ(0, indexers->GetIndexerSize());
+}
+
+TEST_F(CacheManagerTest, TestRecoveryAndRegistrationShareSearcherInitialization) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    auto indexers = std::make_shared<parallel_recover_stub::BlockingIndexerManager>();
+    CacheManager manager(metrics_registry_, registry_manager_);
+    manager.meta_indexer_manager_ = indexers;
+    manager.meta_searcher_manager_ = std::make_shared<MetaSearcherManager>(registry_manager_, indexers);
+    auto recovery = std::async(std::launch::async, [&] {
+        const auto ec = manager.DoRecoverOnce();
+        return std::make_pair(ec, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    });
+    const bool blocked = indexers->gate.WaitForActive(1);
+    std::promise<void> registration_started;
+    auto registration = std::async(std::launch::async, [&] {
+        RequestContext context("register_during_recovery");
+        registration_started.set_value();
+        const auto result = manager.RegisterInstance(
+            &context, "default", "test_instance", 64, createLocationSpecInfos(), createModelDeployment(), {});
+        return std::make_pair(result.first, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    });
+    const auto started_status = registration_started.get_future().wait_for(std::chrono::seconds(5));
+    const auto registration_status = registration.wait_for(std::chrono::milliseconds(30));
+    indexers->gate.Release();
+    const auto [recovery_ec, recovered_searcher] = recovery.get();
+    const auto [registration_ec, registered_searcher] = registration.get();
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(std::future_status::ready, started_status);
+    EXPECT_EQ(std::future_status::timeout, registration_status);
+    EXPECT_EQ(EC_OK, recovery_ec);
+    EXPECT_EQ(EC_OK, registration_ec);
+    EXPECT_EQ(1, indexers->gate.calls);
+    EXPECT_EQ(1, indexers->GetIndexerSize());
+    ASSERT_NE(nullptr, recovered_searcher);
+    EXPECT_EQ(recovered_searcher, registered_searcher);
+    EXPECT_EQ(indexers->GetMetaIndexer("test_instance"), recovered_searcher->meta_indexer_);
 }
 
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
@@ -8669,12 +8735,16 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     // StartRecoverRetryLoop + StopRecoverRetryLoop
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
     cache_manager_->StopRecoverRetryLoop(); // should join within ~100ms
+    EXPECT_FALSE(cache_manager_->recover_retry_thread_.joinable());
 
     // DoCleanup should stop retry thread
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_TRUE(cache_manager_->recover_retry_stop_.load());
+    EXPECT_FALSE(cache_manager_->recover_retry_thread_.joinable());
 }
 
 /* ------------ InvalidateInstanceMetrics tests ------------ */

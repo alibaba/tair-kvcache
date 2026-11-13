@@ -22,7 +22,6 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
                                                                          const std::string &instance_id,
                                                                          CheckLocDataExistFunc check_loc_data_exist,
                                                                          SubmitDelReqFunc submit_del_req) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
     auto instance_mutex = GetInstanceMutex(instance_id);
     std::unique_lock instance_guard(*instance_mutex);
     auto meta_searcher = GetMetaSearcher(instance_id);
@@ -97,7 +96,6 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcher(const std::st
 }
 
 std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std::string &instance_id) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
     auto instance_mutex = GetInstanceMutex(instance_id);
     std::unique_lock instance_guard(*instance_mutex);
     decltype(meta_searcher_map_)::node_type node;
@@ -113,7 +111,6 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std
 
 void MetaSearcherManager::RestoreRetiringMetaSearcher(const std::string &instance_id,
                                                       std::shared_ptr<MetaSearcher> searcher) {
-    std::shared_lock lifecycle_guard(lifecycle_mutex_);
     auto instance_mutex = GetInstanceMutex(instance_id);
     std::unique_lock instance_guard(*instance_mutex);
     std::scoped_lock write_guard(mutex_);
@@ -121,7 +118,6 @@ void MetaSearcherManager::RestoreRetiringMetaSearcher(const std::string &instanc
 }
 
 void MetaSearcherManager::DoCleanup() {
-    std::unique_lock lifecycle_guard(lifecycle_mutex_);
     std::scoped_lock write_guard(mutex_);
     meta_searcher_map_.clear();
     retiring_meta_searcher_map_.clear();

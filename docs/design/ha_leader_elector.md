@@ -188,9 +188,11 @@ Server::Init()
 1. 串行收集 Registry 的 Instance ID 快照，再有界分发。每个任务创建独立 `RequestContext`，在
    `metrics_lifecycle` 共享锁内重新确认实例仍存在，只创建 Searcher/Indexer，不重新注册快照实例。
    因此后台重试与 Admin 删除并发时，旧快照不会复活已删除的 Instance。
-2. 两个 Manager 都采用“生命周期锁 → Instance 锁 → map 锁”的顺序。慢 `Init/Open` 不持全局 map 锁，
-   同 ID 只初始化一次，完成后才发布。Extract/Restore 与同 ID 创建互斥；Cleanup 等待已进入的创建完成。
-   跨 Manager 的清理仍由 CacheManager 的生命周期锁和 Server 串行回调保证顺序。
+2. QueryExecutor 和指标等 Manager 配置在生产启动阶段完成；这些配置的更新不得与创建并发，
+   QueryExecutor 配置还要求索引表为空。
+   `MetaSearcherManager` 以同 ID 锁协调创建、提取和归还；慢 `Init/Open` 在全局 map 锁外执行，成功后才发布。
+   `MetaIndexerManager` 仅用 map 锁保护索引表，同 ID 的 Create/Extract/Restore 由调用者保证串行：
+   正常创建统一经 SearcherManager，删除 pending 状态阻止重建。
 3. backend 内部各任务创建独立 RedisClient，预先分配结果槽位。任一建连任务返回失败，其他 worker 观察到
    失败标记后停止领取任务；已通过检查的 worker 仍可能启动任务。等待全部已启动任务结束后清理成功连接并返回 `EC_ERROR`。
    consumer 只在所有连接和队列就绪后启动；启动线程部分失败也会
@@ -201,7 +203,9 @@ Server::Init()
    当前 hiredis 的同步 DNS 解析不受此超时限制，解析时仍占用各自预算的许可。
 5. `DoRecoverOnce` 等待所有已启动 Instance worker 返回；单个实例失败仍继续其他实例。保留既有语义：
    首轮部分失败时，`DoRecover` 启动后台重试并返回 `EC_OK`，已成功实例可按 Server 原流程提供服务。
-   不等待全量异步回填，不新增按 Instance 开门的协议。Cleanup 先停止并 join 重试，再与同步恢复轮次互斥清理。
+   不等待全量异步回填，不新增按 Instance 开门的协议。Cleanup 前由 Server 关闭并排空业务请求；
+   CacheManager 停止并 join 恢复重试，再通过 `recover_run_mutex_` 等待整轮 worker 结束，随后调用 Manager Cleanup。
+   两个 Manager 的 Cleanup 均以上层已完成排空为前提。
 
 Instance 完成日志包含 `completed/total` 与 elapsed 时间，便于区分同步恢复进度和后台回填。
 恢复 worker 全部返回后，Server 仍通过 `RunIfCurrentPromotionValid` 校验本轮租约；恢复期间失锁不会让旧任务

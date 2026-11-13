@@ -241,9 +241,11 @@ client（MetaClient/gRPC 或 HTTP）→ service（grpc/http 适配 → *ServiceI
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
-MetaIndexer/Searcher 按 `instance_id` 协调单次创建：不同 Instance 的慢 `Init/Open` 在全局 map 锁外并行，
-初始化成功后才发布；同 Instance 的创建、提取和恢复互斥。Manager 的生命周期锁使 Cleanup 等待已进入的
-创建任务结束。Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+QueryExecutor 和指标等 Manager 配置在生产启动阶段完成；这些配置的更新不得与创建并发，QueryExecutor 配置还要求索引表为空。
+`MetaSearcherManager` 用同 ID 锁协调 Searcher 创建、提取和归还，不同 Instance 的慢 `Init/Open` 在全局 map 锁外并行，
+成功后才发布。`MetaIndexerManager` 仅用 map 锁保护索引表；
+同 ID 的 Create/Extract/Restore 依赖调用者串行化，正常创建统一经 SearcherManager，删除 pending 状态阻止重建。
+两个 Manager 的 Cleanup 在上层排空后调用。Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
 删除 Instance 时，Registry 先持久化删除意图并使该 ID 对普通请求不可见；CacheManager 排空 Searcher 持有者，沿原有 TrimCache/Executor 链路删除缓存数据。全量 Trim 后排空 Indexer 持有者并复扫残留，必要时继续 Trim；确认无残留后同步异步写入、删除独立的持久化 metadata 记录（计数、用量），随后释放后端资源并清除删除意图。失败时保留删除意图供重试，同 ID 注册被拒绝；主备切换或重启后的 Recover 只恢复删除中状态并打印告警，不执行 Trim，需后续重试 RemoveInstance 才能完成清理。
 配置 `meta_storage_backend_config.memory_primary=true` 时仅支持 `cached + local + async_redis`：
 Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时不更新 local；全量回填完成并进入 Running 后，
@@ -383,12 +385,15 @@ flowchart LR
 
 `LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。Follower 不处理元数据面/管控面业务读写，只服务 `GetClusterInfo`、健康检查、集群监控和 Leader 运维类请求。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager，并在持锁轮次与租约仍有效时开放 leader-only 请求。失锁时先同步关闭请求入口；选主层暂停本节点竞选，等待已开始的恢复返回并串行清理，同时继续刷新主节点发现信息。降级回调通知 GC/Reclaimer 停止新工作并排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上；Java `AutoFailoverClient` 在收到 `SERVER_NOT_LEADER` 或连接失败后也会重新发现 Leader 并重试。
 
-`CacheManager` 使用独立的有界 worker 恢复 Instance，每任务持有自己的 `RequestContext`，执行前在实例生命周期
-锁内重新读取 Registry；已删除的快照条目直接跳过，不重新注册。每个 `MetaAsyncRedisBackend` 使用另一组有界
-worker 创建专属 consumer 连接；普通 RedisClient 的首次连接、读池懒建和重连共用默认 64 的进程级握手预算，
-协调 RedisClient 使用独立的固定 4 个许可；主动健康探测直接使用 hiredis，不占用任一预算。
+`CacheManager` 使用独立的有界 worker 恢复 Instance，每任务持有自己的 `RequestContext`，执行前在 CacheManager 的
+`metrics_lifecycle` 共享锁内重新读取 Registry；已删除的快照条目直接跳过，不重新注册。
+每个 `MetaAsyncRedisBackend` 使用另一组有界 worker 创建专属 consumer 连接；普通 RedisClient 的首次连接、
+读池懒建和重连共用默认 64 的进程级握手预算，协调 RedisClient 使用独立的固定 4 个许可；
+主动健康探测直接使用 hiredis，不占用任一预算。
 两层 worker 不共用父子等待的线程池；连接任务全部结束后才发布 backend，首轮 Instance 任务全部结束后
-恢复回调才返回。部分失败沿用原有后台重试，Server 的租约校验与业务门禁保持原语义。
+恢复回调才返回。Cleanup 前由 Server 关闭并排空业务请求，CacheManager 停止并 join 恢复重试，再通过
+`recover_run_mutex_` 等待整轮恢复结束，随后调用两个 Manager 的 Cleanup。部分失败沿用原有后台重试，
+Server 的租约校验与业务门禁保持原语义。
 上述变化不新增模块或依赖边；参数和失败处理见 [HA 设计](ha_leader_elector.md#43-有界并行恢复)。
 
 ### 4.10 KVCM 到在线 Optimizer 的事件流
