@@ -172,34 +172,19 @@ TEST_F(RedisConnectionConcurrencyTest, BoundsOpenAndReconnectAcrossClients) {
     EXPECT_EQ(2, gate.peak);
 }
 
-TEST_F(RedisConnectionConcurrencyTest, PermitTimeoutDoesNotEnterHandshakeAndRecoversAfterRelease) {
-    HandshakeGate gate;
-    std::thread first([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
-    std::thread second([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
-    const bool full = gate.WaitForActive(2);
-    std::atomic<int> extra_calls{0};
-    HandshakeRedisClient waiting(
-        [&] {
-            ++extra_calls;
-            return true;
-        },
-        20);
-    const bool timed_out = !waiting.Open();
-    gate.Release();
-    first.join();
-    second.join();
-    EXPECT_TRUE(full);
-    EXPECT_TRUE(timed_out);
-    EXPECT_EQ(0, extra_calls.load());
-    EXPECT_TRUE(waiting.Open());
-    EXPECT_EQ(1, extra_calls.load());
-}
-
 TEST_F(RedisConnectionConcurrencyTest, CoordinationConnectsWhileDefaultBudgetIsSaturated) {
     HandshakeGate gate;
     std::thread first([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
     std::thread second([&] { HandshakeRedisClient([&] { return gate.Enter(); }).Open(); });
     const bool full = gate.WaitForActive(2);
+    size_t default_calls = 0;
+    HandshakeRedisClient waiting(
+        [&] {
+            ++default_calls;
+            return true;
+        },
+        20);
+    const bool timed_out = !waiting.Open();
 
     size_t coordination_calls = 0;
     HandshakeRedisClient coordination(
@@ -212,14 +197,6 @@ TEST_F(RedisConnectionConcurrencyTest, CoordinationConnectsWhileDefaultBudgetIsS
     const bool opened = coordination.Open();
     const bool reconnected = coordination.ReconnectForTest();
 
-    size_t default_calls = 0;
-    HandshakeRedisClient waiting(
-        [&] {
-            ++default_calls;
-            return true;
-        },
-        20);
-    const bool timed_out = !waiting.Open();
     gate.Release();
     first.join();
     second.join();
@@ -230,6 +207,8 @@ TEST_F(RedisConnectionConcurrencyTest, CoordinationConnectsWhileDefaultBudgetIsS
     EXPECT_EQ(2, coordination_calls);
     EXPECT_TRUE(timed_out);
     EXPECT_EQ(0, default_calls);
+    EXPECT_TRUE(waiting.Open());
+    EXPECT_EQ(1, default_calls);
 }
 
 TEST_F(RedisConnectionConcurrencyTest, FailureAndExceptionReleasePermits) {

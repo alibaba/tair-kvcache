@@ -5,6 +5,7 @@
 #include <future>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -104,45 +105,6 @@ TEST_F(MetaIndexerManagerTest, TestSingleThreadCreateAndGet) {
     //           manager_->GetMetaIndexer(id_2)->backend_manager_->persistent_backend_->GetStorageType());
 }
 
-TEST_F(MetaIndexerManagerTest, TestMultiThreadCreateAndGet) {
-    size_t thread_num = 4;
-    std::atomic<MetaIndexer *> meta_indexer = nullptr;
-    std::atomic<int> new_count = 0;
-    std::atomic<int> exist_count = 0;
-    std::atomic<bool> go = false;
-    auto thread_fcn = [this, &meta_indexer, &new_count, &exist_count, &go]() {
-        while (!go.load(std::memory_order_relaxed)) {}
-        ErrorCode ec = this->CreateMetaIndexer("unique_instance", META_LOCAL_BACKEND_TYPE_STR);
-        MetaIndexer *real = this->manager_->GetMetaIndexer("unique_instance").get();
-        if (ec == EC_OK) {
-            new_count.fetch_add(1, std::memory_order_relaxed);
-        } else if (ec == EC_EXIST) {
-            exist_count.fetch_add(1, std::memory_order_relaxed);
-        }
-        MetaIndexer *expected = nullptr;
-        if (!meta_indexer.compare_exchange_strong(expected, real, std::memory_order_acq_rel)) {
-            ASSERT_EQ(meta_indexer.load(std::memory_order_relaxed), real);
-        }
-    };
-    for (int i = 0; i < 20; ++i) {
-        std::vector<std::thread> threads;
-        for (int j = 0; j < thread_num; ++j) {
-            threads.push_back(std::thread(thread_fcn));
-        }
-        go.store(true, std::memory_order_relaxed);
-        for (auto &thread : threads) {
-            thread.join();
-        }
-        ASSERT_EQ(1, new_count.load());
-        ASSERT_EQ(thread_num - 1, exist_count.load());
-        new_count.store(0);
-        exist_count.store(0);
-        meta_indexer.store(nullptr);
-        manager_ = std::make_shared<MetaIndexerManager>();
-        go.store(false, std::memory_order_relaxed);
-    }
-}
-
 TEST_F(MetaIndexerManagerTest, TestCreateFailed) {
     std::string id_1 = "1";
     ASSERT_EQ(ErrorCode::EC_ERROR, CreateMetaIndexer(id_1, "test"));
@@ -181,18 +143,25 @@ TEST_F(MetaIndexerManagerTest, SameInstanceInitializesOnceAndPublishesAfterSucce
         return EC_OK;
     };
     auto config = std::make_shared<MetaIndexerConfig>();
-    auto first = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    auto create = [&] {
+        const auto ec = manager.CreateMetaIndexer("shared", config);
+        return std::make_pair(ec, manager.GetMetaIndexer("shared"));
+    };
+    auto first = std::async(std::launch::async, create);
     const bool entered = gate.WaitForEntered(1);
-    auto second = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("shared", config); });
+    auto second = std::async(std::launch::async, create);
     EXPECT_EQ(nullptr, manager.GetMetaIndexer("shared"));
     const auto second_status = second.wait_for(std::chrono::milliseconds(50));
     gate.Release();
     EXPECT_TRUE(entered);
     EXPECT_EQ(std::future_status::timeout, second_status);
-    EXPECT_EQ(EC_OK, first.get());
-    EXPECT_EQ(EC_EXIST, second.get());
+    const auto [first_ec, first_indexer] = first.get();
+    const auto [second_ec, second_indexer] = second.get();
+    EXPECT_EQ(EC_OK, first_ec);
+    EXPECT_EQ(EC_EXIST, second_ec);
     EXPECT_EQ(1, manager.init_count.load());
-    EXPECT_NE(nullptr, manager.GetMetaIndexer("shared"));
+    EXPECT_NE(nullptr, first_indexer);
+    EXPECT_EQ(first_indexer, second_indexer);
 }
 
 TEST_F(MetaIndexerManagerTest, CleanupWaitsForInFlightInitializationAndLeavesNoPublishedIndexer) {

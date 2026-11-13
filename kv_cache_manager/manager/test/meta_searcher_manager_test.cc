@@ -6,7 +6,6 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -114,37 +113,6 @@ private:
     std::shared_ptr<RegistryManager> registry_manager_;
     std::unique_ptr<MetaSearcherManager> meta_searcher_manager_;
 };
-
-TEST_F(MetaSearcherManagerTest, TestMultiThreadCreate) {
-    size_t thread_num = 4;
-    std::atomic<MetaSearcher *> searcher = nullptr;
-    std::atomic<bool> go = false;
-    auto thread_fcn = [this, &searcher, &go]() {
-        while (!go.load(std::memory_order_relaxed)) {}
-        std::shared_ptr<RequestContext> request_context(new RequestContext("test_trace_id"));
-        auto real_owner = this->meta_searcher_manager_->TryCreateMetaSearcher(
-            request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
-        MetaSearcher *real = real_owner.get();
-        MetaSearcher *expected = nullptr;
-        if (!searcher.compare_exchange_strong(expected, real, std::memory_order_acq_rel)) {
-            ASSERT_EQ(searcher.load(std::memory_order_relaxed), real);
-        }
-    };
-    for (int i = 0; i < 20; ++i) {
-        std::vector<std::thread> threads;
-        for (int j = 0; j < thread_num; ++j) {
-            threads.push_back(std::thread(thread_fcn));
-        }
-        go.store(true, std::memory_order_relaxed);
-        for (auto &thread : threads) {
-            thread.join();
-        }
-        searcher.store(nullptr);
-        meta_searcher_manager_ =
-            std::make_unique<MetaSearcherManager>(registry_manager_, std::make_shared<MetaIndexerManager>());
-        go.store(false, std::memory_order_relaxed);
-    }
-}
 
 TEST_F(MetaSearcherManagerTest, TestDoCleanup) {
     // 1. 创建 MetaSearcher

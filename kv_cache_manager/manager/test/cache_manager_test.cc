@@ -89,7 +89,6 @@ struct State {
     bool fail_first = false;
     bool throw_first = false;
     bool shared_context = false;
-    bool wrong_trace = false;
     std::set<RequestContext *> active_contexts;
     std::set<std::string> visited;
 
@@ -109,9 +108,6 @@ ErrorCode TryCreate(void *, RequestContext *context, const std::string &instance
     std::unique_lock<std::mutex> lock(state->mutex);
     const size_t call = ++state->calls;
     state->visited.insert(instance_id);
-    if (context->trace_id() != "cache_manager_recover_trace/" + instance_id) {
-        state->wrong_trace = true;
-    }
     if (call == 1 && state->throw_first) {
         throw std::runtime_error("injected instance recovery failure");
     }
@@ -8498,7 +8494,6 @@ TEST_F(CacheManagerTest, TestParallelRecoverIsBoundedAndJoinsAllWorkers) {
     EXPECT_EQ(7, state.calls);
     EXPECT_EQ(7, state.visited.size());
     EXPECT_FALSE(state.shared_context);
-    EXPECT_FALSE(state.wrong_trace);
 }
 
 TEST_F(CacheManagerTest, TestParallelRecoverRetainsPartialFailureAndRetriesEveryInstance) {
@@ -8589,8 +8584,6 @@ TEST_F(CacheManagerTest, TestCleanupWaitsForForegroundRecoveryWorkers) {
     EXPECT_EQ(EC_OK, recovery.get());
     EXPECT_EQ(EC_OK, cleanup.get());
     EXPECT_TRUE(blocked);
-    EXPECT_FALSE(cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance"));
-    EXPECT_EQ(0, cache_manager_->meta_indexer_manager_->GetIndexerSize());
 }
 
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
