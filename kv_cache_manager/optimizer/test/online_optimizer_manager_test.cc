@@ -332,7 +332,8 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionReportsReuseIntervalWindow) {
     std::vector<ReuseIntervalMetricInfo> metrics;
     ASSERT_EQ(EC_OK, mgr_->TakeReuseIntervalMetrics(metrics));
     ASSERT_EQ(1, metrics.size());
-    EXPECT_EQ("i1-ttl-0s", metrics[0].instance_id);
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(0, metrics[0].ttl_seconds);
     EXPECT_EQ("g1", metrics[0].instance_group);
     EXPECT_EQ(4, metrics[0].stats.count);
     EXPECT_EQ(4 * kSecond, metrics[0].stats.min_ns);
@@ -359,7 +360,8 @@ TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
     std::vector<IntervalMetricInfo> metrics;
     ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
     ASSERT_EQ(1, metrics.size());
-    EXPECT_EQ("i1-ttl-0s", metrics[0].instance_id);
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(0, metrics[0].ttl_seconds);
     EXPECT_EQ("g1", metrics[0].instance_group);
     EXPECT_TRUE(metrics[0].has_theoretical_max_hit_rate);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, metrics[0].max_hit_rate);
@@ -395,7 +397,8 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     const std::vector<uint32_t> expected_targets = {6000, 8000, 9000, 9500, 9900, 9950};
     const std::vector<int64_t> expected_blocks = {12, 16, 18, 19, 20, 20};
     for (size_t i = 0; i < metrics.size(); ++i) {
-        EXPECT_EQ("i1-ttl-0s", metrics[i].instance_id);
+        EXPECT_EQ("i1", metrics[i].instance_id);
+        EXPECT_EQ(0, metrics[i].ttl_seconds);
         EXPECT_EQ("g1", metrics[i].instance_group);
         EXPECT_EQ(expected_targets[i], metrics[i].target_basis_points);
         EXPECT_EQ(expected_blocks[i] * 16384, metrics[i].capacity_bytes);
@@ -770,8 +773,10 @@ TEST_F(OnlineOptimizerManagerTest, MultipleTtlsHaveIndependentReplayWithoutCapac
     std::vector<IntervalMetricInfo> metrics;
     ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
     ASSERT_EQ(2u, metrics.size());
-    EXPECT_EQ("i1-ttl-10s", metrics[0].instance_id);
-    EXPECT_EQ("i1-ttl-30s", metrics[1].instance_id);
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(10, metrics[0].ttl_seconds);
+    EXPECT_EQ("i1", metrics[1].instance_id);
+    EXPECT_EQ(30, metrics[1].ttl_seconds);
     ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
     std::vector<InstanceSummary> summaries;
     ASSERT_EQ(EC_OK, mgr_->ListInstances("", summaries));

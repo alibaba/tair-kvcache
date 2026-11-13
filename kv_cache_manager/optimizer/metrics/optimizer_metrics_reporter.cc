@@ -64,12 +64,9 @@ void OptimizerMetricsReporter::ReportInterval() {
     manager_->TakeReuseIntervalMetrics(reuse_metrics);
 
     for (const auto &summary : summaries) {
-        {
-            std::lock_guard lock(reported_ids_mutex_);
-            reported_ids_[summary.instance_id].insert(TtlMetricsInstanceId(summary.instance_id, summary.ttl_seconds));
-        }
         MetricsTags instance_tags = {{"instance_group", summary.instance_group},
-                                     {"instance_id", TtlMetricsInstanceId(summary.instance_id, summary.ttl_seconds)}};
+                                     {"instance_id", summary.instance_id},
+                                     {"ttl", std::to_string(summary.ttl_seconds)}};
 
         metrics_registry_->GetGauge("trace_query_total", instance_tags) = static_cast<double>(summary.total_queries);
         metrics_registry_->GetGauge("trace_query_blocks_total", instance_tags) =
@@ -117,7 +114,9 @@ void OptimizerMetricsReporter::ReportInterval() {
     }
 
     for (const auto &metric : interval_metrics) {
-        MetricsTags interval_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags interval_tags = {{"instance_group", metric.instance_group},
+                                     {"instance_id", metric.instance_id},
+                                     {"ttl", std::to_string(metric.ttl_seconds)}};
         if (metric.has_theoretical_max_hit_rate) {
             metrics_registry_->GetGauge("interval.query_max_hit_rate", interval_tags) = metric.max_hit_rate;
         }
@@ -135,12 +134,15 @@ void OptimizerMetricsReporter::ReportInterval() {
     for (const auto &metric : mrc_metrics) {
         MetricsTags tags = {{"instance_group", metric.instance_group},
                             {"instance_id", metric.instance_id},
+                            {"ttl", std::to_string(metric.ttl_seconds)},
                             {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         metrics_registry_->GetGauge("mrc", tags) = static_cast<double>(metric.capacity_bytes);
     }
 
     for (const auto &metric : reuse_metrics) {
-        MetricsTags tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags tags = {{"instance_group", metric.instance_group},
+                            {"instance_id", metric.instance_id},
+                            {"ttl", std::to_string(metric.ttl_seconds)}};
         const auto &stats = metric.stats;
         const double no_samples = std::numeric_limits<double>::quiet_NaN();
         metrics_registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags) =
@@ -221,11 +223,7 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         for (const auto &ttl : p->ttl_results()) {
             MetricsTags ttl_tags = query_tags;
-            ttl_tags["instance_id"] = TtlMetricsInstanceId(p->instance_id(), ttl.ttl_seconds);
-            {
-                std::lock_guard lock(reported_ids_mutex_);
-                reported_ids_[p->instance_id()].insert(ttl_tags["instance_id"]);
-            }
+            ttl_tags["ttl"] = std::to_string(ttl.ttl_seconds);
             if (p->total_blocks() > 0) {
                 for (const auto &capacity : ttl.per_capacity_hits) {
                     const double hit_rate = capacity.hit_rate >= 0.0 ? capacity.hit_rate
@@ -259,16 +257,6 @@ void OptimizerMetricsReporter::RemoveInstanceMetrics(const std::string &instance
     std::lock_guard interval_lock(interval_report_mutex_);
     if (!metrics_registry_) {
         return;
-    }
-    {
-        std::lock_guard lock(reported_ids_mutex_);
-        auto it = reported_ids_.find(instance_id);
-        if (it != reported_ids_.end()) {
-            for (const auto &id : it->second) {
-                metrics_registry_->RemoveByTagFilter({{"instance_id", id}});
-            }
-            reported_ids_.erase(it);
-        }
     }
     MetricsTags filter = {{"instance_id", instance_id}};
     const auto removed = metrics_registry_->RemoveByTagFilter(filter);

@@ -477,8 +477,8 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
         ttl_response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
 
         if (event_manager_) {
-            auto event = std::make_shared<OptimizerQueryHitEvent>(
-                TtlMetricsInstanceId(request.instance_id(), result.ttl_seconds));
+            auto event =
+                std::make_shared<OptimizerQueryHitEvent>(TtlEventSourceId(request.instance_id(), result.ttl_seconds));
             event->SetEventTriggerTime();
             event->SetAdditionalArgs(
                 request.trace_id(), request.timestamp_ns(), response->input_token_len(), response->total_blocks());

@@ -702,7 +702,8 @@ ErrorCode OnlineOptimizerManager::TakeReuseIntervalMetrics(std::vector<ReuseInte
             if (state->linear_step != 0 || !replay->lite_hit) {
                 continue;
             }
-            metrics.push_back({TtlMetricsInstanceId(id, replay->ttl_seconds),
+            metrics.push_back({replay->ttl_seconds,
+                               id,
                                state->instance_info->instance_group_name(),
                                replay->lite_hit->TakeReuseIntervalStats()});
         }
@@ -724,7 +725,8 @@ ErrorCode OnlineOptimizerManager::TakeMrcMetrics(std::vector<MrcMetricInfo> &met
 
             for (const auto &point : replay->mrc_window.Take()) {
                 MrcMetricInfo metric;
-                metric.instance_id = TtlMetricsInstanceId(id, replay->ttl_seconds);
+                metric.instance_id = id;
+                metric.ttl_seconds = replay->ttl_seconds;
                 metric.instance_group = state->instance_info->instance_group_name();
                 metric.target_basis_points = point.target_basis_points;
                 metric.capacity_bytes =
@@ -749,7 +751,8 @@ ErrorCode OnlineOptimizerManager::TakeIntervalMetrics(std::vector<IntervalMetric
             }
 
             IntervalMetricInfo metric;
-            metric.instance_id = TtlMetricsInstanceId(id, replay->ttl_seconds);
+            metric.instance_id = id;
+            metric.ttl_seconds = replay->ttl_seconds;
             metric.instance_group = state->instance_info->instance_group_name();
             metric.has_theoretical_max_hit_rate = state->instance_group->enable_theoretical_max_cache();
 

@@ -57,7 +57,7 @@ struct InstanceState {
     std::vector<std::unique_ptr<TtlReplayState>> replays;
 };
 
-inline std::string TtlMetricsInstanceId(const std::string &id, int64_t ttl) {
+inline std::string TtlEventSourceId(const std::string &id, int64_t ttl) {
     return id + "-ttl-" + std::to_string(ttl) + "s";
 }
 
@@ -91,12 +91,14 @@ struct PerCapacityHitRateInfo {
 };
 
 struct ReuseIntervalMetricInfo {
+    int64_t ttl_seconds = 0;
     std::string instance_id;
     std::string instance_group;
     ReuseIntervalStats stats;
 };
 
 struct MrcMetricInfo {
+    int64_t ttl_seconds = 0;
     std::string instance_id;
     std::string instance_group;
     // Relative target against the reporting window's theoretical maximum hit
@@ -106,6 +108,7 @@ struct MrcMetricInfo {
 };
 
 struct IntervalMetricInfo {
+    int64_t ttl_seconds = 0;
     std::string instance_id;
     std::string instance_group;
     bool has_theoretical_max_hit_rate = false;

@@ -156,7 +156,7 @@ kv_cache_manager/optimizer/
 
 在线服务协议定义在 `kv_cache_manager/protocol/protobuf/optimizer_service.proto`，由 service 层转换为 optimizer online config/runtime 对象。
 
-full-attention TraceQuery 先归一化输入并计算一次 prefix hash，再按 `ttl_seconds_list` 的每个值进入独立 LiteHit 状态。开启理论分析时 `capacity_gb` 可以为空。命中率为命中 block 数 × block size / 输入长度；长度未提供表示完整 blocks。TTL 使用事件到达时间。分析指标在现有 instance_id 后追加 `-ttl-<秒数>s`，service 计数仍按真实请求计一次。
+full-attention TraceQuery 先归一化输入并计算一次 prefix hash，再按 `ttl_seconds_list` 的每个值进入独立 LiteHit 状态。开启理论分析时 `capacity_gb` 可以为空。命中率为命中 block 数 × block size / 输入长度；长度未提供表示完整 blocks。TTL 使用事件到达时间。分析指标保留分析 instance_id，新增独立 `ttl` tag（单位秒，0 表示无限 TTL）；service 指标不带 `ttl`，仍按真实请求计一次。
 
 ---
 

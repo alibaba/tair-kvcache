@@ -106,19 +106,21 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 `mock_cache_layout=false` 时容量取 KVCM Group quota，TTL 使用订阅项的 `ttl_seconds_list`，未填写时默认 `[86400]`；单个 spec group 按 full-attention 使用，没有 group 时将全部 spec 组成 full group，不使用订阅项的容量列表。当前尚未约定可可靠识别 FA / Mamba 等缓存角色的 spec 映射协议，因此真实布局路径不支持多组 spec，跳过这类实例；mock 路径也不模拟混合缓存布局。真实布局路径暂不支持动态 quota 更新：同名 Group 的 quota 变化会导致配置同步失败，阻止新增实例同步，并可能阻止订阅切换到新 Leader。这是已知限制，不影响默认 mock 模式对源 quota 变化的处理。
 
-在线 Group 使用必填的 `ttl_seconds_list`，每项是非负秒数，0 表示不限制时间；空列表、重复、负数和纳秒换算溢出均拒绝。每个分析 Instance 持有各 TTL 独立回放状态，共享一次输入归一化和 prefix hash。TraceQuery 返回 `ttl_results`，每项包含 TTL 与对应结果；ListInstances 每 TTL 一行，保留分析 ID 并携带 TTL。分析指标的现有 `instance_id` 值追加 `-ttl-<秒数>s`，如 `foo_bs128-ttl-86400s`，不新增 tag；service QPS/TPM 按分析 ID（如 `foo_bs128`）计数一次，不按 TTL 重复计数。空容量不生成容量命中率，理论命中率、MRC 等照常输出；mock 字节数模式下的 MRC 字节值基于占位字节数，不能用于实际容量规划。旧 Group 单 TTL 字段不再接受。
+在线 Group 使用必填的 `ttl_seconds_list`，每项是非负秒数，0 表示不限制时间；空列表、重复、负数和纳秒换算溢出均拒绝。每个分析 Instance 持有各 TTL 独立回放状态，共享一次输入归一化和 prefix hash。TraceQuery 返回 `ttl_results`，每项包含 TTL 与对应结果；ListInstances 每 TTL 一行，保留分析 ID 并携带 TTL。分析指标保留分析 `instance_id`（如 `foo_bs128`），新增独立 `ttl` tag，值为十进制秒数（如 `86400`，`0` 表示无限 TTL）；service QPS/TPM/RT/错误指标不带 `ttl`，按分析 ID（如 `foo_bs128`）计数一次，不按 TTL 重复计数。空容量不生成容量命中率，理论命中率、MRC 等照常输出；mock 字节数模式下的 MRC 字节值基于占位字节数，不能用于实际容量规划。旧 Group 单 TTL 字段不再接受。
 
 KVCM 默认在启动时注册 optimizer 订阅服务；设置 `optimizer.enable=false` 则不注册 publisher 和订阅服务。开启但没有订阅者时直接跳过，不创建查询事件；存在订阅者时，在有效 GetHostCacheState 请求中将原始 block keys 和 trace_id 直接送入已有 optimizer 有界队列，时间为 KVCM 到达时间；不发同步 RPC、不等待分析结果，上报失败不改变查询返回。队列满或队列锁竞争时丢弃分析样本，不等待网络发送。最后一个订阅者离开后停止采集，旧订阅批次的排队事件不会发送给重新连接的订阅者。普通缓存读取不再重复进入该 optimizer publisher。没有 input length 时按完整 block 数乘注册 block size 计数，不额外读取 token。独立 Optimizer 仍通过原有 SubscribeEvents 接收事件。
 
 每个 KVCM 订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，唤醒对应 KVCM 的配置刷新；配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，直接调用 TraceQuery 的 timestamp_ns 为 0 时使用 Optimizer 接收时间。
 
-在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id`、`ttl` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
 
-在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_{min,max,avg,p95,p99,p995,p999}_seconds`，单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。P95/P99/P99.5/P99.9 采用 nearest-rank（ceil(N×p)）口径，每份 TTL 回放使用固定 58 KiB 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
+在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_{min,max,avg,p95,p99,p995,p999}_seconds`，单位为秒，标签为 `instance_group`、`instance_id`、`ttl`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。P95/P99/P99.5/P99.9 采用 nearest-rank（ceil(N×p)）口径，每份 TTL 回放使用固定 58 KiB 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
 
 当前仅 LiteHit full-attention 路径提供原生 reuse interval 统计；旧 linear indexer 不上报这些指标，也不再使用旧 hit-age 分桶作为兼容数据源。
 
 #### Prometheus / KMON 指标对应
+
+所有按 TTL 独立回放的指标（逐请求/周期/累计命中、MRC、reuse interval 和状态估计）均带 `ttl` tag，单位为秒；服务指标不带此 tag。大盘按不带 TTL 后缀的 `instance_id` 筛选，回放曲线按 `ttl` 分组并在图例中显示。PromQL 的聚合和向量匹配也需保留 `ttl`，避免把不同回放状态合并。升级后需同步移除大盘的 `-ttl-*s` 后缀筛选；不双写旧后缀指标，历史数据仍保留原标签。查询事件日志的 source 后缀不属于 metrics，本次保持不变。
 
 两种后端共用一次回放快照和一次窗口提取，不分别清空窗口。下表省略服务名前缀；Prometheus 会将指标名中的 `.` 转成 `_`，KMON 保留 `.`。KMON 的服务名前缀由环境变量 `kmonitorServiceName` 配置，不能直接照搬 Prometheus 前缀。
 
@@ -129,7 +131,7 @@ KVCM 默认在启动时注册 optimizer 订阅服务；设置 `optimizer.enable=
 | 错误吞吐 | `service.error_counter` counter | `service.error_qps` QPS | 同请求吞吐，不按 TTL 重复计数 |
 | 处理耗时 | `service.query_rt_us_sum` / `service.query_counter` 的增量比 | `service.query_rt_us` GAUGE 的请求样本均值 | 单位微秒；跨实例应按请求量加权，而不是平均各实例均值 |
 | 错误码 | `service.error_code` | `service.error_code` | 请求样本，不把错误码平均值当错误率 |
-| 逐请求分析 | `query_{hit_rate,hit_count,total_blocks,max_hit_count,max_hit_rate,capacity_efficiency}` | `query.{同名后缀}` | TTL 后缀 instance_id，容量相关项另带 capacity_gb |
+| 逐请求分析 | `query_{hit_rate,hit_count,total_blocks,max_hit_count,max_hit_rate,capacity_efficiency}` | `query.{同名后缀}` | instance_id + ttl，容量相关项另带 capacity_gb |
 | 周期命中 | `interval.query_{hit_rate,max_hit_rate,capacity_efficiency}` | 同名 | 两边同一上报窗口，直接展示比例 |
 | 累计回放和状态 | `trace_query_*` | `trace.query_*` | 两边相同累计快照、token 命中率、内存/工作集/驱逐统计 |
 | 复用时间 | `trace_query_reuse_interval_*_seconds` | `trace.query_reuse_interval_*_seconds` | min/max/avg/P95/P99/P99.5/P99.9；空窗口不补零、不延用旧样本 |

@@ -335,7 +335,7 @@ TEST_F(KvcmEventSubscriberTest, BlockSizeChangeRetiresStateAndRejectsMismatchedE
     subscriber.ProcessEvent(next_event, "127.0.0.1");
     EXPECT_EQ(1, TotalQueries("known", 8));
     const MetricsTags hit_tags = {
-        {"instance_group", "g1"}, {"instance_id", "known_bs8-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
+        {"instance_group", "g1"}, {"instance_id", "known_bs8"}, {"ttl", "86400"}, {"client_ip", "127.0.0.1"}};
     EXPECT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("query_max_hit_count", hit_tags).Get());
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     ASSERT_TRUE(subscriber.SyncConfiguration(leader.rpc_endpoint()));
@@ -466,9 +466,10 @@ TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
     ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
 
     const MetricsTags base_tags = {
-        {"instance_group", "g1"}, {"instance_id", "known_bs4-ttl-86400s"}, {"client_ip", "127.0.0.1"}};
+        {"instance_group", "g1"}, {"instance_id", "known_bs4"}, {"ttl", "86400"}, {"client_ip", "127.0.0.1"}};
     const MetricsTags capacity_tags = {{"instance_group", "g1"},
-                                       {"instance_id", "known_bs4-ttl-86400s"},
+                                       {"instance_id", "known_bs4"},
+                                       {"ttl", "86400"},
                                        {"client_ip", "127.0.0.1"},
                                        {"capacity_gb", std::to_string(2.0)}};
 

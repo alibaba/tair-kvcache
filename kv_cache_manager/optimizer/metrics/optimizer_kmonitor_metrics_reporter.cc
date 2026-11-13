@@ -303,7 +303,7 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 
     for (const auto &ttl : collector->ttl_results()) {
         MetricsTags ttl_tags = query_tags;
-        ttl_tags["instance_id"] = TtlMetricsInstanceId(collector->instance_id(), ttl.ttl_seconds);
+        ttl_tags["ttl"] = std::to_string(ttl.ttl_seconds);
         for (const auto &info : ttl.per_capacity_hits) {
             const double hit_rate = info.hit_rate >= 0.0 ? info.hit_rate
                                                          : static_cast<double>(info.hit_count) /
@@ -337,7 +337,8 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
 
     for (const auto &summary : summaries) {
         MetricsTags base_tags = {{"instance_group", summary.instance_group},
-                                 {"instance_id", TtlMetricsInstanceId(summary.instance_id, summary.ttl_seconds)}};
+                                 {"instance_id", summary.instance_id},
+                                 {"ttl", std::to_string(summary.ttl_seconds)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->trace_query_total_metrics->Report(&tags, static_cast<double>(summary.total_queries));
         kmon_ctx_->trace_query_blocks_total_metrics->Report(&tags, static_cast<double>(summary.total_blocks_queried));
@@ -384,7 +385,9 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
         if (metric.stats.count == 0) {
             continue;
         }
-        MetricsTags base_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags base_tags = {{"instance_group", metric.instance_group},
+                                 {"instance_id", metric.instance_id},
+                                 {"ttl", std::to_string(metric.ttl_seconds)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->trace_query_reuse_interval_min_seconds_metrics->Report(
             &tags, static_cast<double>(metric.stats.min_ns) / 1e9);
@@ -402,7 +405,9 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
     }
 
     for (const auto &metric : interval_metrics) {
-        MetricsTags base_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags base_tags = {{"instance_group", metric.instance_group},
+                                 {"instance_id", metric.instance_id},
+                                 {"ttl", std::to_string(metric.ttl_seconds)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         if (metric.has_theoretical_max_hit_rate) {
             kmon_ctx_->interval_query_max_hit_rate_metrics->Report(&tags, metric.max_hit_rate);
@@ -423,6 +428,7 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
     for (const auto &metric : mrc_metrics) {
         MetricsTags base_tags = {{"instance_group", metric.instance_group},
                                  {"instance_id", metric.instance_id},
+                                 {"ttl", std::to_string(metric.ttl_seconds)},
                                  {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));

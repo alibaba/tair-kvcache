@@ -156,7 +156,7 @@ kv_cache_manager/optimizer/
 
 The online service protocol is defined in `kv_cache_manager/protocol/protobuf/optimizer_service.proto`, and is converted by the service layer into optimizer online config/runtime objects.
 
-Full-attention TraceQuery normalizes the input and prefix hashes once, then replays independent LiteHit states for every configured `ttl_seconds_list` entry. Empty `capacity_gb` is allowed with theoretical analysis enabled. Rates use hit blocks × block size / input length; absent length denotes complete blocks. TTL follows event arrival timestamps. Analysis metrics append `-ttl-<seconds>s` to the existing instance ID label, while service counters count the original request once.
+Full-attention TraceQuery normalizes the input and prefix hashes once, then replays independent LiteHit states for every configured `ttl_seconds_list` entry. Empty `capacity_gb` is allowed with theoretical analysis enabled. Rates use hit blocks × block size / input length; absent length denotes complete blocks. TTL follows event arrival timestamps. Analysis metrics retain the analysis instance ID and add a separate `ttl` tag in seconds (0 means unlimited TTL). Service metrics have no `ttl` tag and count the original request once.
 
 ---
 
