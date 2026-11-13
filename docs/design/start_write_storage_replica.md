@@ -100,6 +100,8 @@ HTTP 请求示例：
 | 可用性及数据存在性 | 复用当前选择策略及 `GetCheckLocDataExistFunc`，不改它们的公共实现 |
 | specs | 沿用现有 min-replica 规则：指定非空 spec group 时，按名称检查单个 Location 是否覆盖该组；未指定时不额外检查 spec 覆盖 |
 
+请求类型按后端注册配置识别。VCNS 为复用 3FS 协议，其 `GetType()` 和已有 Location 的 `type` 可以是 HF3FS，但配置类型仍是 VCNS；指定 `ST_VCNS_3FS` 或排除它时，应识别这个配置身份。只有请求需要区分 3FS 与 VCNS 时，计数才对这两类 Location 根据 URI 中的后端名称查询配置；无法定位后端或 URI 无效时，不猜测其身份、不计入本次门槛。两类均允许或均排除时无需该查询，日常排除 EventReport 的请求保持原判断。筛选后的 Location 仍以原对象进入公共计数函数，不改元数据或响应中的协议类型，也不改变状态、spec、配额和有效性规则。
+
 这是判断某个 Location 是否计入本次写入门槛的条件，不是“一次必须写齐 Instance 全部 specs”的要求。请求指定 `location_spec_group_names` 时，只检查对应 group 的 spec 名称集合，不能仅比较 `spec_size`；未指定或对应 group 名为空时，沿用原来的空 spec 集合和 block 级计数，不增加“必须覆盖全部注册 specs”的规则。实际分配哪些 specs 仍按已有写入逻辑执行。
 
 现有 `StartWriteCache` 支持按已注册的 spec group 分次写入：同一个 key 可以先写 Full 组形成 Location A，再写 Linear 组形成 Location B。后一次申请生成新的 Location，不会把 specs 追加到 A；现有普通查询可合并同一具体存储后端上的有效 Location，返回包含两组 specs 的视图，元数据中的两个 Location 仍独立存在。参见 [分组写入与读取回归用例](../../kv_cache_manager/manager/test/cache_manager_test.cc) 的 `TestStartWriteCacheSpecGroupDedup` 和 `TestWriteThenReadRoundTripWithSpecGroups`。
@@ -133,13 +135,13 @@ HTTP 请求示例：
 
 ### 4.1 后端选择只增加一个有明确用途的过滤条件
 
-为 [SelectCacheWriteDataStorageBackend](../../kv_cache_manager/manager/data_storage_selector.cc) 追加可选目标类型；未指定时保留原来的 `Select(candidates, preference)` 路径。指定时，在现有候选构造后调用已有 `SelectByType(candidates, target_type, false)`，不允许跨类型回退。
+为 [SelectCacheWriteDataStorageBackend](../../kv_cache_manager/manager/data_storage_selector.cc) 追加可选目标类型；未指定时保留原来的 `Select(candidates, preference)` 路径。指定时，在现有候选构造后按 `GetStorageConfig().type()` 筛选，取第一个匹配候选，不允许跨类型回退。公共 `SelectByType` 保持原样，避免改变 Group 原有的协议类型偏好。
 
-排除模式在原有候选构造后移除排除类型，再调用原 `Select(candidates, preference)`。排除列表默认空，旧调用不受影响。原 Group 的 PREFER 回退仅在剩余候选内进行；若 ALWAYS 要求的类型已被排除，则返回原有无候选错误，不绕过排除条件或改写 Group 策略。
+排除模式在原有候选构造后按配置类型移除排除项，再调用原 `Select(candidates, preference)`。排除列表默认空，旧调用不受影响。原 Group 的 PREFER 回退仅在剩余候选内进行；若过滤后没有满足 ALWAYS 策略的候选，则返回原有无候选错误，不绕过排除条件或改写 Group 策略。例如只排除普通 3FS 时仍允许 VCNS，原 `CPS_ALWAYS_3FS` 也仍可选择使用 3FS 协议的 VCNS。
 
 仍然执行 Group `storage_candidates`、后端可写性、总配额和类型配额检查；同类型多个后端沿用当前候选顺序。显式类型取代本次请求的 Group 写入偏好，包括 `CPS_PREFER_*` 和 `CPS_ALWAYS_*`；即使 Group 配置了另一类型的 ALWAYS，本次仍按请求类型选择，但必须满足候选范围和配额等条件。不修改 Group 配置，不扩展通用策略枚举或后端能力注册机制。
 
-`SelectByType` 返回第一个类型匹配的候选，不根据已有 Location 做后端分散。候选及可用状态不变时，多次调用补到 N 份通常仍选择同一后端；本参数不提供 N 个独立存储后端的保证。
+指定模式返回第一个配置类型匹配的候选，不根据已有 Location 做后端分散。候选及可用状态不变时，多次调用补到 N 份通常仍选择同一后端；本参数不提供 N 个独立存储后端的保证。
 
 后端分配选择只在存在待写 key 时执行：在元数据查询、选择策略生成及有效性检查成功，全部 key 计数已达标且没有可执行的 Mark 需要补写时，走现有“无新写入”的返回流程，不执行普通新分配的配额及 Writable 检查。排除模式仍先沿用 Mark 的准入检查。例如后端仍 `Available()`、已有数据有效，但已只读或配额已满，且没有其他 Mark 引导时，可以正常跳过。若 Group 中已注册候选全部不可用，`genSelectLocationPolicy` 可能先返回空，计数前就报错；本次不绕过这一已有检查。
 
@@ -191,7 +193,7 @@ HTTP 请求示例：
 | SSD，DRAM 已回收 | 无或 SSD 目标已覆盖 | 跳过，不补回 DRAM |
 | DRAM | SSD 暂时不可用或配额已满 | 原 Mark 准入退回数量判断；数量已够则跳过，保留 Mark |
 
-若 Mark 目标类型被排除，仅忽略本次引导，不因此清标；数量不足仍尝试允许范围内的普通后端。目标注销、Mark 过期等原有条件清理保持原样。前置准入通过后分配失败沿用错误与回滚，不新增同请求内重选机制。
+若 Mark 目标的配置类型被排除，仅忽略本次引导，不因此清标；数量不足仍尝试允许范围内的普通后端。此处与普通候选使用同一配置类型口径，不用 VCNS 共用的 HF3FS 协议类型代替。目标注销、Mark 过期等原有条件清理保持原样。前置准入通过后分配失败沿用错误与回滚，不新增同请求内重选机制。
 
 `FinishWriteCache` 沿用当前规则：仅本次成功 Location 所在的具体 storage 与 Mark 目标一致时，才按已有清标策略处理；类型相同但具体后端不同不等于满足 Mark。数量已达标本身也不触发清标。不扩展 `MigrationManager`，不增加 session 标志或新的清标策略。
 

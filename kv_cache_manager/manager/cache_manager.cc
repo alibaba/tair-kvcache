@@ -338,6 +338,27 @@ bool LocationHasSpecOnStorage(const CacheLocation &loc, const std::string &stora
     });
 }
 
+// Only replica requirements that distinguish HF3FS from VCNS need this lookup.
+// Keep Location::type() unchanged for existing data-plane and validity checks.
+std::optional<DataStorageType> GetReplicaStorageType(const CacheLocation &location,
+                                                     const std::shared_ptr<DataStorageManager> &storage_manager) {
+    if (ToBaseType(location.type()) != DataStorageType::DATA_STORAGE_TYPE_HF3FS) {
+        return location.type();
+    }
+    if (!storage_manager || location.location_specs().empty()) {
+        return std::nullopt;
+    }
+    const DataStorageUri uri(location.location_specs().front().uri());
+    if (!uri.Valid() || uri.GetHostName().empty()) {
+        return std::nullopt;
+    }
+    const auto backend = storage_manager->GetDataStorageBackend(uri.GetHostName());
+    if (!backend) {
+        return std::nullopt;
+    }
+    return backend->GetStorageConfig().type();
+}
+
 std::vector<std::string> BuildAllLocationSpecNames(const std::shared_ptr<const InstanceInfo> &instance_info) {
     std::vector<std::string> spec_names;
     if (instance_info == nullptr) {
@@ -2330,6 +2351,15 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         !target_storage_type && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
+    const auto excludes_type = [&](DataStorageType type) {
+        return std::find(excluded_storage_types.begin(), excluded_storage_types.end(), type) !=
+               excluded_storage_types.end();
+    };
+    const bool distinguish_hf3fs_types =
+        (target_storage_type && ToBaseType(*target_storage_type) == DataStorageType::DATA_STORAGE_TYPE_HF3FS) ||
+        (excludes_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS) !=
+         excludes_type(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+
     static const std::vector<std::string> empty_spec_names;
     auto existsForWrite =
         [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
@@ -2349,9 +2379,13 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         const CacheLocationMap *counted_locations = &m;
         if (target_storage_type || !excluded_storage_types.empty()) {
             for (const auto &[id, location] : m) {
-                if (location && (!target_storage_type || location->type() == *target_storage_type) &&
-                    std::find(excluded_storage_types.begin(), excluded_storage_types.end(), location->type()) ==
-                        excluded_storage_types.end()) {
+                if (!location) {
+                    continue;
+                }
+                const auto type = distinguish_hf3fs_types
+                                      ? GetReplicaStorageType(*location, registry_manager_->data_storage_manager())
+                                      : std::optional<DataStorageType>{location->type()};
+                if (type && (!target_storage_type || *type == *target_storage_type) && !excludes_type(*type)) {
                     target_locations.emplace(id, location);
                 }
             }
@@ -2393,9 +2427,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                 continue;
             }
             const auto backend = storage_manager->GetDataStorageBackend(target);
-            if (backend &&
-                std::find(excluded_storage_types.begin(), excluded_storage_types.end(), backend->GetType()) !=
-                    excluded_storage_types.end()) {
+            if (backend && excludes_type(backend->GetStorageConfig().type())) {
                 target.clear();
             }
         }

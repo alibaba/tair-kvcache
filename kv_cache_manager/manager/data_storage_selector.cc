@@ -337,19 +337,22 @@ DataStorageSelectResult DataStorageSelector::SelectCacheWriteDataStorageBackend(
     // 0. calculate the candidate list
     std::vector<std::shared_ptr<DataStorageBackend>> candidates;
     GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_table, candidates);
-    if (!excluded_storage_types.empty()) {
+    if (target_type || !excluded_storage_types.empty()) {
         candidates.erase(std::remove_if(candidates.begin(),
                                         candidates.end(),
                                         [&](const auto &backend) {
-                                            return std::find(excluded_storage_types.begin(),
+                                            // VCNS shares the HF3FS protocol type, but has its own configured identity.
+                                            const auto type = backend->GetStorageConfig().type();
+                                            return (target_type && type != *target_type) ||
+                                                   std::find(excluded_storage_types.begin(),
                                                              excluded_storage_types.end(),
-                                                             backend->GetType()) != excluded_storage_types.end();
+                                                             type) != excluded_storage_types.end();
                                         }),
                          candidates.end());
     }
 
     // 1. select backend according to the specified preference
-    const auto chosen_backend = target_type ? SelectByType(request_context, candidates, *target_type, false)
+    const auto chosen_backend = target_type ? (candidates.empty() ? nullptr : candidates.front())
                                             : Select(request_context, candidates, preference);
 
     if (chosen_backend == nullptr) {
