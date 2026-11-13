@@ -137,7 +137,7 @@ TEST_F(LoopThreadTest, TestStopFromOtherThreadDoesNotDetectSelfJoin) {
     EXPECT_FALSE(loop_thread->SelfJoinDetected());
 }
 
-// AC-4: 在自己的 loop 回调里调用 Stop() 属于自连接。检测标志置真、错误日志打出，
+// 在自己的 loop 回调里调用 Stop() 属于自连接。检测标志置真、错误日志打出，
 // 但 join 照常执行并抛出 std::system_error —— 不跳过 join、不 detach，问题被暴露而不是被掩盖。
 TEST_F(LoopThreadTest, TestStopFromOwnLoopThreadDetectsSelfJoin) {
     std::promise<std::shared_ptr<LoopThread>> owner_promise;

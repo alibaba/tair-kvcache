@@ -236,7 +236,7 @@ protected:
     pid_t child_pid_ = -1;
 };
 
-// AC-6: 优雅退出返回 0，并在销毁 service/manager 之前完成完整的关闭日志序列。
+// 优雅退出返回 0，并在销毁 service/manager 之前完成完整的关闭日志序列。
 TEST_F(CommandLineShutdownTest, SingleSigtermShutsDownGracefullyWithExitCodeZero) {
     ASSERT_GE(StartServerChild(), 0);
     ASSERT_TRUE(WaitForServerReady());
@@ -257,7 +257,7 @@ TEST_F(CommandLineShutdownTest, SingleSigtermShutsDownGracefullyWithExitCodeZero
     child_pid_ = -1;
 }
 
-// AC-3: 优雅关闭进行中再次收到退出信号 → 立即以 128+sig 结束。
+// 优雅关闭进行中再次收到退出信号 → 立即以 128+sig 结束。
 // memory backend 的关闭只需约 1ms，用日志轮询做「第二个信号落在关闭进行中」的同步点在负载下
 // 会退化成竞态。这里改为把子进程 SIGSTOP 冻结后一次性投递两个不同编号的退出信号（标准信号
 // 不排队，同编号会被合并；不同编号各有独立 pending 槽），再 SIGCONT 放行：控制线程必然背靠背

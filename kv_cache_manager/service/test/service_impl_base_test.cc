@@ -165,7 +165,7 @@ bool WaitUntil(Pred pred, int64_t timeout_ms) {
 
 } // namespace
 
-// AC-4 + AC-7: 线程 X 持有一个 in-flight leader-only 请求时收到定向退出信号。
+// 线程 X 持有一个 in-flight leader-only 请求时收到定向退出信号。
 // 关闭由主线程执行：先关门禁（新请求拿到拒绝码而不是传输错误），再等 X 完成请求后排空。
 //
 // 说明：POSIX 下 pthread_kill 到已阻塞该信号的线程，信号只挂在该线程自己的 pending
