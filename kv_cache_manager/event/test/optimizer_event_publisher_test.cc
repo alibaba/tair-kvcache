@@ -1,4 +1,5 @@
 #include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
@@ -20,7 +21,9 @@ namespace {
 // Captures what the publisher hands to the subscription queue.
 class RecordingEventSink : public EventSink {
 public:
-    bool Send(const proto::optimizer::TraceQueryRequest &event) override {
+    uint64_t CaptureEpoch() const override { return epoch.load(); }
+    std::atomic<uint64_t> epoch{1};
+    bool Send(const proto::optimizer::TraceQueryRequest &event, uint64_t) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!accept_) {
             ++dropped_;
@@ -75,6 +78,9 @@ std::shared_ptr<CacheGetEvent> MakeGetEvent(const std::string &instance_id,
                                             const std::string &trace_id = "trace-1",
                                             const std::vector<std::string> &location_spec_names = {}) {
     auto event = std::make_shared<CacheGetEvent>(instance_id);
+    event->set_capture_epoch(1);
+    event->set_optimizer_observation(true);
+    event->set_block_size(256);
     event->SetEventTriggerTime();
     event->set_trace_id(trace_id);
     event->SetAddtionalArgs(query_type, keys, tokens, BlockMask(), 0, location_spec_names);
@@ -116,6 +122,13 @@ protected:
         sink_.reset();
     }
 
+    // Conversion tests enqueue before starting the worker so its queue lock
+    // cannot cause an unrelated best-effort drop. Contention is tested separately.
+    void PrepareQueueWithoutWorker() {
+        publisher_->InitBasicQueue(64);
+        publisher_->running_ = true;
+    }
+
     std::shared_ptr<RecordingEventSink> sink_;
     std::unique_ptr<OptimizerEventPublisher> publisher_;
 };
@@ -126,14 +139,16 @@ TEST_F(OptimizerEventPublisherTest, TestInitRequiresSink) {
 }
 
 TEST_F(OptimizerEventPublisherTest, TestForwardsCacheGetEvent) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {11, 22, 33}, std::vector<std::int64_t>(700, 5))));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto events = sink_->Events();
     ASSERT_EQ(1u, events.size());
     const auto &request = events[0];
     EXPECT_EQ("instance-a", request.instance_id());
+    EXPECT_EQ(256, request.block_size());
     ASSERT_EQ(3, request.block_keys_size());
     EXPECT_EQ(11, request.block_keys(0));
     EXPECT_EQ(22, request.block_keys(1));
@@ -146,10 +161,11 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsCacheGetEvent) {
 }
 
 TEST_F(OptimizerEventPublisherTest, TestForwardsExplicitInputTokenLen) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     auto event = MakeGetEvent("instance-a", {11, 22}, {});
     event->set_input_token_len(5);
     ASSERT_TRUE(publisher_->Publish(event));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
@@ -159,10 +175,11 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsExplicitInputTokenLen) {
 
 // Microseconds on the event, nanoseconds on the wire.
 TEST_F(OptimizerEventPublisherTest, TestTimestampConvertedToNanos) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     auto event = MakeGetEvent("instance-a", {1}, {1, 2});
     const std::int64_t trigger_us = event->event_trigger_time_us();
     ASSERT_TRUE(publisher_->Publish(event));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
@@ -172,7 +189,7 @@ TEST_F(OptimizerEventPublisherTest, TestTimestampConvertedToNanos) {
 // Every publisher on EventManager sees every event, so non-read events must be
 // skipped rather than forwarded as garbage.
 TEST_F(OptimizerEventPublisherTest, TestSkipsNonCacheGetEvents) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
 
     auto write_event = std::make_shared<StartWriteCacheEvent>("instance-a");
     write_event->SetEventTriggerTime();
@@ -180,6 +197,7 @@ TEST_F(OptimizerEventPublisherTest, TestSkipsNonCacheGetEvents) {
     ASSERT_TRUE(publisher_->Publish(write_event));
 
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {7}, {1, 2})));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     EXPECT_EQ(1u, sink_->EventCount());
@@ -199,18 +217,20 @@ TEST_F(OptimizerEventPublisherTest, TestPublishAfterStopIsRejected) {
 
 // A sink that refuses everything must not stall or crash the worker.
 TEST_F(OptimizerEventPublisherTest, TestSinkRefusalIsNotCountedAsForwarded) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     sink_->set_accept(false);
 
     for (int i = 0; i < 5; ++i) {
         ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {i}, {1, 2})));
     }
+    ASSERT_TRUE(publisher_->Init(""));
     // Nothing to wait for on the sink, so wait for the queue to be consumed.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (sink_->DroppedCount() < 5 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_EQ(5u, sink_->DroppedCount());
+    EXPECT_EQ(0u, publisher_->DroppedCount());
     EXPECT_EQ(0u, publisher_->ForwardedCount());
 }
 
@@ -239,13 +259,57 @@ TEST_F(OptimizerEventPublisherTest, TestStopIsIdempotentAndStopsSink) {
     EXPECT_EQ(1u, sink_->StopCalls());
 }
 
+TEST_F(OptimizerEventPublisherTest, NoSubscribersAndStaleEpochDoNotEnqueue) {
+    publisher_->InitBasicQueue(4);
+    publisher_->running_ = true;
+    sink_->epoch = 0;
+    EXPECT_EQ(0u, publisher_->CaptureEpoch());
+    EXPECT_TRUE(publisher_->Publish(MakeGetEvent("i", {1}, {})));
+    EXPECT_EQ(0u, publisher_->BasicQueueSize());
+    sink_->epoch = 2;
+    EXPECT_TRUE(publisher_->Publish(MakeGetEvent("i", {1}, {})));
+    EXPECT_EQ(0u, publisher_->BasicQueueSize());
+    publisher_->running_ = false;
+}
+
+TEST_F(OptimizerEventPublisherTest, QueueContentionDropsWithoutWaiting) {
+    publisher_->InitBasicQueue(4);
+    publisher_->running_ = true;
+    std::unique_lock<std::mutex> lock(publisher_->basic_queue_->queue_mutex);
+    auto caller = std::async(std::launch::async, [&] { return publisher_->Publish(MakeGetEvent("i", {1}, {})); });
+    EXPECT_EQ(std::future_status::ready, caller.wait_for(std::chrono::seconds(1)));
+    lock.unlock();
+    EXPECT_TRUE(caller.get());
+    EXPECT_EQ(1u, publisher_->DroppedCount());
+    EXPECT_EQ(0u, publisher_->BasicQueueSize());
+    publisher_->running_ = false;
+}
+
+TEST_F(OptimizerEventPublisherTest, ReconnectDiscardsPreviouslyQueuedEvents) {
+    publisher_->InitBasicQueue(4);
+    publisher_->running_ = true;
+    ASSERT_TRUE(publisher_->Publish(MakeGetEvent("i", {1}, {})));
+    ASSERT_EQ(1u, publisher_->BasicQueueSize());
+    sink_->epoch = 2;
+    auto fresh = MakeGetEvent("i", {2}, {});
+    fresh->set_capture_epoch(2);
+    ASSERT_TRUE(publisher_->Publish(fresh));
+    ASSERT_TRUE(publisher_->Init(""));
+    ASSERT_TRUE(WaitForEvents(*sink_, 1));
+    publisher_->Stop();
+    auto events = sink_->Events();
+    ASSERT_EQ(1u, events.size());
+    EXPECT_EQ(2, events.front().block_keys(0));
+}
+
 TEST_F(OptimizerEventPublisherTest, TestStopWithoutInitIsSafe) { EXPECT_TRUE(publisher_->Stop()); }
 
 // Trace id is what lets a consumer-side anomaly be joined back to the request
 // in kvcm's own logs; the random event id cannot do that.
 TEST_F(OptimizerEventPublisherTest, TestTraceIdIsCarriedThrough) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {1, 2}, {1, 2, 3}, "prefix_match", "trace-abc")));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
@@ -253,9 +317,10 @@ TEST_F(OptimizerEventPublisherTest, TestTraceIdIsCarriedThrough) {
 }
 
 TEST_F(OptimizerEventPublisherTest, TestLocationSpecNamesAreCarriedThrough) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(
         MakeGetEvent("instance-a", {1, 2}, {1, 2, 3}, "prefix_match", "trace-abc", {"tp0", "tp1"})));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
@@ -264,10 +329,11 @@ TEST_F(OptimizerEventPublisherTest, TestLocationSpecNamesAreCarriedThrough) {
 }
 
 TEST_F(OptimizerEventPublisherTest, TestDoesNotFilterQueryType) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {1, 2}, {1, 2}, "reverse_roll_sw_match")));
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {3, 4}, {1, 2}, "prefix_match")));
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {5, 6}, {1, 2}, "prefix_match_with_mamba")));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 3));
 
     EXPECT_EQ(3u, sink_->EventCount());
@@ -284,8 +350,9 @@ TEST_F(OptimizerEventPublisherTest, TestDoesNotFilterQueryType) {
 // request whose tokens belong in the hit-rate denominator, so dropping it
 // would silently inflate the reported hit rate.
 TEST_F(OptimizerEventPublisherTest, TestForwardsEventWithoutBlockKeys) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {}, std::vector<std::int64_t>(100, 7))));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
@@ -298,13 +365,33 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsEventWithoutBlockKeys) {
 // length is unknown here. 0 signals that; the consumer infers a length and
 // accepts the upward bias rather than kvcm guessing.
 TEST_F(OptimizerEventPublisherTest, TestUnknownInputLenIsZero) {
-    ASSERT_TRUE(publisher_->Init(""));
+    PrepareQueueWithoutWorker();
     ASSERT_TRUE(publisher_->Publish(MakeGetEvent("instance-a", {1, 2, 3}, {})));
+    ASSERT_TRUE(publisher_->Init(""));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
     EXPECT_EQ(3, request.block_keys_size());
     EXPECT_EQ(0, request.input_token_len());
+}
+
+TEST_F(OptimizerEventPublisherTest, HostCaptureDoesNotDuplicateOrdinaryReads) {
+    PrepareQueueWithoutWorker();
+    auto ordinary_read = MakeGetEvent("i1", {1, 2}, {});
+    ordinary_read->set_optimizer_observation(false);
+    ASSERT_TRUE(publisher_->Publish(ordinary_read));
+    auto observation = MakeGetEvent("i1", {1, 2}, {}, "prefix_match", "host-query");
+    observation->set_optimizer_observation(true);
+    ASSERT_TRUE(publisher_->Publish(observation));
+    ASSERT_TRUE(publisher_->Init(""));
+    ASSERT_TRUE(WaitForEvents(*sink_, 1));
+    publisher_->Stop();
+    auto events = sink_->Events();
+    ASSERT_EQ(1u, events.size());
+    EXPECT_EQ("host-query", events[0].trace_id());
+    EXPECT_EQ((std::vector<int64_t>{1, 2}),
+              std::vector<int64_t>(events[0].block_keys().begin(), events[0].block_keys().end()));
+    EXPECT_EQ(0, events[0].token_ids_size());
 }
 
 } // namespace kv_cache_manager

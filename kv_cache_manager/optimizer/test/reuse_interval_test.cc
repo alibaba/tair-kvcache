@@ -131,13 +131,43 @@ TEST_F(ReuseIntervalTest, QuantilesMatchSortedOracleWithinErrorBound) {
     }
     std::sort(values.begin(), values.end());
     const auto stats = intervals.Snapshot();
-    for (const auto &[percent, estimate] : {std::pair<uint64_t, uint64_t>{95, stats.p95_ns}, {99, stats.p99_ns}}) {
-        const auto expected = values[(values.size() * percent + 99) / 100 - 1];
+    for (const auto &[percent, estimate] : {std::pair<uint64_t, uint64_t>{9500, stats.p95_ns},
+                                            {9900, stats.p99_ns},
+                                            {9950, stats.p995_ns},
+                                            {9990, stats.p999_ns}}) {
+        const auto expected = values[(values.size() * percent + 9999) / 10000 - 1];
         EXPECT_GE(estimate, expected);
         EXPECT_LE(static_cast<long double>(estimate), static_cast<long double>(expected) * (1.0L + 1.0L / 128));
     }
     EXPECT_LE(stats.p95_ns, stats.p99_ns);
-    EXPECT_LE(stats.p99_ns, stats.max_ns);
+    EXPECT_LE(stats.p99_ns, stats.p995_ns);
+    EXPECT_LE(stats.p995_ns, stats.p999_ns);
+    EXPECT_LE(stats.p999_ns, stats.max_ns);
+}
+
+TEST_F(ReuseIntervalTest, TailPercentilesUseFractionalRanks) {
+    ReuseInterval intervals;
+    for (int i = 0; i < 990; ++i) {
+        intervals.Record(1);
+    }
+    for (int i = 0; i < 5; ++i) {
+        intervals.Record(2);
+    }
+    for (int i = 0; i < 4; ++i) {
+        intervals.Record(3);
+    }
+    intervals.Record(4);
+    auto stats = intervals.Take();
+    EXPECT_EQ(1, stats.p99_ns);
+    EXPECT_EQ(2, stats.p995_ns);
+    EXPECT_EQ(3, stats.p999_ns);
+    stats = intervals.Take();
+    EXPECT_EQ(0, stats.p995_ns);
+    EXPECT_EQ(0, stats.p999_ns);
+    intervals.Record(std::numeric_limits<uint64_t>::max());
+    stats = intervals.Take();
+    EXPECT_EQ(stats.max_ns, stats.p995_ns);
+    EXPECT_EQ(stats.max_ns, stats.p999_ns);
 }
 
 } // namespace kv_cache_manager

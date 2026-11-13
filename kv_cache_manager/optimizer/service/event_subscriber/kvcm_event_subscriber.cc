@@ -31,6 +31,7 @@ constexpr int kReconnectJitterPercent = 20;
 constexpr std::chrono::minutes kKeepaliveTime(6);
 constexpr std::chrono::seconds kKeepaliveTimeout(20);
 constexpr std::chrono::milliseconds kUnaryRpcTimeout(1000);
+constexpr int kKvcmMetaRpcPort = 6381;
 
 } // namespace
 
@@ -128,10 +129,12 @@ bool KvcmEventSubscriber::DiscoverLeader(std::string &leader_endpoint) {
     }
 
     for (const auto &endpoint : endpoints) {
-        if (!endpoint.healthy || endpoint.host.empty()) {
+        if (!endpoint.healthy || endpoint.ip.empty()) {
             continue;
         }
-        auto channel = grpc::CreateChannel(endpoint.host, grpc::InsecureChannelCredentials());
+        // Discovery may advertise an HTTP port; bootstrap Meta gRPC on the fixed port instead.
+        const auto seed_endpoint = FormatEndpoint(endpoint.ip, kKvcmMetaRpcPort);
+        auto channel = grpc::CreateChannel(seed_endpoint, grpc::InsecureChannelCredentials());
         auto stub = proto::meta::MetaService::NewStub(channel);
         grpc::ClientContext context;
         context.set_deadline(std::chrono::system_clock::now() + kUnaryRpcTimeout);
@@ -142,13 +145,13 @@ bool KvcmEventSubscriber::DiscoverLeader(std::string &leader_endpoint) {
         if (!grpc_status.ok() || !response.has_header() || response.header().status().code() != proto::meta::OK ||
             !response.has_leader_endpoint()) {
             KVCM_LOG_WARN("KvcmEventSubscriber: GetClusterInfo failed via seed[%s], grpc_code=%d",
-                          endpoint.host.c_str(),
+                          seed_endpoint.c_str(),
                           static_cast<int>(grpc_status.error_code()));
             continue;
         }
         const auto &leader = response.leader_endpoint();
         if (leader.host().empty() || leader.meta_rpc_port() <= 0 || leader.meta_rpc_port() > 65535) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: invalid leader endpoint returned by seed[%s]", endpoint.host.c_str());
+            KVCM_LOG_WARN("KvcmEventSubscriber: invalid leader endpoint returned by seed[%s]", seed_endpoint.c_str());
             continue;
         }
         leader_endpoint = FormatEndpoint(leader.host(), leader.meta_rpc_port());
@@ -185,18 +188,32 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
     }
 
     std::unordered_set<std::string> unsupported_instance_ids;
-    const ErrorCode ec =
-        optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, config_.capacity_gb());
+    std::unordered_map<std::string, int32_t> registered_instances;
+    std::lock_guard<std::mutex> lock(configuration_mutex_);
+    const auto ec =
+        optimizer_service_->ApplyKvcmConfiguration(response, config_, &unsupported_instance_ids, &registered_instances);
     if (ec != EC_OK) {
-        KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
-                      leader_endpoint.c_str(),
-                      static_cast<int>(ec));
+        KVCM_LOG_WARN("KvcmEventSubscriber: configuration sync failed, ec=%d", static_cast<int>(ec));
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
-        unsupported_instance_ids_ = std::move(unsupported_instance_ids);
+    for (const auto &[source_id, block_size] : registered_instances) {
+        const auto previous = registered_instances_.find(source_id);
+        if (previous != registered_instances_.end() && previous->second != block_size) {
+            proto::optimizer::OptimizerRemoveInstanceRequest remove_request;
+            remove_request.set_instance_id(OptimizerServiceImpl::KvcmAnalysisInstanceId(source_id, previous->second));
+            proto::optimizer::OptimizerRemoveInstanceResponse remove_response;
+            RequestContext context(config_.consumer_id() + "-retire-instance", nullptr);
+            optimizer_service_->RemoveInstance(&context, &remove_request, &remove_response);
+            const auto remove_code = remove_response.header().status().code();
+            if (remove_code != proto::optimizer::OK && remove_code != proto::optimizer::INSTANCE_NOT_EXIST) {
+                KVCM_LOG_ERROR("Failed to retire optimizer instance[%s]", remove_request.instance_id().c_str());
+                unsupported_instance_ids.insert(source_id);
+                continue;
+            }
+        }
+        registered_instances_[source_id] = block_size;
     }
+    unsupported_instance_ids_ = std::move(unsupported_instance_ids);
     KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d",
                   leader_endpoint.c_str(),
                   response.instance_groups_size(),
@@ -307,13 +324,36 @@ void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
 }
 
 void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip) {
+    std::lock_guard<std::mutex> lock(configuration_mutex_);
+    if (unsupported_instance_ids_.count(event.instance_id()) != 0) {
+        return;
+    }
+    if (event.block_size() <= 0 || event.instance_id().empty()) {
+        KVCM_LOG_WARN("Drop invalid KVCM event: trace_id=%s instance_id=%s block_size=%d",
+                      event.trace_id().c_str(),
+                      event.instance_id().c_str(),
+                      event.block_size());
+        return;
+    }
+    const auto registered = registered_instances_.find(event.instance_id());
+    if (registered != registered_instances_.end() && registered->second != event.block_size()) {
+        KVCM_LOG_WARN("Drop mismatched KVCM event: trace_id=%s instance_id=%s event_block_size=%d registered=%d",
+                      event.trace_id().c_str(),
+                      event.instance_id().c_str(),
+                      event.block_size(),
+                      registered->second);
+        RequestConfigurationRefresh();
+        return;
+    }
+    auto request = event;
+    request.set_instance_id(OptimizerServiceImpl::KvcmAnalysisInstanceId(event.instance_id(), event.block_size()));
     std::shared_ptr<OptimizerServiceMetricsCollector> collector;
     if (metrics_registry_) {
         collector = std::make_shared<OptimizerServiceMetricsCollector>(metrics_registry_);
         if (!collector->Init()) {
             collector.reset();
         } else {
-            collector->set_instance_id(event.instance_id());
+            collector->set_instance_id(request.instance_id());
             collector->set_service_error_code_metrics(static_cast<double>(EC_OK));
         }
     }
@@ -326,35 +366,20 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
     ErrorCode ec = EC_OK;
     {
         OptimizerCallGuard guard(&request_context, metrics_reporter_.get());
-        ec = optimizer_service_->ExecuteTraceQuery(event, &response);
+        if (registered == registered_instances_.end()) {
+            ec = EC_INSTANCE_NOT_EXIST;
+        } else {
+            ec = optimizer_service_->ExecuteTraceQuery(request, &response);
+        }
         request_context.set_status_code(static_cast<int>(ec));
         if (ec == EC_OK) {
             if (collector) {
                 collector->set_total_blocks(response.total_blocks());
                 collector->set_input_token_len(response.input_token_len());
-                std::vector<PerCapacityHitInfo> per_capacity_hits;
-                per_capacity_hits.reserve(response.capacity_results_size());
-                for (const auto &capacity_result : response.capacity_results()) {
-                    per_capacity_hits.push_back(
-                        {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
-                }
-                collector->set_per_capacity_hits(std::move(per_capacity_hits));
-                collector->set_max_hit_count(response.theoretical_result().max_hit_count());
-                if (response.theoretical_result().max_hit_count() >= 0) {
-                    collector->set_max_hit_rate(response.theoretical_result().hit_rate());
-                }
+                collector->SetTtlResults(response);
             }
         } else if (collector) {
             collector->set_service_error_code_metrics(static_cast<double>(ec));
-        }
-    }
-    if (ec == EC_INSTANCE_NOT_EXIST) {
-        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
-        if (unsupported_instance_ids_.find(event.instance_id()) != unsupported_instance_ids_.end()) {
-            KVCM_LOG_DEBUG("KvcmEventSubscriber: ignore unsupported instance event, trace_id=%s instance_id=%s",
-                           event.trace_id().c_str(),
-                           event.instance_id().c_str());
-            return;
         }
     }
     if (ec != EC_OK) {

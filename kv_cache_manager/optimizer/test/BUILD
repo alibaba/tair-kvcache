@@ -164,6 +164,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:dynamic_fenwick_tree",
         "//kv_cache_manager/optimizer/liteHit:hit_curve",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
         "//kv_cache_manager/optimizer/liteHit:request_preprocess",
@@ -260,6 +261,7 @@ cc_test(
 
 cc_test(
     name = "OptimizerMetricsReporterTest",
+    linkstatic = True,
     srcs = [
         "optimizer_metrics_reporter_test.cc",
     ],
@@ -270,8 +272,11 @@ cc_test(
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
+        "//kv_cache_manager/optimizer/metrics:optimizer_kmonitor_metrics_reporter",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "@cpp_stub",
+        "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],
 )
 
@@ -335,7 +340,11 @@ cc_test(
     srcs = [
         "online_optimizer_server_event_subscription_test.cc",
     ],
-    copts = ["-fno-access-control"],
+    copts = [
+        "-fno-access-control",
+        "-std=c++20",
+        "-fcoroutines",
+    ],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/event:event_publisher",
@@ -343,5 +352,6 @@ cc_test(
         "//kv_cache_manager/optimizer:online_optimizer_server",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "@grpc//:grpc++",
+        "@yalantinglibs//:ylt",
     ],
 )

@@ -291,6 +291,62 @@ TEST(LiteHitTest, CompactsDynamicPositionsWithoutChangingResults) {
     EXPECT_EQ((std::vector<HitCurveSegment>{{7, 1}}), fact.hit_curve);
 }
 
+TEST(DynamicFenwickTreeTest, ResetToOnesMatchesIncrementalTreeAndSupportsUpdates) {
+    DynamicFenwickTree tree;
+    for (std::size_t count : {0u, 1u, 2u, 3u, 127u, 128u, 129u, 8193u, 0u}) {
+        tree.ResetToOnes(count);
+        EXPECT_EQ(count, tree.size());
+        for (std::size_t i = 0; i <= count; ++i) {
+            ASSERT_EQ(i, tree.PrefixSum(i));
+        }
+        if (count > 0) {
+            tree.Add(1, -1);
+            EXPECT_EQ(count - 1, tree.PrefixSum(count));
+        }
+        tree.AppendZero();
+        tree.Add(count + 1, 1);
+        EXPECT_EQ(count == 0 ? 1 : count, tree.PrefixSum(count + 1));
+    }
+    tree.ResetToOnes(128, 512);
+    const auto bytes = tree.memory_usage_bytes();
+    for (std::size_t i = 129; i <= 512; ++i) {
+        tree.AppendZero();
+        tree.Add(i, 1);
+    }
+    EXPECT_EQ(bytes, tree.memory_usage_bytes());
+    EXPECT_EQ(512u, tree.PrefixSum(512));
+    const auto *storage = tree.tree_.data();
+    tree.ResetToOnes(128, 512);
+    EXPECT_EQ(storage, tree.tree_.data());
+    tree.ResetToOnes(1, 8);
+    EXPECT_LT(tree.memory_usage_bytes(), bytes);
+    EXPECT_EQ(1u, tree.PrefixSum(1));
+}
+
+TEST(DynamicFenwickTreeTest, InPlacePrefixSumsMatchSparseTreeWithoutAllocating) {
+    std::mt19937_64 rng(42);
+    for (std::size_t count : {0u, 1u, 2u, 127u, 128u, 129u, 8193u}) {
+        DynamicFenwickTree tree;
+        for (std::size_t i = 1; i <= count; ++i) {
+            tree.AppendZero();
+            tree.Add(i, rng() % 3);
+        }
+        std::vector<int64_t> expected(count + 1);
+        for (std::size_t i = 0; i <= count; ++i) {
+            expected[i] = tree.PrefixSum(i);
+        }
+        const auto *storage = tree.tree_.data();
+        const auto &prefix = tree.MakePrefixSumsInPlace();
+        EXPECT_EQ(storage, prefix.data());
+        EXPECT_EQ(expected, prefix);
+        tree.ResetToOnes(count);
+        EXPECT_EQ(count, tree.PrefixSum(count));
+        tree.AppendZero();
+        tree.Add(count + 1, 1);
+        EXPECT_EQ(count + 1, tree.PrefixSum(count + 1));
+    }
+}
+
 TEST(LiteHitTest, RetainsAllActiveKeysWithoutCapacityPruning) {
     LiteHit lite_hit;
     for (int64_t key = 0; key < 10000; ++key) {

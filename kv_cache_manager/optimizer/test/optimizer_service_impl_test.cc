@@ -1,3 +1,4 @@
+#include <sstream>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -7,6 +8,7 @@
 #include "kv_cache_manager/event/spec_events/optimizer_query_hit_event.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
@@ -36,6 +38,27 @@ public:
 
 } // namespace
 
+static KvcmEventSubscriptionConfig RegistrationConfig(const std::vector<double> &capacities,
+                                                      const std::vector<int64_t> &ttls) {
+    std::ostringstream json;
+    json << R"({"service_discovery_url":"static://test:1","mock_cache_layout":true,"capacity_gb":[)";
+    for (size_t i = 0; i < capacities.size(); ++i) {
+        if (i)
+            json << ',';
+        json << capacities[i];
+    }
+    json << R"(],"ttl_seconds_list":[)";
+    for (size_t i = 0; i < ttls.size(); ++i) {
+        if (i)
+            json << ',';
+        json << ttls[i];
+    }
+    json << "]}";
+    KvcmEventSubscriptionConfig config;
+    EXPECT_TRUE(config.FromJsonString(json.str()));
+    return config;
+}
+
 class OptimizerServiceImplTest : public TESTBASE {
 protected:
     void SetUp() override {
@@ -53,7 +76,7 @@ protected:
         g->set_name(group_name);
         g->add_capacity_gb(capacity_gb);
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
-        g->set_ttl_seconds(ttl_seconds);
+        g->add_ttl_seconds_list(ttl_seconds);
 
         proto::optimizer::CommonResponse resp;
         RequestContext ctx("setup", nullptr);
@@ -108,6 +131,7 @@ TEST_F(OptimizerServiceImplTest, CreateAndGetInstanceGroup) {
     proto::optimizer::CreateInstanceGroupRequest create_req;
     create_req.set_trace_id("t1");
     auto *g = create_req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("test_grp");
     g->add_capacity_gb(2.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -135,6 +159,7 @@ TEST_F(OptimizerServiceImplTest, CreateDuplicateGroupFails) {
     proto::optimizer::CreateInstanceGroupRequest req;
     req.set_trace_id("t1");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("dup_grp");
     g->add_capacity_gb(1.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -149,6 +174,7 @@ TEST_F(OptimizerServiceImplTest, CreateInstanceGroupUnspecifiedPolicyFails) {
     proto::optimizer::CreateInstanceGroupRequest req;
     req.set_trace_id("t1");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("bad_policy_grp");
     g->add_capacity_gb(1.0);
 
@@ -167,7 +193,7 @@ TEST_F(OptimizerServiceImplTest, UpdateInstanceGroup) {
     g->set_name("upd_grp");
     g->add_capacity_gb(4.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
-    g->set_ttl_seconds(5000);
+    g->add_ttl_seconds_list(5000);
     g->set_enable_theoretical_max_cache(true);
 
     proto::optimizer::CommonResponse resp;
@@ -181,7 +207,7 @@ TEST_F(OptimizerServiceImplTest, UpdateInstanceGroup) {
     proto::optimizer::GetInstanceGroupResponse get_resp;
     service_->GetInstanceGroup(&ctx, &get_req, &get_resp);
     ASSERT_EQ(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU, get_resp.instance_group().eviction_policy());
-    EXPECT_EQ(5000, get_resp.instance_group().ttl_seconds());
+    EXPECT_EQ(5000, get_resp.instance_group().ttl_seconds_list(0));
     EXPECT_DOUBLE_EQ(4.0, get_resp.instance_group().capacity_gb(0));
     EXPECT_TRUE(get_resp.instance_group().enable_theoretical_max_cache());
 }
@@ -259,6 +285,7 @@ TEST_F(OptimizerServiceImplTest, UpdateInstanceGroupWithRegisteredInstanceFails)
     proto::optimizer::UpdateInstanceGroupRequest req;
     req.set_trace_id("t1");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("grp_update_with_inst");
     g->add_capacity_gb(4.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -398,17 +425,17 @@ TEST_F(OptimizerServiceImplTest, TraceQuery) {
     service_->TraceQuery(&ctx, &tq_req, &tq_resp);
     EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
     EXPECT_EQ(3, tq_resp.total_blocks());
-    ASSERT_EQ(1, tq_resp.capacity_results_size());
-    EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
-    EXPECT_EQ(3, tq_resp.capacity_results(0).current_unique_keys());
+    ASSERT_EQ(1, tq_resp.ttl_results(0).capacity_results_size());
+    EXPECT_EQ(0, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
+    EXPECT_EQ(3, tq_resp.ttl_results(0).capacity_results(0).current_unique_keys());
 
     proto::optimizer::TraceQueryResponse tq_resp2;
     service_->TraceQuery(&ctx, &tq_req, &tq_resp2);
     EXPECT_EQ(proto::optimizer::OK, tq_resp2.header().status().code());
     EXPECT_EQ(3, tq_resp2.total_blocks());
-    ASSERT_EQ(1, tq_resp2.capacity_results_size());
-    EXPECT_EQ(3, tq_resp2.capacity_results(0).cache_hit_count());
-    EXPECT_EQ(3, tq_resp2.capacity_results(0).current_unique_keys());
+    ASSERT_EQ(1, tq_resp2.ttl_results(0).capacity_results_size());
+    EXPECT_EQ(3, tq_resp2.ttl_results(0).capacity_results(0).cache_hit_count());
+    EXPECT_EQ(3, tq_resp2.ttl_results(0).capacity_results(0).current_unique_keys());
 }
 
 TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryUsesSharedInputConversion) {
@@ -437,6 +464,7 @@ TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryPublishesOptimizerQueryHitEven
     proto::optimizer::CreateInstanceGroupRequest group_request;
     group_request.set_trace_id("setup");
     auto *group = group_request.mutable_instance_group();
+    group->add_ttl_seconds_list(0);
     group->set_name("grp1");
     for (double capacity_gb : {1.0, 2.0, 4.0}) {
         group->add_capacity_gb(capacity_gb);
@@ -477,25 +505,30 @@ TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryPublishesOptimizerQueryHitEven
     ASSERT_EQ(2, publisher->events.size());
     auto event = std::dynamic_pointer_cast<OptimizerQueryHitEvent>(publisher->events.back());
     ASSERT_NE(nullptr, event);
-    EXPECT_EQ("inst1", event->event_source());
+    EXPECT_EQ("inst1-ttl-0s", event->event_source());
     EXPECT_EQ("optimizer", event->event_component());
     EXPECT_EQ("OptimizerQueryHitEvent", event->event_type());
     EXPECT_EQ("request-id-1", event->trace_id());
     EXPECT_EQ(987654321, event->request_timestamp_ns());
     EXPECT_EQ(hit_response.input_token_len(), event->input_token_len());
     EXPECT_EQ(hit_response.total_blocks(), event->total_blocks());
-    ASSERT_EQ(hit_response.capacity_results_size(), event->capacity_results().size());
+    ASSERT_EQ(hit_response.ttl_results(0).capacity_results_size(), event->capacity_results().size());
     ASSERT_EQ(3, event->capacity_results().size());
-    for (int i = 0; i < hit_response.capacity_results_size(); ++i) {
-        EXPECT_DOUBLE_EQ(hit_response.capacity_results(i).capacity_gb(), event->capacity_results()[i].capacity_gb());
-        EXPECT_EQ(hit_response.capacity_results(i).cache_hit_count(), event->capacity_results()[i].cache_hit_count());
-        EXPECT_DOUBLE_EQ(hit_response.capacity_results(i).hit_rate(), event->capacity_results()[i].hit_rate());
-        EXPECT_EQ(hit_response.capacity_results(i).current_unique_keys(),
+    for (int i = 0; i < hit_response.ttl_results(0).capacity_results_size(); ++i) {
+        EXPECT_DOUBLE_EQ(hit_response.ttl_results(0).capacity_results(i).capacity_gb(),
+                         event->capacity_results()[i].capacity_gb());
+        EXPECT_EQ(hit_response.ttl_results(0).capacity_results(i).cache_hit_count(),
+                  event->capacity_results()[i].cache_hit_count());
+        EXPECT_DOUBLE_EQ(hit_response.ttl_results(0).capacity_results(i).hit_rate(),
+                         event->capacity_results()[i].hit_rate());
+        EXPECT_EQ(hit_response.ttl_results(0).capacity_results(i).current_unique_keys(),
                   event->capacity_results()[i].current_unique_keys());
     }
-    EXPECT_EQ(hit_response.theoretical_result().max_hit_count(), event->theoretical_result().max_hit_count());
-    EXPECT_DOUBLE_EQ(hit_response.theoretical_result().hit_rate(), event->theoretical_result().hit_rate());
-    EXPECT_EQ(hit_response.theoretical_result().current_unique_keys(),
+    EXPECT_EQ(hit_response.ttl_results(0).theoretical_result().max_hit_count(),
+              event->theoretical_result().max_hit_count());
+    EXPECT_DOUBLE_EQ(hit_response.ttl_results(0).theoretical_result().hit_rate(),
+                     event->theoretical_result().hit_rate());
+    EXPECT_EQ(hit_response.ttl_results(0).theoretical_result().current_unique_keys(),
               event->theoretical_result().current_unique_keys());
     EXPECT_GT(event->event_trigger_time_us(), 0);
     event_manager->Stop();
@@ -518,27 +551,107 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     spec_group->set_name("serving-state");
     spec_group->add_spec_names("tp0");
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
-    EXPECT_TRUE(unsupported_instance_ids.empty());
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
 
     auto stored_group = registry_->GetInstanceGroup("kvcm-group");
     ASSERT_NE(nullptr, stored_group);
-    ASSERT_EQ(1u, stored_group->capacity_gb().size());
-    EXPECT_DOUBLE_EQ(2.0, stored_group->capacity_gb().front());
+    EXPECT_TRUE(stored_group->capacity_gb().empty());
     EXPECT_TRUE(stored_group->enable_prefix_hash());
     EXPECT_TRUE(stored_group->enable_theoretical_max_cache());
-    EXPECT_EQ(24 * 60 * 60, stored_group->ttl_seconds());
+    EXPECT_EQ(24 * 60 * 60, stored_group->ttl_seconds_list().front());
 
-    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance_bs4", [](const InstanceState &state) {
         EXPECT_EQ("kvcm-group", state.instance_info->instance_group_name());
         EXPECT_EQ(4, state.instance_info->block_size());
         ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
-        EXPECT_EQ("serving-state", state.instance_info->location_spec_groups().front().name());
-        EXPECT_EQ("serving-state", state.instance_info->optimizer_state_info().full_location_spec_group_name());
+        EXPECT_EQ("full", state.instance_info->location_spec_groups().front().name());
+        EXPECT_EQ("full", state.instance_info->optimizer_state_info().full_location_spec_group_name());
     }));
 
-    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
+}
+
+TEST_F(OptimizerServiceImplTest, DefaultMockLayoutIgnoresQuotaChangesAndMultipleSpecGroups) {
+    KvcmEventSubscriptionConfig config;
+    ASSERT_TRUE(config.FromJsonString(
+        R"({"service_discovery_url":"static://test:1","ttl_seconds_list":[10,30],"capacity_gb":[]})"));
+    ASSERT_TRUE(config.mock_cache_layout());
+    proto::optimizer::KvcmConfigurationResponse source;
+    auto *group = source.add_instance_groups();
+    group->set_name("mock-group");
+    group->set_capacity_bytes(1024);
+    auto *instance = source.add_instances();
+    instance->set_instance_group_name("mock-group");
+    instance->set_instance_id("first");
+    instance->set_block_size(128);
+    for (const auto *name : {"unknown-a", "unknown-b"}) {
+        auto *spec = instance->add_location_spec_infos();
+        spec->set_name(name);
+        spec->set_size(4096);
+        auto *spec_group = instance->add_location_spec_groups();
+        spec_group->set_name(name);
+        spec_group->add_spec_names(name);
+    }
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    source.mutable_instance_groups(0)->set_capacity_bytes(8192);
+    auto second = source.instances(0);
+    second.set_instance_id("second");
+    *source.add_instances() = second;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    EXPECT_TRUE(registry_->GetInstanceGroup("mock-group")->capacity_gb().empty());
+    for (const auto *id : {"first", "second"}) {
+        ASSERT_EQ(EC_OK, manager_->GetInstanceState(std::string(id) + "_bs128", [](const InstanceState &state) {
+            EXPECT_EQ(128, state.instance_info->block_size());
+            EXPECT_EQ(1, state.size_full);
+            ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
+            EXPECT_EQ("full", state.instance_info->location_spec_groups().front().name());
+        }));
+    }
+}
+
+TEST_F(OptimizerServiceImplTest, RealCacheLayoutUsesKvcmCapacitySpecsAndConfiguredTtls) {
+    KvcmEventSubscriptionConfig config;
+    ASSERT_TRUE(config.FromJsonString(
+        R"({"service_discovery_url":"static://test:1","mock_cache_layout":false,"capacity_gb":[99],"ttl_seconds_list":[10,30]})"));
+    proto::optimizer::KvcmConfigurationResponse source;
+    auto *group = source.add_instance_groups();
+    group->set_name("kvcm");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+    auto *instance = source.add_instances();
+    instance->set_instance_group_name("kvcm");
+    instance->set_instance_id("with-group");
+    instance->set_block_size(128);
+    auto *spec = instance->add_location_spec_infos();
+    spec->set_name("tp0");
+    spec->set_size(16);
+    spec = instance->add_location_spec_infos();
+    spec->set_name("tp1");
+    spec->set_size(32);
+    auto *spec_group = instance->add_location_spec_groups();
+    spec_group->set_name("serving-state");
+    spec_group->add_spec_names("tp0");
+    spec_group->add_spec_names("tp1");
+    auto no_group = *instance;
+    no_group.set_instance_id("no-group");
+    no_group.clear_location_spec_groups();
+    *source.add_instances() = no_group;
+    auto multiple_groups = *instance;
+    multiple_groups.set_instance_id("multi-group");
+    multiple_groups.add_location_spec_groups()->set_name("linear");
+    *source.add_instances() = multiple_groups;
+
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    EXPECT_EQ((std::vector<double>{2}), registry_->GetInstanceGroup("kvcm")->capacity_gb());
+    EXPECT_EQ((std::vector<int64_t>{10, 30}), registry_->GetInstanceGroup("kvcm")->ttl_seconds_list());
+    for (const auto *id : {"with-group", "no-group"}) {
+        ASSERT_EQ(EC_OK, manager_->GetInstanceState(std::string(id) + "_bs128", [](const InstanceState &state) {
+            EXPECT_EQ(128, state.instance_info->block_size());
+            EXPECT_EQ(48, state.size_full);
+            EXPECT_EQ(2u, state.instance_info->location_spec_infos().size());
+        }));
+    }
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, manager_->GetInstanceState("multi-group_bs128", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenAbsent) {
@@ -558,17 +671,15 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenA
     tp0->set_name("tp0");
     tp0->set_size(16);
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
-    EXPECT_TRUE(unsupported_instance_ids.empty());
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
 
-    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance_bs4", [](const InstanceState &state) {
         ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
         const auto &full_group = state.instance_info->location_spec_groups().front();
         EXPECT_EQ("full", full_group.name());
-        EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}), full_group.spec_names());
+        EXPECT_EQ((std::vector<std::string>{"block"}), full_group.spec_names());
         EXPECT_EQ("full", state.instance_info->optimizer_state_info().full_location_spec_group_name());
-        EXPECT_EQ(48, state.size_full);
+        EXPECT_EQ(1, state.size_full);
     }));
 }
 
@@ -578,15 +689,14 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationUsesCapacityOverride) {
     group->set_name("kvcm-group");
     group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, {40.0, 10.0, 20.0}));
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({40.0, 10.0, 20.0}, {86400})));
 
     auto stored_group = registry_->GetInstanceGroup("kvcm-group");
     ASSERT_NE(nullptr, stored_group);
     EXPECT_EQ((std::vector<double>{10.0, 20.0, 40.0}), stored_group->capacity_gb());
 }
 
-TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroups) {
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationIgnoresSourceSpecGroups) {
     proto::optimizer::KvcmConfigurationResponse configuration;
     auto *group = configuration.add_instance_groups();
     group->set_name("kvcm-group");
@@ -615,14 +725,12 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroup
     supported_group->set_name("serving-state");
     supported_group->add_spec_names("tp0");
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
-    EXPECT_EQ((std::unordered_set<std::string>{"ambiguous-instance"}), unsupported_instance_ids);
-    EXPECT_NE(EC_OK, manager_->GetInstanceState("ambiguous-instance", [](const InstanceState &) {}));
-    EXPECT_EQ(EC_OK, manager_->GetInstanceState("supported-instance", [](const InstanceState &) {}));
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400})));
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("ambiguous-instance_bs4", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("supported-instance_bs4", [](const InstanceState &) {}));
 }
 
-TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidSupportedInstance) {
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidBlockSize) {
     proto::optimizer::KvcmConfigurationResponse configuration;
     auto *group = configuration.add_instance_groups();
     group->set_name("kvcm-group");
@@ -631,7 +739,7 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidSupportedIn
     auto *instance = configuration.add_instances();
     instance->set_instance_group_name("kvcm-group");
     instance->set_instance_id("invalid-instance");
-    instance->set_block_size(4);
+    instance->set_block_size(0);
     auto *spec = instance->add_location_spec_infos();
     spec->set_name("tp0");
     spec->set_size(16);
@@ -639,10 +747,10 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidSupportedIn
     spec_group->set_name("serving-state");
     spec_group->add_spec_names("missing-spec");
 
-    std::unordered_set<std::string> unsupported_instance_ids;
-    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
-    EXPECT_TRUE(unsupported_instance_ids.empty());
-    EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance", [](const InstanceState &) {}));
+    std::unordered_set<std::string> unsupported;
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {86400}), &unsupported));
+    EXPECT_EQ(1u, unsupported.count("invalid-instance"));
+    EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance_bs4", [](const InstanceState &) {}));
 }
 
 TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {
@@ -666,14 +774,14 @@ TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {
     service_->TraceQuery(&ctx, &tq_req, &first);
     ASSERT_EQ(proto::optimizer::OK, first.header().status().code());
     EXPECT_EQ(13, first.input_token_len());
-    ASSERT_EQ(1, first.capacity_results_size());
-    EXPECT_EQ(0, first.capacity_results(0).cache_hit_count());
+    ASSERT_EQ(1, first.ttl_results(0).capacity_results_size());
+    EXPECT_EQ(0, first.ttl_results(0).capacity_results(0).cache_hit_count());
 
     proto::optimizer::TraceQueryResponse second;
     service_->TraceQuery(&ctx, &tq_req, &second);
     ASSERT_EQ(proto::optimizer::OK, second.header().status().code());
-    EXPECT_EQ(3, second.capacity_results(0).cache_hit_count());
-    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.capacity_results(0).hit_rate());
+    EXPECT_EQ(3, second.ttl_results(0).capacity_results(0).cache_hit_count());
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.ttl_results(0).capacity_results(0).hit_rate());
 
     proto::optimizer::OptimizerListInstancesRequest list_req;
     list_req.set_instance_group("grp1");
@@ -727,15 +835,15 @@ TEST_F(OptimizerServiceImplTest, TraceQueryUsesRequestTimestamp) {
     query.set_timestamp_ns(1005LL * 1000000000);
     service_->TraceQuery(&ctx, &query, &response);
     ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
-    ASSERT_EQ(1, response.capacity_results_size());
-    EXPECT_EQ(2, response.capacity_results(0).cache_hit_count());
+    ASSERT_EQ(1, response.ttl_results(0).capacity_results_size());
+    EXPECT_EQ(2, response.ttl_results(0).capacity_results(0).cache_hit_count());
 
     response.Clear();
     query.set_timestamp_ns(1015LL * 1000000000);
     service_->TraceQuery(&ctx, &query, &response);
     ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
-    ASSERT_EQ(1, response.capacity_results_size());
-    EXPECT_EQ(0, response.capacity_results(0).cache_hit_count());
+    ASSERT_EQ(1, response.ttl_results(0).capacity_results_size());
+    EXPECT_EQ(0, response.ttl_results(0).capacity_results(0).cache_hit_count());
 }
 
 TEST_F(OptimizerServiceImplTest, TraceQueryNonExistentInstance) {
@@ -889,7 +997,7 @@ TEST_F(OptimizerServiceImplTest, CreateInstanceGroupNegativeTtlFails) {
     g->set_name("bad_grp");
     g->add_capacity_gb(1.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
-    g->set_ttl_seconds(-1);
+    g->add_ttl_seconds_list(-1);
 
     proto::optimizer::CommonResponse resp;
     RequestContext ctx("t1", nullptr);
@@ -906,7 +1014,7 @@ TEST_F(OptimizerServiceImplTest, UpdateInstanceGroupNegativeTtlFails) {
     g->set_name("update_grp");
     g->add_capacity_gb(1.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
-    g->set_ttl_seconds(-1);
+    g->add_ttl_seconds_list(-1);
 
     proto::optimizer::CommonResponse resp;
     RequestContext ctx("t1", nullptr);
@@ -918,6 +1026,7 @@ TEST_F(OptimizerServiceImplTest, CreateInstanceGroupEmptyName) {
     proto::optimizer::CreateInstanceGroupRequest req;
     req.set_trace_id("t1");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("");
     g->add_capacity_gb(1.0);
     g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -950,6 +1059,15 @@ TEST_F(OptimizerServiceImplTest, RegisterInstanceUnsupportedIndexerType) {
     RegisterInstanceResult result;
     ErrorCode ec = manager_->RegisterInstance(info, result);
     EXPECT_EQ(EC_BADARGS, ec);
+}
+
+TEST_F(OptimizerServiceImplTest, AutoRegistrationRejectsConflictingGroupParameters) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    configuration.add_instance_groups()->set_name("auto");
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {10, 30})));
+    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({}, {20, 30})));
+    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, RegistrationConfig({1.0}, {10, 30})));
+    EXPECT_EQ((std::vector<int64_t>{10, 30}), registry_->GetInstanceGroup("auto")->ttl_seconds_list());
 }
 
 } // namespace kv_cache_manager

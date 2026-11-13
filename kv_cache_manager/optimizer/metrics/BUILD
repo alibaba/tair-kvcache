@@ -22,6 +22,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/common",
         "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],
 )
 

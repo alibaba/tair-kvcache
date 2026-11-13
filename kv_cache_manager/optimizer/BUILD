@@ -75,6 +75,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         ":optimizer_call_guard",
+        ":online_optimizer_server_config",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
         "//kv_cache_manager/common",

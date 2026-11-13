@@ -22,8 +22,8 @@ class TraceQueryRequest;
 
 // Forwards cache read events to a consumer (the optimizer) for replay.
 //
-// Publish() runs on a serving thread - it is called on the return path of
-// GetCacheLocation - so it does nothing but enqueue. Conversion and
+// Publish() runs on a serving thread for GetHostCacheState or ReportOptimizerEvent.
+// It only attempts a bounded enqueue; it never waits for queue contention. Conversion and
 // subscription delivery happen on the worker thread. When the queue is full
 // the event is dropped rather than the caller blocked: these are analysis
 // samples, and a slow or absent consumer must never slow down serving.
@@ -43,6 +43,7 @@ public:
     bool Init(const std::string &config) override;
     bool Publish(const std::shared_ptr<BaseEvent> &event) override;
     bool Stop() override;
+    uint64_t CaptureEpoch() const override { return running_ && sink_ ? sink_->CaptureEpoch() : 0; }
 
     // Events refused because the queue was full. Read from the base queue, so
     // no extra counter is maintained for it.

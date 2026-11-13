@@ -274,7 +274,9 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
 
 **fanout 模式**：`fanout_all_instances = true` 时每条请求广播到全部 lane（各 lane 独立 LRU 状态、独立 facts 行），配合多个不同 `block_size` 的 instance 即可一次回放对同一份 trace 扫多个分析粒度；与 `override_instance_id` 互斥。facts query 的 summary 按 instance 分组输出（每 instance 一行 + 总计一行），fanout 结果直接可读。
 
-**TTL 回放**：instance group 配置 `ttl_seconds != 0` 时，该组 lane 的 `LiteHit` 核心叠加固定 TTL（与 online `TtlCacheIndexerWrapper` 语义一致：块在距上次访问严格小于 TTL 内存活，过期块对任意容量都是 miss 并像冷块一样截断前缀；每次访问（命中或未命中）都刷新 last_access；时间取 trace 时间戳，回放确定性）。年龄沿 LRU 栈单调，过期块不会抬高存活块的复用距离，因此一次回放对"固定 TTL × 任意容量"的联合口径仍然精确，facts 仍是普通 hit curve 行。TTL 是回放期参数，直接取组里的 `ttl_seconds`；要扫多个 TTL 就配多个 group 各带不同 `ttl_seconds`（可配合 fanout 一次回放完成）。
+**TTL 回放**：针对 instance group 的每个 TTL 配置，该组 lane 的 `LiteHit` 核心叠加固定 TTL（与 online `TtlCacheIndexerWrapper` 语义一致：块在距上次访问严格小于 TTL 内存活，过期块对任意容量都是 miss 并像冷块一样截断前缀；每次访问（命中或未命中）都刷新 last_access；时间取 trace 时间戳，回放确定性）。年龄沿 LRU 栈单调，过期块不会抬高存活块的复用距离，因此一次回放对"固定 TTL × 任意容量"的联合口径仍然精确，facts 仍是普通 hit curve 行。TTL 是回放期参数，取组里的 `ttl_seconds_list`；离线 facts runner 要求每组只有一个值，因此离线扫描多个 TTL 使用多个 group（可配合 fanout 一次回放完成）。
+
+在线回放按列表中的每个 TTL 独立维护状态。离线 facts runner 每组只接受一个 TTL；离线扫描多个 TTL 时配置多个组。
 
 **fail-fast**：时间戳乱序、未知 instance、长度校验失败、全文件零有效行，任一发生即整体失败并给出原因——facts 是全有或全无的对账账本，不允许静默丢行。
 
@@ -305,7 +307,7 @@ trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,
 
 ## 8. Online 集成
 
-Online Optimizer 的 full-attention `InstanceState` 直接持有 `LiteHit`（组配置 `ttl_seconds != 0` 时以墙钟时间叠加固定 TTL，口径与 linear 路径的 `TtlCacheIndexerWrapper` 一致）。每次 TraceQuery：
+Online Optimizer 的 full-attention `InstanceState` 按 `ttl_seconds_list` 每个值保存独立 LiteHit 回放状态；0 表示不限制 TTL。每次 TraceQuery 仅归一化并计算一次 prefix hash，再分发给所有 TTL 状态：
 
 ```text
 NormalizeRequest → ProcessRequest → 得到 RequestFact

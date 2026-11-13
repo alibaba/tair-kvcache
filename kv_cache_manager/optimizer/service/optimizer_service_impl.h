@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -11,6 +12,7 @@
 namespace kv_cache_manager {
 
 class OnlineOptimizerManager;
+class KvcmEventSubscriptionConfig;
 class EventManager;
 class OptimizerMetricsReporter;
 class OptimizerRegistryManager;
@@ -61,9 +63,13 @@ public:
                      proto::optimizer::OptimizerGetInstanceResponse *response);
 
     // KVCM ingress
+    static std::string KvcmAnalysisInstanceId(const std::string &source_id, int32_t block_size) {
+        return source_id + "_bs" + std::to_string(block_size);
+    }
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                     std::unordered_set<std::string> &unsupported_instance_ids,
-                                     const std::vector<double> &capacity_gb_override = {});
+                                     const KvcmEventSubscriptionConfig &config,
+                                     std::unordered_set<std::string> *unsupported_instance_ids = nullptr,
+                                     std::unordered_map<std::string, int32_t> *registered_instances = nullptr);
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,

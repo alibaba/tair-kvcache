@@ -19,13 +19,14 @@ class LiteHitOfflineRunnerTest : public TESTBASE {
 protected:
     static OptimizerInstanceGroup MakeGroup(const std::string &name = "g1") {
         OptimizerInstanceGroup group;
+        group.set_ttl_seconds_list({0});
         group.set_name(name);
         // Capacities are irrelevant to the facts replay; they exist only to
         // satisfy the shared registration path.
         group.set_capacity_gb({1.0});
         group.set_eviction_policy("lru");
         group.set_enable_theoretical_max_cache(false);
-        group.set_ttl_seconds(0);
+        group.set_ttl_seconds_list({0});
         return group;
     }
 
@@ -136,7 +137,7 @@ TEST_F(LiteHitOfflineRunnerTest, TtlGroupLayersTtlOntoTheHitCurve) {
     ASSERT_EQ(0, ::system(("mkdir -p " + output_dir).c_str()));
     OptimizerLiteHitConfig config = MakeConfig(trace_path, output_dir);
     OptimizerInstanceGroup group = MakeGroup();
-    group.set_ttl_seconds(3);
+    group.set_ttl_seconds_list({3});
     config.set_instance_groups({group});
     ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
 
@@ -176,7 +177,7 @@ TEST_F(LiteHitOfflineRunnerTest, RejectsNegativeTtlGroup) {
     const std::string trace_path = WriteTrace("facts_ttl_bad.jsonl", {TraceLine("i1", "r1", 1000, {1}, 4)});
     OptimizerLiteHitConfig config = MakeConfig(trace_path, GetTestTempRootPath());
     OptimizerInstanceGroup group = MakeGroup();
-    group.set_ttl_seconds(-1);
+    group.set_ttl_seconds_list({-1});
     config.set_instance_groups({group});
     EXPECT_FALSE(LiteHitOfflineRunner(config).Run());
 }
@@ -234,8 +235,8 @@ TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
          std::vector<std::pair<std::vector<int64_t>, int64_t>>{{{1, 2, 3}, 13}, {{1, 2, 9}, 12}, {{1, 2, 3}, 13}}) {
         TraceQueryResult result;
         ASSERT_EQ(EC_OK, manager.TraceQuery("i1", request.first, request.second, 0, result));
-        online_cap2_hits += result.hit_count_per_capacity.at(0);
-        online_infinite_hits += result.max_hit_count;
+        online_cap2_hits += result.ttl_results[0].hit_count_per_capacity.at(0);
+        online_infinite_hits += result.ttl_results[0].max_hit_count;
     }
     EXPECT_EQ(4, online_cap2_hits);
     EXPECT_EQ(5, online_infinite_hits);

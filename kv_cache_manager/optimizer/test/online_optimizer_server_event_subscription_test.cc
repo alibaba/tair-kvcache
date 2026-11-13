@@ -15,6 +15,7 @@
 #include "kv_cache_manager/optimizer/service/online_optimizer_server.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
+#include "ylt/coro_http/coro_http_client.hpp"
 
 namespace kv_cache_manager {
 
@@ -69,11 +70,13 @@ public:
     int port_ = 0;
 };
 
-int StartEventServer(LeaderMetaService *meta_service,
+int StartEventServer(const std::string &seed_ip,
+                     LeaderMetaService *meta_service,
                      BlockingEventService *event_service,
                      std::unique_ptr<grpc::Server> *server) {
     int port = 0;
     grpc::ServerBuilder builder;
+    builder.AddListeningPort(seed_ip + ":6381", grpc::InsecureServerCredentials());
     builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
     builder.RegisterService(meta_service);
     builder.RegisterService(event_service);
@@ -109,18 +112,56 @@ int AllocatePort() {
 
 class OnlineOptimizerServerEventSubscriptionTest : public TESTBASE {};
 
+TEST_F(OnlineOptimizerServerEventSubscriptionTest, HealthEndpointWithoutSubscriptionsOrPrometheus) {
+    const int rpc_port = AllocatePort();
+    const int http_port = AllocatePort();
+    ASSERT_GT(rpc_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_NE(rpc_port, http_port);
+
+    const std::string config_path = GetPrivateTestRuntimeDataPath() + "optimizer-health.json";
+    std::ofstream output(config_path);
+    ASSERT_TRUE(output.is_open());
+    output << "{\"rpc_port\":" << rpc_port << ",\"http_port\":" << http_port
+           << R"(,"io_thread_num":1,"registry_storage_uri":"","metrics_report_interval_ms":0,
+                  "enable_prometheus":false,"kvcm_event_subscriptions":[]})";
+    output.close();
+
+    OnlineOptimizerServer server;
+    ASSERT_TRUE(server.Init(config_path));
+    ASSERT_TRUE(server.Start());
+    const std::string url = "http://127.0.0.1:" + std::to_string(http_port);
+    ASSERT_TRUE(WaitUntil([&url] {
+        coro_http::coro_http_client client;
+        return client.get(url + "/api/healthy").status == 200;
+    }));
+    coro_http::coro_http_client client;
+    auto response = client.get(url + "/api/healthy");
+    EXPECT_EQ(200, response.status);
+    EXPECT_EQ(R"({"status":"OK"})", response.resp_body);
+    bool json_content_type = false;
+    for (const auto &[key, value] : response.resp_headers) {
+        if (key == "Content-Type" && value == "application/json") {
+            json_content_type = true;
+        }
+    }
+    EXPECT_TRUE(json_content_type);
+    EXPECT_EQ(404, client.get(url + "/metrics").status);
+    server.Stop();
+}
+
 TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscribersWithServer) {
     LeaderMetaService meta_service_a;
     BlockingEventService event_service_a;
     std::unique_ptr<grpc::Server> event_server_a;
-    const int event_port_a = StartEventServer(&meta_service_a, &event_service_a, &event_server_a);
+    const int event_port_a = StartEventServer("127.0.11.1", &meta_service_a, &event_service_a, &event_server_a);
     ASSERT_NE(nullptr, event_server_a);
     ASSERT_GT(event_port_a, 0);
 
     LeaderMetaService meta_service_b;
     BlockingEventService event_service_b;
     std::unique_ptr<grpc::Server> event_server_b;
-    const int event_port_b = StartEventServer(&meta_service_b, &event_service_b, &event_server_b);
+    const int event_port_b = StartEventServer("127.0.11.2", &meta_service_b, &event_service_b, &event_server_b);
     ASSERT_NE(nullptr, event_server_b);
     ASSERT_GT(event_port_b, 0);
     const int optimizer_rpc_port = AllocatePort();
@@ -141,14 +182,14 @@ TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscri
         "enable_prometheus": false,
         "kvcm_event_subscriptions": [
             {
-                "service_discovery_url": "static://127.0.0.1:)"
-           << event_port_a << R"(",
+                "ttl_seconds_list": [86400],
+                "service_discovery_url": "static://127.0.11.1:6382",
                 "consumer_id": "server-lifecycle-test-a",
                 "discovery_refresh_interval_ms": 50
             },
             {
-                "service_discovery_url": "static://127.0.0.1:)"
-           << event_port_b << R"(",
+                "ttl_seconds_list": [86400],
+                "service_discovery_url": "static://127.0.11.2:6382",
                 "consumer_id": "server-lifecycle-test-b",
                 "discovery_refresh_interval_ms": 50
             }

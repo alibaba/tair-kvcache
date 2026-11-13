@@ -48,8 +48,41 @@ void DynamicFenwickTree::Clear() {
     tree_.swap(empty_tree);
 }
 
+void DynamicFenwickTree::ResetToOnes(std::size_t count, std::size_t reserve_positions) {
+    const std::size_t desired_capacity = (reserve_positions > count ? reserve_positions : count) + 1;
+    if (tree_.capacity() / 2 > desired_capacity) {
+        std::vector<int64_t> tree;
+        tree.reserve(desired_capacity);
+        tree.resize(count + 1, 0);
+        tree_.swap(tree);
+    } else {
+        tree_.reserve(desired_capacity);
+        tree_.resize(count + 1, 0);
+    }
+    tree_[0] = 0;
+    for (std::size_t i = 1; i <= count; ++i) {
+        // A Fenwick node covers lowbit(i) unit markers.
+        tree_[i] = static_cast<int64_t>(i & (~i + 1));
+    }
+}
+
 uint64_t DynamicFenwickTree::memory_usage_bytes() const {
     return SaturatingMultiply(static_cast<uint64_t>(tree_.capacity()), sizeof(tree_[0]));
+}
+
+const std::vector<int64_t> &DynamicFenwickTree::MakePrefixSumsInPlace() {
+    // Undo the linear Fenwick construction in reverse order: each node
+    // still holds its original subtree sum when subtracted from its parent.
+    for (std::size_t i = size(); i > 0; --i) {
+        const std::size_t parent = i + (i & (~i + 1));
+        if (parent < tree_.size()) {
+            tree_[parent] -= tree_[i];
+        }
+    }
+    for (std::size_t i = 1; i < tree_.size(); ++i) {
+        tree_[i] += tree_[i - 1];
+    }
+    return tree_;
 }
 
 } // namespace kv_cache_manager

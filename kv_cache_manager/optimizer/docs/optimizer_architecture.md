@@ -156,7 +156,7 @@ kv_cache_manager/optimizer/
 
 The online service protocol is defined in `kv_cache_manager/protocol/protobuf/optimizer_service.proto`, and is converted by the service layer into optimizer online config/runtime objects.
 
-A full-attention TraceQuery only puts complete blocks into `block_keys`, and passes the original input length including trailing tokens via `input_token_len`. The Online Manager uses the fixed byte charge of the full location spec group to floor `capacity_gb` to block capacity, then hands the same request to LiteHit; both per-request and cumulative hit rates are `prefix_hit_blocks * block_size_tokens / input_tokens`. When old clients lack the length, the compatibility assumption is that there are no trailing tokens. When a full-attention group config has `ttl_seconds != 0`, a fixed TTL is layered on top of LiteHit with wall-clock time (metrics consistent with `TtlCacheIndexerWrapper`); the statistics metrics and TTL behavior of linear attention keep the legacy path unchanged.
+Full-attention TraceQuery normalizes the input and prefix hashes once, then replays independent LiteHit states for every configured `ttl_seconds_list` entry. Empty `capacity_gb` is allowed with theoretical analysis enabled. Rates use hit blocks × block size / input length; absent length denotes complete blocks. TTL follows event arrival timestamps. Analysis metrics retain the analysis instance ID and add a separate `ttl` tag in seconds (0 means unlimited TTL). Service metrics have no `ttl` tag and count the original request once.
 
 ---
 

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -78,11 +79,13 @@ private:
     std::thread supervisor_thread_;
     std::mutex worker_mutex_;
     std::unique_ptr<EndpointWorker> worker_;
+    // Serialize replay against configuration replacement and retired-state cleanup.
+    std::mutex configuration_mutex_;
+    std::unordered_set<std::string> unsupported_instance_ids_;
+    std::unordered_map<std::string, int32_t> registered_instances_;
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
     bool configuration_refresh_requested_ = false;
-    std::mutex unsupported_instances_mutex_;
-    std::unordered_set<std::string> unsupported_instance_ids_;
 };
 
 } // namespace kv_cache_manager

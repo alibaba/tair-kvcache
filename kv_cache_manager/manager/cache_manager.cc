@@ -1260,35 +1260,54 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
         query_keys = GenKeyVector(tokens, block_size);
     }
 
-    if (!event_manager_) {
-        request_context->error_tracer()->AddErrorMsg("event manager is unavailable");
-        return EC_ERROR;
-    }
-    auto publisher = event_manager_->GetPublisher("optimizer_event_publisher");
-    if (!publisher) {
+    if (!EnqueueOptimizerEvent(trace_id,
+                               instance_id,
+                               block_size,
+                               query_keys,
+                               tokens.empty() ? input_token_len : static_cast<int64_t>(tokens.size()),
+                               timestamp_ns,
+                               location_spec_names)) {
         request_context->error_tracer()->AddErrorMsg("optimizer event publisher is unavailable");
-        return EC_ERROR;
-    }
-
-    auto event = std::make_shared<CacheGetEvent>(instance_id);
-    if (timestamp_ns == 0) {
-        event->SetEventTriggerTime();
-    } else {
-        event->SetEventTriggerTimeUs(timestamp_ns / 1000);
-    }
-    event->set_trace_id(request_context->trace_id());
-    event->set_input_token_len(tokens.empty() ? input_token_len : static_cast<int64_t>(tokens.size()));
-    event->SetAddtionalArgs(
-        QueryTypeToString(QueryType::QT_PREFIX_MATCH), query_keys, {}, BlockMask(), 0, location_spec_names);
-    if (!event_manager_->Publish(event)) {
-        request_context->error_tracer()->AddErrorMsg("failed to publish optimizer event");
         return EC_ERROR;
     }
     return EC_OK;
 }
 
-void CacheManager::FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
-                                          CacheLocationVector &locations) {
+bool CacheManager::EnqueueOptimizerEvent(const std::string &trace_id,
+                                         const std::string &instance_id,
+                                         int32_t block_size,
+                                         const KeyVector &keys,
+                                         int64_t input_token_len,
+                                         int64_t timestamp_ns,
+                                         const std::vector<std::string> &location_spec_names) {
+    if (!event_manager_) {
+        return false;
+    }
+    auto publisher = event_manager_->GetPublisher("optimizer_event_publisher");
+    if (!publisher) {
+        return false;
+    }
+    const auto epoch = publisher->CaptureEpoch();
+    if (epoch == 0) {
+        return true;
+    }
+    auto event = std::make_shared<CacheGetEvent>(instance_id);
+    event->set_capture_epoch(epoch);
+    if (timestamp_ns == 0) {
+        event->SetEventTriggerTime();
+    } else {
+        event->SetEventTriggerTimeUs(timestamp_ns / 1000);
+    }
+    event->set_trace_id(trace_id);
+    event->set_optimizer_observation(true);
+    event->set_block_size(block_size);
+    event->set_input_token_len(input_token_len);
+    event->SetAddtionalArgs(
+        QueryTypeToString(QueryType::QT_PREFIX_MATCH), keys, {}, BlockMask(), 0, location_spec_names);
+    return publisher->Publish(event);
+}
+
+void CacheManager::FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info, CacheLocationVector &locations) {
     const auto &spec_infos = instance_info->location_spec_infos();
     for (auto &location : locations) {
         if (!location || location->spec_size() == 0) {
@@ -5555,6 +5574,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
         window_blocks = static_cast<size_t>(1 + (window_tokens - 1) / block_size);
     }
 
+    EnqueueOptimizerEvent(trace_id, instance_id, instance_info->block_size(), block_cache_keys, 0, 0, {});
     PREFIX_LOG(DEBUG, "GetHostCacheState query_type [%s]", QueryTypeToString(query_type).c_str());
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());

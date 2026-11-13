@@ -468,10 +468,11 @@ void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_
         }
     }
 
-    if (!publishers_config.enable_optimizer_event_publisher()) {
+    const auto &config = publishers_config.optimizer_event_publisher_config();
+    if (!config.enable()) {
+        KVCM_LOG_INFO("optimizer event publisher disabled by configuration");
         return;
     }
-    const auto &config = publishers_config.optimizer_event_publisher_config();
     auto sink = std::make_shared<SubscriptionEventSink>(config);
     auto optimizer_publisher = std::make_shared<OptimizerEventPublisher>(sink, config);
     if (!optimizer_publisher->Init("")) {

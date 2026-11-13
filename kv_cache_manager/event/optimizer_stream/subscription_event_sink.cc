@@ -64,6 +64,9 @@ std::shared_ptr<SubscriptionEventSink::Subscription> SubscriptionEventSink::Subs
     auto subscription = std::shared_ptr<Subscription>(
         new Subscription(consumer_id.empty() ? "anonymous" : consumer_id, config_.subscriber_queue_size()));
     subscriptions_.push_back(subscription);
+    if (subscriptions_.size() == 1) {
+        capture_epoch_ = ++next_epoch_;
+    }
     KVCM_LOG_INFO("SubscriptionEventSink: subscriber ready, consumer_id=%s, subscribers=%zu",
                   subscription->consumer_id().c_str(),
                   subscriptions_.size());
@@ -80,6 +83,9 @@ void SubscriptionEventSink::Unsubscribe(const std::shared_ptr<Subscription> &sub
         subscriptions_.erase(std::remove(subscriptions_.begin(), subscriptions_.end(), subscription),
                              subscriptions_.end());
         subscribers = subscriptions_.size();
+        if (subscribers == 0) {
+            capture_epoch_ = 0;
+        }
     }
     subscription->Close();
     KVCM_LOG_INFO("SubscriptionEventSink: subscriber left, consumer_id=%s, subscribers=%zu",
@@ -99,6 +105,7 @@ void SubscriptionEventSink::DisableSubscriptions() {
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
         accepting_subscriptions_ = false;
+        capture_epoch_ = 0;
         subscriptions.swap(subscriptions_);
     }
     for (const auto &subscription : subscriptions) {
@@ -106,11 +113,11 @@ void SubscriptionEventSink::DisableSubscriptions() {
     }
 }
 
-bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
+bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event, uint64_t epoch) {
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-        if (stopped_ || !accepting_subscriptions_) {
+        if (epoch == 0 || epoch != capture_epoch_ || stopped_ || !accepting_subscriptions_) {
             dropped_.fetch_add(1);
             return false;
         }
@@ -140,6 +147,7 @@ void SubscriptionEventSink::Stop() {
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        capture_epoch_ = 0;
         subscriptions.swap(subscriptions_);
     }
     for (const auto &subscription : subscriptions) {
