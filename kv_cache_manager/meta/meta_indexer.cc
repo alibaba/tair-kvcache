@@ -486,12 +486,11 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     if (delete_batch.batch_location_ids.empty()) {
         delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
     } else if (maintenance_no_touch) {
-        delete_ecs = backend_manager_->DeleteLocationsForMaintenance(
-            request_context,
-            delete_batch.batch_keys,
-            delete_batch.batch_location_ids,
-            reclaimed_count,
-            maintenance_write_local_primary);
+        delete_ecs = backend_manager_->DeleteLocationsForMaintenance(request_context,
+                                                                     delete_batch.batch_keys,
+                                                                     delete_batch.batch_location_ids,
+                                                                     reclaimed_count,
+                                                                     maintenance_write_local_primary);
     } else {
         delete_ecs = backend_manager_->Delete(
             request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
@@ -508,8 +507,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
     stats.cache_backend_delete_time_us += v;
 
-    const int32_t error_count = ProcessErrorCodes(
-        trace_id, delete_ecs, delete_batch.batch_indexs, all_keys, kRmwDeleteMetaOperation, result);
+    const int32_t error_count =
+        ProcessErrorCodes(trace_id, delete_ecs, delete_batch.batch_indexs, all_keys, kRmwDeleteMetaOperation, result);
     // For whole-key deletes, success count = keys - errors.
     // For location deletes, reclaimed_count reflects empty blocks auto-removed.
     const int32_t delete_success_count =
@@ -679,14 +678,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count,
                                                                  bool fill_missing_cache) noexcept {
-    return ReadModifyWriteLocationImpl(request_context,
-                                       keys,
-                                       location_ids,
-                                       modifier,
-                                       adjust_reclaimed_key_count,
-                                       false,
-                                       fill_missing_cache,
-                                       false);
+    return ReadModifyWriteLocationImpl(
+        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, fill_missing_cache, false);
 }
 
 MetaIndexer::LocationResult
@@ -799,15 +792,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = (maintenance_no_touch || (fill_missing_cache && backend_manager_->HasCacheBackend()))
-                                 ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
-                                                                               batch_keys,
-                                                                               batch_location_ids,
-                                                                               batch_locations_per_key)
-                                 : backend_manager_->GetLocations(ephemeral_request_context.get(),
-                                                                  batch_keys,
-                                                                  batch_location_ids,
-                                                                  batch_locations_per_key);
+            get_ecs_per_key =
+                (maintenance_no_touch || (fill_missing_cache && backend_manager_->HasCacheBackend()))
+                    ? backend_manager_->GetLocationsForMaintenance(
+                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
+                    : backend_manager_->GetLocations(
+                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -1001,15 +991,14 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 }
             }
         }
-        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(
-            trace_id,
-            ephemeral_request_context.get(),
-            delete_batch,
-            keys,
-            stats,
-            rmw_result,
-            maintenance_no_touch,
-            maintenance_write_local_primary);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(trace_id,
+                                                                          ephemeral_request_context.get(),
+                                                                          delete_batch,
+                                                                          keys,
+                                                                          stats,
+                                                                          rmw_result,
+                                                                          maintenance_no_touch,
+                                                                          maintenance_write_local_primary);
         (void)delete_errs;
         const bool maintenance_delete_synced = !maintenance_no_touch || delete_batch.batch_keys.empty() ||
                                                !backend_manager_->RequiresMaintenancePostDeleteSync() ||
@@ -2032,6 +2021,18 @@ ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_conte
     return ec;
 }
 
+ErrorCode MetaIndexer::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                          const std::string &cursor,
+                                                          const size_t limit,
+                                                          MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (limit == 0 || limit > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        return EC_BADARGS;
+    }
+    return backend_manager_->ScanPersistentLocationsForRecovery(
+        request_context, cursor, static_cast<int64_t>(limit), out);
+}
+
 ErrorCode
 MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -2093,6 +2094,18 @@ ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                         const int64_t count,
+                                                         ReclaimCandidateVector &out_candidates,
+                                                         bool require_read_success) const noexcept {
+    out_candidates.clear();
+    if (count > 0) {
+        out_candidates.reserve(static_cast<size_t>(count));
+    }
+    return backend_manager_->SamplePersistentReclaimCandidates(
+        request_context, count, out_candidates, require_read_success);
+}
+
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
 size_t MetaIndexer::GetLocalKeyCount() const noexcept { return backend_manager_->GetLocalKeyCount(); }
@@ -2102,6 +2115,12 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
+
+bool MetaIndexer::SyncDeletedLocations(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids) noexcept {
+    return backend_manager_->SyncDeletedLocations(request_context, keys, location_ids);
+}
 
 bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 

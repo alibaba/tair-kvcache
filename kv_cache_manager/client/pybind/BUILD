@@ -29,6 +29,7 @@ py_package(
     visibility = ["//visibility:private"],
     deps = [
         ":kvcm_py_client_lib",
+        "//kv_cache_manager/client:kv_meta_object_py_client",
     ],
 )
 
@@ -58,4 +59,13 @@ py_wheel(
         "@bazel_tools//src/conditions:linux_x86_64": python_platform() + "_x86_64",
         "@bazel_tools//src/conditions:linux_aarch64": python_platform() + "_aarch64",
     }),
+)
+
+py_test(
+    name = "KvMetaObjectPythonWheelTest",
+    size = "small",
+    srcs = ["kv_meta_object_client_wheel_test.py"],
+    args = ["$(location :kvcm_py_client_lib_wheel)"],
+    data = [":kvcm_py_client_lib_wheel"],
+    main = "kv_meta_object_client_wheel_test.py",
 )

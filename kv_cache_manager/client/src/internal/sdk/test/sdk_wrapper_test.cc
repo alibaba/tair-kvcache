@@ -13,10 +13,10 @@
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
-#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -154,7 +154,7 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
     ASSERT_EQ(fclose(file), 0);
-    struct stat file_stat{};
+    struct stat file_stat {};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
@@ -184,7 +184,7 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     auto task_result = sdk_wrapper->wait_task_thread_pool_->async([&]() {
         task_started.set_value();
         allow_task_finish_future.wait();
-        struct stat file_stat{};
+        struct stat file_stat {};
         fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
         return ER_OK;
     });
@@ -246,8 +246,8 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     memory_registrations.host = prepared_registration;
     memory_registrations.gpu.push_back({reinterpret_cast<void *>(0x1000), 4096, 0});
 
-    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
         ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &memory_registrations));
@@ -258,6 +258,7 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
         EXPECT_EQ(config->gpu_memory_spans()[0].base, reinterpret_cast<void *>(0x1000));
         EXPECT_EQ(config->gpu_memory_spans()[0].size, 4096u);
         EXPECT_EQ(config->gpu_memory_spans()[0].device_id, 0);
+        EXPECT_EQ(config->gpu_release_state(), memory_registrations.gpu_release_state);
     }
 
     ASSERT_EQ(fclose(file), 0);
@@ -598,8 +599,10 @@ std::unique_ptr<ClientConfig> MakeClientConfigWithTimeouts(int put_timeout_ms, i
             "queue_size": 2000,
             "sdk_backend_configs": [{"type": "file"}],
             "timeout_config": {
-                "put_timeout_ms": )" + std::to_string(put_timeout_ms) + R"(,
-                "get_timeout_ms": )" + std::to_string(get_timeout_ms) + R"(
+                "put_timeout_ms": )" +
+                                    std::to_string(put_timeout_ms) + R"(,
+                "get_timeout_ms": )" +
+                                    std::to_string(get_timeout_ms) + R"(
             }
         },
         "model_deployment": {
@@ -786,4 +789,31 @@ TEST_F(SdkWrapperTest, TestSplitByPathRecordsIndices) {
     ASSERT_EQ(other.indices[1], 3);
     ASSERT_EQ(other.remote_uris[0].ToUriString(), remote_uris[1].ToUriString());
     ASSERT_EQ(other.remote_uris[1].ToUriString(), remote_uris[3].ToUriString());
+}
+
+// Run in a subprocess: unsafe cleanup deliberately poisons registration for the
+// rest of the process, and must not affect unrelated tests.
+TEST_F(SdkWrapperTest, FailedGpuCleanupBlocksNewRegistrations) {
+    ASSERT_EXIT(
+        {
+            ClientMemoryRegistrations registrations;
+            registrations.gpu.push_back({reinterpret_cast<void *>(0x1000), 4096, 0});
+            SdkWrapper wrapper;
+            auto config = std::make_shared<TairMempoolSdkConfig>();
+            if (wrapper.UpdateTairMempoolSdkConfig(config, &registrations) != ER_OK)
+                _exit(1);
+            config->gpu_release_state()->MarkUnsafe();
+            if (registrations.gpu_release_state->release_safe.load())
+                _exit(2);
+            ClientMemoryRegistrations retry;
+            retry.gpu = registrations.gpu;
+            if (wrapper.UpdateTairMempoolSdkConfig(config, &retry) != ER_INVALID_PARAMS)
+                _exit(3);
+            ClientMemoryRegistrations host_only;
+            if (wrapper.UpdateTairMempoolSdkConfig(config, &host_only) != ER_OK)
+                _exit(4);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0),
+        "");
 }

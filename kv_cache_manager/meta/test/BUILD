@@ -1,5 +1,16 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_test(
+    name = "MetaDeleteConfirmationTest",
+    srcs = ["meta_delete_confirmation_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
+    ],
+)
+
 cc_binary(
     name = "recovery_memory_probe",
     testonly = True,
