@@ -29,6 +29,42 @@ cc_test(
 )
 
 cc_test(
+    name = "ServiceRequestExecutorTest",
+    srcs = ["service_request_executor_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service:service_request_executor",
+    ],
+)
+
+cc_test(
+    name = "MetaServiceGRpcDispatchTest",
+    srcs = ["meta_service_grpc_dispatch_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:migration_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "//kv_cache_manager/service:meta_service_impl",
+        "//kv_cache_manager/service:service_request_executor",
+        "//kv_cache_manager/service/grpc_service",
+        "//kv_cache_manager/service/grpc_service:grpc_server_options",
+        "//kv_cache_manager/service/util:common",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",
@@ -103,6 +139,20 @@ cc_test(
         "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
         "//kv_cache_manager/service",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
+    ],
+)
+
+cc_test(
+    name = "ServerMetricsTest",
+    srcs = ["server_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/service:service_request_executor",
     ],
 )
 

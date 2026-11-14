@@ -198,6 +198,15 @@ errors in response bodies remain in `service.error_counter`.
 
 ### Interval Metrics
 
+The Meta request pool exports queue capacity, current depth, window maximum and time-weighted average depth,
+running requests, queue wait MAX/AVG and execution time MAX/AVG (microseconds). Names are
+`service.request_queue_capacity`, `service.request_queue_length`, `service.request_queue_length_max/avg`,
+`service.request_running`, `service.request_wait_time_us_max/avg`, and `service.request_execution_time_us_max/avg`.
+`service.request_completed`, `service.request_rejected`, and `service.request_discarded` are cumulative counters;
+`service.request_queue_wait_seconds` is a cumulative histogram. Empty timing windows report zero.
+See [dispatch metric semantics](design/service_request_dispatch.md). Prometheus replaces dots with underscores
+and adds the configured prefix.
+
 | Metric | Type | Description |
 |---|---|---|
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |

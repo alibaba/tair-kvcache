@@ -113,6 +113,23 @@ struct KmonitorMetricsReporter::Context {
 
     /* ==================== intervallic metrics ===================== */
 
+    // Meta request executor metrics
+    DECLARE_METRICS(service, request_queue_length);
+    DECLARE_METRICS(service, request_queue_length_max);
+    DECLARE_METRICS(service, request_queue_length_avg);
+    DECLARE_METRICS(service, request_queue_capacity);
+    DECLARE_METRICS(service, request_wait_time_us_max);
+    DECLARE_METRICS(service, request_wait_time_us_avg);
+    DECLARE_METRICS(service, request_execution_time_us_max);
+    DECLARE_METRICS(service, request_execution_time_us_avg);
+    DECLARE_METRICS(service, request_completed);
+    DECLARE_METRICS(service, request_running);
+    DECLARE_METRICS(service, request_rejected);
+    DECLARE_METRICS(service, request_discarded);
+    DECLARE_METRICS(service, request_queue_wait_seconds_bucket);
+    DECLARE_METRICS(service, request_queue_wait_seconds_sum);
+    DECLARE_METRICS(service, request_queue_wait_seconds_count);
+
     // meta indexer metrics
     DECLARE_METRICS(meta_indexer, total_key_count);
     DECLARE_METRICS(meta_indexer, total_cache_usage);
@@ -429,6 +446,23 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(data_storage, create_time_us);
 
     /* ==================== intervallic metrics ===================== */
+
+    // KMonitor represents cumulative counters as GAUGE, not QPS increments.
+    REGISTER_GAUGE_METRIC(service, request_queue_length);
+    REGISTER_GAUGE_METRIC(service, request_queue_length_max);
+    REGISTER_GAUGE_METRIC(service, request_queue_length_avg);
+    REGISTER_GAUGE_METRIC(service, request_queue_capacity);
+    REGISTER_GAUGE_METRIC(service, request_wait_time_us_max);
+    REGISTER_GAUGE_METRIC(service, request_wait_time_us_avg);
+    REGISTER_GAUGE_METRIC(service, request_execution_time_us_max);
+    REGISTER_GAUGE_METRIC(service, request_execution_time_us_avg);
+    REGISTER_GAUGE_METRIC(service, request_completed);
+    REGISTER_GAUGE_METRIC(service, request_running);
+    REGISTER_GAUGE_METRIC(service, request_rejected);
+    REGISTER_GAUGE_METRIC(service, request_discarded);
+    REGISTER_GAUGE_METRIC(service, request_queue_wait_seconds_bucket);
+    REGISTER_GAUGE_METRIC(service, request_queue_wait_seconds_sum);
+    REGISTER_GAUGE_METRIC(service, request_queue_wait_seconds_count);
 
     // meta indexer metrics
     REGISTER_GAUGE_METRIC(meta_indexer, total_key_count);
@@ -1066,12 +1100,14 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // Read registry-owned GC metrics with their native
-        // tags, preserving the same labels as Prometheus/local reporting.
+        // Read current gauges and cumulative counters from the registry.
+        // Preserve native tags, matching Prometheus/local reporting.
         if (!metrics_registry_) {
             break;
         }
-        const auto report_registry_metric = [this](kmonitor::MutableMetric *metric, const std::string &name) {
+        const auto report_registry_metric = [this](kmonitor::MutableMetric *metric,
+                                                   const std::string &name,
+                                                   double scale = 1.0) {
             const auto data = metrics_registry_->GetMetricsData(name);
             if (!metric || !data) {
                 return;
@@ -1087,9 +1123,35 @@ void KmonitorMetricsReporter::ReportInterval() {
                     sample = std::get<GaugeValue>(value->value).load(std::memory_order_relaxed);
                 }
                 const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(base_tags);
-                metric->Report(&tags, sample);
+                metric->Report(&tags, sample * scale);
             }
         };
+
+        report_registry_metric(ctx_->service_request_queue_length_metrics.get(), "service.request_queue_length");
+        report_registry_metric(ctx_->service_request_queue_length_max_metrics.get(),
+                               "service.request_queue_length_max");
+        report_registry_metric(ctx_->service_request_queue_length_avg_metrics.get(),
+                               "service.request_queue_length_avg");
+        report_registry_metric(ctx_->service_request_queue_capacity_metrics.get(), "service.request_queue_capacity");
+        report_registry_metric(ctx_->service_request_wait_time_us_max_metrics.get(),
+                               "service.request_wait_time_us_max");
+        report_registry_metric(ctx_->service_request_wait_time_us_avg_metrics.get(),
+                               "service.request_wait_time_us_avg");
+        report_registry_metric(ctx_->service_request_execution_time_us_max_metrics.get(),
+                               "service.request_execution_time_us_max");
+        report_registry_metric(ctx_->service_request_execution_time_us_avg_metrics.get(),
+                               "service.request_execution_time_us_avg");
+        report_registry_metric(ctx_->service_request_completed_metrics.get(), "service.request_completed");
+        report_registry_metric(ctx_->service_request_running_metrics.get(), "service.request_running");
+        report_registry_metric(ctx_->service_request_rejected_metrics.get(), "service.request_rejected");
+        report_registry_metric(ctx_->service_request_discarded_metrics.get(), "service.request_discarded");
+        report_registry_metric(ctx_->service_request_queue_wait_seconds_bucket_metrics.get(),
+                               "service.request_queue_wait_seconds_bucket");
+        // Match Prometheus: the registry's integer sum is in microseconds.
+        report_registry_metric(
+            ctx_->service_request_queue_wait_seconds_sum_metrics.get(), "service.request_queue_wait_seconds_sum", 1e-6);
+        report_registry_metric(ctx_->service_request_queue_wait_seconds_count_metrics.get(),
+                               "service.request_queue_wait_seconds_count");
 
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");

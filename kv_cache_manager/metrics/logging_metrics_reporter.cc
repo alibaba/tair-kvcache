@@ -64,7 +64,22 @@ void LoggingMetricsReporter::ReportInterval() {
 
     std::ostringstream ss;
     ss << "[Report_Interval_By_Print]|";
+    // Keep executor metrics visible even when the complete registry snapshot
+    // exceeds the logger's maximum message length on a large instance fleet.
+    std::ostringstream executor;
+    executor << "[Report_Request_Executor_Metrics_By_Print]|";
+    bool has_executor_metrics = false;
     for (const auto &[name, tags, val] : all_metrics) {
+        if (name.rfind("service.request_", 0) == 0) {
+            has_executor_metrics = true;
+            executor << "[" << name << "]:";
+            if (std::holds_alternative<CounterValue>(val->value)) {
+                executor << std::get<CounterValue>(val->value).load();
+            } else if (std::holds_alternative<GaugeValue>(val->value)) {
+                executor << std::get<GaugeValue>(val->value).load();
+            }
+            executor << "|";
+        }
         // name
         ss << "[" << name << "]:";
 
@@ -87,7 +102,9 @@ void LoggingMetricsReporter::ReportInterval() {
         ss << "|";
     }
 
-    // TODO 要使用专门的logger防止截断
+    if (has_executor_metrics) {
+        KVCM_METRICS_LOG(executor.str());
+    }
     KVCM_METRICS_LOG(ss.str());
 }
 
