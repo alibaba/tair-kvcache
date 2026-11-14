@@ -41,8 +41,8 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 | 模块 | 目录 | 职责 |
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
-| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、Leader 请求门禁、调用守卫与访问日志。`OptimizerEventStreamService` 复用 Meta gRPC server 暴露订阅流，不新增端口。 |
-| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、`ReportEvent`/`GetHostCacheState`、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcherManager`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`ReclaimerTaskSupervisor`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor`、`StartupConfigLoader` 等子组件，同时把生成的 `SelectLocationPolicy` 传给 `MetaSearcher`。 |
+| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、Leader 请求门禁、调用守卫与访问日志。`OptimizerEventStreamService` 复用 Meta gRPC server 暴露订阅流，不新增端口。 KVMeta 默认关闭，启用时将独立 KVMetaService 注册到主 gRPC listener。 |
+| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、`ReportEvent`/`GetHostCacheState`、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcherManager`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`ReclaimerTaskSupervisor`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor`、`StartupConfigLoader` 等子组件，同时把生成的 `SelectLocationPolicy` 传给 `MetaSearcher`。 `KvMetaManager` 提供隔离的变长对象接口，复用 Registry、MetaIndexer 和存储后端。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 隔离管理 `MetaIndexer` 并共享 `QueryExecutor`；`MetaIndexer` 维护 cache key → `CacheLocation` 的索引，提供 Get/Put/CAS/Sample、查询缓存与分片锁；`MetaStorageBackendManager` 组合 local、Redis、memory-primary + async Redis 等后端并负责恢复/备份。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义 Instance Group/Instance/Storage/Quota/回收/迁移等配置对象；`RegistryManager` 持久化实例注册信息（local/Redis registry backend）；`CoordinationBackend`（memory/file/redis）+ `LeaderElector` 提供一主多备的分布式选主。 |
 | **data_storage** | `data_storage/` | 可插拔的 KVCache 数据存储后端。`DataStorageManager` 管理后端集合、URI、健康探测与水位；`DataStorageBackend` 抽象物理存储；`EventReportBackend` 维护 EventReport 类型的 Reporter/Snapshot 状态与 GC 清理判定；`DataStorageUri` 统一位置描述。内置/可选后端：HF3FS、NFS、TairMemPool（DRAM/SSD）、Mooncake（构建开关）、VCNS HF3FS（构建开关）、EventReport（L1.5/L2）与 Dummy。 |
@@ -60,7 +60,7 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
-| **client** | `client/` | C++ 客户端 SDK（含 pybind），是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。通过 `InitParams.role_type` 支持 SCHEDULER/WORKER/HYBRID。面向外部，不被服务端核心调用。 |
+| **client** | `client/` | C++ 客户端 SDK（含 pybind），是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。通过 `InitParams.role_type` 支持 SCHEDULER/WORKER/HYBRID。面向外部，不被服务端核心调用。 变长对象使用独立的 `KvMetaClient` 和 `KvMetaTransferClient`，由 `KvMetaObjectClient` 组合。 |
 | **py_connector** | `py_connector/` | 推理框架集成（Python）。将 client 接入 vLLM/SGLang/TRT-LLM，含 CUDA kernel 辅助，负责在引擎的推理流程中按正确顺序调用元数据面与数据面接口。此外自带一个纯 Python 的 HTTP 元数据面客户端 `KvCacheManagerClient`（`common/manager_client.py`），可通过统一服务发现 URL 获取 Manager 入口，并作为 C++ `MetaClient` 之外的另一条元数据面通路。位于 Python 侧栈顶。 |
 | **client_java** | `client_java/` | Java 元数据客户端。`MetaClient` 接口覆盖 MetaService 的主要元数据 RPC；`AutoFailoverClient` 组合 gRPC 主链路、HTTP 兜底、服务发现和 Leader 自动发现/故障转移。只覆盖元数据面，不含数据搬运。 |
 | **manager_client** | `manager_client/` | 轻量 Python HTTP 客户端独立 wheel（`tair-kvcache-manager-client`）。复用 `py_connector/common/manager_client.py`，仅依赖 `requests`，不打包传输 SDK、推理连接器、PyTorch 或原生扩展。 |
@@ -73,6 +73,7 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 |---|---|---|---|
 | 元数据面 | `MetaClient` → `internal/stub:grpc_stub` | `protocol`、`config`、`service/util:manager_message_proto_util` | MetaService：`GetCacheLocation` / `StartWriteCache` / `FinishWriteCache` / `GetCacheMeta` / `RemoveCache` 等 |
 | 数据面（数据搬运） | `TransferClient` → `internal/sdk` | `data_storage`（URI/common_define）、`common` | 不经过 KVCM，直接读写存储后端 |
+| KVMeta 对象侧路 | `KvMetaObjectClient` → `KvMetaClient` + `KvMetaTransferClient` | `protocol`、`internal/stub`、`internal/sdk`、`data_storage` | 元数据经独立 KVMetaService；数据直接读写存储后端 |
 
 **客户端侧提供多种等价的元数据面入口**，最终都落到服务端同一套 `*ServiceImpl`（`grpc_service`/`http_service` 只是传输适配层）：
 
@@ -80,7 +81,8 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖除 `getHostCacheState` 外的元数据 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`）。`manager_uri` 可直接使用 HTTP(S) 地址，也可使用通用服务发现 URL；启用 Leader 发现后，客户端以动态发现的 Manager 端点调用 `/api/getClusterInfo`，再根据 `leader_endpoint.meta_http_port` 直连 Leader，并处理 `SERVER_NOT_LEADER` 重试。普通 API 请求使用可配置的 `request_timeout_seconds`（默认 1 秒），Leader 查询保留独立的 5 秒超时。独立 wheel `manager_client` 复用该实现。
 3. **Java `client_java`（gRPC + HTTP）**：`MetaClient` 覆盖 MetaService 的主要元数据 RPC；`AutoFailoverClient` 以 gRPC 为主链路、HTTP 为兜底，并结合服务发现与 Leader 自动发现做故障转移。只覆盖元数据面。
 
-数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
+普通 KVCache 数据面统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。KVMeta 只有显式创建
+`KvMetaObjectClient` 时才启用变长对象路径。
 
 client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点）只创建 `MetaClient` 做元数据匹配与写地址申请；**WORKER**（推理节点）只创建 `TransferClient` 做数据搬运；**HYBRID** 两者都有。WORKER 的存储配置由 `MetaClient::GetStorageConfig()` 从 KVCM 下发获得，保证与服务端一致。
 
@@ -141,7 +143,7 @@ flowchart TD
     end
 
     subgraph core["编排与业务核心"]
-        manager["manager<br/>CacheManager + 子组件"]
+        manager["manager<br/>CacheManager / KvMetaManager + 子组件"]
     end
 
     subgraph dataplane["元数据 / 存储 / 配置"]
@@ -201,6 +203,7 @@ flowchart TD
 
     %% 运维工具
     ops -. AdminService .-> service
+    client -. KvMetaClient / 主 gRPC listener .-> service
 
     %% optimizer 的关联
     optimizer -. cache_location 类型 .-> meta
@@ -386,6 +389,14 @@ flowchart LR
 `CacheManager` 在有活跃 optimizer 订阅的 `GetHostCacheState` 路径采集查询，并携带该请求配置中的 block size；普通缓存读取事件不重复送入 optimizer。启用 optimizer publisher 后，单 worker 按事件顺序转换为 `TraceQueryRequest`，保留原始 instance ID 和采集时的 block size，再写入每个 gRPC 订阅者的独立有界队列。KVCM 的 `OptimizerEventStreamService` 注册在现有 Meta gRPC server 上，不新增端口。
 
 Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpoint，再调用 `MetaService.GetClusterInfo` 定位当前 Leader；任意时刻只向 Leader 保持一条 `SubscribeEvents` response stream。supervisor 周期刷新服务发现和 Leader，并通过同一 Meta gRPC 端口上的 `OptimizerEventStreamService.GetConfiguration` 拉取 Instance Group / Instance 快照，按 Group 后 Instance 的顺序自动注册新增配置；分析 ID 为 `<原 instance_id>_bs<block_size>`，事件必须与已注册的 block size 匹配，未知实例或尺寸不匹配会触发额外刷新，不将事件投递给另一尺寸的状态。单实例冲突单独跳过，其他实例继续同步；Group 级冲突仍会阻断同步。block size 切换成功后清理旧分析状态和指标。切主时先同步配置，再迁移 stream。配置替换与事件回放在订阅器内串行，stream 收到有效事件后直接调用 `OnlineOptimizerManager::TraceQuery`，Optimizer 侧不再增加业务队列。
+
+### 4.10 KVMeta 变长通用对象侧路
+
+配置 `kvcm.kv_meta.enabled=true` 后，`KvMetaClient` 通过主 gRPC 端口上的独立 service 调用 `KvMetaManager`。
+每个 miss 按真实 value size 向 PACE 分配对象；`KvMetaObjectClient` 负责元数据事务和数据搬运。KVMeta 按已提交
+对象的真实字节统计 usage，并用独立 LRU worker 回收到 group 的 `used_percentage` 水位。普通 Reclaimer 和
+Cache GC 跳过带完整 KVMeta schema marker 的 instance，固定 block 分配和 `TransferClient` 不变。详见
+[KVMeta EMB Cache 设计](kv_meta_object_storage.md)。
 
 ---
 

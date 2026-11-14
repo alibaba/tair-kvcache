@@ -20,6 +20,7 @@
 #include "kv_cache_manager/event/optimizer_event_publisher.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -33,11 +34,13 @@
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
+#include "kv_cache_manager/service/grpc_service/kv_meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
+#include "kv_cache_manager/service/kv_meta_service_impl.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
@@ -126,6 +129,17 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
+    if (config_.IsKvMetaEnabled()) {
+        kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
+        if (!kv_meta_manager_->Init()) {
+            KVCM_LOG_ERROR("KVMeta manager init failed");
+            return false;
+        }
+        kv_meta_impl_ = std::make_shared<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, metrics_reporter_);
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        KVCM_LOG_INFO("KVMeta service enabled on the primary RPC port %d", config_.GetServiceRpcPort());
+    }
+
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
 
@@ -163,8 +177,17 @@ void Server::OnBecomeLeader() {
     cache_manager_->ResumeReclaimer();
     cache_manager_->StartMigrationManager();
 
-    if (leader_elector_->RunIfCurrentPromotionValid([this]() {
+    // Starting workers can join previous threads, so keep it outside the
+    // elector's fast transition callback. Admission opens only for this epoch.
+    const bool kv_meta_ready = !kv_meta_manager_ || kv_meta_manager_->ResumeMaintenance();
+    if (!kv_meta_ready) {
+        KVCM_LOG_ERROR("KVMeta maintenance start failed; service remains disabled");
+    }
+    if (leader_elector_->RunIfCurrentPromotionValid([this, kv_meta_ready]() {
             meta_impl_->EnableLeaderOnlyRequests();
+            if (kv_meta_manager_ && kv_meta_ready) {
+                kv_meta_impl_->EnableLeaderOnlyRequests();
+            }
             admin_impl_->EnableLeaderOnlyRequests();
             if (optimizer_event_service_) {
                 optimizer_event_service_->EnableSubscriptions();
@@ -172,6 +195,9 @@ void Server::OnBecomeLeader() {
         })) {
         KVCM_LOG_INFO("recover end");
     } else {
+        if (kv_meta_manager_) {
+            kv_meta_manager_->CancelMaintenance();
+        }
         KVCM_LOG_INFO("recover finished after leadership was revoked, cleanup required");
     }
 }
@@ -186,6 +212,10 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
+    if (kv_meta_manager_) {
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        kv_meta_manager_->CancelMaintenance();
+    }
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
@@ -194,6 +224,11 @@ void Server::OnNoLongerLeader() {
     // Stop migration after leader-only requests drain and after GC has stopped consulting
     // active Copy reservations.
     cache_manager_->StopMigrationManager();
+
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        kv_meta_manager_->DoCleanup();
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -277,10 +312,20 @@ bool Server::StartRpcServer() {
     meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
+    if (config_.IsKvMetaEnabled()) {
+        if (!kv_meta_impl_ || !kv_meta_manager_) {
+            KVCM_LOG_ERROR("KVMeta is enabled but its manager is unavailable");
+            return false;
+        }
+        kv_meta_service_ = std::make_shared<KvMetaServiceGRpc>(metrics_registry_, kv_meta_impl_);
+    }
 
     meta_service_->Init();
     admin_service_->Init();
     debug_service_->Init();
+    if (kv_meta_service_) {
+        kv_meta_service_->Init();
+    }
 
     grpc::ServerBuilder builder;
     const int max_threads =
@@ -295,6 +340,12 @@ bool Server::StartRpcServer() {
     builder.RegisterService(meta_service_.get());
     if (optimizer_event_service_) {
         builder.RegisterService(optimizer_event_service_.get());
+    }
+    if (kv_meta_service_) {
+        // The protobuf packages are distinct, so KVMeta and the fixed-block
+        // MetaService have different fully qualified RPC method names even
+        // though both proto services are named MetaService.
+        builder.RegisterService(kv_meta_service_.get());
     }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
@@ -515,6 +566,9 @@ bool Server::CreateLeaderElector() {
     leader_elector_->SetLeadershipLostHandler([this]() {
         meta_impl_->DisableLeaderOnlyRequests();
         admin_impl_->DisableLeaderOnlyRequests();
+        if (kv_meta_impl_) {
+            kv_meta_impl_->DisableLeaderOnlyRequests();
+        }
     });
 
     // 写入本节点的连接信息到协调后端
@@ -566,12 +620,14 @@ bool Server::StartMetricsReportThread() {
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
     if (config_.redis_health_probe_enabled()) {
         std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
-        redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
-            metrics_registry_, metrics_lifecycle_, registry_manager_, cache_manager_->meta_indexer_manager(),
-            [weak_elector]() {
-                const auto elector = weak_elector.lock();
-                return elector && elector->IsLeader();
-            });
+        redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(metrics_registry_,
+                                                                     metrics_lifecycle_,
+                                                                     registry_manager_,
+                                                                     cache_manager_->meta_indexer_manager(),
+                                                                     [weak_elector]() {
+                                                                         const auto elector = weak_elector.lock();
+                                                                         return elector && elector->IsLeader();
+                                                                     });
         redis_health_thread_ = LoopThread::CreateLoopThread([metrics = redis_health_metrics_]() { metrics->Report(); },
                                                             config_.metrics_report_interval_ms() * 1000,
                                                             "redis_health",
@@ -582,11 +638,11 @@ bool Server::StartMetricsReportThread() {
             // Neither slow metadata probes nor loss of leadership may suppress this
             // observation. A minimum interval also bounds load for fast metrics configurations.
             try {
-                coordination_redis_health_thread_ =
-                    LoopThread::CreateLoopThread([metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
-                                                 std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
-                                                 "coord_redis_health",
-                                                 true);
+                coordination_redis_health_thread_ = LoopThread::CreateLoopThread(
+                    [metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
+                    std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
+                    "coord_redis_health",
+                    true);
             } catch (const std::system_error &error) {
                 // Observability must not prevent the existing service from starting.
                 KVCM_LOG_WARN("cannot start coordination Redis health probe thread: %s", error.what());
@@ -616,6 +672,14 @@ void Server::Stop() {
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }
+    if (kv_meta_manager_) {
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        kv_meta_manager_->CancelMaintenance();
+    }
+
+    // Close KVMeta admission before shutting down the shared primary listener.
+    // In-flight KVMeta and fixed-block calls then follow the same existing
+    // graceful gRPC shutdown semantics.
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
@@ -648,6 +712,11 @@ void Server::Stop() {
         coordination_redis_health_thread_->Stop();
     }
     KVCM_LOG_INFO("admin http server stopped.");
+
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        kv_meta_manager_->DoCleanup();
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 

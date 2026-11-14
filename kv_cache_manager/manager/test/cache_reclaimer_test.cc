@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
@@ -27,6 +28,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -245,6 +247,25 @@ std::shared_ptr<InstanceInfo> InstanceInfoFactory() {
     instance_info->set_location_spec_infos({spec_info});
     instance_info->set_model_deployment(model_deployment);
     return instance_info;
+}
+
+std::shared_ptr<InstanceInfo> KvMetaInstanceInfoFactory() {
+    ModelDeployment deployment;
+    deployment.set_model_name(std::string(kKvMetaModelName));
+    deployment.set_dtype(std::string(kKvMetaDtype));
+    deployment.set_tp_size(1);
+    deployment.set_dp_size(1);
+    deployment.set_pp_size(1);
+    deployment.set_extra(std::string(kKvMetaDeploymentExtra));
+    return std::make_shared<InstanceInfo>(
+        "default_quota_group",
+        "default_test_group",
+        std::string(kKvMetaInternalInstancePrefix) + "656d62",
+        1,
+        std::vector<LocationSpecInfo>{LocationSpecInfo(std::string(kKvMetaValueSpecName), 1)},
+        deployment,
+        std::vector<LocationSpecGroup>{},
+        1);
 }
 
 std::pair<ErrorCode, ins_info_ptr_vec>
@@ -1061,9 +1082,8 @@ public:
         return result;
     }
 
-    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
-                                                KeyType rejected_prefix = 0,
-                                                bool event_report_prefix = false) {
+    MetaLocalBackend *
+    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -5545,6 +5565,33 @@ TEST_F(CacheReclaimerTest, TestFairRotationPolicySwitchResetsQueueWithoutResetti
     EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
 }
 
+TEST_F(CacheReclaimerTest, OnlyCompleteKvMetaInstancesAreExcludedFromReclaim) {
+    cache_reclaimer_->job_state_flag_ = true;
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 90);
+    auto malformed_reserved = InstanceInfoFactory();
+    malformed_reserved->set_instance_id(std::string(kKvMetaInternalInstancePrefix) + "future-format");
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->quota_.quota_config_.front().set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+
+    instance_infos = {KvMetaInstanceInfoFactory()};
+    const auto kv_meta_only = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_FALSE(kv_meta_only.water_level_exceeded);
+    EXPECT_FALSE(kv_meta_only.made_progress);
+    EXPECT_EQ(0, sample_reclaim_call_counter);
+    EXPECT_EQ(0, batch_get_loc_call_counter);
+    EXPECT_TRUE(captured_copy_reqs.empty());
+
+    // A caller-selected ordinary instance name must not change legacy
+    // maintenance behavior merely because it shares KVMeta's prefix.
+    instance_infos = {malformed_reserved};
+    const auto ordinary_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(ordinary_result.water_level_exceeded);
+    EXPECT_GT(sample_reclaim_call_counter, 0);
+}
+
 TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {
     cache_reclaimer_->job_state_flag_ = true;
     spe_submit_auto_complete = false;
@@ -7313,12 +7360,12 @@ std::vector<ErrorCode> limited_copy_results;
 // This dispatch fixture stubs metadata and does not exercise actual backend
 // submission. Model the BatchSubmit group gate separately from its candidate
 // input; the real gate/byte-credit path is covered in MigrationManagerTest.
-std::vector<ErrorCode> MigrationManager_BatchSubmitWithGroupLimit_stub(
-    void *obj,
-    const std::string &trace_id,
-    std::vector<MigrationManager::MigrationRequest> requests,
-    MigrationManager::CopyConcurrencyLimit copy_limit,
-    bool lifecycle_lock_held) {
+std::vector<ErrorCode>
+MigrationManager_BatchSubmitWithGroupLimit_stub(void *obj,
+                                                const std::string &trace_id,
+                                                std::vector<MigrationManager::MigrationRequest> requests,
+                                                MigrationManager::CopyConcurrencyLimit copy_limit,
+                                                bool lifecycle_lock_held) {
     MigrationManager_BatchSubmit_stub(obj, trace_id, requests, copy_limit, lifecycle_lock_held);
     auto *manager = static_cast<MigrationManager *>(obj);
     const auto active = manager->ActiveTaskCountForGroup(copy_limit.instance_group_name);

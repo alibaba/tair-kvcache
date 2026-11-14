@@ -129,16 +129,16 @@ TEST(GrpcMaxThreadsTest, ResolvesConfiguredAndAutomaticLimits) {
     EXPECT_EQ(-1, ResolveGrpcMaxThreads(-1, 64));
     EXPECT_EQ(8, ResolveGrpcMaxThreads(8, 64));
     EXPECT_EQ(64, ResolveGrpcMaxThreads(0, 64));
-    EXPECT_EQ(2, ResolveGrpcMaxThreads(0, 2));
-    EXPECT_EQ(2, ResolveGrpcMaxThreads(0, 1));
-    EXPECT_EQ(2, ResolveGrpcMaxThreads(0, 0));
+    EXPECT_EQ(32, ResolveGrpcMaxThreads(0, 2));
+    EXPECT_EQ(32, ResolveGrpcMaxThreads(0, 1));
+    EXPECT_EQ(32, ResolveGrpcMaxThreads(0, 0));
     EXPECT_EQ(std::numeric_limits<int>::max(), ResolveGrpcMaxThreads(0, std::numeric_limits<unsigned int>::max()));
 }
 
 TEST(GrpcMaxThreadsTest, ReservesStreamThreadsOnlyForAutomaticLimits) {
-    EXPECT_EQ(6, ResolveGrpcMaxThreads(0, 2, 4));
-    EXPECT_EQ(6, ResolveGrpcMaxThreads(0, 1, 4));
-    EXPECT_EQ(6, ResolveGrpcMaxThreads(0, 0, 4));
+    EXPECT_EQ(36, ResolveGrpcMaxThreads(0, 2, 4));
+    EXPECT_EQ(36, ResolveGrpcMaxThreads(0, 1, 4));
+    EXPECT_EQ(36, ResolveGrpcMaxThreads(0, 0, 4));
     EXPECT_EQ(68, ResolveGrpcMaxThreads(0, 64, 4));
     EXPECT_EQ(-1, ResolveGrpcMaxThreads(-1, 2, 4));
     EXPECT_EQ(2, ResolveGrpcMaxThreads(2, 2, 4));
@@ -245,6 +245,17 @@ TEST_P(GrpcServerOptionsTest, CountsEveryGrpcStatusWithDefaultThreadQuota) {
         }
     }
     EXPECT_EQ(18u, responses);
+}
+
+TEST_P(GrpcServerOptionsTest, TwoCoreAutoQuotaKeepsUnaryHeadroomDuringBlockedIO) {
+    StartServer(ResolveGrpcMaxThreads(0, 2));
+    StartBlockedRequest();
+    ASSERT_TRUE(service_.WaitUntilEntered());
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_TRUE(Query(*stub_).ok());
+    }
+    EXPECT_EQ(8, service_.query_calls.load());
+    EXPECT_EQ(0u, Count("RESOURCE_EXHAUSTED", GetParam()));
 }
 
 TEST_P(GrpcServerOptionsTest, CountsFrameworkRejectionsAndRecovers) {

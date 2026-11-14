@@ -2,7 +2,9 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <stdexcept>
 
+#include "kv_cache_manager/client/include/kv_meta_object_client.h"
 #include "kv_cache_manager/client/include/transfer_client.h"
 
 namespace py = pybind11;
@@ -24,6 +26,22 @@ struct PyRegistSpan {
     size_t size() const { return span.size; }
 };
 
+// Unsafe registrations retain owners until process exit, including during
+// interpreter shutdown. Native admission is permanently closed after failure,
+// so retries cannot accumulate new registered allocations.
+void QuarantineGpuOwners(const std::shared_ptr<kvcm::GpuMemoryReleaseState> &state,
+                         py::object &gpu_owner,
+                         py::object &host_owner,
+                         std::shared_ptr<PyRegistSpan> &span) {
+    if (state && !state->release_safe.load(std::memory_order_acquire)) {
+        (void)gpu_owner.release();
+        (void)host_owner.release();
+        if (span) {
+            (void)new std::shared_ptr<PyRegistSpan>(std::move(span));
+        }
+    }
+}
+
 struct PyInitParams {
     kvcm::RoleType role_type{kvcm::RoleType::UNKNOWN};
     std::shared_ptr<PyRegistSpan> regist_span;
@@ -37,6 +55,30 @@ struct PyInitParams {
         params.self_location_spec_name = self_location_spec_name;
         params.storage_configs = storage_configs;
         return params;
+    }
+};
+
+struct PyKvMetaObjectClientConfig {
+    kvcm::KvMetaClientConfig metadata;
+    std::string instance_group;
+    std::string user_data;
+    std::string transfer_client_config;
+    PyInitParams transfer_init_params;
+    std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
+    std::int32_t write_timeout_seconds{30};
+    std::vector<std::tuple<std::uint64_t, std::size_t, int>> gpu_memory_spans;
+    py::object gpu_memory_owner = py::none();
+
+    kvcm::KvMetaObjectClientConfig ToCpp() const {
+        kvcm::KvMetaObjectClientConfig config;
+        config.metadata = metadata;
+        config.instance_group = instance_group;
+        config.user_data = user_data;
+        config.transfer_client_config = transfer_client_config;
+        config.transfer_init_params = transfer_init_params.ToCpp();
+        config.max_object_bytes = max_object_bytes;
+        config.write_timeout_seconds = write_timeout_seconds;
+        return config;
     }
 };
 } // namespace
@@ -53,6 +95,9 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     });
 
     module.doc() = "kvcm_py_client pybind11 extension";
+    module.attr("KV_META_GPU_REGISTRATION") = true;
+    module.attr("KV_META_OBJECT_API_VERSION") = kvcm::GetKvMetaObjectClientApiVersion();
+    module.attr("KV_META_OBJECT_TRANSFER_STATE_VERSION") = kvcm::GetKvMetaObjectTransferStateVersion();
 
     // 绑定枚举
     py::native_enum<kvcm::ClientErrorCode>(module, "ClientErrorCode", "enum.Enum")
@@ -78,6 +123,15 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_SERVICE_INVALID_ARGUMENT", kvcm::ClientErrorCode::ER_SERVICE_INVALID_ARGUMENT)
         .value("ER_SERVICE_DUPLICATE_ENTITY", kvcm::ClientErrorCode::ER_SERVICE_DUPLICATE_ENTITY)
         .value("ER_SERVICE_INSTANCE_NOT_EXIST", kvcm::ClientErrorCode::ER_SERVICE_INSTANCE_NOT_EXIST)
+        .value("ER_SERVICE_NOT_LEADER", kvcm::ClientErrorCode::ER_SERVICE_NOT_LEADER)
+        .value("ER_SERVICE_NOT_READY", kvcm::ClientErrorCode::ER_SERVICE_NOT_READY)
+        .value("ER_SERVICE_REACH_MAX_ENTITY_CAPACITY", kvcm::ClientErrorCode::ER_SERVICE_REACH_MAX_ENTITY_CAPACITY)
+        .value("ER_SERVICE_RESOURCE_EXHAUSTED", kvcm::ClientErrorCode::ER_SERVICE_RESOURCE_EXHAUSTED)
+        .value("ER_SERVICE_NOT_FOUND", kvcm::ClientErrorCode::ER_SERVICE_NOT_FOUND)
+        .value("ER_SERVICE_WRITE_IN_PROGRESS", kvcm::ClientErrorCode::ER_SERVICE_WRITE_IN_PROGRESS)
+        .value("ER_SERVICE_SESSION_NOT_FOUND", kvcm::ClientErrorCode::ER_SERVICE_SESSION_NOT_FOUND)
+        .value("ER_SERVICE_SIZE_MISMATCH", kvcm::ClientErrorCode::ER_SERVICE_SIZE_MISMATCH)
+        .value("ER_SERVICE_IO_ERROR", kvcm::ClientErrorCode::ER_SERVICE_IO_ERROR)
         .value("ER_SDK_TIMEOUT", kvcm::ClientErrorCode::ER_SDK_TIMEOUT)
         .value("ER_GETSDK_ERROR", kvcm::ClientErrorCode::ER_GETSDK_ERROR)
         .value("ER_CREATESDK_ERROR", kvcm::ClientErrorCode::ER_CREATESDK_ERROR)
@@ -139,6 +193,24 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_readwrite("self_location_spec_name", &PyInitParams::self_location_spec_name)
         .def_readwrite("storage_configs", &PyInitParams::storage_configs);
 
+    py::class_<kvcm::KvMetaClientConfig, py::smart_holder>(module, "KvMetaClientConfig")
+        .def(py::init<>())
+        .def_readwrite("addresses", &kvcm::KvMetaClientConfig::addresses)
+        .def_readwrite("instance_id", &kvcm::KvMetaClientConfig::instance_id)
+        .def_readwrite("call_timeout_ms", &kvcm::KvMetaClientConfig::call_timeout_ms);
+
+    py::class_<PyKvMetaObjectClientConfig, py::smart_holder>(module, "KvMetaObjectClientConfig")
+        .def(py::init<>())
+        .def_readwrite("metadata", &PyKvMetaObjectClientConfig::metadata)
+        .def_readwrite("instance_group", &PyKvMetaObjectClientConfig::instance_group)
+        .def_readwrite("user_data", &PyKvMetaObjectClientConfig::user_data)
+        .def_readwrite("transfer_client_config", &PyKvMetaObjectClientConfig::transfer_client_config)
+        .def_readwrite("transfer_init_params", &PyKvMetaObjectClientConfig::transfer_init_params)
+        .def_readwrite("max_object_bytes", &PyKvMetaObjectClientConfig::max_object_bytes)
+        .def_readwrite("write_timeout_seconds", &PyKvMetaObjectClientConfig::write_timeout_seconds)
+        .def_readwrite("gpu_memory_spans", &PyKvMetaObjectClientConfig::gpu_memory_spans)
+        .def_readwrite("gpu_memory_owner", &PyKvMetaObjectClientConfig::gpu_memory_owner);
+
     py::class_<kvcm::ForwardContext, py::smart_holder>(module, "ForwardContext")
         .def(py::init<>())
         .def_readwrite("metas", &kvcm::ForwardContext::metas)
@@ -196,5 +268,141 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("block_buffers"),
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
+
+    py::class_<kvcm::KvMetaObjectClient, py::smart_holder>(module, "KvMetaObjectClient", py::dynamic_attr())
+        .def_static(
+            "Create",
+            [](const std::string &trace_id, const PyKvMetaObjectClientConfig &py_config) -> py::tuple {
+                auto config = py_config.ToCpp();
+                auto captured_span = py_config.transfer_init_params.regist_span;
+                py::object captured_owner = captured_span == nullptr ? py::none() : captured_span->owner;
+                auto gpu_owner = py_config.gpu_memory_owner;
+                kvcm::ClientMemoryRegistrations registrations;
+                for (const auto &[base, size, device] : py_config.gpu_memory_spans) {
+                    registrations.gpu.push_back({reinterpret_cast<void *>(base), size, device});
+                }
+                if (captured_span != nullptr && captured_span->fd != -1) {
+                    registrations.host = {captured_span->span.base, captured_span->span.size, captured_span->fd};
+                }
+                std::pair<kvcm::ClientErrorCode, std::unique_ptr<kvcm::KvMetaObjectClient>> result;
+                try {
+                    py::gil_scoped_release release;
+                    if (!registrations.gpu.empty()) {
+                        result =
+                            kvcm::KvMetaObjectClient::CreateWithMemoryRegistrations(trace_id, config, registrations);
+                    } else if (captured_span != nullptr && captured_span->fd != -1) {
+                        kvcm::SharedMemoryRegistration registration;
+                        registration.base = captured_span->span.base;
+                        registration.size = captured_span->span.size;
+                        registration.fd = captured_span->fd;
+                        result = kvcm::KvMetaObjectClient::Create(trace_id, config, registration);
+                    } else {
+                        result = kvcm::KvMetaObjectClient::Create(trace_id, config);
+                    }
+                } catch (...) {
+                    QuarantineGpuOwners(registrations.gpu_release_state, gpu_owner, captured_owner, captured_span);
+                    throw;
+                }
+                if (result.second == nullptr) {
+                    QuarantineGpuOwners(registrations.gpu_release_state, gpu_owner, captured_owner, captured_span);
+                    return py::make_tuple(result.first, py::none());
+                }
+                // Python instance attributes may be cleared before the C++
+                // holder. Tie GPU ownership to the native deleter, not just
+                // dynamic attributes, so GC cannot free registered VRAM first.
+                py::object py_client;
+                if (!registrations.gpu.empty()) {
+                    auto owned_client = std::shared_ptr<kvcm::KvMetaObjectClient>(
+                        result.second.release(),
+                        [owner = gpu_owner,
+                         host_owner = captured_owner,
+                         span = captured_span,
+                         state = registrations.gpu_release_state](kvcm::KvMetaObjectClient *client) mutable {
+                            py::gil_scoped_acquire acquire;
+                            {
+                                py::gil_scoped_release release;
+                                client->Close();
+                                delete client;
+                            }
+                            QuarantineGpuOwners(state, owner, host_owner, span);
+                            owner = py::object();
+                            host_owner = py::object();
+                            span.reset();
+                        });
+                    py_client = py::cast(std::move(owned_client));
+                } else {
+                    py_client = py::cast(std::move(result.second));
+                }
+                py_client.attr("_regist_span") = py::cast(captured_span);
+                py_client.attr("_regist_span_owner") = captured_owner;
+                py_client.attr("_gpu_memory_owner") = gpu_owner;
+                return py::make_tuple(result.first, py_client);
+            },
+            py::arg("trace_id"),
+            py::arg("config"))
+        .def("LoadObjects",
+             &kvcm::KvMetaObjectClient::LoadObjects,
+             py::arg("trace_id"),
+             py::arg("keys"),
+             py::arg("expected_value_sizes"),
+             py::arg("object_buffers"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("SaveObjects",
+             &kvcm::KvMetaObjectClient::SaveObjects,
+             py::arg("trace_id"),
+             py::arg("keys"),
+             py::arg("value_sizes"),
+             py::arg("object_buffers"),
+             py::call_guard<py::gil_scoped_release>())
+        .def(
+            "SaveObjectsWithTransferState",
+            [](kvcm::KvMetaObjectClient &client,
+               const std::string &trace_id,
+               const std::vector<std::string> &keys,
+               const std::vector<std::uint64_t> &sizes,
+               const kvcm::BlockBuffers &buffers) {
+                const auto result = client.SaveObjectsWithTransferState(trace_id, keys, sizes, buffers);
+                return std::make_pair(result.ec, result.data_transfer_may_be_inflight);
+            },
+            py::arg("trace_id"),
+            py::arg("keys"),
+            py::arg("value_sizes"),
+            py::arg("object_buffers"),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "LoadObjectsWithTransferState",
+            [](kvcm::KvMetaObjectClient &client,
+               const std::string &trace_id,
+               const std::vector<std::string> &keys,
+               const std::vector<std::uint64_t> &sizes,
+               const kvcm::BlockBuffers &buffers) {
+                const auto result = client.LoadObjectsWithTransferState(trace_id, keys, sizes, buffers);
+                return std::make_pair(result.ec, result.data_transfer_may_be_inflight);
+            },
+            py::arg("trace_id"),
+            py::arg("keys"),
+            py::arg("expected_value_sizes"),
+            py::arg("object_buffers"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("Remove",
+             &kvcm::KvMetaObjectClient::Remove,
+             py::arg("trace_id"),
+             py::arg("keys"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("Close", [](kvcm::KvMetaObjectClient &client) {
+            {
+                py::gil_scoped_release release;
+                client.Close();
+            }
+            // Close synchronously destroys the transfer client and attempts
+            // deregistration. Only now is its cleanup result known. Propagate
+            // failure so callers retain allocator pools as well as tensors.
+            // The process-wide check is deliberately conservative: no client
+            // may claim safe GPU cleanup after an unconfirmed deregistration.
+            if (kvcm::GpuMemoryReleaseState::RegistrationBlocked().load(std::memory_order_acquire)) {
+                throw std::runtime_error("GPU deregistration did not complete; retain registered buffers and "
+                                         "allocation pools until process exit; restart required");
+            }
+        });
 
 } // namespace kv_cache_manager
