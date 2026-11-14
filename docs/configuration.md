@@ -92,7 +92,7 @@ kvcm.service.admin_http_port=6492
 # 指定 HTTP 服务 IO 线程数，默认为机器核数；不控制 gRPC 线程
 kvcm.service.io_thread_num=2
 
-# 每个 gRPC Server 的同步线程上限（含 poller）。默认 0，自动取 max(2, 硬件并行数)，计算方式参照 HTTP。
+# 每个 gRPC Server 的同步线程上限（含 poller）。默认 0，自动取 max(32, 硬件并行数)，为同步 IO 留出并发余量。
 # Manager 开启 optimizer 事件发布时，主 Meta Server 的自动上限额外加上 max_subscribers，
 # 为长期订阅预留线程；独立 Admin Server 不增加。显式设置正数时仍作为总上限，不额外增加。
 # -1 沿用 gRPC 框架默认，不额外设限；显式上限必须 >= 2。

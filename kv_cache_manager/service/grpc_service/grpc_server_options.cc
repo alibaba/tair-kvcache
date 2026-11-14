@@ -144,8 +144,10 @@ int ResolveGrpcMaxThreads(int configured_max_threads,
     if (configured_max_threads != 0) {
         return configured_max_threads;
     }
+    // Synchronous handlers also wait for metadata/storage IO. A two-core
+    // container still needs polling and handler headroom under concurrent RPCs.
     const auto base =
-        static_cast<int>(std::clamp(hardware_threads, 2u, static_cast<unsigned int>(std::numeric_limits<int>::max())));
+        static_cast<int>(std::clamp(hardware_threads, 32u, static_cast<unsigned int>(std::numeric_limits<int>::max())));
     const auto headroom = static_cast<std::size_t>(std::numeric_limits<int>::max() - base);
     return base + static_cast<int>(std::min(reserved_stream_threads, headroom));
 }

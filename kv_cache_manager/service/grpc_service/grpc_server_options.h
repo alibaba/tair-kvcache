@@ -13,8 +13,8 @@ namespace kv_cache_manager {
 class MetricsRegistry;
 class MetricsReporter;
 
-// Resolve 0 to hardware concurrency, with at least a poller and a handler,
-// plus one thread per allowed long-lived synchronous stream.
+// Resolve 0 to at least 32 threads for pollers and synchronous IO handlers,
+// or hardware concurrency if larger, plus one per allowed long-lived stream.
 // -1 keeps the framework default; positive values are explicit limits.
 int ResolveGrpcMaxThreads(int configured_max_threads,
                           unsigned int hardware_threads,
