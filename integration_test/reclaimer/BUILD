@@ -32,6 +32,7 @@ py_test(
 
 py_test(
     name = "reclaiming_test",
+    size = "large",
     srcs = ["reclaiming_test.py"],
     tags = ["no-remote-exec"],
     data = [
