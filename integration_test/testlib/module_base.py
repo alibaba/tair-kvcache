@@ -3,6 +3,7 @@ import logging
 import shutil
 import subprocess
 import signal
+import time
 
 
 class ModuleBase(object):
@@ -66,10 +67,24 @@ class ModuleBase(object):
 
         return pids
 
-    def _wait_exit(self, module_name, pid):
+    def _wait_exit(self, module_name, pid, timeout=120):
+        if pid is None:
+            return
+        deadline = time.monotonic() + timeout
         while True:
-            if not self._get_pid(module_name, extra='%s' % pid):
-                break
+            try:
+                with open(f"/proc/{pid}/stat") as process_stat:
+                    # The command name in parentheses may itself contain spaces
+                    # or ')'. An unreaped zombie has already finished executing.
+                    state = process_stat.read().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            if state in ("Z", "X"):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{module_name} (pid={pid}) did not exit within {timeout}s")
+            time.sleep(min(0.1, remaining))
 
     @staticmethod
     def _stop(pid=None, force=False):
