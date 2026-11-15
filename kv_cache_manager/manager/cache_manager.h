@@ -294,6 +294,7 @@ public:
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
+    const std::shared_ptr<MetricsRegistry> &metrics_registry() const noexcept { return metrics_registry_; }
 
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
@@ -303,6 +304,8 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    ErrorCode CheckFixedBlockInstance(RequestContext *request_context, const std::string &instance_id) const;
+
     ErrorCode TrimCacheWithIndexer(RequestContext *request_context,
                                    const std::string &instance_id,
                                    const std::shared_ptr<MetaIndexer> &meta_indexer,

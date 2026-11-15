@@ -216,6 +216,8 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, event_report_probe_unknown_count);
     DECLARE_METRICS(cache_gc, event_report_delete_location_count);
 
+    std::unordered_map<std::string, std::unique_ptr<kmonitor::MutableMetric>> kv_meta_reclaim_metrics;
+
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
@@ -536,6 +538,24 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_unknown_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
+
+    // Registry counters remain cumulative GAUGEs; rate conversion belongs to the query.
+    for (const char *suffix : {"stage_count",
+                               "usage_bytes",
+                               "target_bytes",
+                               "candidate_count",
+                               "selected_count",
+                               "deleted_count",
+                               "deleted_bytes"}) {
+        const std::string name = std::string("kv_meta.reclaim.") + suffix;
+        std::unique_ptr<kmonitor::MutableMetric> metric(
+            reporter->RegisterMetric(name, kmonitor::GAUGE, kmonitor::FATAL));
+        if (!metric) {
+            KVCM_LOG_ERROR("failed to register metric:[%s]", name.c_str());
+            return false;
+        }
+        ctx_->kv_meta_reclaim_metrics[name] = std::move(metric);
+    }
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -1096,6 +1116,11 @@ void KmonitorMetricsReporter::ReportInterval() {
                 metric->Report(&tags, sample);
             }
         };
+
+        // Only the seven explicitly registered names are looked up, never the full registry.
+        for (const auto &[name, metric] : ctx_->kv_meta_reclaim_metrics) {
+            report_registry_metric(metric.get(), name);
+        }
 
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");

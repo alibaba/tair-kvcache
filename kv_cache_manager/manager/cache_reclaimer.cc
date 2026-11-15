@@ -33,6 +33,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -2738,9 +2739,18 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
 
     // Retrieve the list before branching, as in the legacy path. The budget
     // policy only changes planning and execution after this point.
-    const auto [ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), ins_gr);
+    auto [ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), ins_gr);
     if (ec != ErrorCode::EC_OK) {
         LOG_WITH_GR(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec));
+        return result;
+    }
+    // KVMeta has its own exact-key lifecycle and reclaimer. Do not spend the
+    // fixed-block reclaim or migration budget sampling those namespaces.
+    instance_infos.erase(std::remove_if(instance_infos.begin(),
+                                        instance_infos.end(),
+                                        [](const auto &instance) { return instance && IsKvMetaInstance(*instance); }),
+                         instance_infos.end());
+    if (instance_infos.empty()) {
         return result;
     }
 

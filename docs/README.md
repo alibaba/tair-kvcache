@@ -22,6 +22,7 @@
 - [Recover 期间允许 EventReport GC 清理](design/event_report_gc_during_recover.md) - 复用删除标记保护整 key 回收与在线重建，逐 key 处理恢复期清理边界
 - [Meta 内存主存储与 Redis 异步备份](design/meta_memory_primary_async_backup.md) - Recover 保持持久化优先，Running 切换内存优先异步备份并复用原锁外 Sync
 - [元数据内存紧凑化设计与实现](design/meta_location_item_memory_compaction.md) - Location、spec name、item 与分段锁的实现及容量验收边界
+- [KVMeta 通用对象存储](design/kv_meta_object_storage.md) - 面向 EPD embedding 的变长 exact-key 元数据、事务、主链路隔离与 RTP 接入
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
@@ -31,6 +32,7 @@
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式
 - [API 文档](api/) - API 接口说明和使用示例
 - [ReportEvent 与查询接口行为](api/report_event.md) - 面向调用方的事件上报、全量对账、查询、错误处理和测试覆盖清单
+- [KVMeta 通用对象 API](api/kv_meta_service.md) - embedding 等变长对象的独立 gRPC 接口契约
 
 ### 部署文档
 - [镜像文档](../open_source/docker/README.md) - Docker镜像构建和使用说明

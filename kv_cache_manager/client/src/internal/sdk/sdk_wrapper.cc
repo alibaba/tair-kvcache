@@ -6,9 +6,9 @@
 #include <unistd.h>
 #include <unordered_map>
 
-#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
@@ -67,6 +67,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     }
     if (memory_registrations != nullptr) {
         prepared_memory_registrations.gpu = memory_registrations->gpu;
+        prepared_memory_registrations.gpu_release_state = memory_registrations->gpu_release_state;
     }
 
     wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(
@@ -104,8 +105,8 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
-        ec = UpdateTairMempoolSdkConfig(
-            sdk_backend_config, memory_registrations == nullptr ? nullptr : &prepared_memory_registrations);
+        ec = UpdateTairMempoolSdkConfig(sdk_backend_config,
+                                        memory_registrations == nullptr ? nullptr : &prepared_memory_registrations);
         if (ec != ER_OK) {
             KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
@@ -205,9 +206,8 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
-        });
+        tasks.push_back(
+            [group, group_actual_uris]() { return group.sdk->Put(group.uris, group.buffers, group_actual_uris); });
     }
 
     // 与 Get 同理：静态预算已在 Init 时注入后端。
@@ -288,8 +288,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
 
     // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
-                      getOpTypeString(op_type).c_str());
+        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full", getOpTypeString(op_type).c_str());
         return ER_SDK_ERROR_BUFFER_SAFE;
     }
 
@@ -336,9 +335,8 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                 continue;
             }
             const auto ec = futures[j].get();
-            all_buffer_safe = all_buffer_safe &&
-                              (ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
-                               ec == ER_SDK_ERROR_BUFFER_SAFE);
+            all_buffer_safe = all_buffer_safe && (ec == ER_OK || ec == ER_TASK_CANCELLED ||
+                                                  ec == ER_SDK_TIMEOUT_BUFFER_SAFE || ec == ER_SDK_ERROR_BUFFER_SAFE);
             timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
         }
         return timed_out;
@@ -365,8 +363,8 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
                           getOpTypeString(op_type).c_str(),
                           static_cast<int>(ec));
-            all_buffer_safe = ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
-                              ec == ER_SDK_ERROR_BUFFER_SAFE;
+            all_buffer_safe =
+                ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || ec == ER_SDK_ERROR_BUFFER_SAFE;
             const bool peer_timed_out = drain(i + 1);
             if (ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || peer_timed_out) {
                 return all_buffer_safe ? ER_SDK_TIMEOUT_BUFFER_SAFE : ER_SDK_TIMEOUT;
@@ -430,7 +428,7 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
         return ER_INVALID_PARAMS;
     }
 
-    struct stat file_stat{};
+    struct stat file_stat {};
     if (fstat(shared_memory_registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<uintmax_t>(file_stat.st_size) < shared_memory_registration.size) {
         KVCM_LOG_WARN("shared memory fd is invalid or smaller than the registered range");
@@ -469,7 +467,14 @@ ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<Sdk
         config->set_shm_size(memory_registrations->host.size);
         config->set_client_base(memory_registrations->host.base);
     }
+    if (!memory_registrations->gpu.empty() &&
+        (GpuMemoryReleaseState::RegistrationBlocked().load(std::memory_order_acquire) ||
+         !memory_registrations->gpu_release_state)) {
+        KVCM_LOG_ERROR("GPU registration unavailable after unsafe cleanup; restart process");
+        return ER_INVALID_PARAMS;
+    }
     config->set_gpu_memory_spans(memory_registrations->gpu);
+    config->set_gpu_release_state(memory_registrations->gpu_release_state);
     return ER_OK;
 }
 

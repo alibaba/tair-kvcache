@@ -29,6 +29,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
@@ -721,6 +722,7 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                                        const std::string & /*instance_group*/,
                                        const std::string &instance_id) {
     SPAN_TRACER(request_context);
+    RETURN_IF_EC_NOT_OK(CheckFixedBlockInstance(request_context, instance_id));
     InstanceRemovalGuard instance_removal_guard(*metrics_lifecycle_, instance_id);
     if (!instance_removal_guard.acquired()) {
         request_context->error_tracer()->AddErrorMsg("instance removal already in progress: " + instance_id);
@@ -1547,6 +1549,9 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                               int32_t min_replica_count,
                               std::optional<StorageReplicaRequirement> storage_replica_requirement) {
     SPAN_TRACER(request_context);
+    if (const auto ec = CheckFixedBlockInstance(request_context, instance_id); ec != EC_OK) {
+        return {ec, StartWriteCacheInfo{}};
+    }
     const std::string &trace_id = request_context->trace_id();
     std::optional<DataStorageType> target_storage_type;
     std::vector<DataStorageType> excluded_storage_types;
@@ -2040,6 +2045,7 @@ ErrorCode CacheManager::RemoveCache(RequestContext *request_context,
                                     const BlockMask &block_mask /*TODO*/) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    RETURN_IF_EC_NOT_OK(CheckFixedBlockInstance(request_context, instance_id));
     assert(schedule_plan_executor_);
     if (keys.empty() && tokens.empty()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "remove cache failed: empty input");
@@ -2085,6 +2091,7 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
                                              const std::shared_ptr<MetaIndexer> &meta_indexer,
                                              bool detached_indexer) const noexcept {
     const std::string &trace_id = request_context->trace_id();
+    RETURN_IF_EC_NOT_OK(CheckFixedBlockInstance(request_context, instance_id));
 
     constexpr std::size_t limit = 256;
     const std::size_t max_inflight = 2 * schedule_plan_executor_->GetWorkerCount();
@@ -4911,6 +4918,23 @@ ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, c
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "create meta searcher failed");
     }
     PREFIX_LOG(INFO, "create meta searcher success");
+    return EC_OK;
+}
+
+ErrorCode CacheManager::CheckFixedBlockInstance(RequestContext *request_context, const std::string &instance_id) const {
+    // Ordinary caller-selected prefixes are allowed; only the complete object
+    // schema is isolated. Avoid another registry lookup on the usual KV path.
+    if (!HasKvMetaInternalInstanceId(instance_id)) {
+        return EC_OK;
+    }
+    auto instance = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!instance) {
+        instance = registry_manager_->GetRemovingInstanceInfo(instance_id);
+    }
+    if (instance && IsKvMetaInstance(*instance)) {
+        request_context->error_tracer()->AddErrorMsg("KVMeta instances require the KVMeta API");
+        return EC_BADARGS;
+    }
     return EC_OK;
 }
 
