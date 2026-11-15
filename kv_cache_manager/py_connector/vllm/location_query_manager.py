@@ -24,6 +24,11 @@ expired hit is a miss: the slot is superseded and the query re-issued.
 In-flight queries are never expired -- the client's request timeout
 bounds them.
 
+**An empty answer never expires.** ``[]`` contains no location pointer, so
+there is no staleness risk. Keep it until the query key changes; expiring it
+would only repeat the query without improving safety. Non-empty answers remain
+subject to the freshness gate.
+
 **Object identity is the version.** A superseded (or invalidated /
 consumed) query must not write its late answer into the new slot. Each
 ask captures the slot object it created; the async callback compares
@@ -206,10 +211,11 @@ class LocationQueryManager:
         Returns the locations when a fresh answer is already cached for
         this exact query key, None while a query is in flight for it (the
         scheduler re-asks next step), and [] when the query answered "no
-        hit". An ask at a different offset -- or one whose cached answer
-        has expired -- supersedes the slot: a new query starts
-        immediately, and the old answer can no longer be consumed. A
-        failed query drops its slot so the next hook call re-issues.
+        hit" (that answer never expires: it holds no pointer). An ask at a
+        different offset -- or one whose cached hit has expired --
+        supersedes the slot: a new query starts immediately, and the old
+        answer can no longer be consumed. A failed query drops its slot so
+        the next hook call re-issues.
         """
         req_id = request.request_id
         key = self._key(request, computed_blocks)
@@ -220,6 +226,11 @@ class LocationQueryManager:
                     # Same query still in flight: dedupe (the scheduler
                     # re-asks every step; the client timeout bounds it).
                     return None
+                if not q.locations:
+                    # No location pointer exists, so there is no staleness risk.
+                    # Expiring [] livelocks requests whenever the manager is
+                    # slower than the horizon (see module docstring).
+                    return q.locations
                 age = time.monotonic() - q.ask_time
                 if age <= self._max_answer_age_s:
                     return q.locations
