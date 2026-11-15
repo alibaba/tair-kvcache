@@ -117,18 +117,26 @@ class LocationQueryFanoutTest(unittest.TestCase):
             time.sleep(0.005)
         self.fail("the manager's answer never landed in the slot")
 
-    def _slow_manager(self, lqm, seconds):
-        """Issue the query, let the manager sit on it for ``seconds`` of real
-        time, then answer. Returns the measured latency, which the caller
-        asserts against the horizon -- the setup is proven, not assumed."""
+    def _slow_answer(self, lqm, call_index, offset=0, seconds=1.1):
+        """Drive one real slow RPC, including the hook call that issues it.
+
+        The hook call also observes (and counts) the previous answer's expiry.
+        Sleeping while the RPC is genuinely in flight proves the age gate fired
+        because of manager latency, not because a test rewrote ``ask_time``.
+        """
         issued = time.monotonic()
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
+        self.assertIsNone(lqm.get_locations_for_query(self.req, offset))
+        gate = self._gate(call_index)
         time.sleep(seconds)
-        self._gate(0).set()
+        gate.set()
         self._await_landing(lqm)
         latency = time.monotonic() - issued
         self.assertGreater(latency, lqm._max_answer_age_s)
         return latency
+
+    def _slow_manager(self, lqm, seconds):
+        """Issue the first query and let the manager sit on it in real time."""
+        return self._slow_answer(lqm, 0, seconds=seconds)
 
     # ------------------------------------------------------------------ #
     # Dedupe: same offset
@@ -321,6 +329,100 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self._gate(1).set()
         self._await_answer(lqm, 0)  # re-answered fresh
         self.assertEqual(lqm.consume_locations("r1"), (["loc0", "loc1"], 0))
+
+    # ------------------------------------------------------------------ #
+    # Expiry observation: only the fourth consecutive non-empty hit is ERROR
+    # ------------------------------------------------------------------ #
+    def test_real_slow_manager_errors_from_fourth_consecutive_expiry(self):
+        lqm = self._manager()  # the shipped one-second horizon, untouched
+        with patch.object(location_query_manager.logger, "error") as error:
+            self._slow_answer(lqm, 0)  # initial answer, not yet an expiry
+            for count in range(1, 6):
+                self._slow_answer(lqm, count)
+                self.assertEqual(error.call_count, max(0, count - 3))
+                if count < 4:
+                    key = lqm._queries["r1"].key
+                    self.assertEqual(lqm._expired_streaks, {key: count})
+
+        self.assertEqual(lqm._max_answer_age_s, 1.0)
+        self.assertEqual(lqm.stale_supersede_count, 5)
+        self.assertEqual(error.call_count, 2)
+        for call, count in zip(error.call_args_list, [4, 5], strict=True):
+            message = call.args[0] % call.args[1:]
+            self.assertIn("req_id=r1", message)
+            self.assertIn("computed_blocks=0", message)
+            self.assertIn("offset=0", message)
+            self.assertIn(f"count={count}", message)
+
+    def test_real_slow_manager_fresh_answer_resets_expiry_streak(self):
+        lqm = self._manager()
+        with patch.object(location_query_manager.logger, "error") as error:
+            self._slow_answer(lqm, 0)
+            self._slow_answer(lqm, 1)  # first consecutive expiry
+
+            # The second expiry is re-answered immediately. Observing that
+            # fresh answer must break the streak before it reaches ERROR.
+            self.client.open = True
+            self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+            self._gate(2)
+            self._await_landing(lqm)
+            self.assertEqual(lqm.get_locations_for_query(self.req, 0), ["loc0", "loc1"])
+            self.assertEqual(lqm._expired_streaks, {})
+            self.client.open = False
+            error.assert_not_called()
+            time.sleep(1.1)  # let the fresh answer become genuinely expired
+
+            # A completely new streak needs four expiries of its own. Without
+            # the fresh reset, the second call here would already be #4.
+            for count in range(1, 5):
+                self._slow_answer(lqm, count + 2)
+                self.assertEqual(error.call_count, int(count == 4))
+            self.assertIn("count=4", error.call_args.args[0] % error.call_args.args[1:])
+
+    def test_real_slow_manager_expiry_streaks_are_isolated_by_offset(self):
+        lqm = self._manager()
+        with patch.object(location_query_manager.logger, "error") as error:
+            self._slow_answer(lqm, 0, offset=0)
+            for count in range(1, 4):
+                self._slow_answer(lqm, count, offset=0)
+            old_key = lqm._queries["r1"].key
+            self.assertEqual(lqm._expired_streaks, {old_key: 3})
+            error.assert_not_called()
+
+            # Merely changing offset retires offset 0's counter. The first
+            # expiry at offset 8 is #1, never a continuation of the old #3.
+            self._slow_answer(lqm, 4, offset=8)
+            self.assertEqual(lqm._expired_streaks, {})
+            self._slow_answer(lqm, 5, offset=8)
+            new_key = lqm._queries["r1"].key
+            self.assertNotEqual(new_key, old_key)
+            self.assertEqual(lqm._expired_streaks, {new_key: 1})
+            error.assert_not_called()
+
+    def test_successful_consume_and_invalidate_clear_expiry_streak(self):
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        self._gate(0).set()
+        self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
+        self._expire(lqm)
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        key = lqm._queries["r1"].key
+        self.assertEqual(lqm._expired_streaks, {key: 1})
+        self._gate(1).set()
+        self._await_landing(lqm)
+        self.assertEqual(lqm.consume_locations("r1"), (["loc0", "loc1"], 0))
+        self.assertEqual(lqm._expired_streaks, {})
+
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        self._gate(2).set()
+        self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
+        self._expire(lqm)
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        key = lqm._queries["r1"].key
+        self.assertEqual(lqm._expired_streaks, {key: 1})
+        lqm.invalidate("r1")
+        self.assertEqual(lqm._expired_streaks, {})
+        self._gate(3).set()
 
     # ------------------------------------------------------------------ #
     # Empty answers: no pointer, hence no expiry
