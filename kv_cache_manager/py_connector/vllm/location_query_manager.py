@@ -125,6 +125,10 @@ class LocationQueryManager:
         self._queries: Dict[str, _Query] = {}
         # Hits refused for age and re-fetched.
         self.stale_supersede_count = 0
+        # Consecutive expired non-empty answers, isolated by the full query key.
+        # Only a fresh answer observed by the hook breaks a streak: an answer
+        # that merely lands in the slot may already be too old to serve.
+        self._expired_streaks: Dict[QueryCacheKey, int] = {}
 
     def shutdown(self) -> None:
         pass
@@ -185,6 +189,7 @@ class LocationQueryManager:
                     # Drop the slot: the next match hook re-issues the query.
                     if self._queries.get(request.request_id) is q:
                         self._queries.pop(request.request_id, None)
+                        self._expired_streaks.pop(q.key, None)
                 return
             with self._lock:
                 if self._queries.get(request.request_id) is q:
@@ -230,12 +235,16 @@ class LocationQueryManager:
                     # No location pointer exists, so there is no staleness risk.
                     # Expiring [] livelocks requests whenever the manager is
                     # slower than the horizon (see module docstring).
+                    self._expired_streaks.pop(key, None)
                     return q.locations
                 age = time.monotonic() - q.ask_time
                 if age <= self._max_answer_age_s:
+                    self._expired_streaks.pop(key, None)
                     return q.locations
                 # Expired: a miss. Old answers are never served.
                 self.stale_supersede_count += 1
+                expired_count = self._expired_streaks.get(key, 0) + 1
+                self._expired_streaks[key] = expired_count
                 logger.info(
                     "req:%s location answer expired after %.3fs "
                     "(max %.3fs); re-querying",
@@ -243,6 +252,19 @@ class LocationQueryManager:
                     age,
                     self._max_answer_age_s,
                 )
+                if expired_count > 3:
+                    logger.error(
+                        "req_id=%s non-empty location answer expired "
+                        "consecutively: computed_blocks=%d offset=%d count=%d",
+                        req_id,
+                        key.computed_blocks,
+                        key.computed_blocks,
+                        expired_count,
+                    )
+            elif q is not None:
+                # A different query key starts a new streak and retires the
+                # old key, so offsets and request generations cannot mix.
+                self._expired_streaks.pop(q.key, None)
             # First ask, a different offset, or an expired answer: the
             # newest ask supersedes.
             q = _Query(
@@ -264,6 +286,7 @@ class LocationQueryManager:
             with self._lock:
                 if self._queries.get(req_id) is q:
                     self._queries.pop(req_id, None)
+                    self._expired_streaks.pop(q.key, None)
             return []
         with self._lock:
             if self._queries.get(req_id) is q:
@@ -286,6 +309,8 @@ class LocationQueryManager:
         flight / already consumed)."""
         with self._lock:
             q = self._queries.pop(req_id, None)
+            if q is not None:
+                self._expired_streaks.pop(q.key, None)
             if q is None or q.locations is None:
                 return None
             return q.locations, q.key.computed_blocks
@@ -294,4 +319,6 @@ class LocationQueryManager:
         """Drop the request's query: it is going away, and any answer still
         in flight must not write into a future slot."""
         with self._lock:
-            self._queries.pop(req_id, None)
+            q = self._queries.pop(req_id, None)
+            if q is not None:
+                self._expired_streaks.pop(q.key, None)
