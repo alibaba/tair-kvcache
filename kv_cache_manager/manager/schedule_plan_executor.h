@@ -55,6 +55,11 @@ struct PlanExecuteResult {
     // them from the backend result.  ErrorCode never authorizes target reuse.
     bool terminal{true};
     bool safe_to_reuse_dst{true};
+    // Actual successful deletion results, not the submitted/predicted batch size.
+    std::uint64_t reclaimed_locations{0};
+    std::uint64_t reclaimed_bytes{0};
+    std::uint64_t physical_deleted_locations{0};
+    std::uint64_t physical_deleted_bytes{0};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -70,6 +75,8 @@ struct CacheLocationDelRequest {
     // Optional serialized values observed by the submitter, parallel to
     // location_ids. A location is reclaimed only if it is still unchanged.
     std::vector<std::vector<std::string>> expected_location_values;
+    // A demoted KVMeta leader must not run a delayed physical delete.
+    std::shared_ptr<std::atomic<bool>> cancel_before_physical;
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};

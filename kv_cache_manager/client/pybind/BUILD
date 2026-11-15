@@ -8,11 +8,23 @@ load("@python_platform//:platform.bzl", "python_platform")
 
 pybind_extension(
     name = "kvcm_py_client",
-    srcs = ["py_client_binding.cc"],
+    srcs = ["py_client_binding.cc", "python_client_owner.h"],
     deps = [
         "//kv_cache_manager/client:client",
     ],
     visibility = ["//visibility:public"],
+)
+
+pybind_extension(
+    name = "kvcm_owner_lifetime_test",
+    srcs = ["owner_lifetime_test.cc", "python_client_owner.h"],
+)
+
+py_library(
+    name = "owner_lifetime_test_lib",
+    data = [":kvcm_owner_lifetime_test.so"],
+    imports = ["."],
+    visibility = ["//kv_cache_manager/client/test:__pkg__"],
 )
 
 py_library(
@@ -29,6 +41,7 @@ py_package(
     visibility = ["//visibility:private"],
     deps = [
         ":kvcm_py_client_lib",
+        "//kv_cache_manager/client:kv_meta_object_py_client",
     ],
 )
 
@@ -58,4 +71,13 @@ py_wheel(
         "@bazel_tools//src/conditions:linux_x86_64": python_platform() + "_x86_64",
         "@bazel_tools//src/conditions:linux_aarch64": python_platform() + "_aarch64",
     }),
+)
+
+py_test(
+    name = "KvMetaObjectPythonWheelTest",
+    size = "small",
+    srcs = ["kv_meta_object_client_wheel_test.py"],
+    args = ["$(location :kvcm_py_client_lib_wheel)"],
+    data = [":kvcm_py_client_lib_wheel"],
+    main = "kv_meta_object_client_wheel_test.py",
 )

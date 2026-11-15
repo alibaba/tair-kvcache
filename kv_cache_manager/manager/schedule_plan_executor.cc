@@ -15,6 +15,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -269,6 +270,9 @@ void SchedulePlanExecutor::WorkerRoutine() {
 
 PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
                                                           const std::shared_ptr<MetaIndexer> &indexer) {
+    if (task.cancel_before_physical && task.cancel_before_physical->load(std::memory_order_acquire)) {
+        return MakeErrorResult(EC_SERVICE_NOT_LEADER, "KVMeta delete cancelled after leader change");
+    }
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -283,7 +287,18 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
     auto ctx = std::make_shared<RequestContext>("schedule_plan_executor_call");
-    ErrorCode get_locations_ec = meta_searcher.BatchGetLocation(ctx.get(), task.block_keys, empty_mask, location_maps);
+    ErrorCode get_locations_ec = EC_OK;
+    if (task.authoritative_read) {
+        const auto get_result = indexer->GetLocationsFromPrimary(ctx.get(), task.block_keys, location_maps);
+        if (get_result.error_codes.size() != task.block_keys.size() ||
+            std::any_of(get_result.error_codes.begin(), get_result.error_codes.end(), [](ErrorCode ec) {
+                return ec != EC_OK && ec != EC_NOENT;
+            })) {
+            get_locations_ec = EC_ERROR;
+        }
+    } else {
+        get_locations_ec = meta_searcher.BatchGetLocation(ctx.get(), task.block_keys, empty_mask, location_maps);
+    }
     if (get_locations_ec != ErrorCode::EC_OK) {
         return MakeErrorResult(ErrorCode::EC_ERROR,
                                StringUtil::FormatString("Failed to get block locations, ec: %d", get_locations_ec));
@@ -298,6 +313,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     std::vector<int64_t> block_keys_to_delete;
     std::vector<std::vector<MetaSearcher::LocationCADTask>> batch_cad_tasks;
     size_t total_locations_to_delete = 0;
+    std::vector<std::vector<std::uint64_t>> batch_location_sizes;
 
     std::map<std::string, std::vector<DataStorageUri>> delete_uris_by_unique_name;
     for (size_t i = 0; i < task.block_keys.size(); i++) {
@@ -306,14 +322,22 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         auto &need_delete_location_ids = task.location_ids[i];
 
         std::vector<MetaSearcher::LocationCADTask> cad_tasks;
+        std::vector<std::uint64_t> location_sizes;
 
-        for (auto &location_id : need_delete_location_ids) {
+        for (size_t location_idx = 0; location_idx < need_delete_location_ids.size(); ++location_idx) {
+            const auto &location_id = need_delete_location_ids[location_idx];
             auto iter = location_map.find(location_id);
             if (iter == location_map.end() || !iter->second) {
                 continue;
             }
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
+            }
+            if (!task.expected_location_values.empty()) {
+                if (location_idx >= task.expected_location_values[i].size() ||
+                    iter->second->ToJsonString() != task.expected_location_values[i][location_idx]) {
+                    continue;
+                }
             }
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
@@ -324,18 +348,27 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                     }
                 }
             }
+            std::uint64_t size = 0;
+            if (iter->second->location_specs().size() == 1) {
+                IsValidKvMetaLocation(iter->second->location_specs().front().uri(), size);
+            }
+            location_sizes.push_back(size);
             cad_tasks.push_back({iter->first, CacheLocationStatus::CLS_DELETING});
         }
         if (!cad_tasks.empty()) {
             block_keys_to_delete.push_back(block_key);
             total_locations_to_delete += cad_tasks.size();
             batch_cad_tasks.emplace_back(std::move(cad_tasks));
+            batch_location_sizes.emplace_back(std::move(location_sizes));
         }
     }
 
     KVCM_LOG_DEBUG("Found %zu meta location(s) to delete", total_locations_to_delete);
 
     // delete storage uris
+    if (task.cancel_before_physical && task.cancel_before_physical->load(std::memory_order_acquire)) {
+        return MakeErrorResult(EC_SERVICE_NOT_LEADER, "KVMeta delete cancelled after leader change");
+    }
     auto request_context = std::make_shared<RequestContext>("location_del_task_trace");
     for (auto &storage_uris_pair : delete_uris_by_unique_name) {
         const std::string &storage_unique_name = storage_uris_pair.first;
@@ -371,6 +404,13 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         size_t failed_count = 0;
         size_t first_failed_index = 0;
         for (size_t i = 0; i < result_count; ++i) {
+            if (delete_results[i] == EC_OK) {
+                std::uint64_t size = 0;
+                if (GetKvMetaObjectSize(storage_uris[i], size)) {
+                    ++result.physical_deleted_locations;
+                    result.physical_deleted_bytes += size;
+                }
+            }
             if (delete_results[i] != ErrorCode::EC_OK && delete_results[i] != ErrorCode::EC_NOENT) {
                 if (failed_count == 0) {
                     first_failed_index = i;
@@ -427,7 +467,10 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             }
             const auto location_result_count = std::min(results.size(), batch_cad_tasks[block_key_idx].size());
             for (size_t location_idx = 0; location_idx < location_result_count; location_idx++) {
-                if (results[location_idx] != ErrorCode::EC_OK) {
+                if (results[location_idx] == EC_OK) {
+                    ++result.reclaimed_locations;
+                    result.reclaimed_bytes += batch_location_sizes[block_key_idx][location_idx];
+                } else {
                     result.status = ErrorCode::EC_PARTIAL_OK;
                     KVCM_LOG_WARN("Failed to CAD meta, instance[%s] key %ld, location: %s, error_code: %d",
                                   task.instance_id.c_str(),
@@ -711,6 +754,8 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         task.authoritative_read);
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
+    result.actual_task.cancel_before_physical = task.cancel_before_physical;
+    result.actual_task.authoritative_read = task.authoritative_read;
     return result;
 }
 
@@ -859,6 +904,26 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                          instance_id.c_str()));
         }
         return admission_result;
+    }
+
+    if (expected_location_values) {
+        std::unordered_map<int64_t, size_t> original_indices;
+        original_indices.reserve(block_keys.size());
+        for (size_t i = 0; i < block_keys.size(); ++i) {
+            original_indices.emplace(block_keys[i], i);
+        }
+        admission_result.actual_task.expected_location_values.reserve(admission_result.actual_task.block_keys.size());
+        for (size_t i = 0; i < admission_result.actual_task.block_keys.size(); ++i) {
+            const auto key = admission_result.actual_task.block_keys[i];
+            const auto &locations = location_maps[original_indices.at(key)];
+            std::vector<std::string> values;
+            for (const auto &id : admission_result.actual_task.location_ids[i]) {
+                auto snapshot = *locations.at(id);
+                snapshot.set_status(CLS_DELETING);
+                values.push_back(snapshot.ToJsonString());
+            }
+            admission_result.actual_task.expected_location_values.push_back(std::move(values));
+        }
     }
 
     if (!indexer->Sync(admission_result.actual_task.block_keys)) {

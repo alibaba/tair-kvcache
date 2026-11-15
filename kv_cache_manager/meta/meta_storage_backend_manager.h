@@ -170,12 +170,20 @@ public:
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    ErrorCode ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                 const std::string &cursor,
+                                                 int64_t limit,
+                                                 MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
                                       bool require_read_success = false) noexcept;
+    ErrorCode SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                int64_t count,
+                                                ReclaimCandidateVector &out_candidates,
+                                                bool require_read_success = false) noexcept;
     // Follow the same source selection as SampleReclaimCandidates: cached
     // metadata is complete only after recovery, not merely when configured.
     bool PreferSingleTaskReclaimSampling() const noexcept;
@@ -189,15 +197,18 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+    // Callers must fence same-key mutations until this check completes.
+    // An async barrier alone cannot prove that an earlier failed/dropped delete persisted.
+    bool SyncDeletedLocations(RequestContext *request_context,
+                              const KeyVector &keys,
+                              const LocationIdsPerKey &location_ids) noexcept;
     bool SyncAll() noexcept;
     // Capture once under the RMW shard fence for the deletion write order.
     // Cached maintenance reads always use hot, independently of this route.
     bool UseLocalPrimaryForMaintenance() const noexcept {
         return memory_primary_ && GetRecoverState() == RecoverState::kRunning;
     }
-    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept {
-        return cache_backend_ || Sync(keys);
-    }
+    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return cache_backend_ || Sync(keys); }
     bool IsMemoryPrimary() const noexcept { return memory_primary_; }
     bool HasCacheBackend() const noexcept { return cache_backend_ != nullptr; }
 

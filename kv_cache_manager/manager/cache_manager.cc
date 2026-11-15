@@ -29,6 +29,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
@@ -782,6 +783,8 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
     }
 
+    const auto removing_info = registry_manager_->GetRemovingInstanceInfo(instance_id);
+    const bool is_kv_meta = removing_info && IsKvMetaInstance(*removing_info);
     auto meta_searcher = meta_searcher_manager_->ExtractMetaSearcher(instance_id);
     lifecycle_guard.unlock();
     if (!WaitForOtherOwners(meta_searcher)) {
@@ -815,7 +818,14 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     constexpr size_t kMaxTrimRounds = 5;
     std::optional<KeyType> previous_residual;
     const char *failure_reason = "scan remaining cache";
-    for (size_t trim_round = 1; trim_round <= kMaxTrimRounds; ++trim_round) {
+    if (is_kv_meta && !WaitForOtherOwners(meta_indexer, /*timeout_seconds*/ 30)) {
+        ec = EC_TIMEOUT;
+        failure_reason = "indexer drain timeout";
+    }
+    // This exceptional KVMeta removal retires metadata only. Fixed-block trim
+    // cannot establish that an object's DMA stopped, so never free its remote
+    // allocations here (including SERVING objects still held by readers).
+    for (size_t trim_round = 1; !is_kv_meta && trim_round <= kMaxTrimRounds; ++trim_round) {
         ec = TrimCacheWithIndexer(request_context, instance_id, meta_indexer, true);
         if (ec != EC_OK) {
             failure_reason = "trim cache";
@@ -876,8 +886,14 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     }
 
     if (ec == EC_OK) {
-        ec = meta_indexer->Retire();
+        ec = is_kv_meta ? meta_indexer->RetireKvMeta(request_context) : meta_indexer->Retire();
         failure_reason = "delete metadata";
+        if (ec == EC_OK && is_kv_meta) {
+            KVCM_LOG_WARN("[%s] KVMeta instance [%s] metadata retired; remote allocations retained for safety, "
+                          "manual storage cleanup required",
+                          trace_id.c_str(),
+                          instance_id.c_str());
+        }
     }
     if (ec != EC_OK) {
         if (!meta_indexer_manager_->RestoreMetaIndexer(instance_id, meta_indexer)) {
@@ -1387,6 +1403,9 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                               int64_t write_timeout_seconds,
                               int32_t min_replica_count) {
     SPAN_TRACER(request_context);
+    if (const auto ec = CheckFixedBlockInstance(request_context, instance_id); ec != EC_OK) {
+        return {ec, StartWriteCacheInfo{}};
+    }
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (!location_spec_group_names.empty()) {
@@ -1831,6 +1850,7 @@ ErrorCode CacheManager::RemoveCache(RequestContext *request_context,
                                     const BlockMask &block_mask /*TODO*/) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    RETURN_IF_EC_NOT_OK(CheckFixedBlockInstance(request_context, instance_id));
     assert(schedule_plan_executor_);
     if (keys.empty() && tokens.empty()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "remove cache failed: empty input");
@@ -1876,6 +1896,7 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
                                              const std::shared_ptr<MetaIndexer> &meta_indexer,
                                              bool detached_indexer) const noexcept {
     const std::string &trace_id = request_context->trace_id();
+    RETURN_IF_EC_NOT_OK(CheckFixedBlockInstance(request_context, instance_id));
 
     constexpr std::size_t limit = 256;
     const std::size_t max_inflight = 2 * schedule_plan_executor_->GetWorkerCount();
@@ -4655,6 +4676,23 @@ ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, c
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "create meta searcher failed");
     }
     PREFIX_LOG(INFO, "create meta searcher success");
+    return EC_OK;
+}
+
+ErrorCode CacheManager::CheckFixedBlockInstance(RequestContext *request_context, const std::string &instance_id) const {
+    // Ordinary caller-selected prefixes are allowed; only the complete object
+    // schema is isolated. Avoid another registry lookup on the usual KV path.
+    if (!HasKvMetaInternalInstanceId(instance_id)) {
+        return EC_OK;
+    }
+    auto instance = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!instance) {
+        instance = registry_manager_->GetRemovingInstanceInfo(instance_id);
+    }
+    if (instance && IsKvMetaInstance(*instance)) {
+        request_context->error_tracer()->AddErrorMsg("KVMeta instances require the KVMeta API");
+        return EC_BADARGS;
+    }
     return EC_OK;
 }
 

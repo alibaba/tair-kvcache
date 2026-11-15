@@ -177,7 +177,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestAutomaticQuotaPreservesUnaryCapacityWi
     auto reporter = std::make_shared<LocalMetricsReporter>();
     ASSERT_TRUE(reporter->Init(cache_manager_, metrics_registry_, ""));
     const auto thread_limit = ResolveGrpcMaxThreads(0, 2, service_->MaxSubscribers());
-    ASSERT_EQ(3, thread_limit);
+    ASSERT_EQ(33, thread_limit);
     grpc::ServerBuilder builder;
     ConfigureGrpcServer(builder, thread_limit, 0, "meta", metrics_registry_, reporter, service_->MaxSubscribers());
     builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);

@@ -255,6 +255,9 @@ public:
      * @return std::size_t Number of keys sampled per instance in a
      * single reclaiming round
      */
+    const CacheReclaimerAsyncDeleteConfig &async_delete_config() const noexcept { return async_delete_config_; }
+    const CacheReclaimerGroupLruConfig &group_lru_config() const noexcept { return group_lru_config_; }
+
     [[nodiscard]] std::size_t GetSamplingSize(const RequestContext *request_context) const noexcept;
 
     /**

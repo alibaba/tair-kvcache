@@ -9,6 +9,7 @@
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/kv_meta_instance.h"
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -352,6 +353,27 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         model_deployment,
                                                         location_spec_groups,
                                                         default_query_type);
+    // Both APIs enter this critical section. Checking at the caller leaves a
+    // race in which ordinary and generic-object instances join the same group.
+    const bool is_kv_meta = IsKvMetaInstance(*instance_info);
+    const auto conflicts = [&](const auto &existing) {
+        return existing && existing->instance_group_name() == instance_group &&
+               IsKvMetaInstance(*existing) != is_kv_meta;
+    };
+    for (const auto &[_, existing] : instance_infos_) {
+        if (conflicts(existing)) {
+            request_context->error_tracer()->AddErrorMsg("KVMeta requires a dedicated instance group");
+            return EC_CONFIG_ERROR;
+        }
+    }
+    // Removal must finish before the group can change kind: background cleanup
+    // can still own the old instance's index and storage allocation.
+    for (const auto &[_, removing] : removing_instance_infos_) {
+        if (conflicts(removing.info)) {
+            request_context->error_tracer()->AddErrorMsg("instance group has incompatible removal pending");
+            return EC_CONFIG_ERROR;
+        }
+    }
     // Keep the full info out of the shared instance index.
     auto ec = UpsertRegistryField(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {
@@ -572,9 +594,8 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
-ErrorCode RegistryManager::UpsertRegistryField(const std::string &key,
-                                               const std::string &id,
-                                               const Jsonizable *jsonizable) {
+ErrorCode
+RegistryManager::UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
     const ErrorCode ec = storage_->UpsertField(key, id, jsonizable ? jsonizable->ToJsonString() : id);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Upsert %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);

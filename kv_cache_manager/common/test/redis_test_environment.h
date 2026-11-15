@@ -17,6 +17,7 @@ inline constexpr int64_t kMetaRedisBackendAlternateDb = 7;
 inline constexpr int64_t kMetaIndexerDb = 8;
 inline constexpr int64_t kMetaStorageBackendManagerDb = 9;
 inline constexpr int64_t kMetaSearcherDb = 10;
+inline constexpr int64_t kKvMetaManagerDb = 11;
 
 inline std::string Host() {
     const char *host = std::getenv("KVCM_TEST_REDIS_HOST");
