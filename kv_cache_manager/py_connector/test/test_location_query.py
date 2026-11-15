@@ -18,13 +18,29 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (  # noqa: F401  installs stubs
     _install_stubs,
 )
+from kv_cache_manager.py_connector.vllm import location_query_manager
 from kv_cache_manager.py_connector.vllm.location_query_manager import (
     LocationQueryManager,
 )
+
+
+class FakeClock:
+    """Stands in for the module's ``time`` (only ``monotonic`` is used), so a
+    test can state the manager's latency instead of sleeping it."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class GatedClient:
@@ -88,6 +104,31 @@ class LocationQueryFanoutTest(unittest.TestCase):
                     return self.client.gates[idx]
             time.sleep(0.005)
         self.fail(f"gate {idx} was never created (calls={self.client.calls})")
+
+    def _await_landing(self, lqm, req_id="r1"):
+        """Wait for the answer to reach the slot *without* asking the hook:
+        an ask could supersede the very slot being watched."""
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with lqm._lock:
+                q = lqm._queries.get(req_id)
+                if q is not None and q.locations is not None:
+                    return
+            time.sleep(0.005)
+        self.fail("the manager's answer never landed in the slot")
+
+    def _slow_manager(self, lqm, seconds):
+        """Issue the query, let the manager sit on it for ``seconds`` of real
+        time, then answer. Returns the measured latency, which the caller
+        asserts against the horizon -- the setup is proven, not assumed."""
+        issued = time.monotonic()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
+        time.sleep(seconds)
+        self._gate(0).set()
+        self._await_landing(lqm)
+        latency = time.monotonic() - issued
+        self.assertGreater(latency, lqm._max_answer_age_s)
+        return latency
 
     # ------------------------------------------------------------------ #
     # Dedupe: same offset
@@ -280,6 +321,52 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self._gate(1).set()
         self._await_answer(lqm, 0)  # re-answered fresh
         self.assertEqual(lqm.consume_locations("r1"), (["loc0", "loc1"], 0))
+
+    # ------------------------------------------------------------------ #
+    # Empty answers: no pointer, hence no expiry
+    # ------------------------------------------------------------------ #
+    def test_empty_answer_served_when_manager_is_slower_than_the_horizon(self):
+        # The live livelock: with the manager slower than max_answer_age_s,
+        # every answer is already too old when the hook consumes it. Expiring
+        # [] re-queried forever, so the hook kept returning None and the
+        # request never left the deferred queue (KV usage 0).
+        self.client.answers = [[]]
+        lqm = self._manager()  # the shipped default horizon, untouched
+        self.assertEqual(lqm._max_answer_age_s, 1.0)
+        self._slow_manager(lqm, 1.3)  # real manager latency > 1s
+        # [] -- not None -- is what keeps the scheduler out of deferred.
+        for _ in range(5):
+            self.assertEqual(lqm.get_locations_for_query(self.req, 0), [])
+        self.assertEqual(self.client.calls, 1, "an empty miss must not re-query")
+        self.assertEqual(lqm.stale_supersede_count, 0)
+        self.assertEqual(lqm.consume_locations("r1"), ([], 0))
+
+    def test_nonempty_answer_at_the_same_latency_is_still_refetched(self):
+        # The control for the test above: identical >1s latency, but the
+        # answer carries pointers the manager may have reclaimed and
+        # re-allocated, so the age gate must still fire.
+        lqm = self._manager()
+        self._slow_manager(lqm, 1.3)
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # expired
+        self._gate(1)  # the re-query reached the client
+        self.assertEqual(self.client.calls, 2)
+        self.assertEqual(lqm.stale_supersede_count, 1)
+        self._gate(1).set()
+
+    def test_empty_answer_never_expires_however_old(self):
+        # Same exemption on a clock the test owns: hours past the horizon,
+        # no wall-clock margin involved.
+        self.client.answers = [[]]
+        lqm = self._manager()
+        clock = FakeClock()
+        with patch.object(location_query_manager, "time", clock):
+            self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+            clock.advance(3600.0)  # the manager took an hour to answer
+            self._gate(0).set()
+            self._await_landing(lqm)
+            self.assertEqual(lqm.get_locations_for_query(self.req, 0), [])
+            self.assertEqual(self.client.calls, 1)
+            self.assertEqual(lqm.stale_supersede_count, 0)
 
     # ------------------------------------------------------------------ #
     # Consume / store / invalidate
