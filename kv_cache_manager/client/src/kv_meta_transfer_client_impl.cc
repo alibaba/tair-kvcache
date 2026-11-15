@@ -198,6 +198,12 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
         sdk_wrapper_.reset();
     }
     if (ec != ER_OK) {
+        // Reserve these codes for this client's pre-I/O validation above.
+        // A backend can report the same code after submitting work; do not
+        // let that authorize an object-client abort and address reuse.
+        if (ec == ER_INVALID_PARAMS || ec == ER_INVALID_LOCAL_BUFFERS || ec == ER_INVALID_SDKWRAPPER_CONFIG) {
+            return {ER_SDKWRITE_ERROR, {}};
+        }
         return {ec, {}};
     }
     auto actual_uris = ConstructLocations(*actual_locations);

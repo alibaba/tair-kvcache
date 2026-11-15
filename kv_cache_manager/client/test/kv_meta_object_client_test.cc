@@ -287,12 +287,12 @@ TEST_F(KvMetaObjectClientTest, WriteErrorsDistinguishMetadataFailureFromUnconfir
     EXPECT_FALSE(result.data_transfer_may_be_inflight);
     EXPECT_EQ(transfer_->save_calls, 1);
 
-    // The same returned RPC error can mask a failed transfer whose abort also
-    // failed. Buffer safety must retain the original data-plane uncertainty.
+    // An unconfirmed transfer must not send an abort RPC at all.
     transfer_->save_ec = ER_SDKWRITE_ERROR;
-    result = client_->SaveObjectsWithTransferState("abort-failed", keys_, sizes_, buffers_);
-    EXPECT_EQ(result.ec, ER_INVALID_GRPCSTATUS);
+    result = client_->SaveObjectsWithTransferState("transfer-failed", keys_, sizes_, buffers_);
+    EXPECT_EQ(result.ec, ER_SDKWRITE_ERROR);
     EXPECT_TRUE(result.data_transfer_may_be_inflight);
+    EXPECT_EQ(metadata_->finish_calls, 1);
     transfer_->save_ec = ER_OK;
     metadata_->finish_throw = ThrowMode::STANDARD;
     result = client_->SaveObjectsWithTransferState("commit-threw", keys_, sizes_, buffers_);
@@ -416,21 +416,56 @@ TEST_F(KvMetaObjectClientTest, UsesMissingMaskCountToAbortMalformedLocationRespo
     EXPECT_EQ((std::vector<bool>{false}), metadata_->finished_keys);
 }
 
-TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenTransferFails) {
+TEST_F(KvMetaObjectClientTest, UnknownTransferFailuresLeaveTheSessionForMetadataOnlyExpiry) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
         MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
         MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
-    transfer_->save_ec = ER_SDKWRITE_ERROR;
-
-    EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
-    EXPECT_EQ(1, metadata_->finish_calls);
-    EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
+    for (const auto ec : {ER_SDKWRITE_ERROR, ER_SDK_TIMEOUT}) {
+        transfer_->save_ec = ec;
+        const auto result = client_->SaveObjectsWithTransferState("trace", keys_, sizes_, buffers_);
+        EXPECT_EQ(ec, result.ec);
+        EXPECT_TRUE(result.data_transfer_may_be_inflight);
+        EXPECT_EQ(0, metadata_->finish_calls);
+    }
 }
 
-TEST_F(KvMetaObjectClientTest, DataPlaneSaveExceptionsAreContainedAndAbortTheSession) {
+TEST_F(KvMetaObjectClientTest, BufferSafeFailuresDoNotReleaseUnconfirmedRemoteAllocations) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
+    };
+    for (const auto ec : {ER_SDK_ERROR_BUFFER_SAFE, ER_SDK_TIMEOUT_BUFFER_SAFE}) {
+        transfer_->save_ec = ec;
+        const auto result = client_->SaveObjectsWithTransferState("trace", keys_, sizes_, buffers_);
+        EXPECT_EQ(ec, result.ec);
+        EXPECT_FALSE(result.data_transfer_may_be_inflight);
+        EXPECT_EQ(0, metadata_->finish_calls);
+    }
+}
+
+TEST_F(KvMetaObjectClientTest, PreIoTransferRejectionsAbortSafely) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
+    };
+    for (const auto ec : {ER_INVALID_PARAMS, ER_INVALID_LOCAL_BUFFERS, ER_INVALID_SDKWRAPPER_CONFIG}) {
+        transfer_->save_ec = ec;
+        const auto result = client_->SaveObjectsWithTransferState("trace", keys_, sizes_, buffers_);
+        EXPECT_EQ(ec, result.ec);
+        EXPECT_FALSE(result.data_transfer_may_be_inflight);
+        EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
+    }
+    EXPECT_EQ(3, metadata_->finish_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, DataPlaneSaveExceptionsNeverAcknowledgeAnAbort) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
@@ -442,11 +477,12 @@ TEST_F(KvMetaObjectClientTest, DataPlaneSaveExceptionsAreContainedAndAbortTheSes
         SCOPED_TRACE(static_cast<int>(mode));
         transfer_->save_throw = mode;
 
-        EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
-        EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
+        const auto result = client_->SaveObjectsWithTransferState("trace", keys_, sizes_, buffers_);
+        EXPECT_EQ(ER_SDKWRITE_ERROR, result.ec);
+        EXPECT_TRUE(result.data_transfer_may_be_inflight);
     }
     EXPECT_EQ(2, transfer_->save_calls);
-    EXPECT_EQ(2, metadata_->finish_calls);
+    EXPECT_EQ(0, metadata_->finish_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
@@ -461,7 +497,9 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
         PaceUri(3, sizeof(second_)),
     };
 
-    EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    const auto result = client_->SaveObjectsWithTransferState("trace", keys_, sizes_, buffers_);
+    EXPECT_EQ(ER_SDKWRITE_ERROR, result.ec);
+    EXPECT_FALSE(result.data_transfer_may_be_inflight);
     EXPECT_EQ(1, transfer_->save_calls);
     EXPECT_EQ(1, metadata_->finish_calls);
     EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
@@ -527,7 +565,7 @@ TEST_F(KvMetaObjectClientTest, ReturnsRollbackErrorWhenAbortOutcomeIsUnknown) {
         MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     metadata_->finish_ec = ER_INVALID_GRPCSTATUS;
-    transfer_->save_ec = ER_SDKWRITE_ERROR;
+    transfer_->save_ec = ER_INVALID_LOCAL_BUFFERS;
 
     EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("trace", keys_, sizes_, buffers_));
 }
@@ -539,7 +577,7 @@ TEST_F(KvMetaObjectClientTest, RollbackExceptionsBecomeAmbiguousErrors) {
         MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
         MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
-    transfer_->save_ec = ER_SDKWRITE_ERROR;
+    transfer_->save_ec = ER_INVALID_LOCAL_BUFFERS;
 
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
         SCOPED_TRACE(static_cast<int>(mode));

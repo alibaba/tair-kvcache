@@ -299,11 +299,26 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjectsImpl(const std::string &trace
         save_ec = result.first;
         actual_uris = std::move(result.second);
     } catch (...) {
-        KVCM_LOG_WARN("KVMeta object data-plane save threw; aborting the write session");
-        return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), ER_SDKWRITE_ERROR);
+        KVCM_LOG_WARN("KVMeta object data-plane save threw; retaining allocations until metadata-only expiry");
+        return ER_SDKWRITE_ERROR;
     }
     if (save_ec != ER_OK) {
-        return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), save_ec);
+        // BUFFER_SAFE permits caller-buffer reuse, but does not establish
+        // that a remote allocation can be recycled. Keep those two decisions
+        // separate, so a safe local failure need not retire the client.
+        if (save_ec == ER_SDK_ERROR_BUFFER_SAFE || save_ec == ER_SDK_TIMEOUT_BUFFER_SAFE) {
+            data_transfer_may_be_inflight = false;
+            return save_ec;
+        }
+        // These are pre-I/O rejections from the transfer client. Other errors
+        // do not prove quiescence: FinishWrite(false) would free addresses an
+        // outstanding write can still reach. Session expiry only hides them.
+        if (save_ec == ER_INVALID_PARAMS || save_ec == ER_INVALID_LOCAL_BUFFERS ||
+            save_ec == ER_INVALID_SDKWRAPPER_CONFIG) {
+            data_transfer_may_be_inflight = false;
+            return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), save_ec);
+        }
+        return save_ec;
     }
     data_transfer_may_be_inflight = false;
     if (!SameStorageUris(requested_uris, actual_uris)) {

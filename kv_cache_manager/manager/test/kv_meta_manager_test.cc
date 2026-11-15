@@ -71,6 +71,59 @@ public:
     std::atomic<int> delete_attempts{0};
 };
 
+class HookLocalBackend : public MetaLocalBackend {
+public:
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &ids,
+                                                     LocationsPerKey &out) noexcept override {
+        auto result = MetaLocalBackend::GetLocations(context, keys, ids, out);
+        auto hook = std::move(after_read);
+        after_read = nullptr;
+        if (hook) {
+            hook();
+        }
+        return result;
+    }
+    std::vector<ErrorCode> Upsert(RequestContext *context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        ++upsert_calls;
+        return MetaLocalBackend::Upsert(context, keys, locations, properties);
+    }
+    std::function<void()> after_read;
+    std::atomic<int> upsert_calls{0};
+};
+
+class ScriptedScanBackend : public MetaLocalBackend {
+public:
+    ErrorCode ScanLocationsForMaintenance(RequestContext *context,
+                                          const std::string &cursor,
+                                          int64_t,
+                                          MaintenanceScanBatch &out) noexcept override {
+        ++scan_calls;
+        const auto page = static_cast<std::size_t>(std::stoul(cursor));
+        if (page >= pages.size()) {
+            return EC_BADARGS;
+        }
+        if (page == failing_page) {
+            return EC_NOENT;
+        }
+        out.keys = pages[page];
+        if (before_locations) {
+            before_locations(page);
+        }
+        out.location_results = MetaLocalBackend::GetLocationsForMaintenance(context, out.keys, out.locations);
+        out.next_cursor = page + 1 == pages.size() ? SCAN_BASE_CURSOR : std::to_string(page + 1);
+        return EC_OK;
+    }
+    std::vector<KeyTypeVec> pages;
+    std::size_t failing_page = static_cast<std::size_t>(-1);
+    std::function<void(std::size_t)> before_locations;
+    int scan_calls = 0;
+};
+
 class PartialCommitBackend : public MetaLocalBackend {
 public:
     explicit PartialCommitBackend(KeyType failing_key) : failing_key_(failing_key) {}
@@ -149,6 +202,10 @@ public:
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()> cb) override {
+        ++delete_calls_;
+        if (before_delete) {
+            before_delete();
+        }
         delete_count_.fetch_add(uris.size(), std::memory_order_release);
         if (cb) {
             cb();
@@ -166,11 +223,14 @@ public:
     }
 
     std::size_t delete_count() const { return delete_count_.load(std::memory_order_acquire); }
+    std::size_t delete_calls() const { return delete_calls_.load(std::memory_order_acquire); }
+    std::function<void()> before_delete;
 
 private:
     DataStorageType type_;
     std::atomic<std::uint64_t> next_offset_{1};
     std::atomic<std::size_t> delete_count_{0};
+    std::atomic<std::size_t> delete_calls_{0};
 };
 
 } // namespace
@@ -269,6 +329,39 @@ protected:
 
     std::shared_ptr<MetaIndexer> Indexer(const std::string &instance_id) {
         return cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+    }
+
+    void CheckDelayedLocalHit(bool replace) {
+        auto backend = std::make_unique<HookLocalBackend>();
+        ASSERT_EQ(EC_OK, backend->Init("delayed-local", std::make_shared<MetaStorageBackendConfig>()));
+        ASSERT_EQ(EC_OK, backend->Open());
+        auto *local = backend.get();
+        Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+        Commit(kDefaultInstance, "object", 17);
+        std::promise<void> read_done, release;
+        auto released = release.get_future();
+        local->after_read = [&]() {
+            read_done.set_value();
+            released.wait();
+        };
+        auto reader = std::async(std::launch::async, [&]() {
+            RequestContext context("delayed_local_hit");
+            return manager_->Get(&context, kDefaultInstance, {"object"});
+        });
+        read_done.get_future().wait();
+        const auto removed = manager_->Remove(&context_, kDefaultInstance, {"object"});
+        if (replace) {
+            Commit(kDefaultInstance, "object", 29);
+        }
+        release.set_value();
+        const auto [ec, values] = reader.get();
+        ASSERT_EQ(EC_OK, removed);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, values.size());
+        EXPECT_FALSE(values[0].found);
+        EXPECT_TRUE(values[0].location.specs.empty());
+        EXPECT_EQ(0u, values[0].location.value_size);
+        EXPECT_EQ(replace ? 29u : 0u, Indexer(kDefaultInstance)->GetStorageUsage());
     }
 
     static bool WaitUntil(const std::function<bool()> &predicate, std::chrono::milliseconds timeout) {
@@ -806,6 +899,52 @@ TEST_F(KvMetaManagerTest, ReclaimerHonorsPhysicalDeleteDelay) {
     EXPECT_TRUE(WaitUntil([&]() { return pace_backend_->delete_count() > 0; }, std::chrono::seconds(2)));
 }
 
+TEST_F(KvMetaManagerTest, ReclaimerBatchesInstancesBeforeOneGracePeriod) {
+    CreateGroup("multi-reclaim", "reclaim-a", 100, 0.1, 300);
+    for (const auto *instance : {"reclaim-b", "reclaim-c"}) {
+        ASSERT_EQ(EC_OK, manager_->RegisterInstance(&context_, "multi-reclaim", instance, "test").first);
+    }
+    for (const auto *instance : {"reclaim-a", "reclaim-b", "reclaim-c"}) {
+        Commit(instance, "object", 30);
+    }
+    auto all_deleted = [&]() {
+        return Indexer("reclaim-a")->GetStorageUsage() == 0 && Indexer("reclaim-b")->GetStorageUsage() == 0 &&
+               Indexer("reclaim-c")->GetStorageUsage() == 0;
+    };
+    pace_backend_->before_delete = [this]() {
+        EXPECT_EQ(0u, Indexer("reclaim-a")->GetStorageUsage());
+        EXPECT_EQ(0u, Indexer("reclaim-b")->GetStorageUsage());
+        EXPECT_EQ(0u, Indexer("reclaim-c")->GetStorageUsage());
+    };
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&context_, 32));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&context_, 8));
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(all_deleted, std::chrono::seconds(3)));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    ASSERT_TRUE(WaitUntil([&]() { return pace_backend_->delete_count() == 3; }, std::chrono::seconds(3)));
+    EXPECT_EQ(1u, pace_backend_->delete_calls());
+    manager_->DoCleanup();
+    pace_backend_->before_delete = nullptr;
+}
+
+TEST_F(KvMetaManagerTest, DemotionDuringMultiInstanceGraceRetainsAllAllocations) {
+    CreateGroup("multi-cancel", "cancel-a", 100, 0.1, 30000);
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(&context_, "multi-cancel", "cancel-b", "test").first);
+    Commit("cancel-a", "object", 45);
+    Commit("cancel-b", "object", 45);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return Indexer("cancel-a")->GetStorageUsage() == 0 && Indexer("cancel-b")->GetStorageUsage() == 0; },
+        std::chrono::seconds(3)));
+    manager_->DoCleanup();
+    EXPECT_EQ(0u, pace_backend_->delete_calls());
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+}
+
 TEST_F(KvMetaManagerTest, ExpiredSessionRetriesCleanupWithoutReleasingAllocation) {
     auto backend = std::make_unique<RetryDeleteBackend>();
     ASSERT_EQ(EC_OK, backend->Init("expiry-retry", std::make_shared<MetaStorageBackendConfig>()));
@@ -861,6 +1000,114 @@ TEST_F(KvMetaManagerTest, CancelThenResumeRestartsExpiryAndReclamationWithoutCle
     Commit("restart-instance", "reclaim-after-restart", 90);
     EXPECT_TRUE(WaitUntil([&]() { return pace_backend_->delete_count() > before; }, std::chrono::seconds(3)));
     EXPECT_EQ(0u, Indexer("restart-instance")->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, DelayedLocalHitCannotReturnDeletedLocation) { CheckDelayedLocalHit(false); }
+
+TEST_F(KvMetaManagerTest, DelayedLocalHitCannotReturnReplacementGeneration) { CheckDelayedLocalHit(true); }
+
+TEST_F(KvMetaManagerTest, LocalHitsDoNotUpsertMetadata) {
+    auto backend = std::make_unique<HookLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("local-hit", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *local = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "object", 17);
+    local->upsert_calls = 0;
+    for (int i = 0; i < 10; ++i) {
+        const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"object"});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, values.size());
+        EXPECT_TRUE(values[0].found);
+    }
+    EXPECT_EQ(0, local->upsert_calls.load());
+}
+
+TEST_F(KvMetaManagerTest, CachedHitsDoNotUpsertPersistentMetadata) {
+    auto persistent = std::make_unique<HookLocalBackend>();
+    auto cached = std::make_unique<HookLocalBackend>();
+    for (auto *backend : {persistent.get(), cached.get()}) {
+        ASSERT_EQ(EC_OK, backend->Init("cached-hit", std::make_shared<MetaStorageBackendConfig>()));
+        ASSERT_EQ(EC_OK, backend->Open());
+    }
+    auto *persistent_ptr = persistent.get();
+    auto *cached_ptr = cached.get();
+    auto &backends = Indexer(kDefaultInstance)->backend_manager_;
+    backends->persistent_backend_ = std::move(persistent);
+    backends->cache_backend_ = std::move(cached);
+    backends->recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    Commit(kDefaultInstance, "object", 17);
+    persistent_ptr->upsert_calls = cached_ptr->upsert_calls = 0;
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"object"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, values.size());
+    EXPECT_TRUE(values[0].found);
+    EXPECT_EQ(0, persistent_ptr->upsert_calls.load());
+    EXPECT_EQ(0, cached_ptr->upsert_calls.load());
+}
+
+TEST_F(KvMetaManagerTest, RecoveryCountsDuplicateKeysAcrossPagesOnlyOnce) {
+    auto backend = std::make_unique<ScriptedScanBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("duplicate-scan", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *scan = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "first", 17);
+    Commit(kDefaultInstance, "second", 23);
+    scan->pages = {{KvMetaManager::InternalKey("first")},
+                   {KvMetaManager::InternalKey("first"), KvMetaManager::InternalKey("second")}};
+    Indexer(kDefaultInstance)->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 999);
+    EXPECT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, scan->scan_calls);
+    EXPECT_EQ(40u, Indexer(kDefaultInstance)->GetStorageUsage());
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"first", "second"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, values.size());
+    EXPECT_TRUE(values[0].found);
+    EXPECT_TRUE(values[1].found);
+}
+
+TEST_F(KvMetaManagerTest, RecoveryContinuesAfterAListedKeyDisappears) {
+    auto backend = std::make_unique<ScriptedScanBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("vanished-scan", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *scan = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "gone", 17);
+    Commit(kDefaultInstance, "live", 23);
+    scan->pages = {{KvMetaManager::InternalKey("gone")}, {KvMetaManager::InternalKey("live")}};
+    scan->before_locations = [&](std::size_t page) {
+        if (page == 0) {
+            scan->MetaLocalBackend::Delete(&context_, {KvMetaManager::InternalKey("gone")});
+        }
+    };
+    Indexer(kDefaultInstance)->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 999);
+    EXPECT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, scan->scan_calls);
+    EXPECT_EQ(23u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_TRUE(manager_->recovery_complete_.load());
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"gone", "live"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[1].found);
+}
+
+TEST_F(KvMetaManagerTest, IncompleteRecoveryScanCannotPublishUsageOrReadiness) {
+    auto backend = std::make_unique<ScriptedScanBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("failed-scan", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *scan = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "object", 17);
+    scan->pages = {{KvMetaManager::InternalKey("object")}, {}};
+    scan->failing_page = 1;
+    Indexer(kDefaultInstance)->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 999);
+    EXPECT_EQ(EC_NOENT, manager_->DoRecover());
+    EXPECT_EQ(2, scan->scan_calls);
+    EXPECT_EQ(999u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_FALSE(manager_->recovery_complete_.load());
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->Get(&context_, kDefaultInstance, {"object"}).first);
 }
 
 TEST_F(KvMetaManagerTest, RecoveryDropsIncompleteWritesAndRebuildsUsage) {
@@ -1144,7 +1391,9 @@ TEST_F(KvMetaManagerRedisTest, DelayedHitCannotResurrectDeletedMetadata) {
     ASSERT_EQ(EC_OK, remove_ec);
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(1u, values.size());
-    EXPECT_TRUE(values[0].found);
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[0].location.specs.empty());
+    EXPECT_EQ(0u, values[0].location.value_size);
     ExpectAbsent("object");
     EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
 }
@@ -1170,8 +1419,9 @@ TEST_F(KvMetaManagerRedisTest, DelayedHitCannotTouchReplacementGeneration) {
     ASSERT_EQ(EC_OK, remove_ec);
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(1u, values.size());
-    EXPECT_TRUE(values[0].found);
-    EXPECT_EQ(17u, values[0].location.value_size);
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[0].location.specs.empty());
+    EXPECT_EQ(0u, values[0].location.value_size);
     EXPECT_EQ(123, Lru("object"));
     EXPECT_EQ(29u, Indexer(kDefaultInstance)->GetStorageUsage());
 }

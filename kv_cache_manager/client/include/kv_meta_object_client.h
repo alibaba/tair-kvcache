@@ -97,10 +97,10 @@ public:
     // operations return ER_CLIENT_NOT_EXISTS.
     virtual void Close() noexcept = 0;
 
-    // False proves that this call either did not dispatch data I/O or completed
-    // it successfully. Metadata failure/mutation uncertainty is independent of
-    // buffer safety. A data-plane error remains conservative even if rollback
-    // succeeds. Append these slots to retain the existing interface layout.
+    // False proves that this call no longer uses the caller's buffers. It does
+    // not prove that a remote allocation can be reused after a failed write;
+    // buffer-safe failures may still leave remote I/O outstanding. Append these
+    // slots to retain the existing interface layout.
     virtual KvMetaObjectResult SaveObjectsWithTransferState(const std::string &trace_id,
                                                             const std::vector<std::string> &keys,
                                                             const std::vector<std::uint64_t> &value_sizes,

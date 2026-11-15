@@ -263,6 +263,23 @@ TEST(KvMetaTransferClientTest, PropagatesSdkErrors) {
     EXPECT_EQ(ER_SDKWRITE_ERROR, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
 }
 
+TEST(KvMetaTransferClientTest, BackendErrorsCannotMasqueradeAsPreIoRejections) {
+    RecordingSdkFactory factory;
+    RecordingSdk *recording = nullptr;
+    auto client = MakeTransferClient(factory, recording);
+    ASSERT_NE(nullptr, recording);
+    char value[5]{};
+    const UriStrVec uris{"pace://pace/1?media_type=0&node_id=1&range_id=0&size=5"};
+    BlockBuffer buffer;
+    buffer.iovs.push_back({MemoryType::CPU, value, sizeof(value), false});
+    const BlockBuffers buffers{buffer};
+    for (const auto ec : {ER_INVALID_PARAMS, ER_INVALID_LOCAL_BUFFERS, ER_INVALID_SDKWRAPPER_CONFIG}) {
+        recording->save_result = ec;
+        EXPECT_EQ(ER_SDKWRITE_ERROR, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
+        EXPECT_EQ(uris, recording->saved);
+    }
+}
+
 TEST(KvMetaTransferClientTest, TimeoutDrainsBackendAndClosesDataPlane) {
     RecordingSdkFactory factory;
     RecordingSdk *recording = nullptr;

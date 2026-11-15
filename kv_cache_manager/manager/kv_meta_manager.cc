@@ -607,6 +607,7 @@ private:
             }
         }
 
+        std::vector<KvMetaManager::SessionItem> round_deleted;
         for (auto &[instance_id, items] : by_instance) {
             std::vector<KvMetaManager::SessionItem> deleted;
             const ErrorCode ec = owner_->DeleteItems(&context, instance_id, items, false, true, &deleted);
@@ -621,12 +622,12 @@ private:
             if (ec != EC_OK) {
                 KVCM_LOG_WARN("KVMeta reclaim failed for instance [%s], ec[%d]", instance_id.c_str(), ec);
             }
-            if (!deleted.empty()) {
-                if (!owner_->WaitForDeletionDelay(strategy->delay_before_delete_ms())) {
-                    return;
-                }
-                owner_->DeletePhysicalBestEffort(&context, deleted);
-            }
+            round_deleted.insert(round_deleted.end(), deleted.begin(), deleted.end());
+        }
+        // Every reader gets a full grace period after the last logical
+        // deletion, without serially waiting once per instance.
+        if (!round_deleted.empty() && owner_->WaitForDeletionDelay(strategy->delay_before_delete_ms())) {
+            owner_->DeletePhysicalBestEffort(&context, round_deleted);
         }
     }
 
@@ -1028,6 +1029,7 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
     // nor refresh a replacement object. Maintenance reads themselves stay cold.
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(InternalInstanceId(instance_id));
     if (indexer) {
+        const bool access_time_already_updated = indexer->TracksAccessTimeOnRead();
         std::vector<std::int64_t> hit_keys;
         std::vector<std::size_t> hit_indices;
         for (std::size_t i = 0; i < result.size(); ++i) {
@@ -1046,11 +1048,13 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
                 ids.push_back({item.location_id});
                 expected.push_back(item.location);
             }
-            auto modifier = [&expected](const std::vector<ErrorCode> &get_ecs,
-                                        const LocationIdVector &,
-                                        std::size_t key_index,
-                                        CacheLocationVector &locations,
-                                        PropertyMap &properties) -> LocationModifierResult {
+            std::vector<bool> generation_valid(expected.size(), false);
+            auto modifier = [&expected, &generation_valid, access_time_already_updated](
+                                const std::vector<ErrorCode> &get_ecs,
+                                const LocationIdVector &,
+                                std::size_t key_index,
+                                CacheLocationVector &locations,
+                                PropertyMap &properties) -> LocationModifierResult {
                 if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= expected.size()) {
                     return {MA_FAIL, {EC_MISMATCH}};
                 }
@@ -1063,17 +1067,29 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
                 if (locations[0]->status() != CLS_SERVING || !SameGeneration(*locations[0], *expected[key_index])) {
                     return {MA_SKIP, {EC_OK}};
                 }
+                generation_valid[key_index] = true;
+                if (access_time_already_updated) {
+                    return {MA_SKIP, {EC_OK}};
+                }
                 properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
                 return {MA_OK, {EC_OK}};
             };
             const auto touch =
                 indexer->ReadModifyWriteLocationsForMaintenance(request_context, layer_keys, ids, modifier);
+            for (std::size_t i = 0; i < layer.size(); ++i) {
+                if (!generation_valid[i]) {
+                    result[hit_indices[layer[i]]] = GetResult{};
+                }
+            }
             // LRU bookkeeping is best effort; a failed auxiliary write does
             // not turn an already validated data-plane hit into a read error.
             if (touch.ec != EC_OK) {
                 KVCM_LOG_WARN("KVMeta hit LRU update failed, instance[%s], ec[%d]", instance_id.c_str(), touch.ec);
             }
         }
+    } else {
+        // The instance disappeared after the initial lookup.
+        result.assign(keys.size(), GetResult{});
     }
     return {EC_OK, std::move(result)};
 }
@@ -1724,6 +1740,7 @@ ErrorCode KvMetaManager::DoRecover() {
                 continue;
             }
             ErrorCode instance_ec = EC_OK;
+            std::unordered_set<std::int64_t> seen_keys;
             std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> usage{};
             std::string cursor = SCAN_BASE_CURSOR;
             do {
@@ -1740,9 +1757,17 @@ ErrorCode KvMetaManager::DoRecover() {
                 if (!batch.keys.empty()) {
                     std::vector<SessionItem> stale;
                     for (std::size_t i = 0; i < batch.keys.size() && instance_ec == EC_OK; ++i) {
+                        // SCAN is not a snapshot: a listed key can disappear
+                        // before the location read, and may recur on later pages.
+                        if (batch.location_results[i] == EC_NOENT) {
+                            continue;
+                        }
                         if (batch.location_results[i] != EC_OK) {
                             instance_ec = batch.location_results[i];
                             break;
+                        }
+                        if (!seen_keys.insert(batch.keys[i]).second) {
+                            continue;
                         }
                         for (const auto &[location_id, location] : batch.locations[i]) {
                             std::uint64_t size = 0;
@@ -1782,7 +1807,11 @@ ErrorCode KvMetaManager::DoRecover() {
                 }
                 indexer->PersistMetaData();
             }
-            overall = FirstHardError(overall, instance_ec);
+            // Unlike an individual vanished key, an incomplete instance scan
+            // must keep recovery unready, including a batch-level EC_NOENT.
+            if (overall == EC_OK) {
+                overall = instance_ec;
+            }
         }
     }
     if (overall == EC_OK && !maintenance_cancelled_.load(std::memory_order_acquire)) {

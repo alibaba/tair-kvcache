@@ -141,6 +141,8 @@ public:
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
+    // Local/hot-cache GetLocations already maintains its access clock.
+    bool TracksAccessTimeOnRead() const noexcept;
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,

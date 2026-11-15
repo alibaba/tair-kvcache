@@ -1050,6 +1050,11 @@ bool MetaIndexer::SupportsSingleLocationRmw() const noexcept {
     return backend_manager_ && backend_manager_->SupportsSingleLocationRmw();
 }
 
+bool MetaIndexer::TracksAccessTimeOnRead() const noexcept {
+    return backend_manager_ &&
+           (backend_manager_->HasCacheBackend() || backend_manager_->SupportsConcurrentLocationValueReads());
+}
+
 MetaIndexer::SingleLocationResult
 MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_context,
                                                   const KeyVector &keys,

@@ -35,6 +35,9 @@ public:
     virtual ClientErrorCode LoadObjects(const UriStrVec &uri_str_vec,
                                         const std::vector<std::uint64_t> &value_sizes,
                                         const BlockBuffers &object_buffers) = 0;
+    // ER_INVALID_PARAMS, ER_INVALID_LOCAL_BUFFERS and
+    // ER_INVALID_SDKWRAPPER_CONFIG are pre-I/O rejections. Other failures may
+    // leave writes in flight and must not authorize allocation reclamation.
     virtual std::pair<ClientErrorCode, UriStrVec> SaveObjects(const UriStrVec &uri_str_vec,
                                                               const std::vector<std::uint64_t> &value_sizes,
                                                               const BlockBuffers &object_buffers) = 0;
