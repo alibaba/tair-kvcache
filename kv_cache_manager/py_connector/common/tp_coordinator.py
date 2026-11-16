@@ -22,6 +22,7 @@ _QUERY_PORT_OFFSET = 1
 #: answers apart from a server that does not know a command: a reply that does
 #: not start with ``_ROSTER_MARK`` is not a roster.
 _QUERY_LOADS = b"loads"
+_QUERY_LOAD_IDS = b"load-ids"
 _QUERY_ROSTER = b"roster"
 _QUERY_SAVES = b"saves:"
 _ROSTER_MARK = b"roster:"
@@ -180,6 +181,7 @@ class TpCoordinatorServer:
         # list would deliver the barrier to a rank whose report is dropped.
         # Bounded: a stale entry costs a lookup, not a leak.
         self._loading_history: List[str] = []
+        self._loading_id_history: List[RunningId] = []
         self._loading_history_lock = threading.Lock()
         # The storage roster of the instance, exactly as the manager published it
         # in the scheduler's `registerInstance` reply; empty until that reply has
@@ -241,6 +243,14 @@ class TpCoordinatorServer:
                             with self._finished_saving_lock:
                                 payload = "\n".join(queue).encode()
                                 queue.clear()
+                    elif command == _QUERY_LOAD_IDS:
+                        with self._loading_history_lock:
+                            payload = orjson.dumps(
+                                [
+                                    [item.request_id, item.write_session_id]
+                                    for item in self._loading_id_history
+                                ]
+                            )
                     elif command == _QUERY_LOADS:
                         with self._loading_history_lock:
                             payload = "\n".join(self._loading_history).encode()
@@ -357,11 +367,13 @@ class TpCoordinatorServer:
 
                     self._finished_loading_lock.acquire()
                     self._failed_loading_block_idxs.extend(load_ctx.failed_block_idxs)
-                    self._finished_loading.append(content.request_id)
+                    self._finished_loading.append(load_id)
                     self._finished_loading_lock.release()
                     with self._loading_history_lock:
                         self._loading_history.append(content.request_id)
                         del self._loading_history[:-_HISTORY]
+                        self._loading_id_history.append(load_id)
+                        del self._loading_id_history[:-_HISTORY]
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)
             elif isinstance(msg.content, StorageConfigsEvent):
                 content: StorageConfigsEvent = msg.content
@@ -395,7 +407,8 @@ class TpCoordinatorServer:
                 len(storage_configs),
             )
 
-    def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
+    def get_finished_tasks_with_ids(self) -> Tuple[List[str], List[RunningId]]:
+        """Drain completions without dropping the load generation."""
         finished_saving = []
         finished_loading = []
         if len(self._finished_loading) > 0:
@@ -409,6 +422,11 @@ class TpCoordinatorServer:
             self._finished_saving = []
             self._finished_saving_lock.release()
         return finished_saving, finished_loading
+
+    def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
+        """Legacy shape for backends that do not track load generations."""
+        finished_saving, finished_loading = self.get_finished_tasks_with_ids()
+        return finished_saving, [item.request_id for item in finished_loading]
 
     def get_failed_loading_block_idxs(self) -> Set[int]:
         if len(self._failed_loading_block_idxs) == 0:
@@ -477,6 +495,18 @@ class TpCoordinatorClient:
                 socket.close(linger=0)
                 self._query_socket = None
                 return None
+
+    def finished_load_ids(self, timeout_ms: int = 1000) -> Set[RunningId]:
+        """The completion history with its generation intact."""
+        payload = self._ask(_QUERY_LOAD_IDS, timeout_ms)
+        if payload is None:
+            return set()
+        if payload == _UNSUPPORTED:
+            raise RuntimeError("coordinator lacks epoch-aware load completion")
+        return {
+            RunningId(str(epoch), request_id)
+            for request_id, epoch in orjson.loads(payload)
+        }
 
     def finished_loads(self, timeout_ms: int = 1000) -> Set[str]:
         """The loads the coordinator has folded completely, or an empty set.

@@ -306,6 +306,28 @@ class TestWorkerUsesBackend(unittest.TestCase):
         self.assertIs(fn, conn._backend.load_task)
         self.assertIsInstance(args[0], MultiResult)
 
+    def test_start_load_kv_uses_the_generation_aware_hook_when_present(self):
+        conn = _bare_worker()
+        conn._backend.submit_load = MagicMock()
+        meta = TairKvCacheConnectorMetadata(epoch=7)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0, 1],
+                need_load_locations=[{"location_specs": []}] * 2,
+                all_block_ids=[[10, 11, 12]],
+            )
+        )
+
+        conn.start_load_kv(MagicMock(), meta)
+
+        conn._backend.submit_load.assert_called_once()
+        req_id, epoch, multi_result, chunks = conn._backend.submit_load.call_args.args
+        self.assertEqual((req_id, epoch), ("r0", 7))
+        self.assertIsInstance(multi_result, MultiResult)
+        self.assertEqual(len(chunks), 1)
+        conn._backend.submit.assert_not_called()
+
     def _register(self, conn):
         conn._backend = None  # built by the call under test
         conn._transfer_client = MagicMock()

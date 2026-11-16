@@ -659,10 +659,16 @@ class ConnectorWorker:
                 self._iter_task_chunks(plans, self._extra_config.block_per_load_task)
             )
             multi_result = MultiResult(len(chunks), done_cb)
-            for task_idx, chunk in enumerate(chunks):
-                self._backend.submit(
-                    self._backend.load_task, multi_result, task_idx, *chunk
-                )
+            submit_load = getattr(self._backend, "submit_load", None)
+            if submit_load is not None:
+                # Backends with device-page lifetimes attach every task to the
+                # exact (request, epoch) session instead of guessing its owner.
+                submit_load(load_req.req_id, meta.epoch, multi_result, chunks)
+            else:
+                for task_idx, chunk in enumerate(chunks):
+                    self._backend.submit(
+                        self._backend.load_task, multi_result, task_idx, *chunk
+                    )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -769,9 +775,18 @@ class ConnectorWorker:
             return None, None
 
         finished_saving = []
-        finished_saving_tasks, finished_loading_tasks = (
-            self._coordinator_server.get_finished_tasks()
+        with_ids = getattr(
+            self._coordinator_server, "get_finished_tasks_with_ids", None
         )
+        if with_ids is None:
+            finished_saving_tasks, finished_loading_tasks = (
+                self._coordinator_server.get_finished_tasks()
+            )
+            self._last_finished_load_ids = set()
+        else:
+            finished_saving_tasks, finished_load_ids = with_ids()
+            self._last_finished_load_ids = set(finished_load_ids)
+            finished_loading_tasks = [item.request_id for item in finished_load_ids]
         for req_id in finished_saving_tasks:
             remaining = self._pending_saves.get(req_id, 0) - 1
             if remaining > 0:

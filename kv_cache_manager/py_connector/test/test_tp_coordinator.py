@@ -15,6 +15,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMessage,
     CoordinateMsgSerializer,
     LoadBlockFinishedEvent,
+    RunningId,
     SendBlockFinishedEvent,
     SendBlockStartEvent,
     StorageConfigsEvent,
@@ -559,13 +560,13 @@ class TestLoadFailureAggregation(unittest.TestCase):
         _wait_for_server(self.port)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
-    def _send(self, tp_rank, failed):
+    def _send(self, tp_rank, failed, epoch=7):
         msg = CoordinateMessage(
             time.time(),
             LoadBlockFinishedEvent(
                 request_id="req-load",
                 tp_rank=tp_rank,
-                epoch=7,
+                epoch=epoch,
                 failed_block_idxs=failed,
             ),
         )
@@ -598,10 +599,19 @@ class TestLoadFailureAggregation(unittest.TestCase):
         self._send(0, [9])
         self.assertEqual(self._poll_failed(), {9})
 
+    def test_completion_history_and_drain_keep_the_load_epoch(self):
+        self._send(0, [])
+        self._send(1, [4])
+        self.assertEqual(self._poll_failed(), {4})
+        expected = RunningId("7", "req-load")
+
+        self.assertEqual(self.client.finished_load_ids(timeout_ms=500), {expected})
+        _, loading = self.server.get_finished_tasks_with_ids()
+        self.assertEqual(loading, [expected])
+
     def tearDown(self):
         self.server._coordinator_running = False
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        _shutdown(self.client)
 
 
 if __name__ == "__main__":
