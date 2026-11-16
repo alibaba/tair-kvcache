@@ -122,8 +122,6 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `max_key_count` | 否 | 1000000000 |
 | `mutex_shard_num` | 否 | 131072 |
 | `batch_key_size` | 否 | 1024 |
-| `search_cache_capacity` | 否 | 10240 |
-| `search_cache_shard_bits` | 否 | 6 |
 | `metadata_backend_mode` | 否 | 新建时不写入；更新已有 Group 时移除旧值 |
 
 `meta_storage_backend_config` 支持 `redis,redis://...`、`cached,redis://...`、`local,local://?capacity=65536&num_shard_bits=15&sample_times=1024`，以及简写 `local`。Redis URI 必须包含 `cluster_name`；local URI 不需要 Redis 地址或参数。local 的 `capacity`、`num_shard_bits`、`sample_times` 可分别省略，省略时由 KVCM 后端使用默认值。显式填写时，`capacity` 和 `sample_times` 必须是正整数，`num_shard_bits` 必须是 0～19 的整数，URI 原样传给后端。Bootstrap 只为 `redis` 和 `cached` 补齐缺失的 URI 参数。Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
@@ -177,7 +175,7 @@ python3 -m kvcm_ops bootstrap --reconcile
 
 **何时需要重启？** 仅当 Group 已有 Instance，且本次同步改变了 MetaIndexer 配置时，命令会提示重启并返回退出码 `3`。执行者重启 KVCM 后，新配置才会用于重建 MetaIndexer。只改 Storage、quota、reclaim 或 candidates，无需因 bootstrap 再重启。
 
-MetaIndexer 配置包括 `meta_storage_backend_config`、`max_key_count`、`mutex_shard_num`、`batch_key_size`、`search_cache_capacity` 和 `search_cache_shard_bits`。
+MetaIndexer 配置包括 `meta_storage_backend_config`、`max_key_count`、`mutex_shard_num` 和 `batch_key_size`。
 
 ## 5. 失败时如何处理
 
@@ -216,8 +214,6 @@ python3 -m kvcm_ops create_instance_group \
   --mutex_shard_num 131072 \
   --batch_key_size 1024 \
   --meta_storage_backend_config 'cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536&timeout_ms=1000&retry_count=3&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=204800&async_max_size=204800&async_enqueue_timeout_ms=10&async_wait_us=1000000' \
-  --search_cache_capacity 10240 \
-  --search_cache_shard_bits 6 \
   --extra_info '{"metadata_backend_mode":3}' \
   --event_report_storage_candidates vineyard_s_test
 ```

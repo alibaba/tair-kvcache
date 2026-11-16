@@ -251,3 +251,19 @@ cc_test(
         "//kv_cache_manager/service",
     ],
 )
+
+
+cc_test(
+    name = "CoroHttpServiceTest",
+    srcs = ["coro_http_service_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fcoroutines",
+        "-fno-access-control",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/http_service",
+        "@yalantinglibs//:ylt",
+    ],
+)

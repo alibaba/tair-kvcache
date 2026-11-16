@@ -70,8 +70,9 @@ public:
                                int32_t block_size,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
-                               const std::vector<LocationSpecGroup> &location_spec_groups = {},
-                               int32_t default_query_type = 0);
+                               const std::vector<LocationSpecGroup> &location_spec_groups,
+                               int32_t default_query_type,
+                               std::optional<bool> disable_write_session);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -102,6 +103,9 @@ public:
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:
+    static bool ValidateSimpleInstanceConfig(const InstanceGroup &instance_group,
+                                             const std::vector<LocationSpecInfo> &location_spec_infos,
+                                             std::string &error_message);
     ErrorCode UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
     ErrorCode DeleteRegistryField(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);

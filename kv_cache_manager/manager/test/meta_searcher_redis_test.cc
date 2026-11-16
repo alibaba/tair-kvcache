@@ -77,9 +77,6 @@ public:
         meta_indexer_config->SetMutexShardNum(32);
         meta_indexer_config->SetMaxKeyCount(10000);
         auto indexer = std::make_shared<MetaIndexer>();
-        auto metaCachePolicyConfig = std::make_shared<MetaCachePolicyConfig>();
-        metaCachePolicyConfig->SetCapacity(10000);
-        meta_indexer_config->SetMetaCachePolicyConfig(metaCachePolicyConfig);
         auto ec = indexer->Init(/*instance_id*/ "meta_searcher_real_service_test", meta_indexer_config);
         if (ec != ErrorCode::EC_OK) {
             KVCM_LOG_ERROR("Init meta indexer failed");
@@ -385,9 +382,6 @@ public:
         indexer_config->SetMetaStorageBackendConfig(backend_config);
         indexer_config->SetMutexShardNum(32);
         indexer_config->SetMaxKeyCount(10000);
-        auto cache_policy = std::make_shared<MetaCachePolicyConfig>();
-        cache_policy->SetCapacity(16);
-        indexer_config->SetMetaCachePolicyConfig(cache_policy);
         meta_indexer_ = std::make_shared<MetaIndexer>();
         // Isolate each mode and repeated test run without flushing the shared Redis database.
         const std::string instance_id = GetCurrentTestName() + "_" + std::to_string(TimestampUtil::GetCurrentTimeUs());

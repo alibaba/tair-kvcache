@@ -12,7 +12,6 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/model_deployment.h"
@@ -76,18 +75,12 @@ std::shared_ptr<InstanceGroup> InstanceGroupFactory() {
     meta_storage_backend_config->SetStorageType("local");
     meta_storage_backend_config->SetStorageUri("file:///tmp/meta_storage");
 
-    // create meta cache policy config
-    const auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(10000);
-    meta_cache_policy_config->SetType("LRU");
-
     // create meta indexer config
     const auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(1000000);
     meta_indexer_config->SetMutexShardNum(16);
     meta_indexer_config->SetBatchKeySize(16);
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
 
     // create cache config
     const auto cache_config = std::make_shared<CacheConfig>();

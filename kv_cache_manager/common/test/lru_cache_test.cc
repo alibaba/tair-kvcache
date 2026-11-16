@@ -386,6 +386,22 @@ TEST(LRUCacheBatchTest, ReleaseFallsBackWhenHandlesNoLongerMatchLookupShards) {
     EXPECT_EQ(0u, cache->GetUsage());
 }
 
+TEST_F(LRUCacheTest, CapacityProbeDoesNotTouchLruOrder) {
+    NewCache(2, 0.0, 1.0, kDefaultToAdaptiveMutex);
+    cache_->SetStrictCapacityLimit(true);
+    EXPECT_EQ(2u, cache_->GetAvailableCapacity());
+    Insert("older", Cache::Priority::LOW, 1);
+    EXPECT_EQ(1u, cache_->GetAvailableCapacity());
+    Insert("newer", Cache::Priority::LOW, 1);
+    EXPECT_EQ(0u, cache_->GetAvailableCapacity());
+    Insert("third", Cache::Priority::LOW, 1);
+    EXPECT_FALSE(Lookup("older"));
+    EXPECT_TRUE(Lookup("newer"));
+    EXPECT_TRUE(Lookup("third"));
+    cache_->SetStrictCapacityLimit(false);
+    EXPECT_EQ(SIZE_MAX, cache_->GetAvailableCapacity());
+}
+
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
     // Allocate 2 cache entries to high-pri pool and 3 to low-pri pool.
     NewCache(5, /* high_pri_pool_ratio */ 0.40, /* low_pri_pool_ratio */ 0.60);

@@ -11,7 +11,6 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
@@ -39,14 +38,11 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     constexpr std::string_view kOtherHost = "other-host:8080";
 
     auto backend_config = std::make_shared<MetaStorageBackendConfig>("local");
-    auto cache_config = std::make_shared<MetaCachePolicyConfig>();
-    cache_config->SetCapacity(0);
     auto indexer_config = std::make_shared<MetaIndexerConfig>();
     indexer_config->SetMaxKeyCount(kMaxKeyCount + 16);
     indexer_config->SetMutexShardNum(256);
     indexer_config->SetBatchKeySize(kSetupBatchSize);
     indexer_config->SetMetaStorageBackendConfig(backend_config);
-    indexer_config->SetMetaCachePolicyConfig(cache_config);
 
     auto indexer = std::make_shared<MetaIndexer>();
     indexer->SetQueryExecutor(std::make_shared<QueryExecutor>(
@@ -96,7 +92,7 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
 
     MetaSearcher searcher(indexer, [](const CacheLocation &) { return true; }, {});
     size_t active_worker_count = 4;
-    const MetaSearcher::CheckHostCacheLocationFunc visibility_check = [](const CacheLocation &candidate,
+    const MetaSearcher::CheckHostCacheLocationFunc visibility_check = [](const CacheLocationReadView &candidate,
                                                                          MetaSearcher::HostCacheLocationInfo &out) {
         out = {};
         std::string_view storage_type;
@@ -107,9 +103,10 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
             return false;
         }
         const bool uri_structure_prevalidated = candidate.HasValidatedLocationSpecs();
-        for (const auto &spec : candidate.location_specs()) {
+        for (size_t i = 0; i < candidate.SpecCount(); ++i) {
             std::string_view version;
-            if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version, uri_structure_prevalidated)) {
+            if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(
+                    candidate.SpecUri(i), version, uri_structure_prevalidated)) {
                 return false;
             }
         }
@@ -152,9 +149,10 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
         for (int iteration = -1; iteration < iterations; ++iteration) {
             const auto begin = std::chrono::steady_clock::now();
             const auto result = indexer->VisitLocationValuesForPrefix(
-                request_context.get(), query_keys, [&query_keys](size_t, const CompactLocationsPerKey &, size_t) {
-                    return query_keys.size();
-                });
+                request_context.get(),
+                query_keys,
+                [&query_keys](size_t, const CompactLocationsPerKey &, size_t) { return query_keys.size(); },
+                false);
             const auto elapsed =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             ASSERT_EQ(EC_OK, result.terminal_ec);
