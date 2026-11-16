@@ -92,7 +92,7 @@ stateDiagram-v2
 3. 对 miss 按真实 size 分组，复用 PACE 批量 Create；返回 location 仍保持请求顺序。分配或后续 metadata 发布失败时，释放尚未公布的私有分配，并对已公布项做 generation 保护的清理。
 4. 复用 MetaIndexer 批量 RMW 条件创建 `WRITING` metadata；hash 冲突按 unique-key layer 拆分，返回和 session 顺序仍按请求对齐，并记录有期限的内存 write session。
 5. 客户端直接向 PACE 写 bytes。
-6. 客户端确认全部数据面写入已结束后调用 `PutFinish`；全部成功时，条件执行 `WRITING -> SERVING` 并增加 usage。
+6. 客户端确认全部数据面写入已结束后调用 `PutFinish`；发布 `SERVING` 前先记入 usage，并保留提交未确认标记。全部提交成功后清除该标记；提交未确认的 generation 由专用 cleanup 退还计量，GC 暂不竞争它的删除归属。
 7. 已确认全部远端 I/O 停止后的失败，可清理本 session 的全部 generation，并尽力释放 allocation；状态未知时不发送 `PutFinish`，等待 session 过期只清理 metadata。
 
 多 key session 提供整批最终成功/失败语义，但不保证多个 key 同时线性化可见。
@@ -157,7 +157,7 @@ group_usage          = Σ group 内全部 KVMeta instance_usage
 
 metadata 发布、提交和删除按 instance 与 key 共同选择 mutation lock，批量操作按固定顺序获取锁。同 key 的 usage 更新、删除确认和新 generation 保持受保护，不同 key 可以并行；PACE 分配不持有该锁。写会话使用到期时间索引，避免每次新写入唤醒后扫描全部会话；默认最多 65536 个活动会话，并上报活动数和拒绝数。
 
-usage 是逻辑已提交字节，不等于 PACE 物理占用，不包含：
+usage 是逻辑已提交字节及未确认提交的保守计量，不等于 PACE 物理占用。提交结果或清理确认后计量收敛；不包含：
 
 - `WRITING` allocation。
 - allocator 对齐和管理开销。
@@ -190,7 +190,7 @@ excess   = group_usage - target
 
 1. 复用普通 Cache 的采样入口；热缓存回填完成时在本地采样，恢复中从持久层采样。
 2. 排除已在途 key；复用维护性 touch 让这些 key 让出冷分片采样位置，避免等待宽限期的 key 占满下一轮候选。
-3. 合并候选并按访问时间排序，按需扩大批次读取 metadata，只保留合法的 SERVING generation。
+3. 合并候选并按访问时间排序，按需扩大批次读取 metadata，只保留合法且提交计量已确认的 SERVING generation。未确认提交的跳过次数见 `stage_count{stage=uncertain_commit,status=skipped}`。
 4. 复用普通 Cache 的单批大小、每轮请求数、pending 对象数/字节数和超时配置，向 SchedulePlanExecutor 提交有界异步删除任务。
 5. executor 校验预期 generation，将 metadata 标记为 DELETING，并按现有删除流程确认持久化。
 6. executor 延迟调度完整 reader grace，不占 worker 睡眠；之后按 storage 分组执行物理删除。
@@ -323,7 +323,7 @@ PACE 接口尚无写入隔离机制。KVMeta 无法安全自动回收未获客�
     -> best-effort PACE Delete
 ```
 
-这是主动 Remove 的清理顺序。后台 GC 使用第 6 节的异步 `DELETING -> reader grace -> 物理删除 -> metadata 清理` 流程；每个异步任务以最后一次状态标记完成时间为起点等待完整 grace，等待期间降主或退出则保留 allocation。
+这是主动 Remove 的清理顺序。Remove 在原子 metadata 修改中避开 `DELETING`，避免与 executor 对同一地址重复释放；它此时已不可读。后台 GC 使用第 6 节的异步 `DELETING -> reader grace -> 物理删除 -> metadata 清理` 流程；每个异步任务以最后一次状态标记完成时间为起点等待完整 grace，等待期间降主或退出则保留 allocation。
 
 该顺序优先保证缓存立即 miss 和主链路不被物理删除故障阻塞，代价是物理 usage 可能与逻辑 usage 偏离。
 

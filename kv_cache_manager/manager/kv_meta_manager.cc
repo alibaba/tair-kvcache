@@ -275,6 +275,11 @@ bool KvMetaManager::TakeUncertainUsage(const std::string &instance_id, const Ses
     return uncertain_usage_.erase(UsageReservationKey(instance_id, item)) != 0;
 }
 
+bool KvMetaManager::HasUncertainUsage(const std::string &instance_id, const SessionItem &item) {
+    std::lock_guard<std::mutex> lock(uncertain_usage_mutex_);
+    return !uncertain_usage_.empty() && uncertain_usage_.count(UsageReservationKey(instance_id, item)) != 0;
+}
+
 class KvMetaWriteSessionManager {
 public:
     using Clock = std::chrono::steady_clock;
@@ -899,8 +904,14 @@ private:
                     if (owner_->ValidateLocation(&context, candidate.key, location_id, *location, size) != EC_OK) {
                         continue;
                     }
-                    by_instance[candidate.instance_id].push_back(
-                        KvMetaManager::SessionItem{candidate.key, location_id, location, size});
+                    KvMetaManager::SessionItem item{candidate.key, location_id, location, size};
+                    // Do not compete with an in-progress/uncertain commit's
+                    // accounting and cleanup ownership.
+                    if (owner_->HasUncertainUsage(candidate.instance_id, item)) {
+                        owner_->ObserveReclaimStage(group->name(), "uncertain_commit", "skipped");
+                        continue;
+                    }
+                    by_instance[candidate.instance_id].push_back(std::move(item));
                     selected_bytes = SaturatingAdd(selected_bytes, size);
                     ++selected_count;
                     if (selected_count >= round_limit || selected_bytes >= projected_usage - target) {
@@ -1582,12 +1593,13 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             expected.push_back(items[index].location);
         }
         std::vector<bool> accepted(layer.size(), false);
+        std::vector<bool> replaced(layer.size(), false);
         std::vector<CacheLocationConstPtr> removed_locations(layer.size());
-        auto modifier = [&expected, &accepted, &removed_locations](const std::vector<ErrorCode> &get_ecs,
-                                                                   const LocationIdVector &,
-                                                                   std::size_t key_index,
-                                                                   CacheLocationVector &locations,
-                                                                   PropertyMap &) -> LocationModifierResult {
+        auto modifier = [&expected, &accepted, &removed_locations, &replaced](const std::vector<ErrorCode> &get_ecs,
+                                                                              const LocationIdVector &,
+                                                                              std::size_t key_index,
+                                                                              CacheLocationVector &locations,
+                                                                              PropertyMap &) -> LocationModifierResult {
             if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= expected.size()) {
                 return {MA_FAIL, {EC_MISMATCH}};
             }
@@ -1598,6 +1610,12 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
                 return {MA_FAIL, {get_ecs[0] == EC_OK ? EC_CORRUPTION : get_ecs[0]}};
             }
             if (!SameGeneration(*locations[0], *expected[key_index])) {
+                replaced[key_index] = true;
+                return {MA_SKIP, {EC_EXIST}};
+            }
+            if (locations[0]->status() == CLS_DELETING) {
+                // The executor owns physical deletion after its atomic mark.
+                // Removing the metadata here could authorize a second release.
                 return {MA_SKIP, {EC_EXIST}};
             }
             removed_locations[key_index] = locations[0];
@@ -1617,9 +1635,10 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         for (std::size_t i = 0; i < layer.size(); ++i) {
             const ErrorCode ec =
                 result.per_location_error_codes[i].size() == 1 ? result.per_location_error_codes[i][0] : EC_MISMATCH;
-            if (ec == EC_NOENT && items[layer[i]].location &&
+            if ((ec == EC_NOENT || (ec == EC_EXIST && replaced[i])) && items[layer[i]].location &&
                 TakeUncertainUsage(internal_instance_id, items[layer[i]])) {
-                // A previous HDEL may have committed and lost its reply.
+                // Absence or replacement proves an old HDEL took effect,
+                // even if its acknowledgement was lost.
                 // Only the failed FinishWrite's outstanding reservation is
                 // refundable; an ordinary miss has no usage to subtract.
                 indexer->SubStorageUsageByType(items[layer[i]].location->type(), items[layer[i]].value_size);
@@ -2076,11 +2095,12 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
             expected.push_back(session.items[index].location);
         }
         std::vector<bool> accepted(layer.size(), false);
-        auto modifier = [&expected, &accepted](const std::vector<ErrorCode> &get_ecs,
-                                               const LocationIdVector &,
-                                               std::size_t key_index,
-                                               CacheLocationVector &locations,
-                                               PropertyMap &properties) -> LocationModifierResult {
+        auto modifier = [this, &expected, &accepted, &accounted, &layer, &session, &internal_instance_id, &indexer](
+                            const std::vector<ErrorCode> &get_ecs,
+                            const LocationIdVector &,
+                            std::size_t key_index,
+                            CacheLocationVector &locations,
+                            PropertyMap &properties) -> LocationModifierResult {
             if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= expected.size()) {
                 return {MA_FAIL, {EC_MISMATCH}};
             }
@@ -2092,24 +2112,20 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
             }
             auto serving = std::make_shared<CacheLocation>(*locations[0]);
             serving->set_status(CLS_SERVING);
+            const auto item_index = layer[key_index];
+            // Charge before publication; GC must never see a SERVING value
+            // whose bytes have not been added. Keep cleanup ownership until
+            // the metadata acknowledgement is known.
+            ReserveUncertainUsage(internal_instance_id, session.items[item_index]);
+            indexer->AddStorageUsageByType(session.items[item_index].location->type(),
+                                           session.items[item_index].value_size);
+            accounted[item_index] = true;
             locations[0] = std::move(serving);
             properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
             accepted[key_index] = true;
             return {MA_OK, {EC_OK}};
         };
         const auto result = indexer->ReadModifyWriteLocation(request_context, layer_keys, ids, modifier);
-        // The backend may apply SERVING and lose its reply, including a
-        // malformed result. Reserve its bytes before releasing this instance
-        // fence, so delayed cleanup or a concurrent Remove/GC cannot subtract
-        // an unaccounted generation from unrelated objects' usage.
-        for (std::size_t i = 0; i < layer.size(); ++i) {
-            if (accepted[i]) {
-                const std::size_t item_index = layer[i];
-                accounted[item_index] = true;
-                indexer->AddStorageUsageByType(session.items[item_index].location->type(),
-                                               session.items[item_index].value_size);
-            }
-        }
         if (result.per_location_error_codes.size() != layer.size()) {
             overall = FirstHardError(overall, EC_MISMATCH);
             continue;
@@ -2129,12 +2145,10 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
         }
     }
     if (overall == EC_OK && std::all_of(committed.begin(), committed.end(), [](bool value) { return value; })) {
-        return EC_OK;
-    }
-    for (std::size_t i = 0; i < session.items.size(); ++i) {
-        if (accounted[i]) {
-            ReserveUncertainUsage(internal_instance_id, session.items[i]);
+        for (const auto &item : session.items) {
+            TakeUncertainUsage(internal_instance_id, item);
         }
+        return EC_OK;
     }
     // A partial metadata transition is not exposed as a partial cache write:
     // remove every generation owned by this session and let the caller retry.
@@ -2191,6 +2205,9 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         if (exact[i].location->status() == CLS_WRITING) {
             AddError(request_context, "KVMeta object is still being written");
             return EC_EXIST;
+        }
+        if (exact[i].location->status() == CLS_DELETING) {
+            continue; // Already unreadable and exclusively owned by GC.
         }
         items.push_back({exact[i].internal_key, exact[i].location_id, exact[i].location, size});
     }

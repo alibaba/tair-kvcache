@@ -156,6 +156,7 @@ private:
     static std::string UsageReservationKey(const std::string &instance_id, const SessionItem &item);
     void ReserveUncertainUsage(const std::string &instance_id, const SessionItem &item);
     bool TakeUncertainUsage(const std::string &instance_id, const SessionItem &item);
+    bool HasUncertainUsage(const std::string &instance_id, const SessionItem &item);
 
 private:
     friend class KvMetaReclaimer;

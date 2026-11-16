@@ -142,6 +142,27 @@ public:
     bool entered = false, released = false;
 };
 
+class PublishedCommitBackend : public MetaLocalBackend {
+public:
+    std::vector<ErrorCode> Upsert(RequestContext *context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        const auto result = MetaLocalBackend::Upsert(context, keys, locations, properties);
+        bool serving = false;
+        for (const auto &map : locations) {
+            for (const auto &[_, location] : map) {
+                serving = serving || (location && location->status() == CLS_SERVING);
+            }
+        }
+        if (serving && after_publication) {
+            after_publication();
+        }
+        return result;
+    }
+    std::function<void()> after_publication;
+};
+
 class ScriptedScanBackend : public MetaLocalBackend {
 public:
     ErrorCode ScanLocationsForMaintenance(RequestContext *context,
@@ -223,7 +244,7 @@ public:
             for (const auto &[_, location] : locations[i]) {
                 serving = serving || (location && location->status() == CLS_SERVING);
             }
-            const bool fail = keys[i] == failed_key_ && serving;
+            const bool fail = fail_commit.load() && keys[i] == failed_key_ && serving;
             if (!fail || apply_failed_commit) {
                 const auto result = MetaLocalBackend::Upsert(context, {keys[i]}, {locations[i]}, {properties[i]});
                 if (!fail) {
@@ -263,6 +284,7 @@ public:
         return MetaLocalBackend::Delete(context, keys);
     }
 
+    std::atomic<bool> fail_commit{true};
     bool apply_failed_commit = true;
     bool malformed_reply = false;
     std::atomic<bool> block_cleanup{false};
@@ -747,7 +769,7 @@ TEST_F(KvMetaManagerTest, DelayedUncertainFinishCleanupCannotUnderchargeConcurre
     EXPECT_EQ(100u, Indexer(kDefaultInstance)->GetStorageUsage());
 }
 
-TEST_F(KvMetaManagerTest, DelayedUncertainFinishCleanupCannotUnderchargeReclaimer) {
+TEST_F(KvMetaManagerTest, ReclaimerSkipsUncertainGenerationUntilCleanupRefundsItsUsage) {
     constexpr const char *name = "uncertain-gc";
     CreateGroup(name, name, 200, 0.5);
     auto backend = std::make_unique<AmbiguousCommitBackend>(KvMetaManager::InternalKey("uncertain"));
@@ -759,20 +781,106 @@ TEST_F(KvMetaManagerTest, DelayedUncertainFinishCleanupCannotUnderchargeReclaime
     ASSERT_TRUE(manager_->ResumeMaintenance());
     ASSERT_TRUE(WaitUntil([&]() { return manager_->recovery_complete_.load(); }, std::chrono::seconds(3)));
     failure->block_cleanup.store(true);
-    const auto start = Start(name, {"uncertain"}, {31});
+    const auto start = Start(name, {"uncertain"}, {131});
     EXPECT_NE(EC_OK, manager_->FinishWrite(&context_, name, start.write_session_id, {true}));
-    Commit(name, "keep", 100);
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return metrics_registry_
+                       ->GetCounter("kv_meta.reclaim.stage_count",
+                                    {{"instance_group", name}, {"stage", "uncertain_commit"}, {"status", "skipped"}})
+                       .Get() >= 5;
+        },
+        std::chrono::seconds(2)));
     EXPECT_EQ(131u, Indexer(name)->GetStorageUsage());
-    // The failed write is older, so reclaim it before the retained object.
-    failure->allow_gc_delete.store(true);
-    ASSERT_TRUE(WaitUntil([&]() { return Indexer(name)->GetStorageUsage() == 100; }, std::chrono::seconds(3)));
-    const auto [ec, values] = manager_->Get(&context_, name, {"keep", "uncertain"});
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    failure->block_cleanup.store(false);
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer(name)->GetStorageUsage() == 0 && pace_backend_->delete_count() == 1; },
+                          std::chrono::seconds(4)));
+}
+
+TEST_F(KvMetaManagerTest, ServingPublicationIsChargedBeforeItsReplyCanBeDelayed) {
+    auto backend = std::make_unique<PublishedCommitBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("published-charge", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *storage = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    const auto start = Start(kDefaultInstance, {"object"}, {131});
+    std::promise<void> published, release;
+    const auto resumed = release.get_future().share();
+    storage->after_publication = [&]() {
+        published.set_value();
+        resumed.wait();
+    };
+    auto finished = std::async(std::launch::async, [&]() {
+        RequestContext context("published_before_accounting");
+        return manager_->FinishWrite(&context, kDefaultInstance, start.write_session_id, {true});
+    });
+    const bool blocked = published.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto charged = Indexer(kDefaultInstance)->GetStorageUsage();
+    release.set_value();
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(131u, charged);
+    EXPECT_EQ(EC_OK, finished.get());
+    EXPECT_TRUE(manager_->uncertain_usage_.empty());
+}
+
+TEST_F(KvMetaManagerTest, CleanupRefundsOnlyOldReservationAfterLostDeleteReplyAndReplacement) {
+    auto backend = std::make_unique<AmbiguousCommitBackend>(KvMetaManager::InternalKey("replaced"));
+    ASSERT_EQ(EC_OK, backend->Init("replaced-reservation", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *fault = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "keep", 100);
+    const auto start = Start(kDefaultInstance, {"replaced"}, {31});
+    fault->lose_delete_reply_once.store(true);
+    EXPECT_NE(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true}));
+    fault->fail_commit.store(false);
+    Commit(kDefaultInstance, "replaced", 17);
+    ASSERT_TRUE(
+        WaitUntil([&]() { return Indexer(kDefaultInstance)->GetStorageUsage() == 117; }, std::chrono::seconds(4)));
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"keep", "replaced"});
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(2u, values.size());
-    EXPECT_TRUE(values[0].found);
-    EXPECT_FALSE(values[1].found);
+    EXPECT_TRUE(values[0].found && values[1].found);
+    EXPECT_EQ(17u, values[1].location.value_size);
+}
+
+TEST_F(KvMetaManagerTest, RemoveRacingReclaimAdmissionCannotReleaseTheAllocationTwice) {
+    constexpr const char *name = "remove-reclaim-owner";
+    CreateGroup(name, name, 100, 0.8, 100);
+    auto backend = std::make_unique<HookLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(name, std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *storage = backend.get();
+    Indexer(name)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(name, "object", 90);
+    std::promise<void> read, release;
+    const auto resumed = release.get_future().share();
+    storage->after_read = [&]() {
+        read.set_value();
+        resumed.wait();
+    };
+    auto removed = std::async(std::launch::async, [&]() {
+        RequestContext context("remove_reclaim_owner");
+        return manager_->Remove(&context, name, {"object"});
+    });
+    const bool blocked = read.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    const bool started = manager_->ResumeMaintenance();
+    const bool marked = WaitUntil(
+        [&]() {
+            const auto [ec, values] = manager_->Get(&context_, name, {"object"});
+            return ec == EC_OK && !values[0].found;
+        },
+        std::chrono::seconds(2));
+    release.set_value();
+    EXPECT_TRUE(blocked && started && marked);
+    EXPECT_EQ(EC_OK, removed.get());
+    EXPECT_TRUE(WaitUntil([&]() { return Indexer(name)->GetStorageUsage() == 0 && pace_backend_->delete_count() == 1; },
+                          std::chrono::seconds(2)));
     manager_->DoCleanup();
-    EXPECT_EQ(100u, Indexer(name)->GetStorageUsage());
+    EXPECT_EQ(1u, pace_backend_->delete_calls());
+    EXPECT_EQ(1u, pace_backend_->delete_count());
 }
 
 TEST_F(KvMetaManagerTest, PartialFinishRollbackHonorsReadersOfCommittedKeys) {
