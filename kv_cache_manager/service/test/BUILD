@@ -1,6 +1,17 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "HttpBodyShrinkTest",
+    srcs = ["http_body_shrink_test.cc"],
+    copts = ["-std=c++20", "-fcoroutines", "-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/http_service:http_service",
+        "@yalantinglibs//:ylt",
+    ],
+)
+
+cc_test(
     name = "ServerRedisHealthMetricsTest",
     srcs = ["server_redis_health_metrics_test.cc"],
     copts = ["-fno-access-control"],
