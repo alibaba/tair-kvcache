@@ -1492,7 +1492,17 @@ bool KvMetaManager::DeletePhysicalBestEffort(RequestContext *request_context,
             std::any_of(results.begin(), results.end(), [](ErrorCode ec) { return ec != EC_OK && ec != EC_NOENT; })) {
             // Physical deletion is best effort. Metadata is already absent, so
             // a provider failure cannot block cache traffic or corrupt usage.
-            KVCM_LOG_WARN("KVMeta physical delete failed for storage [%s]", storage_name.c_str());
+            const auto failed = [](ErrorCode ec) { return ec != EC_OK && ec != EC_NOENT; };
+            const auto first_failure = std::find_if(results.begin(), results.end(), failed);
+            KVCM_LOG_ERROR("KVMeta physical cleanup failed trace_id [%s] storage [%s] requested [%zu] returned [%zu] "
+                           "failed_items [%zu] first_failed_index [%zu] first_error [%d]",
+                           request_context ? request_context->trace_id().c_str() : "",
+                           storage_name.c_str(),
+                           uris.size(),
+                           results.size(),
+                           static_cast<std::size_t>(std::count_if(results.begin(), results.end(), failed)),
+                           static_cast<std::size_t>(std::distance(results.begin(), first_failure)),
+                           static_cast<int>(first_failure == results.end() ? EC_MISMATCH : *first_failure));
             success = false;
         }
     }
@@ -1822,7 +1832,15 @@ KvMetaManager::StartWrite(RequestContext *request_context,
 
     std::vector<SessionItem> candidates;
     candidates.reserve(missing.size());
+    std::vector<SessionItem> unpublished(keys.size());
     const auto rollback_candidates = [&]() {
+        std::vector<SessionItem> private_allocations;
+        for (auto &item : unpublished) {
+            if (item.location) {
+                private_allocations.push_back(std::move(item));
+            }
+        }
+        DeletePhysicalBestEffort(request_context, private_allocations);
         if (candidates.empty()) {
             return;
         }
@@ -1834,48 +1852,74 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             write_session_manager_->ScheduleCleanup(StringUtil::GenerateRandomString(32), std::move(cleanup));
         }
     };
+    // The backend already accepts a batch with one size per key. Group equal
+    // sizes instead of turning a multi-object request into N PACE allocations.
+    std::map<std::uint64_t, std::vector<std::size_t>> by_size;
+    for (const auto index : missing) {
+        by_size[value_sizes[index]].push_back(index);
+    }
+    for (const auto &[size, indices] : by_size) {
+        if (maintenance_cancelled_.load(std::memory_order_acquire) ||
+            KvMetaWriteSessionManager::Clock::now() >= deadline) {
+            rollback_candidates();
+            return {maintenance_cancelled_.load(std::memory_order_acquire) ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, {}};
+        }
+        std::vector<std::string> object_keys;
+        object_keys.reserve(indices.size());
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            object_keys.push_back("kvmeta/" + StringUtil::GenerateRandomString(kKvMetaObjectNonceBytes));
+        }
+        const auto created = storage_manager->Create(
+            request_context, selected.name, object_keys, static_cast<std::size_t>(size), nullptr);
+        ErrorCode allocation_ec = created.size() == indices.size() ? EC_OK : EC_IO_ERROR;
+        for (std::size_t i = 0; i < created.size(); ++i) {
+            if (created[i].first != EC_OK || !created[i].second.Valid()) {
+                if (allocation_ec == EC_OK) {
+                    allocation_ec = created[i].first != EC_OK ? created[i].first : EC_IO_ERROR;
+                }
+                continue;
+            }
+            auto location = std::make_shared<CacheLocation>();
+            location->set_status(CLS_WRITING);
+            location->set_type(selected.type);
+            location->set_spec_size(1);
+            location->set_create_time(TimestampUtil::GetCurrentTimeUs());
+            location->push_location_spec(
+                LocationSpec(std::string(kKvMetaValueSpecName), created[i].second.ToUriString()));
+            if (i >= indices.size()) {
+                // Even a malformed oversized response can contain allocations
+                // owned only by this request; no writer has received them.
+                DeletePhysicalBestEffort(request_context, {{0, {}, std::move(location), size}});
+                continue;
+            }
+            const auto request_index = indices[i];
+            location->set_id(existing[request_index].location_id);
+            unpublished[request_index] = {
+                existing[request_index].internal_key, existing[request_index].location_id, location, size};
+            std::uint64_t actual_size = 0;
+            if (ValidateLocation(request_context,
+                                 existing[request_index].internal_key,
+                                 existing[request_index].location_id,
+                                 *location,
+                                 actual_size) != EC_OK ||
+                actual_size != size) {
+                if (allocation_ec == EC_OK) {
+                    allocation_ec = EC_CORRUPTION;
+                }
+            }
+        }
+        if (allocation_ec != EC_OK) {
+            rollback_candidates();
+            return {allocation_ec, {}};
+        }
+    }
     for (const std::size_t request_index : missing) {
         if (maintenance_cancelled_.load(std::memory_order_acquire) ||
             KvMetaWriteSessionManager::Clock::now() >= deadline) {
             rollback_candidates();
             return {maintenance_cancelled_.load(std::memory_order_acquire) ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, {}};
         }
-        const std::string object_key = "kvmeta/" + StringUtil::GenerateRandomString(kKvMetaObjectNonceBytes);
-        const auto created = storage_manager->Create(request_context,
-                                                     selected.name,
-                                                     {object_key},
-                                                     static_cast<std::size_t>(value_sizes[request_index]),
-                                                     nullptr);
-        if (created.size() != 1 || created[0].first != EC_OK || !created[0].second.Valid()) {
-            rollback_candidates();
-            return {created.size() == 1 && created[0].first != EC_OK ? created[0].first : EC_IO_ERROR, {}};
-        }
-        auto location = std::make_shared<CacheLocation>();
-        location->set_id(existing[request_index].location_id);
-        location->set_status(CLS_WRITING);
-        location->set_type(selected.type);
-        location->set_spec_size(1);
-        location->set_create_time(TimestampUtil::GetCurrentTimeUs());
-        location->push_location_spec(LocationSpec(std::string(kKvMetaValueSpecName), created[0].second.ToUriString()));
-        std::uint64_t actual_size = 0;
-        if (ValidateLocation(request_context,
-                             existing[request_index].internal_key,
-                             existing[request_index].location_id,
-                             *location,
-                             actual_size) != EC_OK ||
-            actual_size != value_sizes[request_index]) {
-            DeletePhysicalBestEffort(request_context,
-                                     {{existing[request_index].internal_key,
-                                       existing[request_index].location_id,
-                                       location,
-                                       value_sizes[request_index]}});
-            rollback_candidates();
-            return {EC_CORRUPTION, {}};
-        }
-        SessionItem candidate{existing[request_index].internal_key,
-                              existing[request_index].location_id,
-                              std::move(location),
-                              value_sizes[request_index]};
+        SessionItem candidate = std::move(unpublished[request_index]);
         bool inserted = false;
         if (const ErrorCode ec = publish_writing(candidate, inserted); ec != EC_OK) {
             if (inserted) {

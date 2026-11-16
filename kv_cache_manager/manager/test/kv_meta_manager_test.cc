@@ -298,10 +298,15 @@ public:
                                                              std::size_t size,
                                                              const std::string &,
                                                              std::function<void()> cb) override {
+        ++create_calls_;
         create_count_.fetch_add(keys.size(), std::memory_order_release);
         std::vector<std::pair<ErrorCode, DataStorageUri>> result;
         result.reserve(keys.size());
         for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (static_cast<int>(i) == failed_create_index) {
+                result.emplace_back(failed_create_error, DataStorageUri{});
+                continue;
+            }
             DataStorageUri uri;
             uri.SetProtocol(kTairMempoolUriScheme);
             uri.SetPath("/" + std::to_string(next_offset_.fetch_add(1)));
@@ -343,6 +348,9 @@ public:
 
     std::size_t delete_count() const { return delete_count_.load(std::memory_order_acquire); }
     std::size_t create_count() const { return create_count_.load(std::memory_order_acquire); }
+    std::size_t create_calls() const { return create_calls_.load(std::memory_order_acquire); }
+    int failed_create_index{-1};
+    ErrorCode failed_create_error{EC_IO_ERROR};
     std::size_t delete_calls() const { return delete_calls_.load(std::memory_order_acquire); }
     std::function<void()> before_delete;
     std::function<void()> after_create;
@@ -352,6 +360,7 @@ private:
     DataStorageType type_;
     std::atomic<std::uint64_t> next_offset_{1};
     std::atomic<std::size_t> create_count_{0};
+    std::atomic<std::size_t> create_calls_{0};
     std::atomic<std::size_t> delete_count_{0};
     std::atomic<std::size_t> delete_calls_{0};
 };
@@ -599,6 +608,54 @@ TEST_F(KvMetaManagerTest, LostCleanupDeleteReplyRefundsOnlyItsReservation) {
     ASSERT_EQ(2u, values.size());
     EXPECT_TRUE(values[0].found);
     EXPECT_FALSE(values[1].found);
+}
+
+TEST_F(KvMetaManagerTest, AllocationBatchesEqualSizesAndPreservesRequestOrder) {
+    const auto calls = pace_backend_->create_calls();
+    const auto start = Start(kDefaultInstance, {"a", "b", "c"}, {7, 11, 7});
+    ASSERT_EQ(3u, start.locations.size());
+    EXPECT_EQ(calls + 2, pace_backend_->create_calls());
+    EXPECT_EQ(7u, start.locations[0].value_size);
+    EXPECT_EQ(11u, start.locations[1].value_size);
+    EXPECT_EQ(7u, start.locations[2].value_size);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true, true, true}));
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"a", "b", "c"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(3u, values.size());
+    EXPECT_TRUE(values[0].found && values[1].found && values[2].found);
+    EXPECT_EQ(25u, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, PartialAllocationFailureReleasesEveryReturnedPrivateAllocation) {
+    pace_backend_->failed_create_index = 1;
+    for (const auto failure : {EC_IO_ERROR, EC_NOENT}) {
+        pace_backend_->failed_create_error = failure;
+        const auto deletes = pace_backend_->delete_count();
+        const auto [ec, start] = manager_->StartWrite(&context_, kDefaultInstance, {"a", "b", "c"}, {7, 7, 7}, 30);
+        EXPECT_EQ(failure, ec);
+        EXPECT_TRUE(start.locations.empty());
+        EXPECT_TRUE(start.write_session_id.empty());
+        EXPECT_EQ(deletes + 2, pace_backend_->delete_count());
+        EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+        const auto [get_ec, values] = manager_->Get(&context_, kDefaultInstance, {"a", "b", "c"});
+        ASSERT_EQ(EC_OK, get_ec);
+        for (const auto &value : values) {
+            EXPECT_FALSE(value.found);
+        }
+    }
+}
+
+TEST_F(KvMetaManagerTest, BatchAdmissionFailureCleansPublishedAndUnpublishedAllocations) {
+    Indexer(kDefaultInstance)->max_key_count_ = 1;
+    const auto deletes = pace_backend_->delete_count();
+    EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&context_, kDefaultInstance, {"a", "b", "c"}, {7, 7, 7}, 30).first);
+    EXPECT_EQ(deletes + 3, pace_backend_->delete_count());
+    EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+    const auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"a", "b", "c"});
+    ASSERT_EQ(EC_OK, ec);
+    for (const auto &value : values) {
+        EXPECT_FALSE(value.found);
+    }
 }
 
 TEST_F(KvMetaManagerTest, FullMetadataKeyCountReleasesRejectedPrivateAllocation) {

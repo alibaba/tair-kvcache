@@ -89,7 +89,7 @@ stateDiagram-v2
    - `SERVING` 且 size 相同：返回 hit。
    - `SERVING` 但 size 不同：返回 `SIZE_MISMATCH`。
    - `WRITING`：返回 `WRITE_IN_PROGRESS`。
-3. 对 miss 使用真实 size 向 PACE 分配空间。
+3. 对 miss 按真实 size 分组，复用 PACE 批量 Create；返回 location 仍保持请求顺序。分配或后续 metadata 发布失败时，释放尚未公布的私有分配，并对已公布项做 generation 保护的清理。
 4. 条件创建 `WRITING` metadata，并记录有期限的内存 write session。
 5. 客户端直接向 PACE 写 bytes。
 6. 客户端确认全部数据面写入已结束后调用 `PutFinish`；全部成功时，条件执行 `WRITING -> SERVING` 并增加 usage。
@@ -217,7 +217,7 @@ excess   = group_usage - target
 升主后启动 KVMeta maintenance worker，等待 Registry 完整恢复及相关 MetaIndexer 创建完成，在首轮 GC 前扫描 persistent metadata：
 
 - 删除遗留 `WRITING` metadata，保留可能仍被旧客户端写入的 allocation。
-- 汇总全部合法 `SERVING` size。
+- 汇总全部合法 `SERVING` 和等待回收的 `DELETING` size。
 - 重建每个 MetaIndexer 的 usage。
 
 同一实例完整扫描按 internal key 去重，每个 key 下仍计量所有合法 location。单 key 在读取前消失时继续扫描；扫描本身失败时不发布该实例的 usage，也不标记 ready。
