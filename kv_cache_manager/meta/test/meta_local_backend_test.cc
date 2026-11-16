@@ -2076,6 +2076,22 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysSelectsOldestShard) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, SparseShardsFillTheRequestedReclaimSample) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=8&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("sparse-reclaim", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    for (int64_t key = 1; key <= 32; ++key) {
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  PutWithFieldMaps(meta_storage_backend_.get(), {key}, {{{PROPERTY_URI, "uri"}}}));
+    }
+    for (int64_t count : {7, 32, 100}) {
+        KeyTypeVec keys;
+        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, count, keys));
+        EXPECT_EQ(static_cast<size_t>(std::min<int64_t>(count, 32)), keys.size());
+        EXPECT_EQ(keys.size(), std::set<KeyType>(keys.begin(), keys.end()).size());
+    }
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysEmptyCache) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=2&sample_times=4");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_empty_sample", meta_storage_backend_config_));
