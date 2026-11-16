@@ -26,6 +26,9 @@ std::uint64_t StorageUsageData::GetStorageUsage() const noexcept {
 }
 
 std::uint64_t StorageUsageData::GetStorageUsageByType(const DataStorageType &type) const noexcept {
+    if (IsEventReportStorageType(type)) {
+        return 0;
+    }
     const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
@@ -46,6 +49,9 @@ void StorageUsageData::Reset() noexcept {
 }
 
 void StorageUsageData::SetStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    if (IsEventReportStorageType(type)) {
+        return;
+    }
     const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
@@ -57,6 +63,9 @@ void StorageUsageData::SetStorageUsageByType(const DataStorageType &type, const 
 }
 
 std::uint64_t StorageUsageData::AddStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    if (IsEventReportStorageType(type)) {
+        return 0;
+    }
     const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
@@ -68,6 +77,9 @@ std::uint64_t StorageUsageData::AddStorageUsageByType(const DataStorageType &typ
 }
 
 std::uint64_t StorageUsageData::SubStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    if (IsEventReportStorageType(type)) {
+        return 0;
+    }
     const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
@@ -100,7 +112,7 @@ std::uint64_t StorageUsageData::SubStorageUsageByType(const DataStorageType &typ
 void StorageUsageData::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
         const auto type = static_cast<DataStorageType>(i);
-        const auto usage = storage_usage_by_type_.at(i).load();
+        const auto usage = IsEventReportStorageType(type) ? 0 : storage_usage_by_type_.at(i).load();
         // Preserve rollback compatibility until the new storage type is
         // actually used. Older binaries reject unknown persisted JSON keys.
         if (type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD && usage == 0) {
@@ -130,7 +142,10 @@ bool StorageUsageData::FromRapidValue(const rapidjson::Value &rapid_value) {
         }
         const size_t_ idx = ToIndex(type);
         if (it->value.IsUint64()) {
-            buf.at(idx) = it->value.GetUint64();
+            // Accept old counters for wire compatibility, but do not recover
+            // exact byte accounting for externally owned cache. Snapshot
+            // overwrite intentionally does not consult the previous size.
+            buf.at(idx) = IsEventReportStorageType(type) ? 0 : it->value.GetUint64();
         } else {
             KVCM_LOG_ERROR("deserialize storage usage data failed: non-integer value for key [%s]", key.c_str());
             return false;

@@ -46,8 +46,9 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS usage data
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
-    // slot 7: DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 usage data
-    // slot 8: DATA_STORAGE_TYPE_EVENT_REPORT_L2 usage data
+    // slots 7/8: EventReport usage is untracked (zero), not owned storage.
+    // Keep serialized fields for older readers; ADD/DELETE/GC are no-ops for
+    // these counters, consistent with snapshot's read-free overwrite path.
     // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD usage data
     array_t_ storage_usage_by_type_;
 };

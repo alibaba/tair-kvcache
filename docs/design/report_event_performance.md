@@ -1842,3 +1842,17 @@ GPU-only 测试按预期跳过。上述 mixed 结果也说明渐进 query 没有
   `bazel test --config=release --nocache_test_results --test_output=errors --jobs=8 //kv_cache_manager/...`：
   106 个可执行测试全部通过，1 个 GPU-only 测试按预期跳过。工作树迁移后复用旧绝对路径 output base 曾导致 7 个
   用例在 0ms 内因 runfiles 缺失失败；独立重建后这些用例全部通过，未把基础设施假失败当作代码缺陷。
+
+## Snapshot 不预读旧 location 的直接覆盖路径
+
+完整 ReportEvent snapshot 通过 flat replacement 调用 `MetaIndexer::OverwriteLocations`：
+按索引批次构造新值，复用 Upsert 的 shard 锁、生命周期准入、错误映射和后端路由；
+省去独立 GetLocations、旧值结果容器及旧 size/create_time 读取。其他 location 与属性保持不变。
+该路径仅接受 EventReport 的 SERVING location；普通 nested replacement 和增量上报继续走原路径。
+恢复期缺失完整 key 的补齐仍保留，不能为避免读取而丢掉其他 reporter 的字段。
+
+EventReport 精确字节统计改为未统计（零），snapshot 创建时间刷新，详见
+[Snapshot 协议中的统计边界](report_event_snapshot_uri_version.md#snapshot-直接覆盖与统计边界)。
+本改动不消除 payload 构造/传输、全量校验、对象重建、写回或同 reporter 的 snapshot/delta gate。
+历史 500 万 key trace 的读取阶段约 4.56 秒，只能用于确定优化方向，不能当作当前版本的实测收益。
+应重新对比未变化/变化 snapshot，并同时记录增量、查询 P99、内存及持久层队列。

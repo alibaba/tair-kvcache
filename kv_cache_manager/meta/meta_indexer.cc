@@ -310,6 +310,69 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     return result;
 }
 
+MetaIndexer::Result
+MetaIndexer::OverwriteLocations(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const std::function<void(size_t, CacheLocationMap &)> &build_locations,
+                                const std::function<ErrorCode()> &admit_write) noexcept {
+    if (keys.empty()) {
+        return Result(EC_OK);
+    }
+    Result result(keys.size());
+    if (!build_locations) {
+        result.ec = EC_BADARGS;
+        std::fill(result.error_codes.begin(), result.error_codes.end(), EC_BADARGS);
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    const auto batches = MakeBatches(keys);
+    auto *metrics = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics, meta_indexer, query_key_count, keys.size());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics, meta_indexer, query_batch_num, batches.size());
+    RmwStats stats;
+    int32_t error_count = 0;
+    bool admitted = false;
+    for (const auto &batch : batches) {
+        BatchMetaData write_batch;
+        write_batch.batch_keys.reserve(batch.global_indices.size());
+        write_batch.batch_indexs.reserve(batch.global_indices.size());
+        write_batch.batch_locations.reserve(batch.global_indices.size());
+        for (const auto index : batch.global_indices) {
+            CacheLocationMap locations;
+            build_locations(index, locations);
+            if (locations.empty()) {
+                continue; // A no-op must not create a key with an empty location map.
+            }
+            write_batch.batch_keys.push_back(keys[index]);
+            write_batch.batch_indexs.push_back(index);
+            write_batch.batch_locations.push_back(std::move(locations));
+        }
+        if (write_batch.batch_keys.empty()) {
+            continue;
+        }
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
+        if (!admitted) {
+            const ErrorCode ec = admit_write ? admit_write() : EC_OK;
+            if (ec != EC_OK) {
+                result.ec = ec;
+                std::fill(result.error_codes.begin(), result.error_codes.end(), ec);
+                return result;
+            }
+            admitted = true;
+        }
+        // Upsert preserves unmentioned locations/properties and retains the
+        // existing recovery, async enqueue and partial-error contracts. In
+        // particular, do not use Put, which can replace the complete key.
+        const auto [errors, created_keys] =
+            ExecuteRmwUpsert(trace_id, request_context, write_batch, {}, keys, stats, result);
+        (void)created_keys;
+        error_count += errors;
+    }
+    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    ProcessErrorResult(trace_id, "overwrite_snapshot_locations", error_count, keys.size(), result);
+    return result;
+}
+
 MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const KeyVector &keys) noexcept {
     if (keys.size() == 0) {
         return Result(EC_OK);

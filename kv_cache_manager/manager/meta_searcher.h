@@ -229,9 +229,12 @@ public:
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    // Authoritative EventReport snapshot overwrite without a metadata pre-read.
+    // Refreshes create_time; EventReport byte usage is intentionally untracked.
     // The flat form reuses ReportEvent's validated sizes and can consume its
     // task URIs. Generic tasks keep strict validation and copy/retry semantics,
-    // as in BatchMergeLocationSpecsFlat. Metadata RMW/counting is unchanged.
+    // as in BatchMergeLocationSpecsFlat. Backend routing and snapshot's
+    // logical key-count contract are unchanged.
     ErrorCode BatchReplaceLocationSpecsFlat(RequestContext *request_context,
                                             const KeyVector &keys,
                                             const std::vector<size_t> &task_offsets,
@@ -450,7 +453,8 @@ private:
                                             const KeyVector &keys,
                                             LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
                                             std::vector<ErrorCode> &out_per_key_ec,
-                                            AcquireMetadataWriteLeaseFunc acquire_write_lease);
+                                            AcquireMetadataWriteLeaseFunc acquire_write_lease,
+                                            bool overwrite_without_read = false);
 
     ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,
                                           const KeyVector &keys,

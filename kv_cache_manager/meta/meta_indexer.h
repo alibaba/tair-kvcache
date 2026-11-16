@@ -104,6 +104,16 @@ public:
                const KeyVector &keys,
                CacheLocationMapVector &location_maps,
                PropertyMapVector &properties) noexcept;
+    // Authoritative snapshot upsert: replace only the supplied locations,
+    // without a location read or a key-count delta (matching snapshot RMW).
+    // The caller validates all keys/locations before entering this method.
+    // Build one batch at a time to avoid a full-snapshot map vector. Admission
+    // runs once under the first shard lock; its lease must outlive this call.
+    // Backend recovery may still fill missing complete keys to preserve peers.
+    Result OverwriteLocations(RequestContext *request_context,
+                              const KeyVector &keys,
+                              const std::function<void(size_t, CacheLocationMap &)> &build_locations,
+                              const std::function<ErrorCode()> &admit_write) noexcept;
     Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     // Block-level RMW: modifier sees only existing location id list per key.
     Result ReadModifyWriteBlock(RequestContext *request_context,

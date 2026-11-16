@@ -4460,7 +4460,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgres
     EXPECT_NE(std::string::npos, uris.front().find("s_v=" + snapshot_token));
 }
 
-TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
+TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotWaitingForMetadataWrite) {
     const std::string host = "192.168.10.43:8080";
     const int64_t key = 94'420;
     auto event_backend = InstallEventReportBackend();
@@ -4474,13 +4474,27 @@ TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
     const std::string baseline_token = baseline.committed_snapshot_version();
     ASSERT_EQ(1u, QueryEventReportUris({key}).size());
 
-    meta_backend->BlockNextLocationRead();
+    // The write-only snapshot has no metadata read to pause. Hold the shard
+    // before admission instead: HOST_DOWN must invalidate this waiting writer.
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    std::unique_lock<std::mutex> shard_lock(*indexer->mutex_shards_[indexer->GetMutexShardIndex(key)]);
     auto snapshot_future = std::async(std::launch::async, [this, host, key] {
         return CallReportEvent(MakeSnapshotRequest(host, {{key, "must_not_commit"}}), "host_down_snapshot_in_flight");
     });
-    const bool snapshot_entered = meta_backend->WaitUntilLocationReadEntered(std::chrono::seconds(1));
+    std::string committed;
+    std::string candidate;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        event_backend->GetSnapshotVersionTokens({"test_instance", host}, committed, candidate);
+        if (!candidate.empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    const bool snapshot_entered = !candidate.empty();
     if (!snapshot_entered) {
-        meta_backend->ReleaseLocationRead();
+        shard_lock.unlock();
     }
     ASSERT_TRUE(snapshot_entered);
 
@@ -4492,12 +4506,12 @@ TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
     host_down_event->set_event_type(proto::meta::EVENT_HOST_DOWN);
     host_down_event->mutable_host_down();
     const auto [host_down_ec, host_down_response] = CallReportEvent(host_down, "host_down_during_snapshot");
+    shard_lock.unlock();
     ASSERT_EQ(EC_OK, host_down_ec);
     EXPECT_EQ(proto::meta::OK, host_down_response.header().status().code());
     EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", host));
     EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
 
-    meta_backend->ReleaseLocationRead();
     ASSERT_EQ(std::future_status::ready, snapshot_future.wait_for(std::chrono::seconds(2)));
     const auto [snapshot_ec, snapshot_response] = snapshot_future.get();
     EXPECT_EQ(EC_PARTIAL_OK, snapshot_ec);
@@ -5241,8 +5255,16 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
 
     auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
     ASSERT_NE(nullptr, meta_indexer);
-    EXPECT_EQ(expected_total_size,
-              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    std::uint64_t actual_total_size = 0;
+    for (const auto &locations : location_maps) {
+        for (const auto &[id, location] : locations) {
+            std::uint64_t size = 0;
+            ASSERT_TRUE(location->GetValidatedTotalSize(size));
+            actual_total_size += size;
+        }
+    }
+    EXPECT_EQ(expected_total_size, actual_total_size);
+    EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesReference) {
@@ -5449,8 +5471,16 @@ TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesRef
 
         auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
         ASSERT_NE(nullptr, meta_indexer);
-        EXPECT_EQ(expected_total_size,
-                  meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2))
+        std::uint64_t actual_total_size = 0;
+        for (const auto &locations : location_maps) {
+            for (const auto &[id, location] : locations) {
+                std::uint64_t size = 0;
+                ASSERT_TRUE(location->GetValidatedTotalSize(size));
+                actual_total_size += size;
+            }
+        }
+        EXPECT_EQ(expected_total_size, actual_total_size);
+        EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2))
             << "round " << round;
     }
 }
@@ -5539,11 +5569,11 @@ TEST_F(CacheManagerTest, TestReportEventRejectsMergeThatOverflowsExistingLocatio
     const auto &stored_specs = location_maps[0].begin()->second->location_specs();
     ASSERT_EQ(1u, stored_specs.size());
     EXPECT_EQ("tp0", stored_specs[0].name());
+    EXPECT_NE(std::string::npos, stored_specs[0].uri().find("size=18446744073709551615"));
 
     auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
     ASSERT_NE(nullptr, meta_indexer);
-    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
-              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFoldedDeltaEventsShareFinalWriteFailure) {
