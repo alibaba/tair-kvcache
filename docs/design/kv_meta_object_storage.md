@@ -199,6 +199,17 @@ excess   = group_usage - target
 
 回收指标分别记录提交对象/字节、实际成功删除 metadata 的对象/字节和物理删除成功的对象/字节；任务完成批数不能当作对象回收 QPS。pending 最老时长、额度超时及限额跳过可用于定位停滞。当前没有长期 DELETING 的自动修复或物理失败持久化重试队列，失败或取消仍可能留下孤儿 allocation。读取安全要求 grace 覆盖完整读取时间及调度抖动。
 
+关键观测项（`kv_meta.` 为 registry/KMonitor 名称前缀）：
+
+- `reclaim.deleted_objects_total` / `reclaim.deleted_bytes_total`：实际 metadata 删除累计量。
+- `reclaim.physical_deleted_objects_total` / `reclaim.physical_deleted_bytes_total`：物理删除成功累计量；与 metadata 删除量分开判断。
+- `reclaim.pending_objects` / `reclaim.pending_bytes` / `reclaim.pending_requests`：全部未完成任务占用；`reclaim.pending_credit_bytes` 仅表示仍可抵扣的预测回收额度。
+- `reclaim.pending_oldest_ms`、`reclaim.round_time_us` 和 `reclaim.stage_count`：排查慢任务、慢轮次、限额跳过与超时。
+- `active_write_sessions`、`write_session_capacity`、`write_session_rejected_total`：会话容量和拒绝。
+- `mutation_lock_wait_us` / `mutation_lock_hold_us` / `mutation_lock_count`：累计等待/持有微秒与次数，窗口增量相除得到平均耗时。
+
+累计计数在 KMonitor 中按累计 Gauge 上报，应在查询侧计算窗口增量/时间；Prometheus 使用 counter 的 rate。例如对象回收速度为 `rate(kvcm_kv_meta_reclaim_deleted_objects_total[1m])`。旧 `reclaim.deleted_count` / `reclaim.deleted_bytes` 是最后完成批次的 Gauge，不代表每秒速度。
+
 ## 7. 恢复和服务隔离
 
 升主后启动 KVMeta maintenance worker，等待 Registry 完整恢复及相关 MetaIndexer 创建完成，在首轮 GC 前扫描 persistent metadata：

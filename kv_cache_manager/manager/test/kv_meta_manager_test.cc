@@ -1196,10 +1196,11 @@ TEST_F(KvMetaLimitedReclaimerTest, SlowDeleteHonorsLimitsAndExpiresCreditWithout
                                "kv_meta.reclaim.stage_count",
                                {{"instance_group", "limited"}, {"stage", "delete_timeout"}, {"status", "error"}})
                            .Get() == 1 &&
-                   metrics_registry_->GetGauge("kv_meta.reclaim.pending_bytes", tags).Get() == 0;
+                   metrics_registry_->GetGauge("kv_meta.reclaim.pending_credit_bytes", tags).Get() == 0;
         },
         std::chrono::seconds(2));
     const auto calls_before_release = pace_backend_->delete_calls();
+    EXPECT_EQ(23, metrics_registry_->GetGauge("kv_meta.reclaim.pending_bytes", tags).Get());
     const auto pending_before_release = metrics_registry_->GetGauge("kv_meta.reclaim.pending_requests", tags).Get();
     release.set_value();
     EXPECT_TRUE(timed_out);

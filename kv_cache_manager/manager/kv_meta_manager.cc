@@ -301,7 +301,10 @@ public:
         if (owner_ && owner_->cache_manager_->metrics_registry()) {
             auto metrics = owner_->cache_manager_->metrics_registry();
             active_sessions_ = metrics->GetGauge("kv_meta.active_write_sessions");
+            metrics->GetGauge("kv_meta.write_session_capacity") = max_sessions_;
             rejected_sessions_ = metrics->GetCounter("kv_meta.write_session_rejected_total");
+            active_sessions_ = 0;
+            rejected_sessions_ += 0;
         }
     }
     ~KvMetaWriteSessionManager() { StopAndDiscard(); }
@@ -597,6 +600,8 @@ private:
                 continue;
             }
             const auto result = it->future.get();
+            owner_->ObserveReclaimGauge(it->group, "deleted_count", result.reclaimed_locations);
+            owner_->ObserveReclaimGauge(it->group, "deleted_bytes", result.reclaimed_bytes);
             owner_->AddReclaimCounter(it->group, "deleted_objects_total", result.reclaimed_locations);
             owner_->AddReclaimCounter(it->group, "deleted_bytes_total", result.reclaimed_bytes);
             owner_->AddReclaimCounter(it->group, "physical_deleted_objects_total", result.physical_deleted_locations);
@@ -739,19 +744,22 @@ private:
         const std::uint64_t target = static_cast<std::uint64_t>(static_cast<long double>(capacity) * threshold);
         owner_->ObserveReclaimGauge(group->name(), "usage_bytes", group_usage);
         owner_->ObserveReclaimGauge(group->name(), "target_bytes", target);
-        std::uint64_t pending_bytes = 0;
+        std::uint64_t pending_bytes = 0, pending_credit_bytes = 0;
         std::size_t pending_requests = 0;
         std::size_t pending_locations = 0;
         for (const auto &pending : pending_deletes_) {
             if (pending.group == group->name()) {
+                pending_bytes = SaturatingAdd(pending_bytes, pending.bytes);
                 if (pending.credit_enabled) {
-                    pending_bytes = SaturatingAdd(pending_bytes, pending.bytes);
+                    pending_credit_bytes = SaturatingAdd(pending_credit_bytes, pending.bytes);
                 }
                 ++pending_requests;
                 pending_locations += pending.ids.size();
             }
         }
         owner_->ObserveReclaimGauge(group->name(), "pending_bytes", pending_bytes);
+        owner_->ObserveReclaimGauge(group->name(), "pending_credit_bytes", pending_credit_bytes);
+        owner_->ObserveReclaimGauge(group->name(), "pending_objects", pending_locations);
         owner_->ObserveReclaimGauge(group->name(), "pending_requests", pending_requests);
         std::uint64_t oldest_ms = 0;
         for (const auto &pending : pending_deletes_) {
@@ -764,7 +772,8 @@ private:
             }
         }
         owner_->ObserveReclaimGauge(group->name(), "pending_oldest_ms", oldest_ms);
-        const std::uint64_t projected_usage = group_usage > pending_bytes ? group_usage - pending_bytes : 0;
+        const std::uint64_t projected_usage =
+            group_usage > pending_credit_bytes ? group_usage - pending_credit_bytes : 0;
         if (projected_usage <= target) {
             owner_->ObserveReclaimStage(group->name(), "round", "skipped");
             return;
@@ -1016,6 +1025,9 @@ bool KvMetaManager::Init() {
         mutation_lock_count_ = metrics->GetCounter("kv_meta.mutation_lock_count");
         mutation_lock_wait_us_ = metrics->GetCounter("kv_meta.mutation_lock_wait_us");
         mutation_lock_hold_us_ = metrics->GetCounter("kv_meta.mutation_lock_hold_us");
+        mutation_lock_count_ += 0;
+        mutation_lock_wait_us_ += 0;
+        mutation_lock_hold_us_ += 0;
     }
     data_storage_selector_ =
         std::make_unique<DataStorageSelector>(cache_manager_->meta_indexer_manager(), registry_manager_);

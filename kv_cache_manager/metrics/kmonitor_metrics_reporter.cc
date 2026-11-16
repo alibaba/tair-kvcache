@@ -216,7 +216,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, event_report_probe_unknown_count);
     DECLARE_METRICS(cache_gc, event_report_delete_location_count);
 
-    std::unordered_map<std::string, std::unique_ptr<kmonitor::MutableMetric>> kv_meta_reclaim_metrics;
+    std::unordered_map<std::string, std::unique_ptr<kmonitor::MutableMetric>> kv_meta_metrics;
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -540,21 +540,41 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
 
     // Registry counters remain cumulative GAUGEs; rate conversion belongs to the query.
-    for (const char *suffix : {"stage_count",
-                               "usage_bytes",
-                               "target_bytes",
-                               "candidate_count",
-                               "selected_count",
-                               "deleted_count",
-                               "deleted_bytes"}) {
-        const std::string name = std::string("kv_meta.reclaim.") + suffix;
+    for (const std::string name : {"kv_meta.reclaim.stage_count",
+                                   "kv_meta.reclaim.usage_bytes",
+                                   "kv_meta.reclaim.target_bytes",
+                                   "kv_meta.reclaim.candidate_count",
+                                   "kv_meta.reclaim.selected_count",
+                                   "kv_meta.reclaim.deleted_count",
+                                   "kv_meta.reclaim.deleted_bytes",
+                                   "kv_meta.reclaim.pending_bytes",
+                                   "kv_meta.reclaim.pending_credit_bytes",
+                                   "kv_meta.reclaim.pending_objects",
+                                   "kv_meta.reclaim.pending_requests",
+                                   "kv_meta.reclaim.pending_oldest_ms",
+                                   "kv_meta.reclaim.round_time_us",
+                                   "kv_meta.reclaim.submitted_count",
+                                   "kv_meta.reclaim.submitted_bytes",
+                                   "kv_meta.reclaim.submitted_objects_total",
+                                   "kv_meta.reclaim.submitted_bytes_total",
+                                   "kv_meta.reclaim.deleted_objects_total",
+                                   "kv_meta.reclaim.deleted_bytes_total",
+                                   "kv_meta.reclaim.physical_deleted_objects_total",
+                                   "kv_meta.reclaim.physical_deleted_bytes_total",
+                                   "kv_meta.reclaim.maintenance_touch_keys_total",
+                                   "kv_meta.active_write_sessions",
+                                   "kv_meta.write_session_capacity",
+                                   "kv_meta.write_session_rejected_total",
+                                   "kv_meta.mutation_lock_count",
+                                   "kv_meta.mutation_lock_wait_us",
+                                   "kv_meta.mutation_lock_hold_us"}) {
         std::unique_ptr<kmonitor::MutableMetric> metric(
             reporter->RegisterMetric(name, kmonitor::GAUGE, kmonitor::FATAL));
         if (!metric) {
             KVCM_LOG_ERROR("failed to register metric:[%s]", name.c_str());
             return false;
         }
-        ctx_->kv_meta_reclaim_metrics[name] = std::move(metric);
+        ctx_->kv_meta_metrics[name] = std::move(metric);
     }
 
     // cache manager
@@ -1117,8 +1137,8 @@ void KmonitorMetricsReporter::ReportInterval() {
             }
         };
 
-        // Only the seven explicitly registered names are looked up, never the full registry.
-        for (const auto &[name, metric] : ctx_->kv_meta_reclaim_metrics) {
+        // Only explicitly registered names are looked up, never the full registry.
+        for (const auto &[name, metric] : ctx_->kv_meta_metrics) {
             report_registry_metric(metric.get(), name);
         }
 
