@@ -19,10 +19,14 @@ only the newest ask's answer may ever be consumed.
 
 **Answers expire.** The manager may delete the blocks a cached answer
 points to at any time after it answered, so a hit is served only while
-younger than ``max_answer_age_s``, measured from query issue. An
-expired hit is a miss: the slot is superseded and the query re-issued.
-In-flight queries are never expired -- the client's request timeout
-bounds them.
+younger than ``max_answer_age_s``. That exposure starts when the RPC
+actually starts, not when the query enters the executor: queueing before
+the request reaches the manager cannot age a pointer the manager has not
+created yet. RPC start is deliberately earlier than the manager's snapshot,
+so request flight, manager processing, response flight and post-answer
+scheduler waiting all remain inside the measured exposure. An expired hit
+is a miss: the slot is superseded and the query re-issued. In-flight
+queries are never expired -- the client's request timeout bounds them.
 
 **An empty answer never expires.** ``[]`` contains no location pointer, so
 there is no staleness risk. Keep it until the query key changes; expiring it
@@ -69,7 +73,8 @@ class _Query:
     version: int = 0
     # None until the manager answered.
     locations: Optional[List[dict]] = None
-    ask_time: float = 0.0  # monotonic clock, at query issue
+    # Monotonic clock at actual RPC start, after any executor queueing.
+    exposure_start: Optional[float] = None
 
 
 def manager_block_keys(token_ids, block_size: int) -> List[int]:
@@ -145,9 +150,13 @@ class LocationQueryManager:
         )
 
     def _fetch_from_manager(
-        self, request: "Request", computed_blocks: int
+        self, request: "Request", computed_blocks: int, q: _Query
     ) -> List[dict]:
-        """Run the actual GetCacheLocation call (http thread or inline)."""
+        """Run GetCacheLocation and mark the pointer exposure's conservative start."""
+        with self._lock:
+            # Before serialization and request flight: the manager can only
+            # snapshot the location later, so this never understates its age.
+            q.exposure_start = time.monotonic()
         get_request = {
             "trace_id": request.request_id,
             "token_ids": request.prompt_token_ids,
@@ -178,7 +187,7 @@ class LocationQueryManager:
     def _query_async(self, request: "Request", key: QueryCacheKey, q: _Query) -> None:
         def run() -> None:
             try:
-                locations = self._fetch_from_manager(request, key.computed_blocks)
+                locations = self._fetch_from_manager(request, key.computed_blocks, q)
             except Exception as e:
                 logger.warning(
                     "get_cache_location error, request_id: %s, error: %s",
@@ -237,7 +246,11 @@ class LocationQueryManager:
                     # slower than the horizon (see module docstring).
                     self._expired_streaks.pop(key, None)
                     return q.locations
-                age = time.monotonic() - q.ask_time
+                age = (
+                    time.monotonic() - q.exposure_start
+                    if q.exposure_start is not None
+                    else float("inf")  # no timestamp: fail closed, never serve
+                )
                 if age <= self._max_answer_age_s:
                     self._expired_streaks.pop(key, None)
                     return q.locations
@@ -246,8 +259,8 @@ class LocationQueryManager:
                 expired_count = self._expired_streaks.get(key, 0) + 1
                 self._expired_streaks[key] = expired_count
                 logger.info(
-                    "req:%s location answer expired after %.3fs "
-                    "(max %.3fs); re-querying",
+                    "req:%s location answer expired after %.3fs from RPC "
+                    "start (max %.3fs); re-querying",
                     req_id,
                     age,
                     self._max_answer_age_s,
@@ -270,7 +283,6 @@ class LocationQueryManager:
             q = _Query(
                 key=key,
                 version=q.version + 1 if q is not None else 0,
-                ask_time=time.monotonic(),
             )
             self._queries[req_id] = q
 
@@ -278,7 +290,7 @@ class LocationQueryManager:
             self._query_async(request, key, q)
             return None
         try:
-            locations = self._fetch_from_manager(request, computed_blocks)
+            locations = self._fetch_from_manager(request, computed_blocks, q)
         except Exception as e:
             logger.warning(
                 "get_cache_location error, request_id: %s, error: %s", req_id, e

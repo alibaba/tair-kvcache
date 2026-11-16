@@ -122,7 +122,7 @@ class LocationQueryFanoutTest(unittest.TestCase):
 
         The hook call also observes (and counts) the previous answer's expiry.
         Sleeping while the RPC is genuinely in flight proves the age gate fired
-        because of manager latency, not because a test rewrote ``ask_time``.
+        because of manager latency, not because a test rewrote the clock.
         """
         issued = time.monotonic()
         self.assertIsNone(lqm.get_locations_for_query(self.req, offset))
@@ -277,10 +277,51 @@ class LocationQueryFanoutTest(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Expiry: an old answer is a miss, never a hit
     # ------------------------------------------------------------------ #
+    def test_executor_queue_before_rpc_does_not_age_a_nonexistent_pointer(self):
+        # Occupy the only HTTP worker so this query cannot start its RPC until
+        # after the clock advances. The manager creates the pointer only after
+        # that queue delay, so charging the delay would expire a brand-new hit.
+        self.executor.shutdown(wait=True)
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        blocker = threading.Event()
+        blocking_future = self.executor.submit(blocker.wait)
+        clock = FakeClock()
+        try:
+            with patch.object(location_query_manager, "time", clock):
+                lqm = self._manager()
+                self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+                clock.advance(3600.0)
+                blocker.set()
+                blocking_future.result(timeout=1)
+                self._gate(0).set()
+                self._await_landing(lqm)
+                self.assertEqual(
+                    lqm.get_locations_for_query(self.req, 0), ["loc0", "loc1"]
+                )
+                self.assertEqual(self.client.calls, 1)
+        finally:
+            blocker.set()
+
+    def test_post_answer_scheduler_wait_still_ages_the_pointer(self):
+        # Excluding pre-RPC executor queueing must not exclude the other side:
+        # once the RPC has started, its round trip and every later slot wait are
+        # real location exposure and remain subject to the freshness gate.
+        clock = FakeClock()
+        with patch.object(location_query_manager, "time", clock):
+            lqm = self._manager()
+            self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+            self._gate(0).set()
+            self._await_landing(lqm)
+            clock.advance(1.1)
+            self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+            self._gate(1)
+            self.assertEqual(self.client.calls, 2)
+            self.assertEqual(lqm.stale_supersede_count, 1)
+
     def _expire(self, lqm, req_id="r1"):
-        """Age the request's slot far past every horizon."""
+        """Age the request's pointer exposure far past every horizon."""
         with lqm._lock:
-            lqm._queries[req_id].ask_time -= 3600.0
+            lqm._queries[req_id].exposure_start -= 3600.0
 
     def test_expired_answer_is_refetched_not_served(self):
         lqm = self._manager()
