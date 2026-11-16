@@ -11,6 +11,14 @@ class MetaCacheBaseBackend : public MetaStorageBackend {
 public:
     ~MetaCacheBaseBackend() override = default;
 
+    // Check estimated local metadata growth before persistent writes; no reservation.
+    virtual ErrorCode CheckWriteCapacity(KeyType /*key*/,
+                                         const CacheLocationMap & /*locations*/,
+                                         const PropertyMap & /*properties*/,
+                                         bool /*replace*/) noexcept {
+        return EC_OK;
+    }
+
     // Bring base-class write overloads into scope (without previous_error_codes).
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::DeleteLocations;

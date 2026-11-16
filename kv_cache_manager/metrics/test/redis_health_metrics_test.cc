@@ -567,7 +567,7 @@ TEST_F(RedisHealthMetricsTest, RuntimeSnapshotKeepsInitializationValues) {
     MetaIndexerManager indexers;
     auto config = std::make_shared<MetaIndexerConfig>();
     config->GetMetaStorageBackendConfig()->SetStorageType("local");
-    ASSERT_EQ(EC_OK, indexers.CreateMetaIndexer("instance", config));
+    ASSERT_EQ(EC_OK, indexers.CreateMetaIndexer("instance", config, {}, nullptr));
     config->GetMetaStorageBackendConfig()->SetStorageType("redis");
     config->GetMetaStorageBackendConfig()->SetStorageUri("redis://new:6379");
     const auto snapshot = indexers.TryGetStorageBackendConfigs();

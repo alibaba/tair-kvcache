@@ -24,9 +24,6 @@ Then query metrics with PromQL:
 # Service QPS (rate over 1 minute)
 rate(kvcm_service_query_counter[1m])
 
-# Search cache hit ratio
-kvcm_meta_indexer_search_cache_hit_ratio
-
 # GetCacheLocation block-level hit rate (5-minute window)
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
   / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
@@ -187,7 +184,6 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.get_io_time_us` | gauge | Wall-time union of metadata-backend call intervals; local mode includes LRU/locks/copies, excludes parallel projection, and does not imply Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | Wall-time union of GetHostCacheState visibility and host/spec projection callback intervals (us) |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
-| `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
 
 `grpc.response_counter` counts the final gRPC status the server prepares to send, including framework
@@ -210,7 +206,6 @@ errors in response bodies remain in `service.error_counter`.
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
-| `cache_manager_instance.local_key_count` | gauge | Resident keys in the instance's local metadata index, labeled by `instance_group` and `instance_id` |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
 | `cache_manager_instance.meta_cache_usage` | gauge | Estimated per-instance local metadata memory (LRU charge, bytes), labeled by `instance_group` and `instance_id` |
 
@@ -220,15 +215,6 @@ Local mode reports the instance's LRU charge, cached mode reports the local port
 It uses the same accounting as `meta_indexer.total_cache_usage`, but sampling times differ, so concurrent writes
 can prevent an exact instantaneous sum. Charge is not RSS or actual container memory and does not fully account
 for fixed lock arrays, allocator overhead, and similar costs. `byte_size` measures KVCache data quota usage.
-
-`cache_manager_instance.local_key_count` is sampled by the same recorder approximately every five seconds and
-exported as `kvcm_cache_manager_instance_local_key_count` in Prometheus. It reads counters already maintained by
-the local LRU shards without scanning keys, accessing Redis, or updating LRU access order. Each resident key is
-counted once, regardless of its Location count or state. Local and cached modes report the current local index;
-during recovery this includes only entries already loaded locally. Backends without a local index report zero.
-Shards are read individually, so this is a concurrent sample. The existing `cache_manager_instance.key_count`
-and `meta_indexer.total_key_count` retain their logical counts from `MetaIndexer::GetKeyCount()` and their existing
-behavior. The new metric does not participate in quota or reclaim decisions.
 
 `is_leader` is a node-level metric without storage labels. It reports ownership
 of the leader lease (1/0), including promotion/recovery, and does not imply that

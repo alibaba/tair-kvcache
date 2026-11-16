@@ -528,7 +528,7 @@ public:
         meta_indexer_config->meta_storage_backend_config_ = ConstructMetaStorageBackendConfig();
         meta_indexer_config->mutex_shard_num_ = 32;
         meta_indexer_config->max_key_count_ = 10000;
-        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config) == ErrorCode::EC_OK;
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr) == ErrorCode::EC_OK;
     }
 
     bool CreateDummyStorage(const std::string &name, const std::string &root) {
@@ -671,7 +671,7 @@ public:
     }
 
     std::string GetRawTieredWriteTarget(int64_t block_key) {
-        auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+        std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kInstance);
         if (indexer == nullptr) {
             return {};
         }
@@ -686,7 +686,7 @@ public:
     }
 
     void SetRawMark(int64_t block_key, const std::string &target, std::optional<std::string> deadline) {
-        auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+        std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kInstance);
         ASSERT_TRUE(indexer);
         auto modifier = [&target, &deadline](const LocationIdVector & /*existing*/,
                                              ErrorCode get_ec,
@@ -1302,9 +1302,9 @@ TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
     ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 3));
 
     auto stats = mgr.GetStats();
-    ASSERT_EQ(2u, stats.marks_added);      // actual=2, not request=3
+    ASSERT_EQ(2u, stats.marks_added); // actual=2, not request=3
     ASSERT_EQ(0u, stats.marks_cleared);
-    ASSERT_EQ(2u, stats.active_marks);     // 2-0=2, 不会有幽灵 +1
+    ASSERT_EQ(2u, stats.active_marks); // 2-0=2, 不会有幽灵 +1
 
     // 清掉全部两个成功的 mark → active 归零
     ClearMarkForTest(mgr, kInstance, 1);
@@ -1312,7 +1312,7 @@ TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
     stats = mgr.GetStats();
     ASSERT_EQ(2u, stats.marks_added);
     ASSERT_EQ(2u, stats.marks_cleared);
-    ASSERT_EQ(0u, stats.active_marks);     // 完全收敛，无漂移
+    ASSERT_EQ(0u, stats.active_marks); // 完全收敛，无漂移
 }
 
 // 打标到未注册的 target storage 应失败（EC_NOENT）且不写入任何 mark，
@@ -1574,8 +1574,7 @@ TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacityAn
         request.dst_storage_name = "cold_01";
         request.src_specs.reserve(3);
         for (size_t i = 0; i < 3; ++i) {
-            request.src_specs.emplace_back(spec_names[i],
-                                           "dummy://hot_01/source_" + std::to_string(i) + "?size=1");
+            request.src_specs.emplace_back(spec_names[i], "dummy://hot_01/source_" + std::to_string(i) + "?size=1");
         }
         return request;
     };
@@ -1968,9 +1967,9 @@ TEST_F(MigrationManagerTest, TestCancelDefersCleanupAndKeepsSlot) {
 
     // Cancel：标记 cancelling，不删不移除。
     ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
-    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, block_key));            // slot 保留
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, block_key));                     // slot 保留
     ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, dst_loc)); // 目标仍被保护
-    ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));      // 目标未删
+    ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));               // 目标未删
 
     // cancelling 期间同 block 不接受新提交（slot 占用）。
     ASSERT_EQ(ErrorCode::EC_EXIST, mgr.Submit("t2", req));
@@ -2544,7 +2543,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_cold/"));
 
-    auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kInstance);
     ASSERT_NE(nullptr, indexer);
     indexer->batch_key_size_ = 1;
     indexer->max_key_count_ = 1;
@@ -2565,8 +2564,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
         req.src_location_id = "src_" + std::to_string(block_key);
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
-        req.src_specs = {
-            LocationSpec("TP0", "dummy://hot_01/src_" + std::to_string(block_key) + "?size=4")};
+        req.src_specs = {LocationSpec("TP0", "dummy://hot_01/src_" + std::to_string(block_key) + "?size=4")};
         return req;
     };
 
@@ -2584,8 +2582,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     const auto results =
         mgr.BatchSubmit("batch_add_location_partial", {make_request(block_keys[0]), make_request(block_keys[1])});
     ASSERT_EQ(2u, results.size());
-    ASSERT_TRUE((results[0] == EC_OK && results[1] == EC_NOSPC) ||
-                (results[1] == EC_OK && results[0] == EC_NOSPC));
+    ASSERT_TRUE((results[0] == EC_OK && results[1] == EC_NOSPC) || (results[1] == EC_OK && results[0] == EC_NOSPC));
 
     const std::size_t success_index = results[0] == EC_OK ? 0 : 1;
     const std::size_t failed_index = 1 - success_index;
@@ -2602,11 +2599,12 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
 
     // 统一口径：add 成功项已提交 executor（stub pending future），计入其 4 字节；
     // add 失败项（EC_NOSPC）已回滚且未提交，不计入。
-    EXPECT_EQ(4u,
-              metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
-                                            {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
-                                             {"unique_name", "cold_01"}})
-                  .Get());
+    EXPECT_EQ(
+        4u,
+        metrics_registry_
+            ->GetCounter("data_storage.write_bytes_dispatched_total",
+                         {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)}, {"unique_name", "cold_01"}})
+            .Get());
 }
 
 // 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
@@ -4252,11 +4250,11 @@ TEST_F(MigrationManagerTest, TestHasActiveCopyTargetLocationIsScoped) {
     ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(other_instance, 2, shared_dst));
 
     // 同 loc_id 但 scope 不匹配 → false（旧的裸 id 实现在此会误报 true）
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 2, shared_dst));         // 错的 block
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(other_instance, 1, shared_dst));    // 错的 block
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 2, shared_dst));              // 错的 block
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(other_instance, 1, shared_dst));         // 错的 block
     ASSERT_FALSE(mgr.HasActiveCopyTargetLocation("nonexistent_instance", 1, shared_dst)); // 错的 instance
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, "different_loc"));    // 错的 loc_id
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, ""));                 // 空 loc_id
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, "different_loc"));         // 错的 loc_id
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, ""));                      // 空 loc_id
 }
 
 TEST_F(MigrationManagerTest, TestSubmitRejectedAfterStop) {

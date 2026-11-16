@@ -23,9 +23,6 @@ scrape_configs:
 # 服务 QPS（1 分钟速率）
 rate(kvcm_service_query_counter[1m])
 
-# 搜索缓存命中率
-kvcm_meta_indexer_search_cache_hit_ratio
-
 # GetCacheLocation Block 级命中率（5 分钟窗口）
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
   / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
@@ -173,7 +170,6 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_indexer.get_io_time_us` | gauge | metadata backend 调用区间的墙钟并集；local 模式包含 LRU/锁/复制，不包含并行 projection，也不表示 Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
-| `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
 | `cache_manager_instance.event_report_location_lifetime_min_us` | gauge | 最近有效 BLOCK_DELETE 批次中，成功删除的 Location 的最短存活时间（微秒） |
 | `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |
@@ -198,7 +194,6 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
-| `cache_manager_instance.local_key_count` | gauge | 单实例 local 元数据索引的驻留 key 数量，标签为 `instance_group`、`instance_id` |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 | `cache_manager_instance.meta_cache_usage` | gauge | 单实例本地元数据估算内存（LRU charge，字节），标签为 `instance_group`、`instance_id` |
 
@@ -207,13 +202,6 @@ Prometheus 名称为 `kvcm_cache_manager_instance_meta_cache_usage`。local 模�
 cached 模式统计本地部分，纯 Redis 模式为 0。该口径与 `meta_indexer.total_cache_usage` 一致，
 但两者采样时刻不同，并发写入时不保证瞬时加总相等。charge 不代表 RSS 或容器实际内存，
 不包含完整的固定锁数组、分配器等开销；`byte_size` 则是 KVCache 数据的配额用量。
-
-`cache_manager_instance.local_key_count` 由同一 Recorder 约每 5 秒采集一次，Prometheus 名称为
-`kvcm_cache_manager_instance_local_key_count`。它读取 local LRU 各 shard 已维护的条目计数，不扫描 key，
-不访问 Redis，也不更新 LRU 访问顺序。每个驻留 key 只计一次，与其 Location 数量和状态无关。
-local 和 cached 模式均统计当前本地索引；恢复期间只反映已经加载到 local 的条目，没有 local 后端时为 0。
-各 shard 分别读取，属于并发采样值。原有 `cache_manager_instance.key_count` 和 `meta_indexer.total_key_count`
-继续使用 `MetaIndexer::GetKeyCount()` 的逻辑计数，含义和行为不变；新指标不参与配额或回收决策。
 
 `is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
 不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。

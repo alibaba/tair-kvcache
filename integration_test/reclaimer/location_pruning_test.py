@@ -552,10 +552,6 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                             "storage_type": "dummy",
                             "storage_uri": f"file://{self.get_workdir()}/meta_storage_{self._instance_group_name}",
                         },
-                        "meta_cache_policy_config": {
-                            "capacity": 1024 * 1024 * 1024,
-                            "type": "LRU",
-                        },
                         "persist_metadata_interval_time_ms": 0,
                     }
                 },

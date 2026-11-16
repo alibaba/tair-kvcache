@@ -1,3 +1,6 @@
+#include <optional>
+
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/account.h"
@@ -104,7 +107,7 @@ void RegistryManagerLocalBackendTest::RegisterInstance(const std::string &instan
     LocationSpecInfo info;
     ModelDeployment model_deployment;
     auto ec = registry_manager_->RegisterInstance(
-        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment);
+        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment, {}, 0, std::nullopt);
     ASSERT_EQ(EC_OK, ec);
 }
 
@@ -155,8 +158,15 @@ TEST_F(RegistryManagerLocalBackendTest, TestRemovingInstanceIntentSurvivesRecove
     updated_group.set_version(group->version() + 1);
     EXPECT_NE(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
     EXPECT_NE(EC_OK,
-              registry_manager_->RegisterInstance(
-                  request_context_.get(), "group1", "instance1", 1024, {LocationSpecInfo{}}, ModelDeployment{}));
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "group1",
+                                                  "instance1",
+                                                  1024,
+                                                  {LocationSpecInfo{}},
+                                                  ModelDeployment{},
+                                                  {},
+                                                  0,
+                                                  std::nullopt));
 
     ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
     ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
@@ -182,9 +192,9 @@ TEST_F(RegistryManagerLocalBackendTest, TestRetiredInstanceRecordRecovery) {
     ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "retired_without_info"));
     ASSERT_EQ(EC_OK,
               registry_manager_->storage_->UpsertField("instance", "retired_with_info", "retired_with_info:retired"));
-    ASSERT_EQ(EC_OK,
-              registry_manager_->storage_->UpsertField(
-                  "instance", "retired_without_info", "retired_without_info:retired"));
+    ASSERT_EQ(
+        EC_OK,
+        registry_manager_->storage_->UpsertField("instance", "retired_without_info", "retired_without_info:retired"));
     ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("retired_without_info", "retired_without_info"));
 
     ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
@@ -268,8 +278,7 @@ TEST_F(RegistryManagerLocalBackendTest, TestMalformedDeletingRecordDoesNotHideSe
     CreateInstanceGroup("group1");
     RegisterInstance("group1", "healthy_instance");
     ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("instance", "broken_instance", "broken_instance"));
-    ASSERT_EQ(EC_OK,
-              registry_manager_->storage_->UpsertField("broken_instance", "broken_instance", "invalid_json"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("broken_instance", "broken_instance", "invalid_json"));
 
     ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
     EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
@@ -363,17 +372,14 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         current_spec->set_media_type(current_media_type);
         // This open-source test uses an NFS backend as a configured-backend holder because the
         // open-source TairMempool backend is intentionally non-functional.
-        backend->config_ =
-            StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
+        backend->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
 
         auto requested_spec = std::make_shared<TairMemPoolStorageSpec>(*current_spec);
         requested_spec->set_media_type(requested_media_type);
-        StorageConfig requested_config(
-            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
+        StorageConfig requested_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
         ASSERT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), requested_config, true));
 
-        const auto unchanged_backend =
-            registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
+        const auto unchanged_backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
         ASSERT_EQ(backend, unchanged_backend);
         const auto unchanged_spec =
             std::dynamic_pointer_cast<TairMemPoolStorageSpec>(unchanged_backend->GetStorageConfig().storage_spec());
@@ -381,10 +387,8 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         ASSERT_EQ(current_media_type, unchanged_spec->media_type());
     };
 
-    verify_media_type_change_rejected(
-        "pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
-    verify_media_type_change_rejected(
-        "pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
+    verify_media_type_change_rejected("pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
+    verify_media_type_change_rejected("pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupManagement) {
@@ -491,9 +495,10 @@ TEST_F(RegistryManagerLocalBackendTest, DuplicateInstanceCannotMoveToAnotherGrou
 
     LocationSpecInfo info;
     ModelDeployment model_deployment;
-    EXPECT_EQ(EC_DUPLICATE_ENTITY,
-              registry_manager_->RegisterInstance(
-                  request_context_.get(), "group2", "shared_instance", 1024, {info}, model_deployment));
+    EXPECT_EQ(
+        EC_DUPLICATE_ENTITY,
+        registry_manager_->RegisterInstance(
+            request_context_.get(), "group2", "shared_instance", 1024, {info}, model_deployment, {}, 0, std::nullopt));
     const auto existing = registry_manager_->GetInstanceInfo(request_context_.get(), "shared_instance");
     ASSERT_NE(nullptr, existing);
     EXPECT_EQ("group1", existing->instance_group_name());
@@ -938,6 +943,43 @@ TEST_F(RegistryManagerLocalBackendTest, TestRecoverRetryLoopLifecycle) {
         rm->StartRecoverRetryLoop();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         rm.reset(); // destructor -> DoCleanup -> StopRecoverRetryLoop
+    }
+}
+
+TEST_F(RegistryManagerLocalBackendTest, DisableWriteSessionForOneSpecEnv) {
+    ASSERT_TRUE(InitRegistryManager("local://?cluster_name=one_spec_env"));
+    CreateInstanceGroup("group");
+    const std::vector<LocationSpecInfo> one{LocationSpecInfo("spec", 4096)};
+    const std::vector<LocationSpecInfo> many{LocationSpecInfo("spec", 4096), LocationSpecInfo("other", 4096)};
+    {
+        ScopedEnv env("kvcm.disable_write_session_for_one_spec", "false");
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "default", 1024, one, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "default")->disable_write_session());
+    }
+    {
+        ScopedEnv env("kvcm.disable_write_session_for_one_spec", "true");
+        for (const std::optional<bool> requested :
+             {std::optional<bool>{}, std::optional<bool>{false}, std::optional<bool>{true}}) {
+            const std::string id = requested.has_value() ? (*requested ? "explicit_true" : "explicit_false") : "auto";
+            ASSERT_EQ(EC_OK,
+                      registry_manager_->RegisterInstance(
+                          request_context_.get(), "group", id, 1024, one, {}, {}, 0, requested));
+            EXPECT_EQ(requested.value_or(true),
+                      registry_manager_->GetInstanceInfo(request_context_.get(), id)->disable_write_session());
+            ASSERT_EQ(EC_OK,
+                      registry_manager_->RegisterInstance(
+                          request_context_.get(), "group", id, 1024, one, {}, {}, 0, requested));
+        }
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "many", 1024, many, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "many")->disable_write_session());
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "default", 1024, one, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "default")->disable_write_session());
     }
 }
 

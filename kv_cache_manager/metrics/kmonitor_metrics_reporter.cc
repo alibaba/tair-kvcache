@@ -82,12 +82,7 @@ struct KmonitorMetricsReporter::Context {
 
     // meta indexer metrics
     DECLARE_METRICS(meta_indexer, query_key_count);
-    DECLARE_METRICS(meta_indexer, get_not_exist_key_count);
     DECLARE_METRICS(meta_indexer, query_batch_num);
-    DECLARE_METRICS(meta_indexer, search_cache_hit_count);
-    DECLARE_METRICS(meta_indexer, search_cache_miss_count);
-    DECLARE_METRICS(meta_indexer, search_cache_hit_ratio);
-    DECLARE_METRICS(meta_indexer, io_data_size);
     DECLARE_METRICS(meta_indexer, put_io_time_us);
     DECLARE_METRICS(meta_indexer, upsert_io_time_us);
     DECLARE_METRICS(meta_indexer, lock_wait_time_us);
@@ -115,8 +110,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta indexer metrics
     DECLARE_METRICS(meta_indexer, total_key_count);
+    DECLARE_METRICS(meta_indexer, total_location_count);
     DECLARE_METRICS(meta_indexer, total_cache_usage);
-    DECLARE_METRICS(meta_indexer, total_data_size);
 
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
@@ -220,7 +215,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
-    DECLARE_METRICS(cache_manager_instance, local_key_count);
+    DECLARE_METRICS(cache_manager_instance, location_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
     DECLARE_METRICS(cache_manager_instance, meta_cache_usage);
     DECLARE_METRICS(cache_manager_instance, async_queue_max_size);
@@ -401,12 +396,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta indexer metrics
     REGISTER_GAUGE_METRIC(meta_indexer, query_key_count);
-    REGISTER_GAUGE_METRIC(meta_indexer, get_not_exist_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, query_batch_num);
-    REGISTER_GAUGE_METRIC(meta_indexer, search_cache_hit_count);
-    REGISTER_GAUGE_METRIC(meta_indexer, search_cache_miss_count);
-    REGISTER_GAUGE_METRIC(meta_indexer, search_cache_hit_ratio);
-    REGISTER_GAUGE_METRIC(meta_indexer, io_data_size);
     REGISTER_GAUGE_METRIC(meta_indexer, put_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, upsert_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, lock_wait_time_us);
@@ -434,8 +424,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta indexer metrics
     REGISTER_GAUGE_METRIC(meta_indexer, total_key_count);
+    REGISTER_GAUGE_METRIC(meta_indexer, total_location_count);
     REGISTER_GAUGE_METRIC(meta_indexer, total_cache_usage);
-    REGISTER_GAUGE_METRIC(meta_indexer, total_data_size);
 
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
@@ -541,7 +531,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
-    REGISTER_GAUGE_METRIC(cache_manager_instance, local_key_count);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, location_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_queue_max_size);
@@ -651,12 +641,7 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
 
         // meta indexer metrics
         REPORT_COLLECTED_METRICS(meta_indexer, query_key_count);
-        REPORT_STEAL_METRICS(meta_indexer, get_not_exist_key_count);
         REPORT_STEAL_METRICS(meta_indexer, query_batch_num);
-        REPORT_STEAL_METRICS(meta_indexer, search_cache_hit_count);
-        REPORT_STEAL_METRICS(meta_indexer, search_cache_miss_count);
-        REPORT_STEAL_METRICS(meta_indexer, search_cache_hit_ratio);
-        REPORT_STEAL_METRICS(meta_indexer, io_data_size);
         REPORT_STEAL_METRICS(meta_indexer, put_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, upsert_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, lock_wait_time_us);
@@ -725,12 +710,15 @@ void KmonitorMetricsReporter::ReportInterval() {
         }
 
         double total_key_count_v;
+        double total_location_count_v;
         double total_cache_usage_v;
         GET_METRICS_(p, meta_indexer, total_key_count, total_key_count_v);
+        GET_METRICS_(p, meta_indexer, total_location_count, total_location_count_v);
         GET_METRICS_(p, meta_indexer, total_cache_usage, total_cache_usage_v);
 
         const kmonitor::MetricsTags tags;
         REPORT_METRICS(meta_indexer, total_key_count, total_key_count_v);
+        REPORT_METRICS(meta_indexer, total_location_count, total_location_count_v);
         REPORT_METRICS(meta_indexer, total_cache_usage, total_cache_usage_v);
     } while (false);
 
@@ -1149,9 +1137,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     double key_count_v, byte_size_v, max_lru_age_us_v;
                     GET_METRICS_(p, cache_manager_instance, key_count, key_count_v);
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
-                    double local_key_count_v;
-                    GET_METRICS_(p, cache_manager_instance, local_key_count, local_key_count_v);
-                    REPORT_METRICS(cache_manager_instance, local_key_count, local_key_count_v);
+                    double location_count_v;
+                    GET_METRICS_(p, cache_manager_instance, location_count, location_count_v);
+                    REPORT_METRICS(cache_manager_instance, location_count, location_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
                     double meta_cache_usage_v;

@@ -36,7 +36,6 @@ public:
     virtual size_t GetMemUsage() const noexcept = 0;
 
     // Resident local metadata keys; backends without a local index contribute zero.
-    virtual size_t GetLocalKeyCount() const noexcept { return 0; }
 
     // Oldest access timestamp in microseconds; INT64_MAX if unavailable or empty.
     virtual int64_t GetOldestAccessTime() const noexcept = 0;

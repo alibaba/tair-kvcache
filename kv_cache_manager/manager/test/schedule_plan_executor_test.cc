@@ -94,19 +94,31 @@ void CapturePhysicalDeleteWarnings(int level, const char *, int, const char *fun
 
 Stub *cas_refresh_stub = nullptr;
 std::string location_to_refresh_during_cas;
-ErrorCode RefreshLocationBeforeCas(void *obj,
-                                   RequestContext *context,
-                                   const KeyVector &keys,
-                                   const std::vector<std::vector<MetaSearcher::LocationCASTask>> &tasks,
-                                   std::vector<std::vector<ErrorCode>> &results,
-                                   bool authoritative_read) {
-    cas_refresh_stub->reset(ADDR(MetaSearcher, BatchCASLocationStatus));
-    auto *searcher = static_cast<MetaSearcher *>(obj);
-    std::vector<std::vector<ErrorCode>> update_results;
-    EXPECT_EQ(EC_OK,
-              searcher->BatchUpdateLocationStatus(
-                  context, {keys.front()}, {{{location_to_refresh_during_cas, CLS_WRITING}}}, update_results));
-    return searcher->BatchCASLocationStatus(context, keys, tasks, results, authoritative_read);
+MetaIndexer::LocationResult RefreshLocationBeforeRmw(void *obj,
+                                                     RequestContext *context,
+                                                     const KeyVector &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     const LocationModifierFunc &modifier,
+                                                     bool adjust_reclaimed_key_count,
+                                                     bool fill_missing_cache) {
+    cas_refresh_stub->reset(ADDR(MetaIndexer, ReadModifyWriteLocation));
+    MetaIndexer *indexer = static_cast<MetaIndexer *>(obj);
+    const LocationModifierFunc refresh = [](const std::vector<ErrorCode> &errors,
+                                            const LocationIdVector &,
+                                            size_t,
+                                            CacheLocationVector &locations,
+                                            PropertyMap &) -> LocationModifierResult {
+        EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, errors);
+        auto writing = std::make_shared<CacheLocation>(*locations.front());
+        writing->set_status(CLS_WRITING);
+        locations.front() = std::move(writing);
+        return {MA_OK, errors};
+    };
+    const MetaIndexer::LocationResult refreshed = indexer->ReadModifyWriteLocation(
+        context, {keys.front()}, {{location_to_refresh_during_cas}}, refresh, true, false);
+    EXPECT_EQ(EC_OK, refreshed.ec);
+    return indexer->ReadModifyWriteLocation(
+        context, keys, location_ids, modifier, adjust_reclaimed_key_count, fill_missing_cache);
 }
 
 bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
@@ -260,7 +272,7 @@ public:
         meta_indexer_config->meta_storage_backend_config_ = backend_config;
         meta_indexer_config->mutex_shard_num_ = 32;
         meta_indexer_config->max_key_count_ = 10000;
-        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr);
     }
 
     ErrorCode CreateCachedMetaIndexer(const std::string &instance_id, const std::string &path) {
@@ -272,7 +284,7 @@ public:
         meta_indexer_config->meta_storage_backend_config_ = std::move(backend_config);
         meta_indexer_config->mutex_shard_num_ = 32;
         meta_indexer_config->max_key_count_ = 10000;
-        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr);
     }
 
     static void WaitForCachedMetaIndexerRunning(const std::shared_ptr<MetaIndexer> &indexer) {
@@ -537,7 +549,7 @@ TEST_F(BackendGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsa
     Stub cas_stub;
     cas_refresh_stub = &cas_stub;
     location_to_refresh_during_cas = "refreshed";
-    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    cas_stub.set(ADDR(MetaIndexer, ReadModifyWriteLocation), RefreshLocationBeforeRmw);
     const auto result = Run(request);
     cas_refresh_stub = nullptr;
     EXPECT_EQ(EC_OK, result.status);
@@ -769,7 +781,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
 
 TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionAndSync) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
-    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     auto &manager = *indexer->backend_manager_;
     manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
     auto backup = std::make_unique<SyncResultBackend>();
@@ -832,7 +844,7 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionA
 
 TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteForceEnqueuesOnlyUnadmittedKeys) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
-    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     auto &manager = *indexer->backend_manager_;
     manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
     auto backup = std::make_unique<SyncResultBackend>();
@@ -1091,7 +1103,7 @@ TEST_F(SchedulePlanExecutorTest, TestAdmittedDeleteRetainsIndexerAfterManagerDet
     ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
     SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
 
-    const auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     ASSERT_NE(nullptr, indexer);
     MetaSearcher meta_searcher(indexer);
     auto request_context = std::make_shared<RequestContext>("detach_indexer");
@@ -1591,7 +1603,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     Stub cas_stub;
     cas_refresh_stub = &cas_stub;
     location_to_refresh_during_cas = refreshed_id;
-    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    cas_stub.set(ADDR(MetaIndexer, ReadModifyWriteLocation), RefreshLocationBeforeRmw);
     auto partial_submission = executor.SubmitAsync(partial_request);
     ASSERT_TRUE(partial_submission.accepted);
     EXPECT_EQ(EC_OK, partial_submission.future.get().status);
@@ -2674,31 +2686,33 @@ TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAd
 }
 
 TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyFillsRecoverMissingKeysAndNeverDeletesSkippedTargets) {
-    for (const std::string scenario : {"recover_missing", "recover_deleted", "running_missing",
-                                        "recover_target_missing", "recover_target_changed"}) {
+    for (const std::string scenario : {"recover_missing",
+                                       "recover_deleted",
+                                       "running_missing",
+                                       "recover_target_missing",
+                                       "recover_target_changed"}) {
         SCOPED_TRACE(scenario);
         const std::string instance_id = "cached_gc_" + scenario;
         const std::string persistent_path = GetPrivateTestRuntimeDataPath() + instance_id;
         ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
-        const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
+        const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(instance_id);
         WaitForCachedMetaIndexerRunning(indexer);
         auto &manager = *indexer->backend_manager_;
 
-        auto physical_backend = std::make_shared<RecordingDeleteBackend>(
-            "nfs_01", DataStorageType::DATA_STORAGE_TYPE_NFS, false);
+        auto physical_backend =
+            std::make_shared<RecordingDeleteBackend>("nfs_01", DataStorageType::DATA_STORAGE_TYPE_NFS, false);
         data_storage_manager_->storage_map_["nfs_01"] = physical_backend;
         RequestContext context("cached_gc_admission_test");
         MetaSearcher searcher(indexer);
         const int64_t key = 913;
         auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
-            DataStorageType::DATA_STORAGE_TYPE_NFS,
-            1,
-            {LocationSpec("default", "nfs://nfs_01/cached_gc?size=1")});
+            DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {LocationSpec("default", "nfs://nfs_01/cached_gc?size=1")});
         std::vector<std::string> ids;
         ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {key}, {location}, ids));
         ASSERT_EQ(1u, ids.size());
         std::vector<std::vector<ErrorCode>> status_results;
-        ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {key}, {{{ids.front(), CLS_SERVING}}}, status_results));
+        ASSERT_EQ(EC_OK,
+                  searcher.BatchUpdateLocationStatus(&context, {key}, {{{ids.front(), CLS_SERVING}}}, status_results));
         ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), status_results);
         CacheLocationMapVector original;
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->GetLocations(nullptr, {key}, original));
@@ -2717,9 +2731,8 @@ TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyFillsRecoverMissingKeysAndNe
         } else {
             ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->Delete(nullptr, {key}));
         }
-        manager.recover_state_.store(scenario == "running_missing"
-                                        ? MetaStorageBackendManager::RecoverState::kRunning
-                                        : MetaStorageBackendManager::RecoverState::kRecover);
+        manager.recover_state_.store(scenario == "running_missing" ? MetaStorageBackendManager::RecoverState::kRunning
+                                                                   : MetaStorageBackendManager::RecoverState::kRecover);
         if (scenario == "recover_deleted") {
             manager.deleted_keys_.insert(key);
         }

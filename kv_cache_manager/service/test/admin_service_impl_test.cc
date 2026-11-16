@@ -62,9 +62,7 @@ public:
         instance_group->cache_config_->cache_prefer_strategy_ = CachePreferStrategy::CPS_PREFER_3FS;
         auto backend_config = std::make_shared<MetaStorageBackendConfig>();
         backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
-        auto cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
         meta_indexer_config->meta_storage_backend_config_ = backend_config;
-        meta_indexer_config->meta_cache_policy_config_ = cache_policy_config;
 
         std::vector<LocationSpecInfo> spec_infos = {LocationSpecInfo("tp0", 512)};
         ModelDeployment md;
@@ -142,7 +140,7 @@ public:
 
     // 在 meta 中为 block_key 直接登记一个位于 hot_01 的 SERVING 源 location
     void SeedServingSource(int64_t block_key, std::optional<std::string> checksum = std::nullopt) {
-        auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+        const std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
         auto rc = std::make_shared<RequestContext>("seed");
@@ -163,10 +161,8 @@ public:
 
     // 在 meta 中为 block_key 直接添加一个位于指定 storage 的 CacheLocation。
     // status=CLS_SERVING 时 CAS WRITING->SERVING；status=CLS_WRITING 则保持。
-    void SeedLocationOnStorage(int64_t block_key,
-                               const std::string &storage_name,
-                               CacheLocationStatus status) {
-        auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    void SeedLocationOnStorage(int64_t block_key, const std::string &storage_name, CacheLocationStatus status) {
+        std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
         auto rc = std::make_shared<RequestContext>("seed_dst");
@@ -417,9 +413,7 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     std::thread reclaimer_thread([&] {
         wait_for_start();
         reclaimer_results = cache_manager_->migration_manager()->BatchSubmit(
-            "admin_reclaimer_limit_reclaimer",
-            {reclaimer_req},
-            MigrationManager::CopyConcurrencyLimit{"default", 1});
+            "admin_reclaimer_limit_reclaimer", {reclaimer_req}, MigrationManager::CopyConcurrencyLimit{"default", 1});
     });
     while (ready.load(std::memory_order_acquire) != 2) {
         std::this_thread::yield();
@@ -603,7 +597,7 @@ TEST_F(AdminServiceImplTest, TestRuleSampling) {
 }
 
 TEST_F(AdminServiceImplTest, TestRuleSamplingFailureReturnsError) {
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
     ASSERT_NE(nullptr, indexer);
     ASSERT_EQ(EC_OK, indexer->backend_manager_->Close());
 
