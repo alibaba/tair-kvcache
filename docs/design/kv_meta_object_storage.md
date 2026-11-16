@@ -77,7 +77,9 @@ stateDiagram-v2
     ABSENT --> WRITING: PutStart 分配 PACE 并发布 metadata
     WRITING --> SERVING: PutFinish 全部成功
     WRITING --> ABSENT: 失败 / 超时 / 恢复清理
-    SERVING --> ABSENT: Remove / GC
+    SERVING --> ABSENT: Remove
+    SERVING --> DELETING: GC 条件标记，不再可读
+    DELETING --> ABSENT: grace 后物理删除返回并条件清理 metadata
 ```
 
 ### 3.1 写入
@@ -149,7 +151,7 @@ group_usage          = Σ group 内全部 KVMeta instance_usage
 |---|---|
 | 创建/清理 `WRITING` | 不变 |
 | `WRITING -> SERVING` 成功 | 增加真实 size |
-| Remove/GC 成功删除 `SERVING` | 减少真实 size |
+| Remove 条件删除已提交对象 / GC 清理对应 `DELETING` metadata | 减少真实 size |
 | 条件删除失败 | 不变 |
 | PACE 物理删除失败 | 不恢复 |
 
@@ -321,7 +323,7 @@ PACE 接口尚无写入隔离机制。KVMeta 无法安全自动回收未获客�
     -> best-effort PACE Delete
 ```
 
-同一 group 的一轮 GC 先完成所有逻辑删除，再统一等待一次完整宽限期，然后按 storage 分组物理删除；等待期间降主或退出则保留 allocation。
+这是主动 Remove 的清理顺序。后台 GC 使用第 6 节的异步 `DELETING -> reader grace -> 物理删除 -> metadata 清理` 流程；每个异步任务以最后一次状态标记完成时间为起点等待完整 grace，等待期间降主或退出则保留 allocation。
 
 该顺序优先保证缓存立即 miss 和主链路不被物理删除故障阻塞，代价是物理 usage 可能与逻辑 usage 偏离。
 
@@ -353,4 +355,4 @@ PACE 接口尚无写入隔离机制。KVMeta 无法安全自动回收未获客�
 3. 生产 metadata/Registry 是否持久化，保证重启后能重建 usage 和 allocation ownership。
 4. RTP key 是否完整包含内容和版本信息，并实现热点 miss singleflight。
 5. 是否接受无容量 reservation 带来的短暂超调和 PACE 分配失败回退。
-6. RTP 文档不得宣称当前支持 NFS、`DELETING` tombstone或 post-load generation fence。
+6. RTP 文档不得宣称当前支持 NFS 或 post-load generation fence；GC 的 `DELETING` 不代表长期 tombstone 自动修复能力。
