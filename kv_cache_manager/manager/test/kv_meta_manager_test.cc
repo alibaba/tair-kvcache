@@ -610,6 +610,50 @@ TEST_F(KvMetaManagerTest, LostCleanupDeleteReplyRefundsOnlyItsReservation) {
     EXPECT_FALSE(values[1].found);
 }
 
+TEST_F(KvMetaManagerTest, PublicationUsesBatchedMetadataMutations) {
+    auto backend = std::make_unique<HookLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("batch-publication", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *local = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 32; ++i) {
+        keys.push_back("batch-publish-" + std::to_string(i));
+    }
+    const auto create_calls = pace_backend_->create_calls();
+    const auto start = Start(kDefaultInstance, keys, std::vector<std::uint64_t>(keys.size(), 7));
+    ASSERT_EQ(keys.size(), start.locations.size());
+    EXPECT_EQ(create_calls + 1, pace_backend_->create_calls());
+    RecordProperty("publication_upsert_calls", local->upsert_calls.load());
+    EXPECT_LT(local->upsert_calls.load(), static_cast<int>(keys.size()));
+    ASSERT_EQ(EC_OK,
+              manager_->FinishWrite(
+                  &context_, kDefaultInstance, start.write_session_id, std::vector<bool>(keys.size(), true)));
+    EXPECT_EQ(keys.size() * 7, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, BatchedPublicationConflictPreservesTheReplacementObject) {
+    bool entered = false;
+    pace_backend_->after_create = [&]() {
+        if (!entered) {
+            entered = true;
+            Commit(kDefaultInstance, "raced", 13);
+        }
+    };
+    const auto [ec, start] = manager_->StartWrite(&context_, kDefaultInstance, {"new", "raced"}, {7, 7}, 30);
+    pace_backend_->after_create = nullptr;
+    EXPECT_EQ(EC_EXIST, ec);
+    EXPECT_TRUE(start.locations.empty());
+    EXPECT_EQ(2u, pace_backend_->delete_count());
+    const auto [get_ec, values] = manager_->Get(&context_, kDefaultInstance, {"new", "raced"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(2u, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[1].found);
+    EXPECT_EQ(13u, values[1].location.value_size);
+    EXPECT_EQ(13u, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
 TEST_F(KvMetaManagerTest, AllocationBatchesEqualSizesAndPreservesRequestOrder) {
     const auto calls = pace_backend_->create_calls();
     const auto start = Start(kDefaultInstance, {"a", "b", "c"}, {7, 11, 7});
@@ -645,7 +689,7 @@ TEST_F(KvMetaManagerTest, PartialAllocationFailureReleasesEveryReturnedPrivateAl
     }
 }
 
-TEST_F(KvMetaManagerTest, BatchAdmissionFailureCleansPublishedAndUnpublishedAllocations) {
+TEST_F(KvMetaManagerTest, BatchAdmissionFailureReleasesEveryAllocation) {
     Indexer(kDefaultInstance)->max_key_count_ = 1;
     const auto deletes = pace_backend_->delete_count();
     EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&context_, kDefaultInstance, {"a", "b", "c"}, {7, 7, 7}, 30).first);

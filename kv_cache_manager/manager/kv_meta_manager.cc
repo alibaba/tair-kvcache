@@ -1794,40 +1794,46 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     }
 
     const auto deadline = KvMetaWriteSessionManager::Clock::now() + std::chrono::seconds(write_timeout_seconds);
-    auto publish_writing = [&](const SessionItem &candidate, bool &inserted) {
-        inserted = false;
-        auto modifier = [&candidate, &inserted](const std::vector<ErrorCode> &get_ecs,
-                                                const LocationIdVector &,
-                                                std::size_t,
-                                                CacheLocationVector &locations,
-                                                PropertyMap &) -> LocationModifierResult {
-            if (get_ecs.size() != 1 || locations.size() != 1) {
+    auto publish_writing = [&](const std::vector<SessionItem> &batch, std::vector<bool> &inserted) {
+        inserted.assign(batch.size(), false);
+        KeyVector batch_keys;
+        LocationIdsPerKey ids;
+        for (const auto &candidate : batch) {
+            batch_keys.push_back(candidate.internal_key);
+            ids.push_back({candidate.location_id});
+        }
+        auto modifier = [&batch, &inserted](const std::vector<ErrorCode> &get_ecs,
+                                            const LocationIdVector &,
+                                            std::size_t key_index,
+                                            CacheLocationVector &locations,
+                                            PropertyMap &) -> LocationModifierResult {
+            if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= batch.size()) {
                 return {MA_FAIL, {EC_MISMATCH}};
             }
             if (get_ecs[0] != EC_NOENT) {
                 return {get_ecs[0] == EC_OK ? MA_SKIP : MA_FAIL, {get_ecs[0] == EC_OK ? EC_EXIST : get_ecs[0]}};
             }
-            locations[0] = candidate.location;
-            inserted = true;
+            locations[0] = batch[key_index].location;
+            inserted[key_index] = true;
             return {MA_OK, {EC_OK}};
         };
-        auto mutation_lock = LockMetadataMutation(internal_instance_id, {candidate.internal_key});
-        const auto result = indexer->ReadModifyWriteTargetLocations(
-            request_context, {candidate.internal_key}, {{candidate.location_id}}, modifier);
-        if (result.per_location_error_codes.size() != 1 || result.per_location_error_codes[0].size() != 1) {
-            return EC_MISMATCH;
+        auto mutation_lock = LockMetadataMutation(internal_instance_id, batch_keys);
+        const auto result = indexer->ReadModifyWriteTargetLocations(request_context, batch_keys, ids, modifier);
+        std::vector<ErrorCode> errors(batch.size(), EC_MISMATCH);
+        if (result.per_location_error_codes.size() != batch.size()) {
+            return errors;
         }
-        const ErrorCode item_ec = result.per_location_error_codes[0][0];
-        if (inserted && item_ec == EC_OK && (result.ec == EC_OK || result.ec == EC_PARTIAL_OK)) {
-            return EC_OK;
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (result.per_location_error_codes[i].size() != 1) {
+                continue;
+            }
+            const auto item_ec = result.per_location_error_codes[i][0];
+            errors[i] = item_ec != EC_OK                                   ? item_ec
+                        : result.ec != EC_OK && result.ec != EC_PARTIAL_OK ? result.ec
+                        : inserted[i]                                      ? EC_OK
+                                                                           : EC_EXIST;
         }
-        if (item_ec != EC_OK) {
-            return item_ec;
-        }
-        if (result.ec != EC_OK && result.ec != EC_PARTIAL_OK) {
-            return result.ec;
-        }
-        return EC_EXIST;
+        return errors;
     };
 
     std::vector<SessionItem> candidates;
@@ -1913,40 +1919,66 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             return {allocation_ec, {}};
         }
     }
-    for (const std::size_t request_index : missing) {
+    KeyVector missing_keys;
+    for (const auto request_index : missing) {
+        missing_keys.push_back(existing[request_index].internal_key);
+    }
+    std::vector<std::size_t> candidate_positions;
+    for (const auto &layer : MakeUniqueKeyLayers(missing_keys)) {
         if (maintenance_cancelled_.load(std::memory_order_acquire) ||
             KvMetaWriteSessionManager::Clock::now() >= deadline) {
             rollback_candidates();
             return {maintenance_cancelled_.load(std::memory_order_acquire) ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, {}};
         }
-        SessionItem candidate = std::move(unpublished[request_index]);
-        bool inserted = false;
-        if (const ErrorCode ec = publish_writing(candidate, inserted); ec != EC_OK) {
-            if (inserted) {
-                // The modifier ran, but a key-count admission failure can
-                // reject it before any metadata write. A failed backend
-                // reply, however, may hide a committed write. Only free an
-                // allocation after a fresh lookup proves this generation is
-                // absent; otherwise retain the existing guarded cleanup.
-                std::vector<ExactLocation> observed;
-                const ErrorCode lookup_ec = LoadExactLocations(
-                    request_context, internal_instance_id, {keys[request_index]}, observed);
-                if (lookup_ec == EC_OK && observed.size() == 1 &&
-                    (observed[0].ec == EC_NOENT ||
-                     (observed[0].ec == EC_OK && observed[0].location &&
-                      !SameGeneration(*observed[0].location, *candidate.location)))) {
-                    DeletePhysicalBestEffort(request_context, {candidate});
-                } else {
-                    candidates.push_back(std::move(candidate));
-                }
-            } else {
-                DeletePhysicalBestEffort(request_context, {candidate});
-            }
-            rollback_candidates();
-            return {ec, {}};
+        std::vector<SessionItem> batch;
+        std::vector<std::string> business_keys;
+        for (const auto index : layer) {
+            const auto request_index = missing[index];
+            batch.push_back(std::move(unpublished[request_index]));
+            business_keys.push_back(keys[request_index]);
         }
-        candidates.push_back(std::move(candidate));
+        std::vector<bool> inserted;
+        const auto errors = publish_writing(batch, inserted);
+        const auto failure = std::find_if(errors.begin(), errors.end(), [](ErrorCode ec) { return ec != EC_OK; });
+        if (failure == errors.end()) {
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                candidates.push_back(std::move(batch[i]));
+                candidate_positions.push_back(layer[i]);
+            }
+            continue;
+        }
+        // A modifier can run before admission rejects a new key, or before a
+        // backend reply is lost. Verify uncertain publications once as a batch:
+        // release only allocations whose generation is proven absent/replaced.
+        std::vector<ExactLocation> observed;
+        const bool lookup_needed = std::any_of(inserted.begin(), inserted.end(), [](bool value) { return value; });
+        const bool lookup_ok =
+            lookup_needed &&
+            LoadExactLocations(request_context, internal_instance_id, business_keys, observed) == EC_OK &&
+            observed.size() == batch.size();
+        std::vector<SessionItem> private_allocations;
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            const bool absent = lookup_ok && (observed[i].ec == EC_NOENT ||
+                                              (observed[i].ec == EC_OK && observed[i].location &&
+                                               !SameGeneration(*observed[i].location, *batch[i].location)));
+            if (!inserted[i] || absent) {
+                private_allocations.push_back(std::move(batch[i]));
+            } else {
+                candidates.push_back(std::move(batch[i]));
+            }
+        }
+        DeletePhysicalBestEffort(request_context, private_allocations);
+        rollback_candidates();
+        return {*failure, {}};
     }
+
+    // Collision layers may be visited out of request order. Keep both the
+    // returned locations and write-session flags aligned with missing keys.
+    std::vector<SessionItem> ordered_candidates(missing.size());
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        ordered_candidates[candidate_positions[i]] = std::move(candidates[i]);
+    }
+    candidates = std::move(ordered_candidates);
 
     std::vector<ValueLocation> output_locations;
     output_locations.reserve(candidates.size());

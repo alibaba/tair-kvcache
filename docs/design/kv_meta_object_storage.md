@@ -90,7 +90,7 @@ stateDiagram-v2
    - `SERVING` 但 size 不同：返回 `SIZE_MISMATCH`。
    - `WRITING`：返回 `WRITE_IN_PROGRESS`。
 3. 对 miss 按真实 size 分组，复用 PACE 批量 Create；返回 location 仍保持请求顺序。分配或后续 metadata 发布失败时，释放尚未公布的私有分配，并对已公布项做 generation 保护的清理。
-4. 条件创建 `WRITING` metadata，并记录有期限的内存 write session。
+4. 复用 MetaIndexer 批量 RMW 条件创建 `WRITING` metadata；hash 冲突按 unique-key layer 拆分，返回和 session 顺序仍按请求对齐，并记录有期限的内存 write session。
 5. 客户端直接向 PACE 写 bytes。
 6. 客户端确认全部数据面写入已结束后调用 `PutFinish`；全部成功时，条件执行 `WRITING -> SERVING` 并增加 usage。
 7. 已确认全部远端 I/O 停止后的失败，可清理本 session 的全部 generation，并尽力释放 allocation；状态未知时不发送 `PutFinish`，等待 session 过期只清理 metadata。
