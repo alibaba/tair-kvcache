@@ -36,7 +36,7 @@ KVMeta 为 embedding 等变长对象提供独立的 exact-key 元数据协议。
 - `locations`：只包含 miss，顺序与请求中 miss 的相对顺序一致。
 - `write_session_id`：存在 miss 时非空；全部 hit 时为空。
 
-同 key 已有 `WRITING` 返回 `WRITE_IN_PROGRESS`；已有对象 size 不同返回 `SIZE_MISMATCH`。
+同 key 已有 `WRITING` 或 `DELETING` 返回 `WRITE_IN_PROGRESS`；已有已提交对象 size 不同返回 `SIZE_MISMATCH`。`DELETING` 不可读，当前写入应跳过并等待正常回收完成，而不是覆盖其 allocation。
 
 `PutStart` 不预留 group 容量，不以 `used_percentage` 拒绝请求。并发写可短暂超过回收水位甚至 capacity，最终由 PACE allocation 和异步 GC 决定结果。
 
@@ -66,6 +66,8 @@ transport error 代表结果可能未知，应先 `Get` 对账，不能盲目重
 
 `Trim` 仅作为旧 proto 的保留 RPC，V1 client 不暴露该接口，调用时由 gRPC 返回标准
 `UNIMPLEMENTED`。按 key 删除使用 `Remove`，容量回收由后台 GC 完成。
+
+异常管理操作 `AdminService.RemoveInstance` 使用编码后的内部 instance id。KVMeta 分支会排空索引使用者并清理该 instance 的对象 metadata，再移除注册；它不调用普通固定块 Trim，不承诺释放远端 allocation。同一公共 ID 重新注册后，旧对象和旧写会话不能继续可见。详见 [设计说明](../design/kv_meta_object_storage.md#34-删除-instance)。
 
 ## 主要状态码
 

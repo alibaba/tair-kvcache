@@ -74,10 +74,12 @@ with KvMetaObjectClient(config) as client:
 一次 Python 调用会校验 key、真实 byte size 和 buffer，再按 64 objects / 4 GiB 上限分批。它不自动重试 mutation，
 也不回滚已经成功的前序 batch。CUDA/MUSA producer 在调用 `save` 前须同步对应 device stream。
 
+示例中的 `remove` 仅展示接口；正常共享 key 不应每次读取后删除，容量淘汰交给 Reclaimer。
+
 Python package、native extension 与 `kv_cache_manager_client.so` 必须来自同一次构建；client 会校验
 `KV_META_OBJECT_API_VERSION`。mutation 遇到 transport error 时，异常的 `unknown_outcome=True`。
 `remove` 的服务端错误也可能部分生效；`completed_items` 仅统计完整成功的批次，失败批次不可直接重试。
-PACE I/O 超时后 native data-plane client 会先 drain 在飞任务再失效；应销毁并重新创建高层 client。
+原始 SDK timeout 会使私有 native data-plane client drain 在飞任务并失效；`*_BUFFER_SAFE` 错误则允许复用已静止的本地 buffer/client，但不授权回收远端 allocation。带注册 GPU arena 的调用方不能在每次请求超时后重新分配、重新注册 client：应保留 arena/owner，确认 Close 与注销成功；无法确认 DMA/注销安全时隔离 transport 并重启 worker。CPU 或未注册 GPU arena 的独立调用方，在旧 client 安全关闭后才可显式创建替代 client。
 
 需要自行编排控制面和数据面时，才直接使用下面的低层 `KvMetaClient`：
 
