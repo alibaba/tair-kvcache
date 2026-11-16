@@ -242,8 +242,7 @@ class LocationQueryManager:
                     return None
                 if not q.locations:
                     # No location pointer exists, so there is no staleness risk.
-                    # Expiring [] livelocks requests whenever the manager is
-                    # slower than the horizon (see module docstring).
+                    # Empty answers are retained until the query key changes.
                     self._expired_streaks.pop(key, None)
                     return q.locations
                 age = (
