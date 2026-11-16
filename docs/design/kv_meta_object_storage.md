@@ -139,7 +139,7 @@ SDK 超时或抛异常后会销毁私有 wrapper 并等待后台任务退出，�
 ### 5.1 Usage
 
 ```text
-instance_usage[type] = Σ 当前 SERVING 对象的 value_size
+instance_usage[type] = Σ 已提交且 metadata 尚未删除的对象 value_size（含等待回收的 DELETING）
 group_usage          = Σ group 内全部 KVMeta instance_usage
 ```
 
@@ -153,7 +153,7 @@ group_usage          = Σ group 内全部 KVMeta instance_usage
 | 条件删除失败 | 不变 |
 | PACE 物理删除失败 | 不恢复 |
 
-metadata 发布、提交和删除使用同一把 instance 分片 mutation lock，使 usage 更新和持久化删除确认不与新 generation 交叉；PACE 分配不持有该锁。
+metadata 发布、提交和删除按 instance 与 key 共同选择 mutation lock，批量操作按固定顺序获取锁。同 key 的 usage 更新、删除确认和新 generation 保持受保护，不同 key 可以并行；PACE 分配不持有该锁。写会话使用到期时间索引，避免每次新写入唤醒后扫描全部会话；默认最多 65536 个活动会话，并上报活动数和拒绝数。
 
 usage 是逻辑已提交字节，不等于 PACE 物理占用，不包含：
 
@@ -184,22 +184,20 @@ target   = floor(capacity * used_percentage)
 excess   = group_usage - target
 ```
 
-当 `group_usage > target` 时，KvMetaReclaimer 执行：
+当扣除仍有效的在途回收额度后 `group_usage > target` 时，KvMetaReclaimer 执行：
 
-1. 汇总 group 内全部 KVMeta instance usage。
-2. 从每个 instance 的 persistent metadata keyspace 采样候选。
-3. 若候选命中 metadata hot cache，用 hot-cache 最新访问时间覆盖 persistent 时间。
-4. 合并全部候选，按访问时间升序排序。
-5. 重新读取 metadata，只保留合法 `SERVING` generation。
-6. 选择至多一个 batch，或预计删除字节达到 `excess`。
-7. generation 条件删除 metadata；只有成功删除才扣 usage。
-8. 确认删除已持久化，再等待 reader grace period，best-effort 删除 PACE allocation。
-9. 后续轮次继续采样，直到 usage 回到 target 以下。
+1. 复用普通 Cache 的采样入口；热缓存回填完成时在本地采样，恢复中从持久层采样。
+2. 排除已在途 key；复用维护性 touch 让这些 key 让出冷分片采样位置，避免等待宽限期的 key 占满下一轮候选。
+3. 合并候选并按访问时间排序，按需扩大批次读取 metadata，只保留合法的 SERVING generation。
+4. 复用普通 Cache 的单批大小、每轮请求数、pending 对象数/字节数和超时配置，向 SchedulePlanExecutor 提交有界异步删除任务。
+5. executor 校验预期 generation，将 metadata 标记为 DELETING，并按现有删除流程确认持久化。
+6. executor 延迟调度完整 reader grace，不占 worker 睡眠；之后按 storage 分组执行物理删除。
+7. 物理删除返回后条件清理 metadata、扣减 usage。删除失败不会恢复可读状态，也不会自动重试物理释放。
+8. 超时任务停止抵扣预测回收额度，但保留 pending 去重和限额占用，避免重复释放；后续完成时再移除 pending。
 
-这是异步采样 LRU，不是每轮全量排序。persistent source 保证 hot-cache 淘汰的 key 仍有机会被回收；maintenance 查询不会刷新 LRU。
-本地或 hot-cache 命中复用读取时已更新的访问时间，不再 upsert location 和 LRU 属性；纯 Redis 命中仍更新持久化 LRU。
+这是异步采样 LRU，不是每轮全量扫描。普通 maintenance 读取不刷新业务访问时间；对已在途候选的维护性 touch 只调整本地采样顺序，不记录业务命中或写持久层。本地或 hot-cache 业务命中复用读取时已更新的访问时间，不重复 upsert；纯 Redis 命中仍更新持久化 LRU。
 
-当前没有 KVMeta `DELETING` tombstone，也没有物理删除失败的持久化重试队列。逻辑 cache 会立即 miss，但 PACE 可能留下孤儿 allocation。
+回收指标分别记录提交对象/字节、实际成功删除 metadata 的对象/字节和物理删除成功的对象/字节；任务完成批数不能当作对象回收 QPS。pending 最老时长、额度超时及限额跳过可用于定位停滞。当前没有长期 DELETING 的自动修复或物理失败持久化重试队列，失败或取消仍可能留下孤儿 allocation。读取安全要求 grace 覆盖完整读取时间及调度抖动。
 
 ## 7. 恢复和服务隔离
 

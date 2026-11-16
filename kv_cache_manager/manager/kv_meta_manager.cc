@@ -559,9 +559,11 @@ private:
         std::int64_t last_access_time_us = 0;
     };
 
+    using PendingLocationKey = CacheReclaimer::PendingLocationKey;
+
     struct PendingDelete {
         std::string group;
-        std::vector<std::string> ids;
+        std::vector<PendingLocationKey> ids;
         std::uint64_t bytes = 0;
         std::future<PlanExecuteResult> future;
         std::chrono::steady_clock::time_point submitted_at;
@@ -569,8 +571,15 @@ private:
         bool credit_enabled = true;
     };
 
-    static std::string PendingId(const std::string &instance, const std::string &location) {
-        return instance + '\0' + location;
+    static PendingLocationKey PendingId(const std::string &instance, std::int64_t key,
+                                        const std::string &location) {
+        return {instance, key, location};
+    }
+
+    bool IsPendingKey(const Candidate &candidate) const {
+        const auto it = pending_ids_.lower_bound(PendingId(candidate.instance_id, candidate.key, {}));
+        return it != pending_ids_.end() && it->instance_id == candidate.instance_id &&
+               it->block_key == candidate.key;
     }
 
     void PollDeletes() {
@@ -732,12 +741,14 @@ private:
         owner_->ObserveReclaimGauge(group->name(), "target_bytes", target);
         std::uint64_t pending_bytes = 0;
         std::size_t pending_requests = 0;
+        std::size_t pending_locations = 0;
         for (const auto &pending : pending_deletes_) {
             if (pending.group == group->name()) {
                 if (pending.credit_enabled) {
                     pending_bytes = SaturatingAdd(pending_bytes, pending.bytes);
                 }
                 ++pending_requests;
+                pending_locations += pending.ids.size();
             }
         }
         owner_->ObserveReclaimGauge(group->name(), "pending_bytes", pending_bytes);
@@ -765,12 +776,9 @@ private:
         }
         const auto [sampling_baseline, batching_size] = BatchSizes();
         const auto &lru_config = LruConfig();
-        const auto sampling_size =
-            std::min(lru_config.max_sampling_size,
-                     std::max(sampling_baseline,
-                              static_cast<size_t>(std::min<std::uint64_t>(
-                                  lru_config.max_sampling_size,
-                                  SaturatingMultiply(batching_size, lru_config.min_sampling_ratio)))));
+        const auto sampling_size = std::min<std::uint64_t>(lru_config.max_sampling_size,
+            SaturatingAdd(pending_locations, std::max<std::uint64_t>(sampling_baseline,
+                SaturatingMultiply(batching_size, lru_config.min_sampling_ratio))));
         const auto round_limit = SaturatingMultiply(batching_size, lru_config.max_delete_requests_per_round);
         const std::int64_t round_us = TimestampUtil::GetCurrentTimeUs();
         std::vector<Candidate> candidates;
@@ -790,6 +798,26 @@ private:
             }
             for (const auto &candidate : sampled) {
                 candidates.push_back({instance->instance_id(), candidate.key, candidate.last_access_time_us});
+            }
+        }
+        // Ordinary Cache also excludes pending locations before selecting
+        // victims. Pending keys must not consume either metadata-read work or
+        // the sampling window while their reader grace is outstanding.
+        std::map<std::string, KeyVector> pending_keys;
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+            [this, &pending_keys](const Candidate &candidate) {
+                if (!IsPendingKey(candidate)) {
+                    return false;
+                }
+                pending_keys[candidate.instance_id].push_back(candidate.key);
+                return true;
+            }), candidates.end());
+        for (const auto &[instance_id, keys] : pending_keys) {
+            if (auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id)) {
+                // Yield rejected keys just like ordinary Cache. Otherwise an
+                // oldest-shard sample can repeatedly return only pending keys.
+                owner_->AddReclaimCounter(group->name(), "maintenance_touch_keys_total",
+                                         indexer->TouchKeysForMaintenance(keys));
             }
         }
         std::sort(candidates.begin(), candidates.end(), [](const Candidate &lhs, const Candidate &rhs) {
@@ -855,7 +883,7 @@ private:
                 for (const auto &[location_id, location] : found->second) {
                     if (!location || location->status() != CLS_SERVING ||
                         location_id.compare(0, kKvMetaLocationIdPrefix.size(), kKvMetaLocationIdPrefix) != 0 ||
-                        pending_ids_.count(PendingId(candidate.instance_id, location_id)) != 0) {
+                        pending_ids_.count(PendingId(candidate.instance_id, candidate.key, location_id)) != 0) {
                         continue;
                     }
                     std::uint64_t size = 0;
@@ -889,12 +917,12 @@ private:
                 request.delay = std::chrono::milliseconds(strategy->delay_before_delete_ms());
                 request.authoritative_read = true;
                 request.cancel_before_physical = cancel_deletes_;
-                std::vector<std::string> ids;
+                std::vector<PendingLocationKey> ids;
                 std::uint64_t bytes = 0;
                 const auto end = std::min(items.size(), begin + batching_size);
                 for (auto i = begin; i < end; ++i) {
                     const auto &item = items[i];
-                    const auto id = PendingId(instance_id, item.location_id);
+                    const auto id = PendingId(instance_id, item.internal_key, item.location_id);
                     if (!pending_ids_.insert(id).second) {
                         continue;
                     }
@@ -956,7 +984,7 @@ private:
     bool stopping_ = true;
     std::shared_ptr<std::atomic<bool>> cancel_deletes_;
     std::vector<PendingDelete> pending_deletes_;
-    std::unordered_set<std::string> pending_ids_;
+    std::set<PendingLocationKey> pending_ids_;
     std::thread thread_;
 };
 

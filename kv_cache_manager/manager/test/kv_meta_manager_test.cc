@@ -108,9 +108,17 @@ public:
         maintenance_calls.fetch_add(1);
         auto largest = max_batch.load();
         while (largest < keys.size() && !max_batch.compare_exchange_weak(largest, keys.size())) {}
-        return MetaLocalBackend::GetLocationMapsForMaintenance(context, keys, out);
+        const auto result = MetaLocalBackend::GetLocationMapsForMaintenance(context, keys, out);
+        for (const auto &locations : out) {
+            for (const auto &[id, location] : locations) {
+                if (location && location->status() == CLS_DELETING) {
+                    ++deleting_reads;
+                }
+            }
+        }
+        return result;
     }
-    std::atomic<size_t> maintenance_calls{0}, max_batch{0};
+    std::atomic<size_t> maintenance_calls{0}, max_batch{0}, deleting_reads{0};
 };
 
 class BlockingCommitBackend : public MetaLocalBackend {
@@ -1255,6 +1263,41 @@ TEST_F(KvMetaManagerTest, SlowCommitDoesNotSerializeUnrelatedKeysInSameInstance)
     EXPECT_EQ(EC_OK, blocked.get());
     EXPECT_EQ(EC_OK, other.get());
     EXPECT_EQ(36u, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, PendingKeysAreSkippedBeforeReadingReclaimCandidateMetadata) {
+    CreateGroup("pending-filter", "pending-instance", 100000, 0.0001);
+    auto backend = std::make_unique<CountingMaintenanceBackend>();
+    auto *local = backend.get();
+    ASSERT_EQ(EC_OK, backend->Init("pending-filter", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    Indexer("pending-instance")->backend_manager_->persistent_backend_ = std::move(backend);
+    for (int i = 0; i < 32; ++i) {
+        Commit("pending-instance", "object-" + std::to_string(i), 23);
+    }
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    pace_backend_->before_delete = [released]() { released.wait(); };
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 5);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&context_, 32));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&context_, 8));
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    const bool blocked = WaitUntil([&]() { return pace_backend_->delete_calls() > 0; }, std::chrono::seconds(2));
+    for (int i = 32; i < 64; ++i) {
+        Commit("pending-instance", "object-" + std::to_string(i), 23);
+    }
+    const MetricsTags tags{{"instance_group", "pending-filter"}};
+    const bool submitted = WaitUntil([&]() {
+        return metrics_registry_->GetCounter("kv_meta.reclaim.submitted_objects_total", tags).Get() == 64;
+    }, std::chrono::seconds(2));
+    const auto repeated_reads = local->deleting_reads.load();
+    release.set_value();
+    EXPECT_TRUE(blocked);
+    EXPECT_TRUE(submitted);
+    EXPECT_EQ(0u, repeated_reads);
+    EXPECT_TRUE(WaitUntil([&]() {
+        return metrics_registry_->GetCounter("kv_meta.reclaim.deleted_objects_total", tags).Get() == 64;
+    }, std::chrono::seconds(2)));
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerBatchesCandidateReadsAndReportsActualDeletedBytes) {
