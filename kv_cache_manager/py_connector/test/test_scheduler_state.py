@@ -1302,5 +1302,95 @@ class TestBuildConnectorMeta(unittest.TestCase):
         self.assertNotIn("r0", conn._tracked)
 
 
+class TestSchedulerLifecycleSeams(unittest.TestCase):
+    def _conn(self):
+        conn = make_scheduler_connector(mbs=16)
+        conn._extra_config = SimpleNamespace(
+            instance_id="instance", write_timeout_seconds=30
+        )
+        return conn
+
+    def test_shutdown_finishes_queued_sessions_once(self):
+        conn = self._conn()
+        conn._location_query_manager = MagicMock()
+        conn._waiting_to_save_requests.append(
+            SaveRequest("r0", make_locations(2), [4, 5], "queued")
+        )
+
+        conn.shutdown()
+        conn.shutdown()
+
+        self.assertEqual(conn._waiting_to_save_requests, [])
+        conn._http_executor.shutdown.assert_called_with(wait=False)
+        payloads = conn._manager_client.finish_write_cache.call_args_list
+        self.assertEqual(len(payloads), 1)
+        body = payloads[0].args[0]
+        self.assertEqual(body["write_session_id"], "queued")
+        self.assertEqual(body["success_blocks"]["bool_masks"]["values"], [False, False])
+
+    def test_late_start_write_response_self_drains_during_shutdown(self):
+        conn = self._conn()
+        conn._stopping = True
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": make_locations(1),
+            "write_session_id": "late",
+            "block_mask": {"offset": 0},
+        }
+
+        conn.start_save_kvcache_async("late-req", list(range(16)), 1, [])
+
+        self.assertEqual(conn._waiting_to_save_requests, [])
+        body = conn._manager_client.finish_write_cache.call_args.args[0]
+        self.assertEqual(body["write_session_id"], "late")
+        self.assertEqual(body["success_blocks"]["bool_masks"]["values"], [False])
+
+    def test_save_arriving_after_request_retirement_is_finished_not_dropped(self):
+        conn = self._conn()
+        conn._waiting_to_save_requests.append(
+            SaveRequest("ghost", make_locations(1), [7], "orphan")
+        )
+
+        meta = conn.build_connector_meta(fake_scheduler_output())
+
+        self.assertEqual(meta.to_save_requests, [])
+        body = conn._manager_client.finish_write_cache.call_args.args[0]
+        self.assertEqual(body["write_session_id"], "orphan")
+        self.assertEqual(body["success_blocks"]["bool_masks"]["values"], [False])
+
+    def test_completion_and_retirement_hooks_fire_without_invalid_blocks(self):
+        conn = self._conn()
+        conn.on_finished_sending = MagicMock()
+        conn.on_finished_recving = MagicMock()
+        conn.update_connector_output(
+            SimpleNamespace(finished_sending={"saved"}, finished_recving={"loaded"})
+        )
+        conn.on_finished_sending.assert_called_once_with("saved")
+        conn.on_finished_recving.assert_called_once_with("loaded")
+
+        req = FakeRequest("retire", [1])
+        conn._tracked["retire"] = RequestLedger(req, [], 0)
+        conn.on_request_retired = MagicMock()
+        conn._retire_request("retire")
+        conn.on_request_retired.assert_called_once_with("retire")
+
+    def test_load_allocation_and_step_veto_hooks_carries_their_context(self):
+        conn = self._conn()
+        req = FakeRequest("load", list(range(40)))
+        conn._location_query_manager.locations = make_locations(1)
+        conn._location_query_manager.in_flight = False
+        conn.get_num_new_matched_tokens(req, 0)
+        blocks = SimpleNamespace(get_block_ids=lambda: [[10, 11, 12]])
+        conn.on_load_allocated = MagicMock()
+        conn.update_state_after_alloc(req, blocks, 16)
+        conn.on_load_allocated.assert_called_once_with(req, blocks)
+
+        conn._vetoed_save_requests = lambda: frozenset({"veto"})
+        output = fake_scheduler_output()
+        output.preempted_req_ids = {"preempt"}
+        meta = conn.build_connector_meta(output)
+        self.assertEqual(meta.preempted_req_ids, frozenset({"preempt"}))
+        self.assertEqual(meta.vetoed_save_req_ids, frozenset({"veto"}))
+
+
 if __name__ == "__main__":
     unittest.main()

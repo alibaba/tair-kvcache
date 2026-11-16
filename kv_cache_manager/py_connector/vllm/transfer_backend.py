@@ -9,10 +9,12 @@ engine whose device has neither Triton nor PCIe-pinned host memory reuses
 the whole connector by naming its own backend module in
 ``extra_config.transfer_backend_module_path``.
 
-The six methods below are the frozen contract: they are exactly what
-``ConnectorWorker`` calls, and ``DataTransferManager`` implements them
-verbatim -- the four byte-moving ones itself, the two done callbacks through
-:class:`BlockVerdicts`.
+The methods on ``TransferBackend`` are the mandatory contract: they are what
+``ConnectorWorker`` calls, and ``DataTransferManager`` implements them -- the
+byte-moving ones itself, the done callbacks through :class:`BlockVerdicts`.
+``GenerationAwareTransferBackend`` is the optional extension for backends whose
+native operations need request/epoch ownership; legacy backends keep the simple
+submission path.
 
 Because the worker needs them whichever backend is in use, this module also
 hosts the pieces of the data plane that are backend-agnostic: :class:`MultiResult`
@@ -43,6 +45,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
+    TransferChunk,
     TransferGroup,
 )
 
@@ -99,12 +102,78 @@ class MultiResult:
 class HostSpan:
     """One host-memory segment a backend moves bytes through.
 
-    The connector only states which segments exist; whether and how they are
-    registered for a zero-copy channel is the backend's and the client's
-    business."""
+    ``fd=None`` preserves the original best-effort registration contract. An
+    fd-bearing span instead states that its descriptor must cross the client
+    boundary: silently dropping either ``regist_spans`` or ``RegistSpan.fd``
+    would move the backend to a different data path, so client creation fails
+    loudly. The descriptor remains owned by the backend, not by this value.
+    """
 
     base: int
     size: int
+    fd: Optional[int] = None
+
+
+def client_span(kvcm_py_client: Any, span: HostSpan) -> Any:
+    """Convert a backend segment without dropping its registration identity.
+
+    This is public for backends whose client creation is deferred by their own
+    lifecycle. They must use the same fd availability checks as the worker's
+    eager factory rather than maintaining a second base/size-only conversion.
+    """
+    converted = kvcm_py_client.RegistSpan()
+    converted.base = span.base
+    converted.size = span.size
+    fd = getattr(span, "fd", None)
+    if fd is None:
+        if hasattr(converted, "fd"):
+            raise RuntimeError(
+                "the transfer backend supplied a host span without an fd, but "
+                "this kvcm_py_client requires one for every registered span; "
+                "refusing to create a partially specified registration"
+            )
+        return converted
+    if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
+        raise ValueError(f"host span fd must be a non-negative integer, got {fd!r}")
+    if not hasattr(converted, "fd"):
+        raise RuntimeError(
+            "the transfer backend supplied host-span fds, but this "
+            "kvcm_py_client.RegistSpan cannot carry them; refusing to "
+            "register anonymous base/size spans instead"
+        )
+    converted.fd = fd
+    return converted
+
+
+def configure_host_spans(
+    kvcm_py_client: Any, init_params: Any, spans: Sequence[HostSpan]
+) -> bool:
+    """Populate ``InitParams.regist_spans`` and return whether it was possible.
+
+    An fd-bearing backend requires the channel; anonymous legacy spans retain
+    the old warning-and-fallback behavior. All entries are converted before the
+    caller invokes Create, so one missing fd fails the whole registration rather
+    than leaving a partially specified list for the native client.
+    """
+    if not spans:
+        return False
+    fd_required = any(getattr(span, "fd", None) is not None for span in spans)
+    if not hasattr(init_params, "regist_spans"):
+        if fd_required:
+            raise RuntimeError(
+                "the transfer backend supplied host-span fds, but this "
+                "kvcm_py_client.InitParams has no regist_spans channel; "
+                "refusing to create a client with the segments unregistered"
+            )
+        logger.warning(
+            "the transfer client cannot register host spans; %d segment(s) "
+            "of %d bytes stay unregistered",
+            len(spans),
+            sum(span.size for span in spans),
+        )
+        return False
+    init_params.regist_spans = [client_span(kvcm_py_client, span) for span in spans]
+    return True
 
 
 class TransferBackend(Protocol):
@@ -142,9 +211,16 @@ class TransferBackend(Protocol):
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
-        ready_event: Any,
+        manager_block_ids: Optional[Sequence[int]] = None,
+        ready_event: Any = None,
     ) -> None:
-        """Write one group's chunk of manager blocks to storage."""
+        """Write one group's chunk of manager blocks to storage.
+
+        ``manager_block_ids`` is aligned with ``remote_uris`` and is None only
+        for a legacy plan that cannot name its blocks. The built-in GPU backend
+        does not use the ids; device backends may need them for diagnostics and
+        ownership checks.
+        """
         ...
 
     def load_task(
@@ -155,6 +231,7 @@ class TransferBackend(Protocol):
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
+        manager_block_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Read one group's chunk of manager blocks back into the engine."""
         ...
@@ -190,6 +267,28 @@ class TransferBackend(Protocol):
 
     def shutdown(self) -> None:
         """Release threads, pools and SDK handles."""
+        ...
+
+
+class GenerationAwareTransferBackend(TransferBackend, Protocol):
+    """Optional load-submission extension for device-page lifetime ownership.
+
+    It remains outside the mandatory factory contract so ordinary backends keep
+    the simple per-task path. A backend that can outlive an engine verdict must
+    implement it: the worker passes the exact ``(req_id, epoch)`` used to create
+    the done callback, plus canonical chunks whose manager ids survive slicing.
+    Empty chunks are completed by the worker as rank abstentions and are never
+    submitted here.
+    """
+
+    def submit_load(
+        self,
+        req_id: str,
+        epoch: int,
+        multi_result: MultiResult,
+        chunks: Sequence[TransferChunk],
+    ) -> None:
+        """Submit every chunk against the already-registered load generation."""
         ...
 
 

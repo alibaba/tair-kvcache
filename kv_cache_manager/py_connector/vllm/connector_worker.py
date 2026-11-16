@@ -10,6 +10,7 @@ shell.
 
 import copy
 import json
+import time
 import typing
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -28,10 +29,18 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
+from kv_cache_manager.py_connector.vllm.save_session import (
+    SaveDisposition,
+    SaveSessionBook,
+    finish_save_session,
+    finish_write_cache_payload,
+    flush_mask,
+)
 from kv_cache_manager.py_connector.vllm.transfer_backend import (
-    HostSpan,
     MultiResult,
     TransferBackend,
+    client_span,
+    configure_host_spans,
     get_device_module,
     make_transfer_backend,
 )
@@ -39,6 +48,7 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
     StateTransferGroup,
+    TransferChunk,
     TransferGroup,
     TransferPlan,
 )
@@ -59,12 +69,9 @@ if typing.TYPE_CHECKING:
     from vllm.attention import AttentionMetadata  # ty: ignore[unresolved-import]
 
 
-def _client_span(kvcm_py_client: Any, span: "HostSpan") -> Any:
-    """Convert a backend segment into the binding's span object."""
-    client_span = kvcm_py_client.RegistSpan()
-    client_span.base = span.base
-    client_span.size = span.size
-    return client_span
+# Kept for callers of the original private helper; new deferred factories use
+# transfer_backend.client_span directly.
+_client_span = client_span
 
 
 def _multi_group_invalid_block_recovery() -> bool:
@@ -113,6 +120,10 @@ class ConnectorWorker:
         # no mirrored request table (every instruction is self-contained).
         self._pending_saves: dict = {}
         self._finish_pending: set = set()
+        # vLLM may expose save instructions only to an idle get_finished step.
+        # These markers make wait_for_save/get_finished execute them once.
+        self._ran_saves = False
+        self._settled_meta: Optional[TairKvCacheConnectorMetadata] = None
 
         self._tp_rank = self.worker_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -196,12 +207,48 @@ class ConnectorWorker:
         return self._tp_size
 
     def shutdown(self) -> None:
-        """Release the data plane.
+        """Finish rank-0's open leases, then release the data plane.
 
-        The coordinator thread and the transfer client are process-scoped and
-        are not torn down here."""
+        The coordinator thread and transfer client are process-scoped and are
+        not torn down here. Backends without a SaveSessionBook keep the legacy
+        shutdown path; backends with one must close it before stopping their IO.
+        """
+        self._finish_open_save_sessions()
         if self._backend is not None:
             self._backend.shutdown()
+
+    def _finish_open_save_sessions(self) -> None:
+        """Flush sessions no coordinator fold will finish before teardown."""
+        backend = self._backend
+        if self._tp_rank != 0 or not isinstance(backend, SaveSessionBook):
+            return
+        budget_s = self._extra_config.sdk_put_timeout_ms / 1000.0 / 10
+        deadline = time.monotonic() + budget_s
+        while backend.open_save_sessions() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        sessions = backend.take_open_save_sessions()
+        self._pending_saves.clear()
+        if not sessions:
+            return
+        try:
+            for session in sessions:
+                vetoed, verdicts = backend.save_session_flush_state(session)
+                mask = (
+                    [False] * session.num_blocks
+                    if vetoed
+                    else flush_mask(verdicts, world=self.world_size())
+                )
+                finish_save_session(
+                    manager_client=self._manager_client,
+                    instance_id=self._extra_config.instance_id,
+                    write_session_id=session.write_session_id,
+                    mask=mask,
+                    reason=(
+                        f"the engine stopped; request {session.req_id}, vetoed={vetoed}"
+                    ),
+                )
+        finally:
+            backend.complete_save_session_flush(sessions)
 
     # ------------------------------------------------------------------ #
     # Storage config plumbing
@@ -292,18 +339,7 @@ class ConnectorWorker:
         init_params.role_type = kvcm_py_client.RoleType.WORKER
         init_params.self_location_spec_name = self._self_location_spec_name
         init_params.storage_configs = f"{self._storage_configs}"
-        if spans:
-            if hasattr(init_params, "regist_spans"):
-                init_params.regist_spans = [
-                    _client_span(kvcm_py_client, span) for span in spans
-                ]
-            else:
-                logger.warning(
-                    "the transfer client cannot register host spans; %d segment(s) "
-                    "of %d bytes stay unregistered",
-                    len(spans),
-                    sum(span.size for span in spans),
-                )
+        configure_host_spans(kvcm_py_client, init_params, spans)
         logger.info("transfer_client_config: %s", self._transfer_client_config)
         client = kvcm_py_client.TransferClient.Create(
             self._transfer_client_config, init_params
@@ -464,6 +500,32 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # Load / save
     # ------------------------------------------------------------------ #
+    def _iter_backend_tasks(
+        self, plans: List[TransferPlan], per_task: int
+    ) -> Iterator[TransferChunk]:
+        """Slice plans into canonical backend tasks, preserving manager ids.
+
+        This is the worker's submission path. ``_iter_task_chunks`` below keeps
+        the older four-element shape for external planners that built on it;
+        keeping the compatibility view here avoids making them append a second
+        copy of the manager ids when the canonical path gained them.
+        """
+        for plan in plans:
+            n = len(plan.uris)
+            declared_ids = getattr(plan, "manager_block_ids", ())
+            manager_ids = declared_ids if len(declared_ids) == n else None
+            for i in range(0, n, per_task):
+                end = min(n, i + per_task)
+                yield (
+                    plan.group,
+                    plan.uris[i:end],
+                    plan.token_indices[i:end]
+                    if plan.token_indices is not None
+                    else None,
+                    plan.block_ids[i:end] if plan.block_ids is not None else None,
+                    manager_ids[i:end] if manager_ids is not None else None,
+                )
+
     def _iter_task_chunks(
         self, plans: List[TransferPlan], per_task: int
     ) -> Iterator[
@@ -474,22 +536,20 @@ class ConnectorWorker:
             Optional[List[int]],
         ]
     ]:
-        """Slice each plan's blocks into per-task chunks.
+        """Compatibility view of a chunk without its manager-block ids.
 
-        Pure generator: the task index is the consumer's concern (enumerate
-        there); this only reads the plans."""
-        for plan in plans:
-            n = len(plan.uris)
-            for i in range(0, n, per_task):
-                end = min(n, i + per_task)
-                yield (
-                    plan.group,
-                    plan.uris[i:end],
-                    plan.token_indices[i:end]
-                    if plan.token_indices is not None
-                    else None,
-                    plan.block_ids[i:end] if plan.block_ids is not None else None,
-                )
+        New backends are submitted through ``_iter_backend_tasks``. Existing
+        subclasses may still consume this four-tuple and append their own
+        addressing field; their task signature keeps working during migration.
+        """
+        for (
+            group,
+            uris,
+            token_indices,
+            block_ids,
+            _,
+        ) in ConnectorWorker._iter_backend_tasks(self, plans, per_task):
+            yield group, uris, token_indices, block_ids
 
     def _plan_group_transfers(
         self,
@@ -534,6 +594,7 @@ class ConnectorWorker:
                         token_indices=self._attn_token_indices(
                             group, manager_block_idxes, block_table
                         ),
+                        manager_block_ids=tuple(manager_block_idxes),
                     )
                 )
             else:
@@ -548,6 +609,7 @@ class ConnectorWorker:
                             manager_block_idxes,
                             block_table,
                         ),
+                        manager_block_ids=tuple(manager_block_idxes),
                     )
                 )
         return plans
@@ -575,17 +637,23 @@ class ConnectorWorker:
         **kwargs: Any,
     ) -> None:
         for load_req in meta.to_load_requests:
-            if not load_req.need_load_locations:
-                continue
             assert self._backend is not None, (
                 "start_load_kv before register_kv_caches: the data plane only "
                 "exists once the KV tensors are known"
             )
             num_blocks = len(load_req.manager_block_idxes)
-            plans = self._plan_group_transfers(
-                load_req.need_load_locations,
-                load_req.manager_block_idxes,
-                load_req.all_block_ids,
+            # No locations is a real rank-level abstention, not an instruction
+            # to stay silent: the coordinator still needs this rank's verdict
+            # for the exact request generation. A non-empty location list with
+            # the wrong cardinality remains a whole-load failure in the planner.
+            plans = (
+                self._plan_group_transfers(
+                    load_req.need_load_locations,
+                    load_req.manager_block_idxes,
+                    load_req.all_block_ids,
+                )
+                if load_req.need_load_locations
+                else []
             )
 
             # Report failures against the block table vLLM can act on: map each
@@ -610,7 +678,7 @@ class ConnectorWorker:
             # Remove the gating once upstream supports multi-group
             # invalid-block recovery.
             report_ids = []
-            report_failures = (
+            report_failures = (plans is None or bool(plans)) and (
                 len(load_req.all_block_ids) == 1
                 or _multi_group_invalid_block_recovery()
             )
@@ -656,8 +724,14 @@ class ConnectorWorker:
                 continue
 
             chunks = list(
-                self._iter_task_chunks(plans, self._extra_config.block_per_load_task)
+                self._iter_backend_tasks(plans, self._extra_config.block_per_load_task)
             )
+            if not chunks:
+                # This rank owns no byte-moving task. Report an abstention as
+                # success for every block (never as a failed load), and do not
+                # construct MultiResult(0), whose callback could never fire.
+                done_cb([True] * num_blocks * self._num_groups)
+                continue
             multi_result = MultiResult(len(chunks), done_cb)
             submit_load = getattr(self._backend, "submit_load", None)
             if submit_load is not None:
@@ -683,6 +757,7 @@ class ConnectorWorker:
         pass
 
     def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
+        self._ran_saves = True
         if not meta.to_save_requests:
             return
         assert self._backend is not None, (
@@ -710,17 +785,22 @@ class ConnectorWorker:
                 continue
 
             chunks = list(
-                self._iter_task_chunks(plans, self._extra_config.block_per_save_task)
+                self._iter_backend_tasks(plans, self._extra_config.block_per_save_task)
             )
-            multi_result = MultiResult(len(chunks), done_cb)
-            for task_idx, chunk in enumerate(chunks):
-                self._backend.submit(
-                    self._backend.save_task,
-                    multi_result,
-                    task_idx,
-                    *chunk,
-                    ready_event,
-                )
+            if not chunks:
+                # A silent rank abstains successfully; a zero-sized MultiResult
+                # would never call back and would hold the write lease forever.
+                done_cb([True] * num_blocks * self._num_groups)
+            else:
+                multi_result = MultiResult(len(chunks), done_cb)
+                for task_idx, chunk in enumerate(chunks):
+                    self._backend.submit(
+                        self._backend.save_task,
+                        multi_result,
+                        task_idx,
+                        *chunk,
+                        ready_event,
+                    )
             if self._tp_rank == 0:
                 # One session in flight; the coordinator's completion event
                 # for this req decrements it (see get_finished).
@@ -731,12 +811,28 @@ class ConnectorWorker:
     def on_save_finished(
         self, write_session_id: str, save_context: SaveContext
     ) -> None:
-        for block_idx in range(len(save_context.locations)):
-            fully_saved = all(
+        disposition = SaveDisposition.PUBLISH
+        backend = getattr(self, "_backend", None)
+        if isinstance(backend, SaveSessionBook):
+            disposition = backend.close_save_session(write_session_id)
+        if disposition is SaveDisposition.ALREADY_REPORTED:
+            return
+        if disposition is SaveDisposition.VETO:
+            # Source-page ownership is gone. Preserve the all-rank AND shape,
+            # but force this rank's verdict false so late success cannot publish.
+            num_blocks = len(save_context.locations)
+            save_context.result_per_rank[self.worker_rank()] = [False] * num_blocks
+            logger.warning(
+                "vetoing late save session %s because its source pages were released",
+                write_session_id,
+            )
+        save_context.success_mask = [
+            all(
                 save_context.result_per_rank[rank][block_idx]
                 for rank in range(self.world_size())
             )
-            save_context.success_mask.append(fully_saved)
+            for block_idx in range(len(save_context.locations))
+        ]
         logger.debug(
             "finish_write_cache mask:%s session:%s",
             save_context.success_mask,
@@ -744,19 +840,64 @@ class ConnectorWorker:
         )
         try:
             self._manager_client.finish_write_cache(
-                {
-                    "trace_id": "finish_%s" % write_session_id[:8],
-                    "instance_id": self._extra_config.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {
-                        "bool_masks": {"values": save_context.success_mask}
-                    },
-                }
+                finish_write_cache_payload(
+                    instance_id=self._extra_config.instance_id,
+                    write_session_id=write_session_id,
+                    mask=save_context.success_mask,
+                )
             )
         except Exception as e:
             logger.warning(
                 "finish_write_cache failed, session: %s, error: %s", write_session_id, e
             )
+
+    def _veto_saves_from_metadata(
+        self, meta: TairKvCacheConnectorMetadata
+    ) -> frozenset[str]:
+        """Terminally veto old sessions before their source pages can be reused."""
+        req_ids = frozenset(getattr(meta, "preempted_req_ids", ()) or ())
+        req_ids |= frozenset(getattr(meta, "vetoed_save_req_ids", ()) or ())
+        backend = self._backend
+        veto = getattr(backend, "veto_save_sessions", None)
+        if req_ids and callable(veto):
+            veto(req_ids)
+        return req_ids
+
+    def _report_untouched_save(self, save_req: Any, *, written: bool) -> None:
+        """Report a rank that will move no bytes, through the normal session seam."""
+        num_blocks = len(save_req.target_locations)
+        if num_blocks <= 0:
+            return
+        assert self._backend is not None
+        done_cb = self._backend.create_save_done_callback(
+            save_req.req_id,
+            self._tp_rank,
+            save_req.write_session_id,
+            num_blocks,
+        )
+        done_cb([written] * num_blocks * self._num_groups)
+
+    def handle_preemptions(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Drop saves whose source pages are about to change ownership.
+
+        Existing sessions are vetoed first. Instructions removed here still send
+        an all-false rank verdict, so every manager lease settles instead of
+        waiting for a transfer that will never be submitted.
+        """
+        req_ids = self._veto_saves_from_metadata(meta)
+        if not req_ids:
+            return
+        save_reqs = list(getattr(meta, "to_save_requests", ()) or ())
+        doomed = [req for req in save_reqs if req.req_id in req_ids]
+        if not doomed:
+            return
+        meta.to_save_requests = [req for req in save_reqs if req.req_id not in req_ids]
+        for save_req in doomed:
+            logger.info(
+                "dropping save of preempted req=%s: its source pages may be reused",
+                save_req.req_id,
+            )
+            self._report_untouched_save(save_req, written=False)
 
     def get_finished(
         self, finished_req_ids: set, meta: TairKvCacheConnectorMetadata
@@ -768,6 +909,23 @@ class ConnectorWorker:
         finish_write_cache). The scheduler's FinishRequest -- sent when its
         own ledger says the request is settled -- either reports immediately
         or defers until the last session lands."""
+        veto = getattr(self, "_veto_saves_from_metadata", None)
+        if veto is not None:
+            veto(meta)
+        try:
+            if (
+                meta is not getattr(self, "_settled_meta", None)
+                and not getattr(self, "_ran_saves", False)
+                and getattr(meta, "to_save_requests", None)
+            ):
+                # No forward means no wait_for_save call. The instructions are
+                # still live, so run them once here rather than letting the
+                # manager expire a lease nobody executed.
+                self._settled_meta = meta
+                self.handle_preemptions(meta)
+                self.wait_for_save(meta)
+        finally:
+            self._ran_saves = False
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
                 self._pending_saves.pop(finish_req.req_id, None)

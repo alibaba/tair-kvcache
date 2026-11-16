@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import FrozenSet, List
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
@@ -50,6 +50,10 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         self.to_load_requests: List[LoadRequest] = []
         self.to_save_requests: List[SaveRequest] = []
         self.to_finish_requests: List[FinishRequest] = []
+        # Source-page ownership fences. They are part of the envelope rather
+        # than ad-hoc attributes added by one engine's scheduler subclass.
+        self.preempted_req_ids: FrozenSet[str] = frozenset()
+        self.vetoed_save_req_ids: FrozenSet[str] = frozenset()
 
     def add_load_request(self, request: LoadRequest) -> None:
         self.to_load_requests.append(request)

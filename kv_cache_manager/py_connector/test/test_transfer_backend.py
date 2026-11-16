@@ -37,10 +37,15 @@ from kv_cache_manager.py_connector.vllm.metadata import (
     SaveRequest,
     TairKvCacheConnectorMetadata,
 )
+from kv_cache_manager.py_connector.vllm.save_session import (
+    SaveDisposition,
+    SaveSession,
+)
 from kv_cache_manager.py_connector.vllm.transfer_backend import (
     HostSpan,
     MultiResult,
     TransferBackend,
+    configure_host_spans,
     make_transfer_backend,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -105,6 +110,44 @@ class FakeBackend:
         pass
 
 
+class SessionBackend(FakeBackend):
+    """Protocol-complete session book with mockable publication decisions."""
+
+    def __init__(self):
+        self.vetoed = []
+        self.disposition = SaveDisposition.PUBLISH
+        self.sessions = []
+        self.flush_completed = []
+        self.shutdown_called = False
+
+    def open_save_sessions(self):
+        return []
+
+    def take_open_save_sessions(self):
+        sessions, self.sessions = self.sessions, []
+        return sessions
+
+    def complete_save_session_flush(self, sessions):
+        self.flush_completed.extend(sessions)
+
+    def save_session_flush_state(self, session):
+        return session.vetoed, list(session.verdicts)
+
+    def veto_save_sessions(self, req_ids):
+        doomed = frozenset(req_ids)
+        self.vetoed.append(doomed)
+        for session in self.sessions:
+            if session.req_id in doomed:
+                session.vetoed = True
+        return len(doomed)
+
+    def close_save_session(self, write_session_id):
+        return self.disposition
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
 def _attn_kv_cache(num_blocks=4, kernel_bs=8, heads=2, head_dim=4):
     """A packed 4-D KV page laid out as vLLM >= 0.26 allocates it: the tensor
     exposes (blocks, heads, kernel_block, 2*head_dim) while the bytes inside
@@ -153,6 +196,8 @@ def _bare_worker():
     conn = make_connector(manager_block_size=8)
     conn._self_spec_names = {0: "tp0_g0"}
     conn._pending_saves = {}
+    conn._ran_saves = False
+    conn._settled_meta = None
     conn._extra_config = (  # ty: ignore[invalid-assignment]
         SimpleNamespace(block_per_save_task=8, block_per_load_task=8)
     )
@@ -328,6 +373,83 @@ class TestWorkerUsesBackend(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         conn._backend.submit.assert_not_called()
 
+    def test_canonical_chunks_keep_manager_ids_and_legacy_view_drops_them(self):
+        conn = _bare_worker()
+        plan = TransferPlan(
+            group=_attn_group(),
+            uris=["u4", "u5", "u6"],
+            token_indices=[[4], [5], [6]],
+            manager_block_ids=(4, 5, 6),
+        )
+
+        canonical = list(conn._iter_backend_tasks([plan], per_task=2))
+        legacy = list(conn._iter_task_chunks([plan], per_task=2))
+
+        self.assertEqual([chunk[4] for chunk in canonical], [(4, 5), (6,)])
+        self.assertTrue(all(len(chunk) == 4 for chunk in legacy))
+        self.assertEqual([chunk[1] for chunk in legacy], [["u4", "u5"], ["u6"]])
+
+    def test_load_without_locations_reports_a_rank_abstention(self):
+        conn = _bare_worker()
+        done = MagicMock()
+        conn._backend.create_load_done_callback.return_value = done
+        meta = TairKvCacheConnectorMetadata(epoch=11)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="silent",
+                manager_block_idxes=[4],
+                need_load_locations=[],
+                all_block_ids=[[10]],
+            )
+        )
+
+        conn.start_load_kv(MagicMock(), meta)
+
+        done.assert_called_once_with([True])
+        conn._plan_group_transfers.assert_not_called()
+        conn._backend.submit.assert_not_called()
+
+    def test_empty_load_chunks_complete_instead_of_constructing_zero_multi_result(self):
+        conn = _bare_worker()
+        conn._plan_group_transfers.return_value = []
+        done = MagicMock()
+        conn._backend.create_load_done_callback.return_value = done
+        meta = TairKvCacheConnectorMetadata(epoch=12)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="empty",
+                manager_block_idxes=[3],
+                need_load_locations=[{}],
+                all_block_ids=[[10]],
+            )
+        )
+
+        conn.start_load_kv(MagicMock(), meta)
+
+        done.assert_called_once_with([True])
+        conn._backend.submit.assert_not_called()
+
+    def test_empty_save_chunks_report_successful_abstention(self):
+        conn = _bare_worker()
+        conn._plan_group_transfers.return_value = []
+        done = MagicMock()
+        conn._backend.create_save_done_callback.return_value = done
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_save_request(
+            SaveRequest(
+                req_id="empty-save",
+                target_locations=[{}],
+                manager_block_idxes=[0],
+                write_session_id="sess-empty",
+            )
+        )
+
+        conn.wait_for_save(meta)
+
+        done.assert_called_once_with([True])
+        conn._backend.submit.assert_not_called()
+        self.assertEqual(conn._pending_saves, {"empty-save": 1})
+
     def _register(self, conn):
         conn._backend = None  # built by the call under test
         conn._transfer_client = MagicMock()
@@ -376,6 +498,104 @@ class TestWorkerShutdown(unittest.TestCase):
         conn = _bare_worker()
         conn.shutdown()
         conn._backend.shutdown.assert_called_once_with()
+
+
+class TestWorkerLifecycleSeams(unittest.TestCase):
+    def test_idle_get_finished_runs_save_metadata_once(self):
+        conn = _bare_worker()
+        done = MagicMock()
+        conn._backend.create_save_done_callback.return_value = done
+        conn._coordinator_server = MagicMock()
+        conn._coordinator_server.get_finished_tasks_with_ids.return_value = ([], [])
+        conn._finish_pending = set()
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_save_request(SaveRequest("r0", [{}, {}], [0, 1], "sess"))
+
+        conn.get_finished(set(), meta)
+        conn.get_finished(set(), meta)
+
+        conn._backend.submit.assert_called_once()
+        self.assertEqual(conn._pending_saves, {"r0": 1})
+
+    def test_preemption_vetoes_old_sessions_and_reports_new_instruction_false(self):
+        conn = _bare_worker()
+        backend = SessionBackend()
+        done = MagicMock()
+        backend.create_save_done_callback = MagicMock(return_value=done)
+        conn._backend = backend
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.preempted_req_ids = frozenset({"r0"})
+        meta.add_save_request(SaveRequest("r0", [{}], [0], "sess"))
+
+        conn.handle_preemptions(meta)
+
+        self.assertEqual(meta.to_save_requests, [])
+        self.assertEqual(backend.vetoed, [frozenset({"r0"})])
+        done.assert_called_once_with([False])
+
+    def test_shutdown_flush_uses_the_shared_payload(self):
+        conn = _bare_worker()
+        backend = SessionBackend()
+        session = SaveSession("r0", "flush", 2, [True, False])
+        backend.sessions = [session]
+        conn._backend = backend
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(
+            sdk_put_timeout_ms=1000, instance_id="instance"
+        )
+
+        conn.shutdown()
+
+        body = conn._manager_client.finish_write_cache.call_args.args[0]
+        self.assertEqual(body["write_session_id"], "flush")
+        self.assertEqual(body["success_blocks"]["bool_masks"]["values"], [True, False])
+        self.assertEqual(backend.flush_completed, [session])
+        self.assertTrue(backend.shutdown_called)
+
+    def test_shell_forwards_preemption_and_block_pool_seams(self):
+        shell = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        shell.connector_worker = MagicMock()
+        shell.connector_scheduler = None
+        metadata = object()
+        shell.handle_preemptions(metadata)
+        shell.connector_worker.handle_preemptions.assert_called_once_with(metadata)
+
+        shell.connector_worker = None
+        shell.connector_scheduler = MagicMock()
+        pool = object()
+        with patch.object(
+            v1_connector.KVConnectorBase_V1, "bind_gpu_block_pool", create=True
+        ) as base_bind:
+            shell.bind_gpu_block_pool(pool)
+        shell.connector_scheduler.bind_block_pool.assert_called_once_with(pool)
+        base_bind.assert_called_once_with(pool)
+
+    def test_coordinator_fold_honors_veto_and_duplicate_flush(self):
+        for disposition, expected_calls, expected_mask in (
+            (SaveDisposition.VETO, 1, [False]),
+            (SaveDisposition.ALREADY_REPORTED, 0, None),
+        ):
+            with self.subTest(disposition=disposition):
+                conn = _bare_worker()
+                backend = SessionBackend()
+                backend.disposition = disposition
+                conn._backend = backend
+                conn._manager_client = MagicMock()
+                conn._extra_config = SimpleNamespace(instance_id="instance")
+                context = SaveContext(locations=[{}], result_per_rank={0: [True]})
+
+                conn.on_save_finished("sess", context)
+
+                self.assertEqual(
+                    conn._manager_client.finish_write_cache.call_count,
+                    expected_calls,
+                )
+                if expected_mask is not None:
+                    body = conn._manager_client.finish_write_cache.call_args.args[0]
+                    self.assertEqual(
+                        body["success_blocks"]["bool_masks"]["values"],
+                        expected_mask,
+                    )
 
 
 class TestRankHooks(unittest.TestCase):
@@ -590,10 +810,33 @@ class TestPipelineParallelGate(unittest.TestCase):
         connector.shutdown()
 
 
-
-
 class TestHostSpans(unittest.TestCase):
     """The backend states its host segments before the client exists."""
+
+    def test_deferred_factory_uses_the_same_fd_contract_without_torch(self):
+        binding = SimpleNamespace(
+            RegistSpan=lambda: SimpleNamespace(base=0, size=0, fd=-1)
+        )
+        init_params = SimpleNamespace(regist_spans=None)
+
+        registered = configure_host_spans(
+            binding, init_params, [HostSpan(base=4096, size=8192, fd=7)]
+        )
+
+        self.assertTrue(registered)
+        self.assertEqual(init_params.regist_spans[0].fd, 7)
+        with self.assertRaisesRegex(RuntimeError, "without an fd"):
+            configure_host_spans(
+                binding,
+                SimpleNamespace(regist_spans=None),
+                [HostSpan(base=4096, size=8192)],
+            )
+        with self.assertRaisesRegex(RuntimeError, "no regist_spans"):
+            configure_host_spans(
+                binding,
+                SimpleNamespace(),
+                [HostSpan(base=4096, size=8192, fd=7)],
+            )
 
     def _spanned_backend(self, spans):
         class SpannedBackend(FakeBackend):
@@ -602,7 +845,7 @@ class TestHostSpans(unittest.TestCase):
 
         return SpannedBackend()
 
-    def _register(self, spans, *, binding_supports_spans):
+    def _register(self, spans, *, binding_supports_spans, binding_supports_fd=False):
         conn = _bare_worker()
         conn._extra_config = _extra_config(transfer_backend_module_path=BACKEND_MODULE)
         conn._self_location_spec_name = "tp0_g0"
@@ -621,10 +864,16 @@ class TestHostSpans(unittest.TestCase):
             created["client"] = MagicMock(name="client")
             return created["client"]
 
+        def regist_span():
+            span = SimpleNamespace(base=0, size=0)
+            if binding_supports_fd:
+                span.fd = -1
+            return span
+
         binding = SimpleNamespace(
             InitParams=lambda: init_params,
             RoleType=SimpleNamespace(WORKER="worker"),
-            RegistSpan=lambda: SimpleNamespace(base=0, size=0),
+            RegistSpan=regist_span,
             TransferClient=SimpleNamespace(Create=create),
         )
         with (
@@ -640,7 +889,9 @@ class TestHostSpans(unittest.TestCase):
         conn, created, init_params = self._register(spans, binding_supports_spans=True)
 
         registered = init_params.regist_spans
-        self.assertEqual([(s.base, s.size) for s in registered], [(4096, 8192), (16384, 4096)])
+        self.assertEqual(
+            [(s.base, s.size) for s in registered], [(4096, 8192), (16384, 4096)]
+        )
         # The backend attached the client it did not receive at construction.
         self.assertIs(conn._backend.transfer_client, created["client"])
 
@@ -651,6 +902,52 @@ class TestHostSpans(unittest.TestCase):
 
         self.assertFalse(hasattr(init_params, "regist_spans"))
         self.assertIs(conn._backend.transfer_client, created["client"])
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_fd_reaches_an_fd_capable_client(self):
+        conn, created, init_params = self._register(
+            [HostSpan(base=4096, size=8192, fd=9)],
+            binding_supports_spans=True,
+            binding_supports_fd=True,
+        )
+
+        self.assertEqual(init_params.regist_spans[0].fd, 9)
+        self.assertIs(conn._backend.transfer_client, created["client"])
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_fd_capable_client_rejects_a_span_without_fd(self):
+        with self.assertRaisesRegex(RuntimeError, "without an fd"):
+            self._register(
+                [HostSpan(base=4096, size=8192)],
+                binding_supports_spans=True,
+                binding_supports_fd=True,
+            )
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_fd_is_not_dropped_when_regist_span_cannot_carry_it(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot carry"):
+            self._register(
+                [HostSpan(base=4096, size=8192, fd=9)],
+                binding_supports_spans=True,
+                binding_supports_fd=False,
+            )
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_fd_spans_do_not_fall_back_when_regist_spans_is_unavailable(self):
+        with self.assertRaisesRegex(RuntimeError, "no regist_spans"):
+            self._register(
+                [HostSpan(base=4096, size=8192, fd=9)],
+                binding_supports_spans=False,
+            )
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_invalid_fd_fails_before_client_create(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            self._register(
+                [HostSpan(base=4096, size=8192, fd=-1)],
+                binding_supports_spans=True,
+                binding_supports_fd=True,
+            )
 
     @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
     def test_the_default_backend_states_no_spans(self):

@@ -272,6 +272,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------ #
     # Scheduler hooks (called on the scheduler-role instance)
     # ------------------------------------------------------------------ #
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        """Forward the optional page-lifetime seam, then retain base behavior."""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_block_pool(gpu_block_pool)
+        base_bind = getattr(super(), "bind_gpu_block_pool", None)
+        if base_bind is not None:
+            base_bind(gpu_block_pool)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> Tuple[Optional[int], bool]:
@@ -331,6 +339,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         # (start_load_kv / wait_for_save receive it explicitly); no mirror
         # to replay here.
         super().bind_connector_metadata(connector_metadata)
+
+    def handle_preemptions(self, kv_connector_metadata: Any) -> None:
+        """Forward the source-page ownership fence to the worker role."""
+        if self.connector_worker is not None:
+            self.connector_worker.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         assert self.connector_worker is not None

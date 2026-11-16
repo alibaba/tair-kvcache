@@ -348,6 +348,59 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
         # Should be 2, not 3 (duplicate rank 0 deduplicated by add_new_rank)
         self.assertEqual(save_context.get_size(), 2)
 
+    def test_late_duplicate_after_completion_is_not_a_new_session(self):
+        start = CoordinateMessage(
+            time.time(),
+            SendBlockStartEvent(
+                request_id="req-late",
+                write_session_id="session-late",
+                locations=[],
+            ),
+        )
+        self.client.send(CoordinateMsgSerializer.dumps(start))
+        for rank in (0, 1):
+            self.client.send(
+                CoordinateMsgSerializer.dumps(
+                    CoordinateMessage(
+                        time.time(),
+                        SendBlockFinishedEvent(
+                            request_id="req-late",
+                            tp_rank=rank,
+                            write_session_id="session-late",
+                            is_success_list=[],
+                        ),
+                    )
+                )
+            )
+        self.assertTrue(self.callback_event.wait(timeout=5))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            saving, _ = self.server.get_finished_tasks()
+            if saving == ["req-late"]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(saving, ["req-late"])
+
+        # Both a repeated verdict and a repeated start arrive after the fold.
+        self.client.send(
+            CoordinateMsgSerializer.dumps(
+                CoordinateMessage(
+                    time.time(),
+                    SendBlockFinishedEvent(
+                        request_id="req-late",
+                        tp_rank=1,
+                        write_session_id="session-late",
+                        is_success_list=[],
+                    ),
+                )
+            )
+        )
+        self.client.send(CoordinateMsgSerializer.dumps(start))
+        time.sleep(0.2)
+
+        self.assertEqual(len(self.callback_results), 1)
+        self.assertEqual(self.server.get_finished_tasks(), ([], []))
+
     def tearDown(self):
         self.server._coordinator_running = False
         # Don't join - thread is blocked on recv() and will be cleaned up as daemon
@@ -608,6 +661,44 @@ class TestLoadFailureAggregation(unittest.TestCase):
         self.assertEqual(self.client.finished_load_ids(timeout_ms=500), {expected})
         _, loading = self.server.get_finished_tasks_with_ids()
         self.assertEqual(loading, [expected])
+
+    def test_late_duplicate_does_not_complete_the_same_epoch_twice(self):
+        self._send(0, [4])
+        self._send(1, [])
+        self.assertEqual(self._poll_failed(), {4})
+        expected = RunningId("7", "req-load")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            _, loading = self.server.get_finished_tasks_with_ids()
+            if loading == [expected]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(loading, [expected])
+
+        self._send(0, [])
+        self._send(1, [9])
+        time.sleep(0.2)
+
+        self.assertEqual(self.server.get_finished_tasks_with_ids(), ([], []))
+        self.assertEqual(self.server.get_failed_loading_block_idxs(), set())
+        self.assertEqual(self.server._loading_id_history.count(expected), 1)
+
+    def test_same_request_has_an_independent_completion_per_epoch(self):
+        self._send(0, [], epoch=7)
+        self._send(1, [], epoch=7)
+        self._send(0, [], epoch=8)
+        self._send(1, [], epoch=8)
+
+        expected = {RunningId("7", "req-load"), RunningId("8", "req-load")}
+        deadline = time.time() + 5
+        loading = []
+        while time.time() < deadline:
+            _, loading = self.server.get_finished_tasks_with_ids()
+            if set(loading) == expected:
+                break
+            time.sleep(0.01)
+        self.assertEqual(set(loading), expected)
+        self.assertEqual(self.client.finished_load_ids(timeout_ms=500), expected)
 
     def tearDown(self):
         self.server._coordinator_running = False

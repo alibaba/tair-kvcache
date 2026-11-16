@@ -1,6 +1,7 @@
 import orjson
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -275,6 +276,19 @@ class TpCoordinatorServer:
 
         running_load: Dict[RunningId, LoadContext] = {}
         running_save: Dict[RunningId, SaveContext] = {}
+        # Completed generations are tombstoned for as long as their completion
+        # history can be queried. A late duplicate must not recreate a context,
+        # emit a second completion, or sit forever in the out-of-order buffer.
+        completed_loads: OrderedDict[RunningId, None] = OrderedDict()
+        completed_saves: OrderedDict[RunningId, None] = OrderedDict()
+
+        def remember_completed(
+            completed: OrderedDict[RunningId, None], running_id: RunningId
+        ) -> None:
+            completed[running_id] = None
+            while len(completed) > _HISTORY:
+                completed.popitem(last=False)
+
         # Buffer for SendBlockFinishedEvent that arrives before SendBlockStartEvent
         pending_save_finishes: Dict[RunningId, List[SendBlockFinishedEvent]] = {}
 
@@ -287,6 +301,7 @@ class TpCoordinatorServer:
             if save_context.get_size() != self._tp_world_size:
                 return
             save_context = running_save.pop(save_id)
+            remember_completed(completed_saves, save_id)
             self._on_finished_callback(write_session_id, save_context)
             with self._finished_saving_lock:
                 self._finished_saving.append(request_id)
@@ -305,6 +320,8 @@ class TpCoordinatorServer:
             if isinstance(msg.content, SendBlockStartEvent):
                 content: SendBlockStartEvent = msg.content
                 save_id = RunningId(content.write_session_id, content.request_id)
+                if save_id in completed_saves:
+                    continue
                 if save_id not in running_save:
                     running_save[save_id] = SaveContext(content.locations)
 
@@ -322,6 +339,8 @@ class TpCoordinatorServer:
             elif isinstance(msg.content, SendBlockFinishedEvent):
                 content: SendBlockFinishedEvent = msg.content
                 save_id = RunningId(content.write_session_id, content.request_id)
+                if save_id in completed_saves:
+                    continue
 
                 if save_id not in running_save:
                     # Start event hasn't arrived yet, buffer this finish
@@ -338,6 +357,8 @@ class TpCoordinatorServer:
             elif isinstance(msg.content, LoadBlockFinishedEvent):
                 content: LoadBlockFinishedEvent = msg.content
                 load_id = RunningId(str(content.epoch), content.request_id)
+                if load_id in completed_loads:
+                    continue
                 if load_id not in running_load:
                     running_load[load_id] = LoadContext()
                     if _TRACE:
@@ -364,6 +385,7 @@ class TpCoordinatorServer:
                     )
                 if load_ctx.get_size() == self._tp_world_size:
                     running_load.pop(load_id)
+                    remember_completed(completed_loads, load_id)
 
                     self._finished_loading_lock.acquire()
                     self._failed_loading_block_idxs.extend(load_ctx.failed_block_idxs)

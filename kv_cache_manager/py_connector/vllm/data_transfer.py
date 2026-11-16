@@ -274,7 +274,8 @@ class DataTransferManager(BlockVerdicts):
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
-        ready_event: Any,
+        manager_block_ids: Optional[Sequence[int]] = None,
+        ready_event: Any = None,
     ) -> None:
         """Gather one group's manager blocks from HBM and save them.
 
@@ -421,6 +422,7 @@ class DataTransferManager(BlockVerdicts):
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
+        manager_block_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Load one group's manager blocks from storage into HBM.
 

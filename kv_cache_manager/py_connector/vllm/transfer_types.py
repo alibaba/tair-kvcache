@@ -15,7 +15,7 @@ Nothing here is consumed by the sglang connector; per the placement rule
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -109,6 +109,24 @@ class TransferPlan:
     token_indices: Optional[List[List[int]]] = None
     # State groups: source/target state block id per manager block.
     block_ids: Optional[List[int]] = None
+    # Manager block index per URI, in URI order. A task-local offset cannot
+    # recover this after slicing: loads and incremental saves need not start at
+    # manager block zero. Empty means the plan cannot name its blocks; backends
+    # that only move bytes may ignore it, while failure reporting must refuse to
+    # invent task-local manager ids.
+    manager_block_ids: Tuple[int, ...] = ()
+
+
+# Canonical backend task arguments after ``multi_result, task_idx``. The fifth
+# element is optional only for legacy plans; plans built by ConnectorWorker
+# always carry the manager ids.
+TransferChunk = Tuple[
+    TransferGroup,
+    List[Optional[str]],
+    Optional[List[List[int]]],
+    Optional[List[int]],
+    Optional[Tuple[int, ...]],
+]
 
 
 @dataclass(frozen=True)

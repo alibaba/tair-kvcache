@@ -41,6 +41,7 @@ from kv_cache_manager.py_connector.vllm.metadata import (
     SaveRequest,
     TairKvCacheConnectorMetadata,
 )
+from kv_cache_manager.py_connector.vllm.save_session import finish_abandoned
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     ATTN_ONLY_SPEC_GROUP,
     ALL_SPEC_GROUP,
@@ -143,6 +144,8 @@ class ConnectorScheduler:
         self._waiting_to_finish_requests: List[FinishRequest] = []
         self._canceled_save_request_ids_lock = threading.Lock()
         self._canceled_save_request_ids: List[str] = []
+        # A late StartWriteCache response self-drains once teardown has begun.
+        self._stopping = False
         # External-match discipline; cleaned at retirement.
         self._load_failed: set = set()
         self._load_attempted: set = set()
@@ -152,8 +155,54 @@ class ConnectorScheduler:
         self._state_pages: Dict[str, Dict[int, Dict[int, int]]] = {}
 
     def shutdown(self) -> None:
+        """Close queued write leases before releasing their producer.
+
+        ``ThreadPoolExecutor.shutdown(wait=False)`` lets an already-running
+        StartWriteCache finish later. Its success path checks ``_stopping`` and
+        calls the same idempotent drain after enqueueing, so neither an early
+        nor a late response is left for the manager to expire silently.
+        """
+        self._stopping = True
+        self._finish_queued_sessions()
         self._location_query_manager.shutdown()
         self._http_executor.shutdown(wait=False)
+        self._finish_queued_sessions()
+
+    def _finish_queued_sessions(self) -> None:
+        """Finish save requests no worker will consume, exactly once."""
+        with self._waiting_to_save_requests_lock:
+            queued = self._waiting_to_save_requests
+            self._waiting_to_save_requests = []
+        for save_req in queued:
+            finish_abandoned(
+                manager_client=self._manager_client,
+                instance_id=self._extra_config.instance_id,
+                write_session_id=save_req.write_session_id,
+                num_blocks=len(save_req.manager_block_idxes),
+                reason="the scheduler stopped before handing the session to a worker",
+            )
+
+    # ------------------------------------------------------------------ #
+    # Optional engine lifecycle hooks (no-ops for the built-in data plane)
+    # ------------------------------------------------------------------ #
+    def bind_block_pool(self, block_pool: object) -> None:
+        """Receive the engine block pool when a subclass holds page references."""
+
+    def on_load_allocated(self, request: "Request", blocks: "KVCacheBlocks") -> None:
+        """Runs after an external LoadRequest has been fully addressed."""
+
+    def on_finished_sending(self, req_id: str) -> None:
+        """Runs when the engine confirms a request's saves have finished."""
+
+    def on_finished_recving(self, req_id: str) -> None:
+        """Runs when the engine confirms a request's load has drained."""
+
+    def on_request_retired(self, req_id: str) -> None:
+        """Runs after the scheduler drops its own per-request state."""
+
+    def _vetoed_save_requests(self) -> frozenset[str]:
+        """Additional requests whose in-flight saves must never publish."""
+        return frozenset()
 
     # ------------------------------------------------------------------ #
     # Hybrid state coverage
@@ -504,6 +553,7 @@ class ConnectorScheduler:
                 all_block_ids=[list(b) for b in ledger.block_ids_per_group],
             )
         )
+        self.on_load_allocated(request, blocks)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Consume the worker's step output: mark requests whose external
@@ -515,20 +565,23 @@ class ConnectorScheduler:
         blocks to recompute exactly is vLLM's decision.
         """
         invalid = getattr(connector_output, "invalid_block_ids", None)
-        if not invalid:
-            return
-        for req_id, ledger in self._tracked.items():
-            if any(
-                b in invalid
-                for group_ids in ledger.block_ids_per_group
-                for b in group_ids
-            ):
-                self._load_failed.add(req_id)
-                logger.warning(
-                    "req:%s external load failed (invalid blocks "
-                    "reached its block table)",
-                    req_id,
-                )
+        if invalid:
+            for req_id, ledger in self._tracked.items():
+                if any(
+                    b in invalid
+                    for group_ids in ledger.block_ids_per_group
+                    for b in group_ids
+                ):
+                    self._load_failed.add(req_id)
+                    logger.warning(
+                        "req:%s external load failed (invalid blocks "
+                        "reached its block table)",
+                        req_id,
+                    )
+        for req_id in getattr(connector_output, "finished_sending", None) or ():
+            self.on_finished_sending(req_id)
+        for req_id in getattr(connector_output, "finished_recving", None) or ():
+            self.on_finished_recving(req_id)
 
     # ------------------------------------------------------------------ #
     # Per-step metadata assembly and saving orchestration
@@ -547,6 +600,9 @@ class ConnectorScheduler:
         """
         meta = TairKvCacheConnectorMetadata(self._epoch)
         self._epoch += 1
+        meta.preempted_req_ids = frozenset(
+            getattr(scheduler_output, "preempted_req_ids", ()) or ()
+        )
 
         self._ingest_scheduled_reqs(scheduler_output)
         self._record_state_offers(scheduler_output)
@@ -554,6 +610,7 @@ class ConnectorScheduler:
         self._collect_load_instructions(meta)
         self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
+        meta.vetoed_save_req_ids = frozenset(self._vetoed_save_requests())
         return meta
 
     def _ingest_scheduled_reqs(self, scheduler_output: "SchedulerOutput") -> None:
@@ -677,9 +734,7 @@ class ConnectorScheduler:
                 # steps, and the block table alone cannot name a boundary's
                 # current page (see _record_state_offers).
                 mask = self._state_complete_mask(ledger, range(target_save_num))
-                tables = self._tables_with_state_pages(
-                    ledger, target_save_num
-                )
+                tables = self._tables_with_state_pages(ledger, target_save_num)
                 # Snapshot the state mask and page IDs before asynchronous dispatch. The
 # engine's hand-off defines the page-lifetime contract; allocation history and
 # output-equivalence observations are not substitutes for that contract.
@@ -722,7 +777,16 @@ class ConnectorScheduler:
             ledger = self._tracked.get(save_req.req_id)
             if ledger is None:
                 logger.warning(
-                    "request %s is not tracked, skip saving", save_req.req_id
+                    "request %s retired before its save was handed over; "
+                    "finishing the session as unwritten",
+                    save_req.req_id,
+                )
+                finish_abandoned(
+                    manager_client=self._manager_client,
+                    instance_id=self._extra_config.instance_id,
+                    write_session_id=save_req.write_session_id,
+                    num_blocks=len(save_req.manager_block_idxes),
+                    reason="the request retired before the save was handed over",
                 )
                 continue
             # Snapshot the ledger for the worker unless the dispatch already
@@ -730,9 +794,7 @@ class ConnectorScheduler:
             # _tables_with_state_pages): a later step's table would name pages
             # the mask was not computed against.
             if not save_req.all_block_ids:
-                save_req.all_block_ids = [
-                    list(b) for b in ledger.block_ids_per_group
-                ]
+                save_req.all_block_ids = [list(b) for b in ledger.block_ids_per_group]
             meta.add_save_request(save_req)
             ledger.sent_saving_count += 1
             if (
@@ -759,6 +821,7 @@ class ConnectorScheduler:
         self._load_failed.discard(req_id)
         self._load_attempted.discard(req_id)
         self._location_query_manager.invalidate(req_id)
+        self.on_request_retired(req_id)
 
     def start_save_kvcache_async(
         self,
@@ -898,15 +961,15 @@ class ConnectorScheduler:
         self._coordinator_client.send(CoordinateMsgSerializer.dumps(message))
 
         with self._waiting_to_save_requests_lock:
-            save_req = SaveRequest(
-                req_id, locations, need_block_idx, write_session_id
-            )
+            save_req = SaveRequest(req_id, locations, need_block_idx, write_session_id)
             if block_tables is not None:
                 # Snapshot at dispatch time, together with the mask it belongs
                 # to: the pages the worker copies must be the pages whose
                 # existence the manager was told about.
                 save_req.all_block_ids = [list(b) for b in block_tables]
             self._waiting_to_save_requests.append(save_req)
+        if getattr(self, "_stopping", False):
+            self._finish_queued_sessions()
 
     def handle_canceled_save_req(self) -> None:
         with self._canceled_save_request_ids_lock:
