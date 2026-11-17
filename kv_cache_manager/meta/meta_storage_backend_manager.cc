@@ -416,7 +416,7 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
 }
 
 void MetaStorageBackendManager::FilterRecoverFallbackKeys(KeyTypeVec &keys,
-                                                           std::vector<size_t> &indices) const noexcept {
+                                                          std::vector<size_t> &indices) const noexcept {
     if (keys.empty()) {
         return;
     }
@@ -438,7 +438,7 @@ void MetaStorageBackendManager::FilterRecoverFallbackKeys(KeyTypeVec &keys,
 }
 
 void MetaStorageBackendManager::RecordRecoverDeletedKeys(const KeyVector &keys,
-                                                          const std::vector<ErrorCode> &results) noexcept {
+                                                         const std::vector<ErrorCode> &results) noexcept {
     if (!cache_backend_ || GetRecoverState() != RecoverState::kRecover) {
         return;
     }
@@ -455,8 +455,8 @@ void MetaStorageBackendManager::RecordRecoverDeletedKeys(const KeyVector &keys,
 }
 
 bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context,
-                                                const KeyTypeVec &keys,
-                                                std::vector<ErrorCode> *out_results) noexcept {
+                                                 const KeyTypeVec &keys,
+                                                 std::vector<ErrorCode> *out_results) noexcept {
     if (out_results) {
         out_results->assign(keys.size(), EC_OK);
     }
@@ -975,9 +975,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             continue;
         }
         if (id_ecs[i] == EC_NOENT && !existing_location_ids[i].empty()) {
-            KVCM_LOG_ERROR("%s maintenance location-id read returned NOENT with values for key[%ld]",
-                           read_layer,
-                           keys[i]);
+            KVCM_LOG_ERROR(
+                "%s maintenance location-id read returned NOENT with values for key[%ld]", read_layer, keys[i]);
             results[i] = EC_ERROR;
             continue;
         }
@@ -991,19 +990,18 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             continue;
         }
         if (cache_backend_ &&
-            std::none_of(existing_location_ids[i].begin(),
-                         existing_location_ids[i].end(),
-                         [&](const LocationId &existing_id) {
-                             return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) !=
-                                    location_ids[i].end();
-                         })) {
+            std::none_of(
+                existing_location_ids[i].begin(), existing_location_ids[i].end(), [&](const LocationId &existing_id) {
+                    return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) !=
+                           location_ids[i].end();
+                })) {
             // An empty hot key or a stale target list is not a whole-key
             // deletion candidate. At least one current target must remain.
             results[i] = EC_NOENT;
             continue;
         }
-        const bool only_targets =
-            std::all_of(existing_location_ids[i].begin(), existing_location_ids[i].end(), [&](const LocationId &existing_id) {
+        const bool only_targets = std::all_of(
+            existing_location_ids[i].begin(), existing_location_ids[i].end(), [&](const LocationId &existing_id) {
                 return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) != location_ids[i].end();
             });
         if (only_targets) {
@@ -1388,8 +1386,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPrimary(
     return results;
 }
 
-std::vector<ErrorCode>
-MetaStorageBackendManager::EnsureCacheForGc(RequestContext *request_context, const KeyVector &keys) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::EnsureCacheForGc(RequestContext *request_context,
+                                                                   const KeyVector &keys) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     if (!cache_backend_ || GetRecoverState() != RecoverState::kRecover) {
         return results;
@@ -1613,8 +1611,7 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
         for (size_t j = 0; j < location_ids[i].size(); ++j) {
             auto &ec = results[i][j];
             auto &location = out_locations[i][j];
-            if ((ec == EC_OK && (!location || location->id() != location_ids[i][j])) ||
-                (ec == EC_NOENT && location)) {
+            if ((ec == EC_OK && (!location || location->id() != location_ids[i][j])) || (ec == EC_NOENT && location)) {
                 ec = EC_ERROR;
             }
             if (ec != EC_OK) {
@@ -1922,17 +1919,16 @@ std::vector<ErrorCode> ReadForMaintenance(const KeyVector &keys,
 
 std::vector<ErrorCode> MetaStorageBackendManager::GetLocationMapsForMaintenance(
     RequestContext *request_context, const KeyVector &keys, CacheLocationMapVector &out_locations) noexcept {
-    return ReadForMaintenance(keys,
-                              cache_backend_.get(),
-                              persistent_backend_.get(),
-                              recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning,
-                              out_locations,
-                              [&](const auto &backend, const auto &batch, auto &out) {
-                                  return backend->GetLocationMapsForMaintenance(request_context, batch, out);
-                              },
-                              [&](auto &missing, auto &indices) {
-                                  FilterRecoverFallbackKeys(missing, indices);
-                              });
+    return ReadForMaintenance(
+        keys,
+        cache_backend_.get(),
+        persistent_backend_.get(),
+        recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning,
+        out_locations,
+        [&](const auto &backend, const auto &batch, auto &out) {
+            return backend->GetLocationMapsForMaintenance(request_context, batch, out);
+        },
+        [&](auto &missing, auto &indices) { FilterRecoverFallbackKeys(missing, indices); });
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::GetProperties(RequestContext *request_context,
@@ -2123,6 +2119,27 @@ ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext 
     return EC_OK;
 }
 
+ErrorCode MetaStorageBackendManager::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                                        const std::string &cursor,
+                                                                        const int64_t limit,
+                                                                        MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    const ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, out);
+    if (ec != EC_OK) {
+        out.Clear();
+        return ec;
+    }
+    if (out.next_cursor.empty() || out.keys.size() != out.locations.size() ||
+        out.keys.size() != out.location_results.size()) {
+        out.Clear();
+        return EC_ERROR;
+    }
+    return EC_OK;
+}
+
 ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_context,
                                                   const int64_t count,
                                                   KeyTypeVec &out_keys) noexcept {
@@ -2174,29 +2191,41 @@ ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *req
     if (count <= 0) {
         return EC_OK;
     }
-    if (!cache_backend_) {
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        if (cache_backend_) {
+            return cache_backend_->SampleReclaimCandidates(
+                request_context, count, out_candidates, require_read_success);
+        }
         return persistent_backend_->SampleReclaimCandidates(
             request_context, count, out_candidates, require_read_success);
     }
 
-    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
+    return SamplePersistentReclaimCandidates(request_context, count, out_candidates, require_read_success);
+}
+
+ErrorCode MetaStorageBackendManager::SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                                       const int64_t count,
+                                                                       ReclaimCandidateVector &out_candidates,
+                                                                       bool require_read_success) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    if (!persistent_backend_) {
+        return EC_ERROR;
     }
 
     // The persistent layer is the only complete key source while recovery is
-    // still backfilling the hot cache. Its timestamps can be stale, however,
-    // so overlay every cache hit with the current in-memory timestamp using a
-    // no-touch exact-key lookup. Cache misses retain the persistent timestamp.
+    // backfilling or after hot-cache eviction. Overlay cache hits with their
+    // current timestamp; misses retain the persistent timestamp.
     ErrorCode ec =
         persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
-    if (ec != EC_OK) {
-        out_candidates.clear();
+    if (ec != EC_OK || out_candidates.empty() || !cache_backend_) {
+        if (ec != EC_OK) {
+            out_candidates.clear();
+        }
         return ec;
     }
-    if (out_candidates.empty()) {
-        return EC_OK;
-    }
-
     KeyTypeVec keys;
     keys.reserve(out_candidates.size());
     for (const auto &candidate : out_candidates) {
@@ -2244,6 +2273,31 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
         return true;
     }
     return persistent_backend_->Sync(keys);
+}
+
+bool MetaStorageBackendManager::SyncDeletedLocations(RequestContext *request_context,
+                                                     const KeyVector &keys,
+                                                     const LocationIdsPerKey &location_ids) noexcept {
+    if (keys.size() != location_ids.size() || !persistent_backend_ || !Sync(keys)) {
+        return false;
+    }
+    LocationsPerKey locations;
+    const auto results =
+        persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, locations);
+    if (results.size() != keys.size() || locations.size() != keys.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (results[i].size() != location_ids[i].size() || locations[i].size() != location_ids[i].size()) {
+            return false;
+        }
+        for (std::size_t j = 0; j < location_ids[i].size(); ++j) {
+            if (results[i][j] != EC_NOENT || locations[i][j]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool MetaStorageBackendManager::SyncAll() noexcept {

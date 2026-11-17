@@ -44,6 +44,15 @@ struct ReportedLifetime {
 };
 thread_local std::vector<ReportedLifetime> reported_lifetimes;
 
+thread_local std::map<std::pair<std::string, MetricsTags>, double> reported_kv_meta_metrics;
+
+void CaptureKvMetaMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    const auto pos = metric->metric_name_.find("kv_meta.");
+    if (pos != std::string::npos) {
+        reported_kv_meta_metrics[{metric->metric_name_.substr(pos), tags->GetTagsMap()}] = value;
+    }
+}
+
 void CaptureEventAges(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     const auto pos = metric->metric_name_.find("cache_manager_instance.event_report_location_lifetime_");
     if (pos != std::string::npos) {
@@ -315,6 +324,75 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         reporter_->metrics_registry_ = nullptr;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, KvMetaReclaimReportsCumulativeValuesAndNativeTags) {
+    const std::string prefix = "kv_meta.reclaim.";
+    const MetricsTags group_tags{{"instance_group", "emb_a"}};
+    const MetricsTags other_tags{{"instance_group", "emb_b"}};
+    std::map<std::pair<std::string, MetricsTags>, double> expected;
+    for (const char *status : {"total", "success", "error", "skipped"}) {
+        const MetricsTags tags{{"instance_group", "emb_a"}, {"stage", "logical_delete"}, {"status", status}};
+        metrics_registry_->GetCounter(prefix + "stage_count", tags) += 3;
+        expected[{prefix + "stage_count", tags}] = 3;
+    }
+    for (const char *suffix :
+         {"usage_bytes", "target_bytes", "candidate_count", "selected_count", "deleted_count", "deleted_bytes"}) {
+        metrics_registry_->GetGauge(prefix + suffix, group_tags) = 7;
+        metrics_registry_->GetGauge(prefix + suffix, other_tags) = 0;
+        expected[{prefix + suffix, group_tags}] = 7;
+        expected[{prefix + suffix, other_tags}] = 0;
+    }
+    for (const char *suffix : {"pending_bytes",
+                               "pending_credit_bytes",
+                               "pending_objects",
+                               "pending_requests",
+                               "pending_oldest_ms",
+                               "round_time_us",
+                               "submitted_count",
+                               "submitted_bytes"}) {
+        metrics_registry_->GetGauge(prefix + suffix, group_tags) = 17;
+        expected[{prefix + suffix, group_tags}] = 17;
+    }
+    for (const char *suffix : {"submitted_objects_total",
+                               "submitted_bytes_total",
+                               "deleted_objects_total",
+                               "deleted_bytes_total",
+                               "physical_deleted_objects_total",
+                               "physical_deleted_bytes_total",
+                               "maintenance_touch_keys_total"}) {
+        metrics_registry_->GetCounter(prefix + suffix, group_tags) += 23;
+        expected[{prefix + suffix, group_tags}] = 23;
+    }
+    for (const char *suffix :
+         {"mutation_lock_count", "mutation_lock_wait_us", "mutation_lock_hold_us", "write_session_rejected_total"}) {
+        const std::string name = std::string("kv_meta.") + suffix;
+        metrics_registry_->GetCounter(name) += 31;
+        expected[{name, {}}] = 31;
+    }
+    for (const char *suffix : {"active_write_sessions", "write_session_capacity"}) {
+        const std::string name = std::string("kv_meta.") + suffix;
+        metrics_registry_->GetGauge(name) = 64;
+        expected[{name, {}}] = 64;
+    }
+    // Do not publish untouched series or names outside the explicit allowlist.
+    metrics_registry_->GetCounter(prefix + "stage_count", {{"instance_group", "untouched"}});
+    metrics_registry_->GetGauge(prefix + "unexpected", group_tags) = 99;
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureKvMetaMetrics);
+    for (int interval = 0; interval < 2; ++interval) {
+        reported_kv_meta_metrics.clear();
+        reporter_->ReportInterval();
+        EXPECT_EQ(expected, reported_kv_meta_metrics);
+    }
+    const MetricsTags tags{{"instance_group", "emb_a"}, {"stage", "logical_delete"}, {"status", "total"}};
+    metrics_registry_->GetCounter(prefix + "stage_count", tags) += 2;
+    expected[{prefix + "stage_count", tags}] = 5;
+    reported_kv_meta_metrics.clear();
+    reporter_->ReportInterval();
+    EXPECT_EQ(expected, reported_kv_meta_metrics);
 }
 
 TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {

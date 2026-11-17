@@ -141,6 +141,8 @@ public:
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
+    // Local/hot-cache GetLocations already maintains its access clock.
+    bool TracksAccessTimeOnRead() const noexcept;
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,
@@ -185,6 +187,10 @@ public:
                                           const std::string &cursor,
                                           size_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    ErrorCode ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                 const std::string &cursor,
+                                                 size_t limit,
+                                                 MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
@@ -192,6 +198,10 @@ public:
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
                                       bool require_read_success = false) const noexcept;
+    ErrorCode SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                int64_t count,
+                                                ReclaimCandidateVector &out_candidates,
+                                                bool require_read_success = false) const noexcept;
     // A complete local sampling source does not need parallel I/O fragments.
     bool PreferSingleTaskReclaimSampling() const noexcept;
     size_t TouchKeysForMaintenance(const KeyVector &keys) const noexcept;
@@ -205,6 +215,10 @@ public:
     // Flush outstanding writes and remove persistent per-instance counters.
     // On success the backend is released so destruction cannot recreate them.
     ErrorCode Retire() noexcept;
+    // Remove all object metadata before retiring a KVMeta registration. The
+    // remote allocations are deliberately left untouched: an old DMA may
+    // still be in flight when an administrator removes the instance.
+    ErrorCode RetireKvMeta(RequestContext *request_context) noexcept;
     size_t GetKeyCount() const noexcept;
     // Local container occupancy for monitoring, independent of the persisted logical count.
     size_t GetLocalKeyCount() const noexcept;
@@ -214,6 +228,9 @@ public:
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncDeletedLocations(RequestContext *request_context,
+                              const KeyVector &keys,
+                              const LocationIdsPerKey &location_ids) noexcept;
     bool SyncAll() noexcept;
 
     // Returns async write path stats from async backend.

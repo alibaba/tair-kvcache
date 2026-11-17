@@ -1703,10 +1703,12 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context
         return EC_OK;
     }
 
-    size_t select_count = std::min(num_rounds, shard_times.size());
-    std::partial_sort(shard_times.begin(), shard_times.begin() + select_count, shard_times.end());
+    // Sparse shards may contain fewer keys than their share of the budget.
+    // Continue into the next cold shard rather than silently truncating the
+    // requested sample to sample_times_ * sparse-shard occupancy.
+    std::sort(shard_times.begin(), shard_times.end());
     int64_t remaining = count;
-    for (size_t i = 0; i < select_count && remaining > 0; ++i) {
+    for (size_t i = 0; i < shard_times.size() && remaining > 0; ++i) {
         size_t batch = static_cast<size_t>(std::min(per_round_count, remaining));
         size_t collected = CollectOldestKeysFromShard(shard_times[i].second, batch, out_keys);
         remaining -= static_cast<int64_t>(collected);

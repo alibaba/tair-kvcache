@@ -2673,6 +2673,61 @@ TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAd
     EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
 }
 
+TEST_F(SchedulePlanExecutorTest, DelayedDeleteCannotRemoveReplacementWithSameLocationId) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    auto storage = std::make_shared<RecordingDeleteBackend>(
+        "nfs_01", DataStorageType::DATA_STORAGE_TYPE_NFS, false);
+    data_storage_manager_->storage_map_["nfs_01"] = storage;
+    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    MetaSearcher searcher(indexer);
+    RequestContext context("replacement_during_delete");
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {LocationSpec("test_loc", "nfs://nfs_01/old?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {914}, {location}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<ErrorCode>> statuses;
+    ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {914}, {{{ids[0], CLS_SERVING}}}, statuses));
+
+    CacheLocationMapVector before;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer->backend_manager_->persistent_backend_->GetLocations(
+                                                  &context, {914}, before));
+    const auto expected = before[0].at(ids[0])->ToJsonString();
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {914},
+        .location_ids = {{ids[0]}},
+        .delay = std::chrono::milliseconds(200),
+        .expected_location_values = {{expected}},
+    };
+    auto submitted = executor.SubmitAsync(request);
+    ASSERT_TRUE(submitted.accepted);
+    bool deleting = false;
+    for (int retry = 0; retry < 100; ++retry) {
+        CacheLocationMapVector current;
+        const auto ec = indexer->backend_manager_->persistent_backend_->GetLocations(&context, {914}, current);
+        if (ec == std::vector<ErrorCode>{EC_OK} && current[0].at(ids[0])->status() == CLS_DELETING) {
+            deleting = true;
+            auto replacement = std::make_shared<CacheLocation>(*current[0].at(ids[0]));
+            replacement->set_create_time(replacement->create_time() + 1);
+            replacement->set_location_specs({LocationSpec("test_loc", "nfs://nfs_01/new?size=1")});
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      indexer->backend_manager_->persistent_backend_->Upsert(
+                          &context, {914}, {{{ids[0], replacement}}}, PropertyMapVector(1)));
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ASSERT_TRUE(deleting);
+    EXPECT_EQ(EC_OK, submitted.future.get().status);
+    EXPECT_TRUE(storage->delete_batches.empty());
+    CacheLocationMapVector after;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              indexer->backend_manager_->persistent_backend_->GetLocations(&context, {914}, after));
+    EXPECT_EQ("nfs://nfs_01/new?size=1", after[0].at(ids[0])->location_specs()[0].uri());
+}
+
 TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyFillsRecoverMissingKeysAndNeverDeletesSkippedTargets) {
     for (const std::string scenario : {"recover_missing", "recover_deleted", "running_missing",
                                         "recover_target_missing", "recover_target_changed"}) {

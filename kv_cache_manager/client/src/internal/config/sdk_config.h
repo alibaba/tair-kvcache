@@ -66,11 +66,17 @@ public:
     const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
     void set_timeout_config(const SdkTimeoutConfig &value) { timeout_config_ = value; }
 
+    // Registered-buffer clients retain memory until transfer completion. This
+    // runtime policy is injected by SdkWrapper, not read from user JSON.
+    int completion_wait_timeout_ms() const { return completion_wait_timeout_ms_; }
+    void set_completion_wait_timeout_ms(int value) { completion_wait_timeout_ms_ = value; }
+
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
+    int completion_wait_timeout_ms_{0};
     SdkTimeoutConfig timeout_config_;
 };
 
@@ -175,12 +181,15 @@ public:
     void set_shm_size(size_t size) { shm_size_ = size; }
     void set_client_base(void *base) { client_base_ = base; }
     void set_gpu_memory_spans(const std::vector<GpuMemorySpan> &spans) { gpu_memory_spans_ = spans; }
+    const std::shared_ptr<GpuMemoryReleaseState> &gpu_release_state() const { return gpu_release_state_; }
+    void set_gpu_release_state(const std::shared_ptr<GpuMemoryReleaseState> &state) { gpu_release_state_ = state; }
 
 private:
     int shm_fd_{-1};
     size_t shm_size_{0};
     void *client_base_{nullptr};
     std::vector<GpuMemorySpan> gpu_memory_spans_;
+    std::shared_ptr<GpuMemoryReleaseState> gpu_release_state_;
 };
 
 class NfsSdkConfig : public SdkBackendConfig {
