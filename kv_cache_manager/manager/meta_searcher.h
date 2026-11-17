@@ -59,9 +59,8 @@ public:
         // When true, the checker has already parsed the EventReport location
         // id and validated every spec URI while applying query visibility.
         bool has_reporter_identity = false;
-        // Views borrow the immutable CacheLocation id and are consumed while
-        // that location is still held by the current projection; they are
-        // never retained in output.
+        // Views borrow the immutable source held by the current projection
+        // and are never retained in output.
         std::string_view reporter_medium;
         std::string_view reporter_host;
         // Optional request-owned projection of one physical reporter onto one
@@ -71,7 +70,7 @@ public:
         const std::vector<std::string> *logical_hosts = nullptr;
     };
     using CheckHostCacheLocationFunc =
-        std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
+        std::function<bool(const CacheLocationReadView &location, HostCacheLocationInfo &out_info)>;
     using ListHostCacheCandidateHostsFunc =
         std::function<std::vector<std::string>(const std::vector<std::string> &medium_filter)>;
 
@@ -217,6 +216,9 @@ public:
                                                                                    : nullptr;
         }
     };
+    std::vector<std::vector<int32_t>> GetWriteBatches(const KeyVector &keys) const;
+    static ErrorCode ValidateReplaceLocationSpecsTask(const ReplaceLocationSpecsTask &task,
+                                                      std::uint64_t &out_total_size);
     // Replaces existing specs or creates the stable location in one metadata
     // read-modify-write operation per batch. Keys and location ids within a
     // key must be unique. Every task requires non-empty, uniquely named specs

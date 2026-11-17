@@ -223,12 +223,6 @@ class RedisClusterIsolationTest(TestBase, unittest.TestCase):
                         "storage_type": "redis",
                         "storage_uri": self._redis.uri,
                     },
-                    "meta_cache_policy_config": {
-                        "type": "LRU",
-                        "capacity": 10000,
-                        "cache_shard_bits": 0,
-                        "high_pri_pool_ratio": 0.0,
-                    },
                 },
             },
             "user_data": f"{cluster}-group-{group_idx}",

@@ -24,14 +24,24 @@ thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
 thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
-thread_local std::map<MetricsTags, double> reported_local_key_count;
 thread_local std::map<MetricsTags, double> reported_key_count;
+thread_local Gauge interleaved_query_key_count;
+thread_local std::vector<double> reported_query_key_counts;
+
+void CaptureRequestQueryKeyCounts(kmonitor::MutableMetric *metric,
+                                  const kmonitor::MetricsTags * /*tags*/,
+                                  double value) {
+    if (metric->metric_name_.find("service.qps") != std::string::npos) {
+        interleaved_query_key_count = 123.;
+    }
+    if (metric->metric_name_.find("meta_indexer.query_key_count") != std::string::npos) {
+        reported_query_key_counts.push_back(value);
+    }
+}
 
 void CaptureInstanceMetadataMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
         reported_meta_cache_usage[tags->GetTagsMap()] = value;
-    } else if (metric->metric_name_.find("cache_manager_instance.local_key_count") != std::string::npos) {
-        reported_local_key_count[tags->GetTagsMap()] = value;
     } else if (metric->metric_name_.find("cache_manager_instance.key_count") != std::string::npos) {
         reported_key_count[tags->GetTagsMap()] = value;
     }
@@ -128,8 +138,6 @@ TEST_F(KmonitorMetricsReporterTest, InstanceMetadataMetricsPreserveTagsAndReport
     cache_manager_->metrics_recorder_ = recorder;
     recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 2048;
     recorder->group_instance_id_metric_map_["group_b"]["instance_b"].meta_cache_usage = 4096;
-    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].local_key_count = 2;
-    recorder->group_instance_id_metric_map_["group_b"]["instance_b"].local_key_count = 3;
     recorder->group_instance_id_metric_map_["group_a"]["instance_a"].key_count = 100;
     recorder->group_instance_id_metric_map_["group_b"]["instance_b"].key_count = 200;
     const MetricsTags tags_a{{"instance_group", "group_a"}, {"instance_id", "instance_a"}};
@@ -139,45 +147,33 @@ TEST_F(KmonitorMetricsReporterTest, InstanceMetadataMetricsPreserveTagsAndReport
         &kmonitor::MutableMetric::Report);
     stub.set(report, CaptureInstanceMetadataMetrics);
     reported_meta_cache_usage.clear();
-    reported_local_key_count.clear();
     reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(2u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(2048, reported_meta_cache_usage.at(tags_a));
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
-    ASSERT_EQ(2u, reported_local_key_count.size());
     ASSERT_EQ(2u, reported_key_count.size());
-    EXPECT_DOUBLE_EQ(2, reported_local_key_count.at(tags_a));
-    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
     EXPECT_DOUBLE_EQ(100, reported_key_count.at(tags_a));
     EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 
     recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 0;
-    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].local_key_count = 0;
     reported_meta_cache_usage.clear();
-    reported_local_key_count.clear();
     reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(2u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(0, reported_meta_cache_usage.at(tags_a));
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
-    ASSERT_EQ(2u, reported_local_key_count.size());
     ASSERT_EQ(2u, reported_key_count.size());
-    EXPECT_DOUBLE_EQ(0, reported_local_key_count.at(tags_a));
-    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
     EXPECT_DOUBLE_EQ(100, reported_key_count.at(tags_a));
     EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 
     cache_manager_->InvalidateInstanceMetrics("instance_a");
     reported_meta_cache_usage.clear();
-    reported_local_key_count.clear();
     reported_key_count.clear();
     reporter_->ReportInterval();
     ASSERT_EQ(1u, reported_meta_cache_usage.size());
     EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
-    ASSERT_EQ(1u, reported_local_key_count.size());
     ASSERT_EQ(1u, reported_key_count.size());
-    EXPECT_DOUBLE_EQ(3, reported_local_key_count.at(tags_b));
     EXPECT_DOUBLE_EQ(200, reported_key_count.at(tags_b));
 }
 
@@ -223,7 +219,7 @@ TEST_F(KmonitorMetricsReporterTest, TestReportPerQuery) {
         DummyMetricsCollector collector;
         collector.Init();
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
-        EXPECT_EQ(3, metrics_registry_->GetSize());
+        EXPECT_EQ(4, metrics_registry_->GetSize());
     }
 
     {
@@ -527,4 +523,24 @@ TEST_F(KmonitorMetricsReporterTest, CleanupBetweenSamplingAndQueueingAllowsOnlyC
         EXPECT_EQ(replace ? 1 : 0, capacity_samples);
         before_storage_report = {};
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, ReportsPrivateQueryKeyCountsDespiteInterleavedRegistryWrites) {
+    ServiceMetricsCollector shared(metrics_registry_, {{"api_name", "ReportEvent"}});
+    ASSERT_TRUE(shared.Init());
+    std::shared_ptr<ServiceMetricsCollector> snapshot = shared.MakeRequestCollector();
+    std::shared_ptr<ServiceMetricsCollector> heartbeat = shared.MakeRequestCollector();
+    std::shared_ptr<ServiceMetricsCollector> add = shared.MakeRequestCollector();
+    SET_METRICS_(snapshot, meta_indexer, query_key_count, 3600000.);
+    SET_METRICS_(add, meta_indexer, query_key_count, 17.);
+    COPY_METRICS_(&shared, meta_indexer, query_key_count, interleaved_query_key_count);
+    Stub stub;
+    void (kmonitor::MutableMetric::*report)(const kmonitor::MetricsTags *, double) = &kmonitor::MutableMetric::Report;
+    stub.set(report, CaptureRequestQueryKeyCounts);
+    reported_query_key_counts.clear();
+    reporter_->ReportPerQuery(snapshot.get(), false);
+    reporter_->ReportPerQuery(heartbeat.get(), false);
+    reporter_->ReportPerQuery(add.get(), false);
+    EXPECT_EQ((std::vector<double>{3600000., 0., 17.}), reported_query_key_counts);
+    interleaved_query_key_count = Gauge();
 }

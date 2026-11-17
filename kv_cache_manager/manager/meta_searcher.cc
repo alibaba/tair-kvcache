@@ -660,36 +660,36 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
                              const MediumViewSet &medium_set,
                              bool visit_spec_names,
                              Visitor &&visitor) {
-    for (const auto &loc : locations) {
+    for (const CacheLocationReadView loc : locations) {
         // GetHostCacheState reports readable data, not metadata intent. A URI
         // attached to WRITING/DELETING/NEW must never become a cache hit.
-        if (!loc || loc->status() != CacheLocationStatus::CLS_SERVING || loc->location_specs().empty()) {
+        if (!loc || loc.status() != CacheLocationStatus::CLS_SERVING || loc.SpecCount() == 0) {
             continue;
         }
 
-        if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
-            loc->type() == DataStorageType::DATA_STORAGE_TYPE_NFS ||
-            loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD) {
+        if (loc.type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
+            loc.type() == DataStorageType::DATA_STORAGE_TYPE_NFS ||
+            loc.type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD) {
             continue;
         }
 
         MetaSearcher::HostCacheLocationInfo location_info;
         if (request_check_location) {
-            if (!(*request_check_location)(*loc, location_info)) {
+            if (!(*request_check_location)(loc, location_info)) {
                 continue;
             }
-        } else if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
+        } else if (check_loc_data_exist && !check_loc_data_exist(loc.OriginalLocation())) {
             continue;
         }
 
-        const bool is_event_report = IsEventReportStorageType(loc->type());
+        const bool is_event_report = IsEventReportStorageType(loc.type());
         bool has_reporter_identity = is_event_report && location_info.has_reporter_identity;
         if (!has_reporter_identity && is_event_report) {
             std::string_view storage_type;
             has_reporter_identity = SnapshotUriUtils::ParseEventReportLocationIdView(
-                loc->id(), storage_type, location_info.reporter_medium, location_info.reporter_host);
+                loc.id(), storage_type, location_info.reporter_medium, location_info.reporter_host);
         }
-        const bool is_vineyard = loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        const bool is_vineyard = loc.type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
         if (has_reporter_identity) {
             if (!IsReporterMediumMatched(location_info.reporter_medium, medium_set) ||
                 location_info.reporter_host.empty()) {
@@ -702,10 +702,7 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
             const auto visit_logical_hosts = [&](std::string_view spec_name) {
                 if (location_info.logical_hosts && !location_info.logical_hosts->empty()) {
                     for (const auto &logical_host : *location_info.logical_hosts) {
-                        visitor(std::string_view(logical_host),
-                                spec_name,
-                                is_vineyard,
-                                location_info.reporter_host);
+                        visitor(std::string_view(logical_host), spec_name, is_vineyard, location_info.reporter_host);
                     }
                     return;
                 }
@@ -716,31 +713,31 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
                     visit_logical_hosts(std::string_view{});
                     continue;
                 }
-                for (const auto &spec : loc->location_specs()) {
-                    if (StandardUri(spec.uri()).Valid()) {
+                for (size_t i = 0; i < loc.SpecCount(); ++i) {
+                    if (StandardUri(loc.SpecUri(i)).Valid()) {
                         visit_logical_hosts(std::string_view{});
                         break;
                     }
                 }
                 continue;
             }
-            for (const auto &spec : loc->location_specs()) {
-                if (!specs_already_validated && !StandardUri(spec.uri()).Valid()) {
+            for (size_t i = 0; i < loc.SpecCount(); ++i) {
+                if (!specs_already_validated && !StandardUri(loc.SpecUri(i)).Valid()) {
                     continue;
                 }
-                visit_logical_hosts(std::string_view(spec.name()));
+                visit_logical_hosts(std::string_view(loc.SpecName(i)));
             }
             continue;
         }
 
-        for (const auto &spec : loc->location_specs()) {
-            const StandardUri uri(spec.uri());
+        for (size_t i = 0; i < loc.SpecCount(); ++i) {
+            const StandardUri uri(loc.SpecUri(i));
             if (!uri.Valid() || !IsMediumMatched(uri, medium_set)) {
                 continue;
             }
             const std::string host = uri.GetHostPort();
             if (!host.empty()) {
-                visitor(std::string_view(host), std::string_view(spec.name()), false, std::string_view(host));
+                visitor(std::string_view(host), std::string_view(loc.SpecName(i)), false, std::string_view(host));
             }
         }
     }
@@ -752,14 +749,13 @@ void BuildHostsForOneKey(const LocationRange &locations,
                          const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
                          const MediumViewSet &medium_set,
                          std::vector<std::string> &hosts) {
-    VisitHostSpecsForOneKey(locations,
-                            check_loc_data_exist,
-                            request_check_location,
-                            medium_set,
-                            false,
-                            [&hosts](std::string_view host, std::string_view, bool, std::string_view) {
-                                hosts.emplace_back(host);
-                            });
+    VisitHostSpecsForOneKey(
+        locations,
+        check_loc_data_exist,
+        request_check_location,
+        medium_set,
+        false,
+        [&hosts](std::string_view host, std::string_view, bool, std::string_view) { hosts.emplace_back(host); });
     std::sort(hosts.begin(), hosts.end());
     hosts.erase(std::unique(hosts.begin(), hosts.end()), hosts.end());
 }
@@ -771,25 +767,24 @@ void BuildCandidatePresenceForOneKey(const LocationRange &locations,
                                      const MediumViewSet &medium_set,
                                      const std::vector<std::string> &candidate_hosts,
                                      std::uint64_t *presence_words) {
-    VisitHostSpecsForOneKey(locations,
-                            check_loc_data_exist,
-                            request_check_location,
-                            medium_set,
-                            false,
-                            [&candidate_hosts, presence_words](
-                                std::string_view host, std::string_view, bool, std::string_view) {
-                                const auto it =
-                                    std::lower_bound(candidate_hosts.begin(),
-                                                     candidate_hosts.end(),
-                                                     host,
-                                                     [](const std::string &candidate, std::string_view value) {
-                                                         return std::string_view(candidate) < value;
-                                                     });
-                                if (it != candidate_hosts.end() && std::string_view(*it) == host) {
-                                    const size_t index = static_cast<size_t>(it - candidate_hosts.begin());
-                                    presence_words[index / 64] |= std::uint64_t{1} << (index % 64);
-                                }
-                            });
+    VisitHostSpecsForOneKey(
+        locations,
+        check_loc_data_exist,
+        request_check_location,
+        medium_set,
+        false,
+        [&candidate_hosts, presence_words](std::string_view host, std::string_view, bool, std::string_view) {
+            const auto it = std::lower_bound(candidate_hosts.begin(),
+                                             candidate_hosts.end(),
+                                             host,
+                                             [](const std::string &candidate, std::string_view value) {
+                                                 return std::string_view(candidate) < value;
+                                             });
+            if (it != candidate_hosts.end() && std::string_view(*it) == host) {
+                const size_t index = static_cast<size_t>(it - candidate_hosts.begin());
+                presence_words[index / 64] |= std::uint64_t{1} << (index % 64);
+            }
+        });
 }
 
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
@@ -1164,7 +1159,10 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     LocationsPerKey locations;
-    auto result = meta_indexer->GetLocationValues(request_context, keys, locations);
+    const bool read_views = request_check_location && !meta_indexer->SupportsWriteSession();
+    CompactLocationsPerKey compact(read_views);
+    const MetaIndexer::Result result = read_views ? meta_indexer->GetLocationValues(request_context, keys, compact)
+                                                  : meta_indexer->GetLocationValues(request_context, keys, locations);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     LogErrorCodes("PrefixMatchByHostWithRemote", result.error_codes, keys);
     size_t key_count = 0;
@@ -1184,13 +1182,23 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
     const bool projected = meta_indexer->ParallelForQuery(key_count, [&](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
-            BuildHostSpecNamesForOneKey(locations[i],
-                                        check_location,
-                                        request_check_location,
-                                        mediums,
-                                        projection[i].hosts,
-                                        projection[i].peers,
-                                        enable_p2p ? &projection[i].local_peers : nullptr);
+            if (read_views) {
+                BuildHostSpecNamesForOneKey(compact.ReadViews(i),
+                                            check_location,
+                                            request_check_location,
+                                            mediums,
+                                            projection[i].hosts,
+                                            projection[i].peers,
+                                            enable_p2p ? &projection[i].local_peers : nullptr);
+            } else {
+                BuildHostSpecNamesForOneKey(locations[i],
+                                            check_location,
+                                            request_check_location,
+                                            mediums,
+                                            projection[i].hosts,
+                                            projection[i].peers,
+                                            enable_p2p ? &projection[i].local_peers : nullptr);
+            }
         }
     });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
@@ -1220,8 +1228,9 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
     }
     const auto selected = SelectTopHostIndicesByLocal(matches, top_k_host_count);
     const bool needs_tair_candidates = use_tair && list_candidate_hosts && matches.size() < top_k_host_count;
+    // Simple records only contain EventReport locations, so they have no Tair base specs.
     const auto base_specs =
-        use_tair && (!selected.empty() || needs_tair_candidates)
+        use_tair && !read_views && (!selected.empty() || needs_tair_candidates)
             ? SelectBaseSpecs(
                   locations, key_count, check_location, request_check_location, full_groups, state_groups, policy)
             : SpecsByKey(key_count);
@@ -1310,7 +1319,7 @@ ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
             std::size_t first_local_index = 0;
             if (begin == 0) {
                 BuildHostsForOneKey(
-                    locations[0], check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
+                    locations.ReadViews(0), check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
                 if (candidate_hosts.empty()) {
                     return size_t{0};
                 }
@@ -1340,7 +1349,7 @@ ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
                 }
 
                 std::fill(presence_words.begin(), presence_words.end(), 0);
-                BuildCandidatePresenceForOneKey(locations[local_index],
+                BuildCandidatePresenceForOneKey(locations.ReadViews(local_index),
                                                 check_loc_data_exist,
                                                 request_check_location,
                                                 medium_set,
@@ -1373,7 +1382,8 @@ ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
             }
             return every_host_stopped ? last_required_key : keys.size();
         };
-    const auto result = meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor);
+    const MetaIndexer::PrefixLocationResult result =
+        meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor, request_check_location != nullptr);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
@@ -1478,7 +1488,7 @@ ErrorCode PrefixMatchWithGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
         auto projection_scope = projection_wall_timer.Measure();
         if (begin == 0) {
             BuildHostsForOneKey(
-                locations[0], check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
+                locations.ReadViews(0), check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
             if (candidate_hosts.empty()) {
                 return size_t{0};
             }
@@ -1515,7 +1525,7 @@ ErrorCode PrefixMatchWithGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
             std::fill(seen_words.begin(), seen_words.end(), 0);
             std::fill(host_present.begin(), host_present.end(), 0);
             VisitHostSpecsForOneKey(
-                locations[local_index],
+                locations.ReadViews(local_index),
                 check_loc_data_exist,
                 request_check_location,
                 medium_set,
@@ -1579,7 +1589,8 @@ ErrorCode PrefixMatchWithGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
         }
         return every_host_stopped ? last_required_key : keys.size();
     };
-    const auto result = meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor);
+    const MetaIndexer::PrefixLocationResult result =
+        meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor, request_check_location != nullptr);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
@@ -2600,6 +2611,23 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsFlat(RequestContext *request_co
                                          true);
 }
 
+std::vector<std::vector<int32_t>> MetaSearcher::GetWriteBatches(const KeyVector &keys) const {
+    return meta_indexer_->GetWriteBatches(keys);
+}
+
+ErrorCode MetaSearcher::ValidateReplaceLocationSpecsTask(const ReplaceLocationSpecsTask &task,
+                                                         std::uint64_t &out_total_size) {
+    out_total_size = 0;
+    if (task.ResolvedLocationId().empty() || task.SpecCount() == 0) {
+        return EC_BADARGS;
+    }
+    if (task.prevalidated_total_size.has_value()) {
+        out_total_size = task.prevalidated_total_size->value();
+        return EC_OK;
+    }
+    return ValidateConsistentSnapshotVersion(task.specs, &out_total_size);
+}
+
 ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
@@ -2651,16 +2679,11 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             const auto &task = tasks.At(key_index, task_index);
             const auto &location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
-            if (location_id.empty() || task.SpecCount() == 0 ||
-                (overwrite_without_read && (!IsEventReportStorageType(task.type) || task.status != CLS_SERVING)) ||
+            if ((overwrite_without_read && (!IsEventReportStorageType(task.type) || task.status != CLS_SERVING)) ||
                 (tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
-                (!task.prevalidated_total_size.has_value() &&
-                 ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK)) {
+                ValidateReplaceLocationSpecsTask(task, incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
-            }
-            if (task.prevalidated_total_size.has_value()) {
-                incoming_size = task.prevalidated_total_size->value();
             }
             if (overwrite_without_read) {
                 overwrite_sizes[usage_offsets[key_index] + task_index] = incoming_size;
@@ -2800,8 +2823,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result =
-        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, std::move(modifier));
+    MetaIndexer::LocationResult result =
+        meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
     bool malformed_result = result.per_location_error_codes.size() != keys.size();
@@ -2839,7 +2862,7 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
         out_per_key_ec[key_index] = key_ec;
     }
     if (result.ec != ErrorCode::EC_OK) {
-        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteTargetLocations failed, ec: %d", result.ec);
     }
     return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
 }
@@ -3445,7 +3468,8 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
     // ReadModifyWriteLocation 返回 flat 维度结果，这里映射回原始 key/task 维度。
@@ -3561,7 +3585,8 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_batch_results = std::move(result.per_location_error_codes);
 
@@ -3738,7 +3763,8 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    auto result =
+        meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier, true, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_batch_results = std::move(result.per_location_error_codes);
 
@@ -3872,7 +3898,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
                       ? meta_indexer_->ReadModifyWriteLocationsForMaintenance(
                             request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count)
                       : meta_indexer_->ReadModifyWriteLocation(
-                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count);
+                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count, false);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_per_location_ec = std::move(result.per_location_error_codes);
 

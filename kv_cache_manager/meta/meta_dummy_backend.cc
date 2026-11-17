@@ -210,6 +210,51 @@ std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_conte
     return results;
 }
 
+std::vector<ErrorCode> MetaDummyBackend::UpsertWithStats(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const CacheLocationMapVector &locations,
+                                                         const PropertyMapVector &properties,
+                                                         std::vector<UpsertStats> &out_stats,
+                                                         size_t max_new_keys,
+                                                         const BeforeUpsertWrite &before_write) noexcept {
+    out_stats.assign(keys.size(), {});
+    if (locations.size() != keys.size() || properties.size() != keys.size() || before_write) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndModify(keys[i], [&](DummyItem &existing) {
+            for (const auto &[id, location] : locations[i]) {
+                auto [it, inserted] = existing.locations.emplace(id, location);
+                if (!inserted) {
+                    it->second = location;
+                }
+                out_stats[i].locations_created += inserted;
+            }
+            for (const auto &[name, value] : properties[i]) {
+                existing.properties[name] = value;
+            }
+            existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+        });
+        if (!found) {
+            if (max_new_keys == 0) {
+                results[i] = EC_NOSPC;
+                continue;
+            }
+            DummyItem item;
+            item.locations = locations[i];
+            item.properties = properties[i];
+            item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            table_.Upsert(keys[i], std::move(item));
+            out_stats[i] = {true, locations[i].size()};
+            --max_new_keys;
+        }
+    }
+    PersistToPath();
+    return results;
+}
+
 std::vector<ErrorCode> MetaDummyBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);

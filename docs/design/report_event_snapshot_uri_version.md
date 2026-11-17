@@ -286,8 +286,20 @@ Get/Set/Add/Sub 的该类型计数统一为零或 no-op，旧 Redis 统计读取
 每个 location 的 validated size、本地索引实际内存计量不变。EventReport 原本就不计入
 GetStorageUsage 总量，也不参与常规容量回收。依赖按类型统计的自定义监控/配置需注意此口径变化。
 
-直接覆盖保留旧 snapshot RMW 的逻辑 key_count 行为（不因每轮覆盖增加计数）；本地实际条目数
-仍由容器维护。精确重算 snapshot 新增 key 的逻辑计数不是本次改动的内容。
+直接覆盖由底层 `UpsertWithStats` 返回每个成功写入实际新增的 key 和 location 数，更新
+`key_count` 与 `location_count`；重复覆盖不重复计数，同一 key 新增其他 reporter 的 location
+只增加 location 数。正常 snapshot 不调用 `Get`、`GetLocations`、`GetLocationIds` 或 `Exists`
+预读旧元数据；本地后端复用写入所需的查找和插入结果，纯 Redis 后端通过单 key Lua 写入及
+`HSET` 返回值统计。接近 key 上限时纯 Redis 最多使用两批 pipeline，先更新已有 key，再按
+剩余额度创建新 key，已有 key 不因额度耗尽而拒绝更新。
+
+双层后端使用完整、不自动逐出的本地视图计数，保留原来的持久层优先或 memory-primary 写入
+顺序。恢复期仍需先补齐缺失的完整 key，避免丢失其他 location/property；补齐和异步备份不计新增。
+单 key 失败不增加计数；异步备份沿用原来的入队/成功语义，不新增同步等待。计数沿用主干的
+逻辑计数口径：旧基线不会全表校准，Redis 写成功但响应丢失等情况不提供 exactly-once 保证。
+snapshot 中遗漏的旧 location 仍在实际 GC 删除时扣减，不在 snapshot 提交时提前扣减。
+容量预检不预留内存，真正发布前仍逐项复检；并发增长或同批增长导致本地容量不足时，保留原有
+持久层已接受而本地失败的部分写入语义，由 snapshot abort 和后续重试收敛。
 
 不同 reporter、不同 storage type 可以并行。第二个并发 snapshot 返回
 `SNAPSHOT_IN_PROGRESS`。

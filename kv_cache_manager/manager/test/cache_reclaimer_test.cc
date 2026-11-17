@@ -27,7 +27,6 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/migration_strategy.h"
@@ -189,18 +188,12 @@ std::shared_ptr<InstanceGroup> InstanceGroupFactory() {
     meta_storage_backend_config->SetStorageType("local");
     meta_storage_backend_config->SetStorageUri("file:///tmp/meta_storage");
 
-    // create meta cache policy config
-    const auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(10000);
-    meta_cache_policy_config->SetType("LRU");
-
     // create meta indexer config
     const auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(1000000);
     meta_indexer_config->SetMutexShardNum(16);
     meta_indexer_config->SetBatchKeySize(16);
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
 
     // create cache config
     const auto cache_config = std::make_shared<CacheConfig>();
@@ -1061,9 +1054,8 @@ public:
         return result;
     }
 
-    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
-                                                KeyType rejected_prefix = 0,
-                                                bool event_report_prefix = false) {
+    MetaLocalBackend *
+    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -3511,7 +3503,9 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) { promise->set_exception(std::current_exception()); }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -6430,7 +6424,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 }
 
 TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudgets) {
-    auto indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
+    std::shared_ptr<MetaIndexer> indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
     ASSERT_NE(nullptr, indexer);
     indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
     indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();

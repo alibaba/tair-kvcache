@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -29,6 +30,13 @@ public:
                                   const std::vector<std::map<std::string, std::string>> &field_maps);
     std::vector<ErrorCode> Upsert(const std::vector<std::string> &keys,
                                   const std::vector<std::map<std::string, std::string>> &field_maps);
+    // Atomic per-key upsert plus creation counts; no client-side existence read.
+    std::vector<ErrorCode> UpsertWithStats(const std::vector<std::string> &keys,
+                                           const std::vector<std::map<std::string, std::string>> &field_maps,
+                                           const std::string &counted_field_prefix,
+                                           size_t max_new_keys,
+                                           std::vector<std::pair<bool, size_t>> &out_stats);
+
     std::vector<ErrorCode> Delete(const std::vector<std::string> &keys);
     std::vector<ErrorCode> DeleteFields(const std::vector<std::string> &keys,
                                         const std::vector<std::vector<std::string>> &field_names_vec);

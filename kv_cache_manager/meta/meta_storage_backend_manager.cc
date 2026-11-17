@@ -57,6 +57,12 @@ MetaStorageBackendManager::~MetaStorageBackendManager() {
 
 ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
                                           const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept {
+    return Init(instance_id, config, nullptr);
+}
+
+ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
+                                          const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                          std::unique_ptr<MetaCacheBaseBackend> injected_local) noexcept {
     try {
         std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
         if (instance_id.empty()) {
@@ -73,12 +79,26 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         }
 
         const std::string &storage_uri = config->GetStorageUri();
-        if (config->GetStorageType() != META_CACHED_BACKEND_TYPE_STR) {
+        const std::string &storage_type = config->GetStorageType();
+        if (injected_local && storage_type != META_CACHED_BACKEND_TYPE_STR &&
+            storage_type != META_LOCAL_BACKEND_TYPE_STR) {
+            return EC_BADARGS;
+        }
+        if (storage_type != META_CACHED_BACKEND_TYPE_STR) {
             if (config->GetMemoryPrimary()) {
                 return EC_BADARGS;
             }
-            // Single-backend mode: one backend serves every read/write directly.
-            auto persistent_backend = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, config);
+            // The injected local occupies the sole backend slot in pure-local mode.
+            std::unique_ptr<MetaStorageBackend> persistent_backend;
+            if (injected_local) {
+                const ErrorCode init_ec = injected_local->Init(instance_id, config);
+                if (init_ec != EC_OK) {
+                    return init_ec;
+                }
+                persistent_backend = std::move(injected_local);
+            } else {
+                persistent_backend = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, config);
+            }
             if (!persistent_backend) {
                 KVCM_LOG_ERROR("fail to create persistent backend uri[%s]", storage_uri.c_str());
                 return EC_ERROR;
@@ -122,7 +142,15 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         }
         auto cache_config = std::make_shared<MetaStorageBackendConfig>(cache_type);
         cache_config->SetStorageUri(storage_uri);
-        auto cache_backend = MetaStorageBackendFactory::CreateCacheBackend(instance_id, cache_config);
+        std::unique_ptr<MetaCacheBaseBackend> cache_backend = std::move(injected_local);
+        if (cache_backend) {
+            const ErrorCode cache_init_ec = cache_backend->Init(instance_id, cache_config);
+            if (cache_init_ec != EC_OK) {
+                return cache_init_ec;
+            }
+        } else {
+            cache_backend = MetaStorageBackendFactory::CreateCacheBackend(instance_id, cache_config);
+        }
         if (!cache_backend) {
             KVCM_LOG_ERROR("fail to create cache backend uri[%s]", storage_uri.c_str());
             return EC_ERROR;
@@ -622,6 +650,53 @@ int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
     return backfilled_count;
 }
 
+std::vector<ErrorCode> MetaStorageBackendManager::WritePrimary(RequestContext *request_context,
+                                                               BatchMetaData &batch,
+                                                               const WriteRoute &route,
+                                                               bool replace) noexcept {
+    auto write =
+        [&](const KeyVector &keys, const CacheLocationMapVector &locations, const PropertyMapVector &properties) {
+            return replace ? route.primary.Put(request_context, keys, locations, properties)
+                           : route.primary.Upsert(request_context, keys, locations, properties);
+        };
+    if (!cache_backend_ || route.local_primary) {
+        return write(batch.batch_keys, batch.batch_locations, batch.batch_properties);
+    }
+    std::vector<ErrorCode> results(batch.batch_keys.size(), EC_OK);
+    bool rejected = false;
+    for (size_t i = 0; i < results.size(); ++i) {
+        results[i] = cache_backend_->CheckWriteCapacity(
+            batch.batch_keys[i], batch.batch_locations[i], batch.batch_properties[i], replace);
+        rejected = rejected || results[i] != EC_OK;
+    }
+    if (!rejected) {
+        return write(batch.batch_keys, batch.batch_locations, batch.batch_properties);
+    }
+    KeyVector keys;
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    std::vector<size_t> indices;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i] == EC_OK) {
+            keys.push_back(batch.batch_keys[i]);
+            locations.push_back(batch.batch_locations[i]);
+            properties.push_back(batch.batch_properties[i]);
+            indices.push_back(i);
+        }
+    }
+    if (!keys.empty()) {
+        const std::vector<ErrorCode> written = write(keys, locations, properties);
+        const bool valid = written.size() == indices.size();
+        if (!valid) {
+            KVCM_LOG_ERROR("primary write results[%lu] mismatch keys[%lu]", written.size(), indices.size());
+        }
+        for (size_t i = 0; i < indices.size(); ++i) {
+            results[indices[i]] = valid ? written[i] : EC_ERROR;
+        }
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_context, BatchMetaData &batch) noexcept {
     const KeyVector &keys = batch.batch_keys;
     batch.EnsureLocationsAndPropertiesResized();
@@ -630,7 +705,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     const WriteRoute route =
         GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
     const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
-    std::vector<ErrorCode> primary_results = route.primary.Put(request_context, keys, locations, properties);
+    std::vector<ErrorCode> primary_results = WritePrimary(request_context, batch, route, true);
     if (route.local_primary && request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -677,7 +752,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         }
     }
     const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
-    std::vector<ErrorCode> primary_results = route.primary.Upsert(request_context, keys, locations, properties);
+    std::vector<ErrorCode> primary_results = WritePrimary(request_context, batch, route, false);
     if (route.local_primary && request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -738,6 +813,82 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
     return secondary_results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::UpsertWithStats(RequestContext *request_context,
+                                                                  BatchMetaData &batch,
+                                                                  std::vector<UpsertStats> &out_stats,
+                                                                  size_t max_new_keys) noexcept {
+    const auto &keys = batch.batch_keys;
+    batch.EnsureLocationsAndPropertiesResized();
+    out_stats.assign(keys.size(), {});
+    if (!cache_backend_) {
+        return persistent_backend_->UpsertWithStats(
+            request_context, keys, batch.batch_locations, batch.batch_properties, out_stats, max_new_keys);
+    }
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover &&
+        !EnsureKeyInCache(request_context, keys)) {
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    const bool local_primary =
+        memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning;
+    BeforeUpsertWrite before_write;
+    int64_t primary_time_us = 0;
+    if (!local_primary) {
+        before_write = [&](const std::vector<ErrorCode> &admission) {
+            const int64_t primary_begin = TimestampUtil::GetCurrentTimeUs();
+            if (std::all_of(admission.begin(), admission.end(), [](ErrorCode ec) { return ec == EC_OK; })) {
+                auto results =
+                    persistent_backend_->Upsert(request_context, keys, batch.batch_locations, batch.batch_properties);
+                primary_time_us += TimestampUtil::GetCurrentTimeUs() - primary_begin;
+                return results;
+            }
+            KeyVector accepted_keys;
+            CacheLocationMapVector accepted_locations;
+            PropertyMapVector accepted_properties;
+            std::vector<size_t> positions;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (admission[i] != EC_OK) {
+                    continue;
+                }
+                positions.push_back(i);
+                accepted_keys.push_back(keys[i]);
+                accepted_locations.push_back(batch.batch_locations[i]);
+                accepted_properties.push_back(batch.batch_properties[i]);
+            }
+            std::vector<ErrorCode> results = admission;
+            const auto writes =
+                persistent_backend_->Upsert(request_context, accepted_keys, accepted_locations, accepted_properties);
+            for (size_t i = 0; i < positions.size(); ++i) {
+                results[positions[i]] = writes.size() == positions.size() ? writes[i] : EC_MISMATCH;
+            }
+            primary_time_us += TimestampUtil::GetCurrentTimeUs() - primary_begin;
+            return results;
+        };
+    }
+    // The complete, non-evicting online view supplies counts for both cached
+    // routes. Recover backfill and the backup write never count as additions.
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->UpsertWithStats(
+        request_context, keys, batch.batch_locations, batch.batch_properties, out_stats, max_new_keys, before_write);
+    if (request_context) {
+        auto *metrics = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(metrics,
+                                           meta_indexer,
+                                           cache_backend_upsert_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin - primary_time_us);
+    }
+    if (results.size() != keys.size() || out_stats.size() != keys.size()) {
+        out_stats.assign(keys.size(), {});
+        return std::vector<ErrorCode>(keys.size(), EC_MISMATCH);
+    }
+    if (local_primary) {
+        // Snapshot publishes SERVING only; retain ordinary best-effort backup
+        // admission without adding a Sync or waiting for Redis flush.
+        (void)persistent_backend_->Upsert(
+            request_context, keys, batch.batch_locations, batch.batch_properties, results);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::UpsertSingleLocations(RequestContext *request_context,
@@ -1412,10 +1563,11 @@ MetaStorageBackendManager::GetLocationValuesCompact(RequestContext *request_cont
         return persistent_backend_->GetLocationValuesCompact(request_context, keys, key_count, out_locations);
     }
 
-    // Cached mode must retain its recovery/fallback behavior. The large-query
-    // compact fast path is deliberately restricted to the single local backend,
-    // so use the existing manager API when this method is reached in another
-    // configuration.
+    if (out_locations.ReadViewsRequested() &&
+        recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return cache_backend_->GetLocationValuesCompact(request_context, keys, key_count, out_locations);
+    }
+    // Recovering reads retain the existing Redis fallback and tombstone filtering.
     KeyVector key_vector;
     if (key_count != 0) {
         if (keys == nullptr) {
@@ -2269,13 +2421,6 @@ size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
         usage += cache_backend_->GetMemUsage();
     }
     return usage;
-}
-
-size_t MetaStorageBackendManager::GetLocalKeyCount() const noexcept {
-    if (cache_backend_) {
-        return cache_backend_->GetLocalKeyCount();
-    }
-    return persistent_backend_ ? persistent_backend_->GetLocalKeyCount() : 0;
 }
 
 int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {

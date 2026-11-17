@@ -198,7 +198,9 @@ MetaServiceMetricsBase::ResolveReportEventMetricsCollector(const proto::meta::Re
         collector = get_metrics_collector_from_map_for_ReportEvent(request.instance_id());
         break;
     }
-    return collector ? std::move(collector) : KVCM_METRICS_COLLECTOR_(ReportEvent);
+    const std::shared_ptr<ServiceMetricsCollector> shared_collector =
+        std::static_pointer_cast<ServiceMetricsCollector>(collector ? collector : KVCM_METRICS_COLLECTOR_(ReportEvent));
+    return shared_collector->MakeRequestCollector();
 }
 
 void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto::meta::ReportEventRequest &request,

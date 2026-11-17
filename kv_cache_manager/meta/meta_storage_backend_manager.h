@@ -41,6 +41,10 @@ public:
     ~MetaStorageBackendManager();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept;
+    // Injected local serves as the sole backend for local, or the hot layer for cached.
+    ErrorCode Init(const std::string &instance_id,
+                   const std::shared_ptr<MetaStorageBackendConfig> &config,
+                   std::unique_ptr<MetaCacheBaseBackend> injected_local) noexcept;
 
     ErrorCode Open() noexcept;
     ErrorCode Close() noexcept;
@@ -51,6 +55,10 @@ public:
     // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *request_context,
+                                           BatchMetaData &batch,
+                                           std::vector<UpsertStats> &out_stats,
+                                           size_t max_new_keys) noexcept;
     std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
                                                  const KeyVector &keys,
                                                  const LocationIdRefVector &location_ids,
@@ -213,7 +221,6 @@ public:
 
     size_t GetMemUsage() const noexcept;
     // Current local view, including partial recovery; never queries persistent key counts.
-    size_t GetLocalKeyCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
@@ -239,6 +246,8 @@ private:
                 local_primary ? persistent_backend_.get() : cache_backend_.get(),
                 local_primary};
     }
+    std::vector<ErrorCode>
+    WritePrimary(RequestContext *request_context, BatchMetaData &batch, const WriteRoute &route, bool replace) noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,

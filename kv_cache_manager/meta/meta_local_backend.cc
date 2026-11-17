@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "kv_cache_manager/common/cache/lru_cache.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -89,7 +90,7 @@ size_t LocalLocationStore::EstimateUsage(const LocalItemExtra *extra) const {
 }
 
 const CacheLocationConstPtr *LocalLocationStore::Find(const LocationId &location_id,
-                                                       const LocalItemExtra *extra) const {
+                                                      const LocalItemExtra *extra) const {
     if (extra && extra->multiple_locations) {
         const auto it = extra->multiple_locations->find(location_id);
         return it == extra->multiple_locations->end() ? nullptr : &it->second;
@@ -349,6 +350,72 @@ size_t LocalPropertyStore::EstimateUsage(const LocalItemExtra *extra) const {
     return usage;
 }
 
+size_t MetaMemCacheItem::EstimateLocationGrowth(const LocationId &id,
+                                                const CacheLocationConstPtr &location,
+                                                bool include_inline_conversion) const {
+    const CacheLocationConstPtr *previous = FindLocation(id);
+    if (previous) {
+        const size_t before = (*previous)->EstimateMemUsage();
+        const size_t after = location->EstimateMemUsage();
+        return after > before ? after - before : 0;
+    }
+    size_t growth = location->EstimateMemUsage();
+    const size_t count = LocationCount();
+    if (count > 0) {
+        growth += sizeof(void *) * 4 + id.size() + sizeof(CacheLocationConstPtr);
+        if (count == 1 && include_inline_conversion) {
+            locations_.ForEach(extra_.get(), [&](const LocationId &old_id, const CacheLocationConstPtr &) {
+                growth += sizeof(void *) * 4 + old_id.size() + sizeof(CacheLocationConstPtr);
+            });
+            growth += sizeof(CacheLocationMap) + (extra_ ? 0 : sizeof(LocalItemExtra));
+        }
+    }
+    return growth;
+}
+
+size_t MetaMemCacheItem::EstimateMergeGrowth(const CacheLocationMap &locations, const PropertyMap &properties) const {
+    // Sum positive field growth conservatively; do not offset additions with unrelated shrinkage.
+    size_t growth = 0;
+    const bool single_location = LocationCount() == 1;
+    bool include_inline_conversion = true;
+    for (const CacheLocationMap::value_type &entry : locations) {
+        growth += EstimateLocationGrowth(entry.first, entry.second, include_inline_conversion);
+        if (single_location && include_inline_conversion && !FindLocation(entry.first)) {
+            include_inline_conversion = false;
+        }
+    }
+    if (LocationsEmpty() && locations.size() > 1) {
+        growth += sizeof(CacheLocationMap) + (extra_ ? 0 : sizeof(LocalItemExtra));
+        for (const CacheLocationMap::value_type &entry : locations) {
+            growth += sizeof(void *) * 4 + entry.first.size() + sizeof(CacheLocationConstPtr);
+        }
+    }
+    bool needs_property_map = false;
+    for (const PropertyMap::value_type &entry : properties) {
+        KeyType parsed = 0;
+        if (entry.first == PROPERTY_PREV_BLOCK_KEY &&
+            (entry.second.empty() ||
+             (StringUtil::StrToInt64(entry.second.c_str(), parsed) && std::to_string(parsed) == entry.second))) {
+            continue;
+        }
+        if (extra_ && extra_->extra_properties) {
+            const PropertyMap::const_iterator previous = extra_->extra_properties->find(entry.first);
+            if (previous != extra_->extra_properties->end()) {
+                if (entry.second.size() > previous->second.capacity()) {
+                    growth += entry.second.size() - previous->second.capacity();
+                }
+                continue;
+            }
+        }
+        growth += EstimatePropertyEntryUsage(entry.first, entry.second);
+        needs_property_map = true;
+    }
+    if (needs_property_map && (!extra_ || !extra_->extra_properties)) {
+        growth += sizeof(PropertyMap) + (extra_ ? 0 : sizeof(LocalItemExtra));
+    }
+    return growth;
+}
+
 SingleLocationRmwScratch::~SingleLocationRmwScratch() { ReleaseRetainedHandles(); }
 
 void SingleLocationRmwScratch::ReleaseRetainedHandles() noexcept {
@@ -394,16 +461,15 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
             return EC_BADARGS;
         }
     }
-    if (capacity <= 0 || num_shard_bits < 0 || num_item_mutex_shard_bits < 0 ||
-        num_item_mutex_shard_bits > 24 || sample_times_ <= 0) {
-        KVCM_LOG_ERROR(
-            "invalid local backend parameters, capacity[%lu] num_shard_bits[%d] "
-            "num_item_mutex_shard_bits[%d] sample_times[%zu], storage uri[%s]",
-            capacity,
-            num_shard_bits,
-            num_item_mutex_shard_bits,
-            sample_times_,
-            storage_uri.c_str());
+    if (capacity <= 0 || num_shard_bits < 0 || num_item_mutex_shard_bits < 0 || num_item_mutex_shard_bits > 24 ||
+        sample_times_ <= 0) {
+        KVCM_LOG_ERROR("invalid local backend parameters, capacity[%lu] num_shard_bits[%d] "
+                       "num_item_mutex_shard_bits[%d] sample_times[%zu], storage uri[%s]",
+                       capacity,
+                       num_shard_bits,
+                       num_item_mutex_shard_bits,
+                       sample_times_,
+                       storage_uri.c_str());
         return EC_BADARGS;
     }
 
@@ -411,7 +477,8 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     item_mutex_shard_mask_ = (uint32_t{1} << num_item_mutex_shard_bits) - 1;
     item_mutexes_.reset(new (std::nothrow) std::shared_mutex[item_mutex_shard_mask_ + 1]);
     if (!item_mutexes_) {
-        KVCM_LOG_ERROR("fail to allocate item mutex shards, instance[%s] bits[%d]", instance_id.c_str(),
+        KVCM_LOG_ERROR("fail to allocate item mutex shards, instance[%s] bits[%d]",
+                       instance_id.c_str(),
                        num_item_mutex_shard_bits);
         return EC_ERROR;
     }
@@ -479,6 +546,34 @@ ErrorCode MetaLocalBackend::Close() noexcept {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+ErrorCode MetaLocalBackend::CheckWriteCapacity(KeyType key,
+                                               const CacheLocationMap &locations,
+                                               const PropertyMap &properties,
+                                               bool replace) noexcept {
+    const size_t replacement_size =
+        replace ? sizeof(MetaMemCacheItem) + MetaMemCacheItem().EstimateMergeGrowth(locations, properties) : 0;
+    size_t growth = 0;
+    auto estimate = [&](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+        const MetaMemCacheItem &item = *static_cast<MetaMemCacheItem *>(value);
+        std::shared_lock lock(ItemMutex(key));
+        if (replace) {
+            const size_t before = item.Size();
+            const size_t after = replacement_size;
+            growth = after > before ? after - before : 0;
+        } else {
+            growth = item.EstimateMergeGrowth(locations, properties);
+        }
+        return 0;
+    };
+    const bool found = cache_->ApplyToEntryNoTouch(KeyToView(key), std::ref(estimate));
+    if (!found) {
+        growth = replace ? replacement_size
+                         : sizeof(MetaMemCacheItem) + MetaMemCacheItem().EstimateMergeGrowth(locations, properties);
+        growth += sizeof(LRUHandle) - 1 + sizeof(KeyType);
+    }
+    return growth <= cache_->GetAvailableCapacity(KeyToView(key)) ? EC_OK : EC_NOSPC;
+}
+
 ErrorCode MetaLocalBackend::CreateAndInsert(std::string_view key_sv,
                                             const CacheLocationMap &locations,
                                             const PropertyMap &properties) {
@@ -517,13 +612,18 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(std::string_view key_sv,
 ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
                                                 Cache::Handle *handle,
                                                 const CacheLocationMap &locations,
-                                                const PropertyMap &properties) {
+                                                const PropertyMap &properties,
+                                                bool check_capacity) {
     assert(handle != nullptr);
-    auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    existing->TouchAccessTime();
+    MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    const size_t available = check_capacity ? cache_->GetAvailableCapacity(KeyToView(key)) : 0;
     ssize_t charge_delta = 0;
     {
-        std::unique_lock lock(ItemMutex(key));
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
+        if (check_capacity && existing->EstimateMergeGrowth(locations, properties) > available) {
+            return EC_NOSPC;
+        }
+        existing->TouchAccessTime();
         charge_delta += existing->MergeLocations(locations);
         charge_delta += existing->MergeProperties(properties);
     }
@@ -539,11 +639,15 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(KeyType key,
                                                               CacheLocationConstPtr location,
                                                               CacheLocationVector *retired_locations) {
     assert(handle != nullptr);
-    auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    existing->TouchAccessTime();
+    MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    const size_t available = cache_->GetAvailableCapacity(KeyToView(key));
     ssize_t charge_delta = 0;
     {
-        std::unique_lock lock(ItemMutex(key));
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
+        if (existing->EstimateLocationGrowth(location_id, location, true) > available) {
+            return EC_NOSPC;
+        }
+        existing->TouchAccessTime();
         charge_delta = existing->UpsertLocation(location_id, std::move(location), retired_locations);
     }
     if (charge_delta != 0) {
@@ -554,12 +658,13 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(KeyType key,
 
 ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
                                           const CacheLocationMap &locations,
-                                          const PropertyMap &properties) {
+                                          const PropertyMap &properties,
+                                          bool check_capacity) {
     Cache::Handle *handle = cache_->Lookup(key_sv);
     if (!handle) {
         return EC_NOENT;
     }
-    const ErrorCode ec = UpdateHandleInPlace(ViewToKey(key_sv), handle, locations, properties);
+    const ErrorCode ec = UpdateHandleInPlace(ViewToKey(key_sv), handle, locations, properties, check_capacity);
     cache_->Release(handle);
     return ec;
 }
@@ -597,10 +702,12 @@ ErrorCode MetaLocalBackend::UpsertSingleLocationForOneKey(KeyType key,
 // Per-key helpers
 // ---------------------------------------------------------------------------
 
-ErrorCode
-MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties) {
+ErrorCode MetaLocalBackend::UpsertForOneKey(KeyType key,
+                                            const CacheLocationMap &locations,
+                                            const PropertyMap &properties,
+                                            bool check_capacity) {
     std::string_view key_sv = KeyToView(key);
-    ErrorCode update_ec = UpdateInPlace(key_sv, locations, properties);
+    ErrorCode update_ec = UpdateInPlace(key_sv, locations, properties, check_capacity);
     if (update_ec != EC_OK && update_ec != EC_NOENT) {
         KVCM_LOG_ERROR("local backend fail to update key[%ld] in upsert, ec[%d]", key, update_ec);
         return update_ec;
@@ -624,11 +731,11 @@ ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vec
     if (!handle) {
         return EC_NOENT;
     }
-    auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    MetaMemCacheItem *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     item->TouchAccessTime();
     ssize_t charge_delta = 0;
     {
-        std::unique_lock lock(ItemMutex(key));
+        std::unique_lock<std::shared_mutex> lock(ItemMutex(key));
         charge_delta = item->EraseLocations(location_ids);
     }
     if (charge_delta != 0) {
@@ -648,7 +755,10 @@ std::vector<ErrorCode> MetaLocalBackend::Put(RequestContext * /*request_context*
                                              const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = CreateAndInsert(KeyToView(keys[i]), locations[i], properties[i]);
+        results[i] = CheckWriteCapacity(keys[i], locations[i], properties[i], true);
+        if (results[i] == EC_OK) {
+            results[i] = CreateAndInsert(KeyToView(keys[i]), locations[i], properties[i]);
+        }
     }
     return results;
 }
@@ -690,7 +800,7 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
         // general backend API. ReportEvent supplies sorted unique keys and
         // therefore stays on the batched-LRU fast path below.
         for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
+            results[i] = UpsertForOneKey(keys[i], locations[i], properties[i], true);
         }
         return results;
     }
@@ -714,7 +824,7 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
         // batched-LRU fast paths below.
         for (size_t i = 0; i < keys.size(); ++i) {
             if (handles[i]) {
-                results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i]);
+                results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i], true);
                 cache_->Release(handles[i]);
             } else {
                 results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
@@ -725,7 +835,7 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
 
     if (missing_count == 0) {
         for (size_t i = 0; i < keys.size(); ++i) {
-            results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i]);
+            results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i], true);
         }
         cache_->ReleaseBatch(handles.data(), handles.size());
         return results;
@@ -737,6 +847,83 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
     assert(missing_count == handles.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::UpsertWithStats(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const CacheLocationMapVector &locations,
+                                                         const PropertyMapVector &properties,
+                                                         std::vector<UpsertStats> &out_stats,
+                                                         size_t max_new_keys,
+                                                         const BeforeUpsertWrite &before_write) noexcept {
+    out_stats.assign(keys.size(), {});
+    if (locations.size() != keys.size() || properties.size() != keys.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::vector<UpsertStats> candidates(keys.size());
+    std::vector<std::string_view> key_views(keys.size());
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    cache_->LookupBatch(key_views.data(), keys.size(), handles.data());
+    // Reuse the handles needed by Upsert itself. No old location objects are
+    // materialized and no metadata read API is called for these counters.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        candidates[i].key_created = handles[i] == nullptr;
+        if (!before_write) {
+            continue; // Single-backend admission happens at the mutation below.
+        }
+        size_t growth = 0;
+        if (handles[i]) {
+            const auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handles[i]));
+            std::shared_lock lock(ItemMutex(keys[i]));
+            growth = item->EstimateMergeGrowth(locations[i], properties[i]);
+        } else {
+            growth = sizeof(MetaMemCacheItem) + MetaMemCacheItem().EstimateMergeGrowth(locations[i], properties[i]) +
+                     sizeof(LRUHandle) - 1 + sizeof(KeyType);
+        }
+        if (growth > cache_->GetAvailableCapacity(key_views[i])) {
+            results[i] = EC_NOSPC;
+        }
+    }
+    // Persistent-first cached writes run here, outside all cache/item locks.
+    AdmitCountedUpsert(results, candidates, max_new_keys, before_write);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        if (handles[i]) {
+            auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handles[i]));
+            const size_t available = cache_->GetAvailableCapacity(key_views[i]);
+            ssize_t charge_delta = 0;
+            {
+                std::unique_lock lock(ItemMutex(keys[i]));
+                if (item->EstimateMergeGrowth(locations[i], properties[i]) > available) {
+                    results[i] = EC_NOSPC;
+                    continue;
+                }
+                const size_t before = item->LocationCount();
+                item->TouchAccessTime();
+                charge_delta += item->MergeLocations(locations[i]);
+                charge_delta += item->MergeProperties(properties[i]);
+                out_stats[i].locations_created = item->LocationCount() - before;
+            }
+            if (charge_delta != 0) {
+                cache_->AdjustCharge(handles[i], charge_delta);
+            }
+        } else {
+            results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+            if (results[i] == EC_OK) {
+                out_stats[i] = {true, locations[i].size()};
+            }
+        }
+    }
+    if (std::any_of(handles.begin(), handles.end(), [](auto *handle) { return handle != nullptr; })) {
+        cache_->ReleaseBatch(handles.data(), handles.size());
     }
     return results;
 }
@@ -970,7 +1157,7 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = (previous_error_codes[i] == EC_OK) ? UpsertForOneKey(keys[i], locations[i], properties[i])
+        results[i] = (previous_error_codes[i] == EC_OK) ? UpsertForOneKey(keys[i], locations[i], properties[i], false)
                                                         : previous_error_codes[i];
     }
     return results;
@@ -1195,10 +1382,9 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext
         item->TouchAccessTime(access_time_us);
         {
             std::shared_lock lock(ItemMutex(keys[i]));
-            item->ForEachLocation(
-                [&out_locations](const LocationId &, const CacheLocationConstPtr &location) {
-                    out_locations.values.push_back(location);
-                });
+            item->ForEachLocation([&out_locations](const LocationId &, const CacheLocationConstPtr &location) {
+                out_locations.values.push_back(location);
+            });
         }
         out_locations.FinishKey();
     }
@@ -1808,8 +1994,6 @@ ErrorCode MetaLocalBackend::DeleteMetaData() noexcept { return EC_OK; }
 
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_ ? cache_->GetUsage() : 0; }
 
-size_t MetaLocalBackend::GetLocalKeyCount() const noexcept { return cache_ ? cache_->GetOccupancyCount() : 0; }
-
 bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept {
     if (!cache_) {
         return false;
@@ -1841,5 +2025,6 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
     }
     return string_keys.size();
 }
+
 
 } // namespace kv_cache_manager

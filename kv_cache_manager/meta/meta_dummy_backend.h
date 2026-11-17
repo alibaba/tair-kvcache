@@ -49,6 +49,13 @@ public:
                                const KeyTypeVec &keys,
                                const CacheLocationMapVector &locations,
                                const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const CacheLocationMapVector &locations,
+                                           const PropertyMapVector &properties,
+                                           std::vector<UpsertStats> &out_stats,
+                                           size_t max_new_keys,
+                                           const BeforeUpsertWrite &before_write = {}) noexcept override;
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,

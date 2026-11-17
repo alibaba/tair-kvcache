@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -377,6 +378,50 @@ using CacheLocationVector = std::vector<CacheLocationConstPtr>;
 using CacheLocationMap = std::unordered_map<std::string, CacheLocationConstPtr>;
 using CacheLocationMapVector = std::vector<CacheLocationMap>;
 
+// Query fields borrow strings from sources retained by the compact batch.
+class CacheLocationReadView {
+public:
+    CacheLocationReadView(const CacheLocation &location) : source_(std::cref(location)) {}
+    CacheLocationReadView(const CacheLocationConstPtr &location) {
+        if (location) {
+            source_ = std::cref(*location);
+        }
+    }
+    CacheLocationReadView(const std::string &id, const std::string &name, const std::string &uri, DataStorageType type)
+        : source_(SimpleFields{std::cref(id), std::cref(name), std::cref(uri), type}) {}
+
+    explicit operator bool() const { return source_.index() != 0; }
+    const CacheLocation &OriginalLocation() const { return std::get<1>(source_).get(); }
+    const std::string &id() const { return IsSimple() ? std::get<2>(source_).id.get() : OriginalLocation().id(); }
+    DataStorageType type() const { return IsSimple() ? std::get<2>(source_).type : OriginalLocation().type(); }
+    CacheLocationStatus status() const { return IsSimple() ? CLS_SERVING : OriginalLocation().status(); }
+    size_t SpecSize() const { return IsSimple() ? 1 : OriginalLocation().spec_size(); }
+    size_t SpecCount() const { return IsSimple() ? 1 : OriginalLocation().location_specs().size(); }
+    bool HasSpecName(size_t index) const {
+        return IsSimple() || static_cast<bool>(OriginalLocation().location_specs()[index].name_handle());
+    }
+    const std::string &SpecName(size_t index) const {
+        return IsSimple() ? std::get<2>(source_).name.get() : OriginalLocation().location_specs()[index].name();
+    }
+    const std::string &SpecUri(size_t index) const {
+        return IsSimple() ? std::get<2>(source_).uri.get() : OriginalLocation().location_specs()[index].uri();
+    }
+    std::string_view SpecChecksum(size_t index) const {
+        return IsSimple() ? std::string_view{} : OriginalLocation().location_specs()[index].checksum();
+    }
+    bool HasValidatedLocationSpecs() const { return !IsSimple() && OriginalLocation().HasValidatedLocationSpecs(); }
+
+private:
+    struct SimpleFields {
+        std::reference_wrapper<const std::string> id;
+        std::reference_wrapper<const std::string> name;
+        std::reference_wrapper<const std::string> uri;
+        DataStorageType type;
+    };
+    bool IsSimple() const { return source_.index() == 2; }
+    std::variant<std::monostate, std::reference_wrapper<const CacheLocation>, SimpleFields> source_;
+};
+
 // Compact positional representation for large all-location reads. Keeping one
 // vector object per key is disproportionately expensive for GetHostCacheState:
 // a million-key request otherwise constructs a million small vectors and, for
@@ -401,6 +446,38 @@ private:
 };
 
 struct CompactLocationsPerKey {
+    CompactLocationsPerKey() = default;
+    explicit CompactLocationsPerKey(bool read_views) : read_views_requested_(read_views) {}
+
+    class ReadViewRange {
+    public:
+        class Iterator {
+        public:
+            Iterator(const CompactLocationsPerKey &batch, size_t index) : batch_(batch), index_(index) {}
+            CacheLocationReadView operator*() const { return batch_.ReadViewAt(index_); }
+            Iterator &operator++() {
+                ++index_;
+                return *this;
+            }
+            bool operator!=(const Iterator &other) const { return index_ != other.index_; }
+
+        private:
+            const CompactLocationsPerKey &batch_;
+            size_t index_;
+        };
+        ReadViewRange(const CompactLocationsPerKey &batch, size_t begin, size_t end)
+            : batch_(batch), begin_(begin), end_(end) {}
+        Iterator begin() const { return Iterator(batch_, begin_); }
+        Iterator end() const { return Iterator(batch_, end_); }
+        bool empty() const { return begin_ == end_; }
+        size_t size() const { return end_ - begin_; }
+
+    private:
+        const CompactLocationsPerKey &batch_;
+        size_t begin_;
+        size_t end_;
+    };
+
     std::vector<size_t> offsets{0};
     CacheLocationVector values;
 
@@ -410,13 +487,24 @@ struct CompactLocationsPerKey {
         offsets.push_back(0);
         values.clear();
         values.reserve(location_capacity);
+        read_views_.clear();
+        read_owners_.clear();
+        if (read_views_requested_) {
+            read_views_.reserve(location_capacity);
+            read_owners_.reserve(key_capacity + 1);
+        }
     }
+
+    bool ReadViewsRequested() const { return read_views_requested_; }
+    void HoldReadOwner(std::shared_ptr<const void> owner) { read_owners_.push_back(std::move(owner)); }
+    void AppendReadView(CacheLocationReadView view) { read_views_.push_back(std::move(view)); }
+    ReadViewRange ReadViews(size_t index) const { return ReadViewRange(*this, offsets[index], offsets[index + 1]); }
 
     [[nodiscard]] size_t size() const { return offsets.empty() ? 0 : offsets.size() - 1; }
     [[nodiscard]] bool empty() const { return size() == 0; }
     [[nodiscard]] bool IsValid(size_t expected_key_count) const {
         if (offsets.size() != expected_key_count + 1 || offsets.empty() || offsets.front() != 0 ||
-            offsets.back() != values.size()) {
+            offsets.back() != ValueCount() || (!read_owners_.empty() && !values.empty())) {
             return false;
         }
         for (size_t i = 1; i < offsets.size(); ++i) {
@@ -432,7 +520,30 @@ struct CompactLocationsPerKey {
                                       values.begin() + static_cast<ptrdiff_t>(offsets[index + 1]));
     }
 
-    void FinishKey() { offsets.push_back(values.size()); }
+    void FinishKey() { offsets.push_back(ValueCount()); }
+    void AppendBatch(CompactLocationsPerKey &&batch) {
+        const size_t base = ValueCount();
+        values.insert(
+            values.end(), std::make_move_iterator(batch.values.begin()), std::make_move_iterator(batch.values.end()));
+        read_views_.insert(read_views_.end(),
+                           std::make_move_iterator(batch.read_views_.begin()),
+                           std::make_move_iterator(batch.read_views_.end()));
+        read_owners_.insert(read_owners_.end(),
+                            std::make_move_iterator(batch.read_owners_.begin()),
+                            std::make_move_iterator(batch.read_owners_.end()));
+        for (size_t i = 1; i < batch.offsets.size(); ++i) {
+            offsets.push_back(base + batch.offsets[i]);
+        }
+    }
+
+private:
+    size_t ValueCount() const { return read_owners_.empty() ? values.size() : read_views_.size(); }
+    CacheLocationReadView ReadViewAt(size_t index) const {
+        return read_owners_.empty() ? CacheLocationReadView(values[index]) : read_views_[index];
+    }
+    bool read_views_requested_ = false;
+    std::vector<CacheLocationReadView> read_views_;
+    std::vector<std::shared_ptr<const void>> read_owners_;
 };
 
 } // namespace kv_cache_manager
