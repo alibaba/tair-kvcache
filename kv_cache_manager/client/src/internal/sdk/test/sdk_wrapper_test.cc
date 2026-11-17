@@ -727,6 +727,63 @@ TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
 }
 
+TEST_F(SdkWrapperTest, CompletionWaitKeepsLateSuccessReusable) {
+    SdkWrapper wrapper;
+    ASSERT_EQ(ER_OK, wrapper.Init(client_config_, init_params_, nullptr, /*wait_for_completion=*/true));
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    auto operation = std::async(std::launch::async, [&]() {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET,
+                                              {[&]() {
+                                                  started.set_value();
+                                                  released.wait();
+                                                  return ER_OK;
+                                              }},
+                                              100);
+    });
+    const bool began = started_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(began);
+    if (began) {
+        EXPECT_EQ(std::future_status::timeout, operation.wait_for(std::chrono::milliseconds(150)));
+    }
+    release.set_value();
+    EXPECT_EQ(ER_OK, operation.get());
+    EXPECT_EQ(ER_OK, wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, {[]() { return ER_OK; }}, 100));
+}
+
+TEST_F(SdkWrapperTest, CompletionWaitDrainsPeersAndPreservesUnknownErrors) {
+    SdkWrapper wrapper;
+    ASSERT_EQ(ER_OK, wrapper.Init(client_config_, init_params_, nullptr, /*wait_for_completion=*/true));
+    std::promise<void> peer_started;
+    auto peer_ready = peer_started.get_future().share();
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    auto operation = std::async(std::launch::async, [&]() {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::PUT,
+                                              {[&]() {
+                                                   peer_ready.wait_for(std::chrono::seconds(2));
+                                                   return ER_SDK_ERROR_BUFFER_SAFE;
+                                               },
+                                               [&]() {
+                                                   peer_started.set_value();
+                                                   released.wait();
+                                                   return ER_OK;
+                                               }},
+                                              100);
+    });
+    const bool began = peer_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(began);
+    if (began) {
+        EXPECT_EQ(std::future_status::timeout, operation.wait_for(std::chrono::milliseconds(150)));
+    }
+    release.set_value();
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, operation.get());
+    EXPECT_EQ(ER_SDK_TIMEOUT,
+              wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::PUT, {[]() { return ER_SDK_TIMEOUT; }}, 100));
+}
+
 // 验证静态预算注入：wrapper 在 Init 阶段把自身 timeout_config 注入
 // SdkBackendConfig，后端（fake 观测面）读到的是同一份预算 —— 这是后端
 // "从自身任务起点起算 deadline 并自律"的数据来源。

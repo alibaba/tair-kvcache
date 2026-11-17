@@ -30,7 +30,9 @@ SdkWrapper::~SdkWrapper() {
 
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
-                                 const ClientMemoryRegistrations *memory_registrations) {
+                                 const ClientMemoryRegistrations *memory_registrations,
+                                 bool wait_for_completion) {
+    wait_for_completion_ = wait_for_completion;
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
@@ -322,14 +324,26 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    // Drain only until the existing deadline. SAFE survives only when every
+    // Ordinary KVCache keeps its advisory deadline. KVMeta is already called
+    // from a deadline-bounded worker and retains buffers while this call runs:
+    // wait for the backend's actual result instead of turning a late success
+    // into client teardown and permanent GPU registration quarantine.
+    auto wait_ready = [&](std::future<ClientErrorCode> &future) {
+        if (wait_for_completion_) {
+            future.wait();
+            return true;
+        }
+        return future.wait_until(deadline) == std::future_status::ready;
+    };
+
+    // SAFE survives only when every
     // submitted host returned success, explicit SAFE, or cancellation before I/O.
     bool all_buffer_safe = true;
     auto drain = [&](size_t from) {
         stop->store(true);
         bool timed_out = false;
         for (size_t j = from; j < futures.size(); ++j) {
-            if (futures[j].wait_until(deadline) != std::future_status::ready) {
+            if (!wait_ready(futures[j])) {
                 all_buffer_safe = false;
                 timed_out = true;
                 continue;
@@ -343,7 +357,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     };
 
     for (size_t i = 0; i < futures.size(); ++i) {
-        if (futures[i].wait_until(deadline) != std::future_status::ready) {
+        if (!wait_ready(futures[i])) {
             auto overdue_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
                     .count();

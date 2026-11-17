@@ -321,7 +321,9 @@ GDR 表示 PACE 与注册 GPU arena 之间的 GPU 数据路径；不代表整个
 
 调用方读 deadline 限制 future 等待，超时即回源；不会强制终止后台 DMA。任务和字节预算保留至实际 worker 完成，已取消但仍执行的任务不能提前复用 buffer。对象恢复、CUDA 同步和 Close 也不由该 future deadline 强制中断，因此不能承诺整个 GPU 推理流程具有同一个硬 deadline。
 
-安全且已完成的 SDK 错误允许复用 client；无法确认 DMA 已停止时隔离 transport 并保留注册内存，输出需重启 worker 的诊断。服务发现刷新只更新 metadata 端点，不销毁重建正在复用的 GDR arena；刷新失败先回源，不盲目重放写入。
+KVMeta 数据面显式启用 `SdkWrapper` 的 completion wait：已开始的 I/O 等待后端真实完成，不能只因 wrapper 等待预算耗尽就销毁 Client 和 GPU 注册。普通 KVCache 保留原有 advisory deadline 行为。RTP 调用方仍按自己的 deadline 回源；后台任务完成前继续持有 buffer 和在途预算。后端自身必须提供有界完成或明确的 buffer-safe 错误，这一模式不提供强制 DMA 取消。
+
+安全且已完成的 SDK 错误允许复用 client；无法确认 DMA 已停止时隔离 transport 并保留注册内存。ViT 安装故障恢复回调，在首条详细隔离日志之后以失败状态退出，由已有父进程监护和部署平台重启；不在仍存活的失效进程内重新注册另一块 arena，也不继续以健康状态永久回源。独立 SDK 用户未安装此回调时仍需自行重启进程。服务发现刷新只更新 metadata 端点，不销毁重建正在复用的 GDR arena；刷新失败先回源，不盲目重放写入。
 
 正常成功通过指标观察，不逐请求打印成功日志。异常日志应带 operation、stage、trace_id、错误类型/错误码、字节数和耗时；读取总量还需区分 hit、miss、timeout 与 admission skip。计数应满足 `total = success + error + skipped`，miss 属于成功的 metadata 查询。caller timeout 后的晚到错误是补充诊断，不能重复计为新的请求失败。
 
