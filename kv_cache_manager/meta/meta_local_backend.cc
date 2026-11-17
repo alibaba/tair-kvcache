@@ -613,7 +613,8 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
                                                 Cache::Handle *handle,
                                                 const CacheLocationMap &locations,
                                                 const PropertyMap &properties,
-                                                bool check_capacity) {
+                                                bool check_capacity,
+                                                UpsertStats *stats) {
     assert(handle != nullptr);
     MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     const size_t available = check_capacity ? cache_->GetAvailableCapacity(KeyToView(key)) : 0;
@@ -623,9 +624,13 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
         if (check_capacity && existing->EstimateMergeGrowth(locations, properties) > available) {
             return EC_NOSPC;
         }
+        const size_t previous_count = stats ? existing->LocationCount() : 0;
         existing->TouchAccessTime();
         charge_delta += existing->MergeLocations(locations);
         charge_delta += existing->MergeProperties(properties);
+        if (stats) {
+            stats->locations_created = existing->LocationCount() - previous_count;
+        }
     }
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
@@ -897,24 +902,7 @@ std::vector<ErrorCode> MetaLocalBackend::UpsertWithStats(RequestContext * /*requ
             continue;
         }
         if (handles[i]) {
-            auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handles[i]));
-            const size_t available = cache_->GetAvailableCapacity(key_views[i]);
-            ssize_t charge_delta = 0;
-            {
-                std::unique_lock lock(ItemMutex(keys[i]));
-                if (item->EstimateMergeGrowth(locations[i], properties[i]) > available) {
-                    results[i] = EC_NOSPC;
-                    continue;
-                }
-                const size_t before = item->LocationCount();
-                item->TouchAccessTime();
-                charge_delta += item->MergeLocations(locations[i]);
-                charge_delta += item->MergeProperties(properties[i]);
-                out_stats[i].locations_created = item->LocationCount() - before;
-            }
-            if (charge_delta != 0) {
-                cache_->AdjustCharge(handles[i], charge_delta);
-            }
+            results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i], true, &out_stats[i]);
         } else {
             results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
             if (results[i] == EC_OK) {

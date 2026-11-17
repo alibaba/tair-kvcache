@@ -427,7 +427,8 @@ private:
                                   Cache::Handle *handle,
                                   const CacheLocationMap &locations,
                                   const PropertyMap &properties,
-                                  bool check_capacity);
+                                  bool check_capacity,
+                                  UpsertStats *stats = nullptr);
     ErrorCode UpdateHandleInPlaceSingleLocation(KeyType key,
                                                 Cache::Handle *handle,
                                                 const LocationId &location_id,

@@ -246,8 +246,11 @@ private:
                 local_primary ? persistent_backend_.get() : cache_backend_.get(),
                 local_primary};
     }
-    std::vector<ErrorCode>
-    WritePrimary(RequestContext *request_context, BatchMetaData &batch, const WriteRoute &route, bool replace) noexcept;
+    std::vector<ErrorCode> WritePrimary(RequestContext *request_context,
+                                        BatchMetaData &batch,
+                                        const WriteRoute &route,
+                                        bool replace,
+                                        const std::vector<ErrorCode> *admission = nullptr) noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,

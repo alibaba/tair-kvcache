@@ -128,6 +128,11 @@ public:
     ErrorCode DeleteMetaData() noexcept override;
 
 private:
+    std::vector<ErrorCode> UpsertImpl(const KeyTypeVec &keys,
+                                      const CacheLocationMapVector &locations,
+                                      const PropertyMapVector &properties,
+                                      std::vector<UpsertStats> *stats = nullptr,
+                                      size_t max_new_keys = 0);
     ErrorCode PersistToPath();
 
     std::mutex mutex_;

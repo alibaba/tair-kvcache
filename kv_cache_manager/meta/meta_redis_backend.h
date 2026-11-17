@@ -101,6 +101,12 @@ public:
     ErrorCode DeleteMetaData() noexcept override;
 
 private:
+    std::vector<ErrorCode> UpsertImpl(RequestContext *request_context,
+                                      const KeyTypeVec &keys,
+                                      const CacheLocationMapVector &locations,
+                                      const PropertyMapVector &properties,
+                                      std::vector<UpsertStats> *stats = nullptr,
+                                      size_t max_new_keys = 0);
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
 

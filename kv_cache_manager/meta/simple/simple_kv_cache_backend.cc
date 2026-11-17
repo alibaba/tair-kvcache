@@ -168,6 +168,20 @@ ErrorCode SimpleKVCacheBackend::PublishItem(KeyType key, const std::shared_ptr<S
     return EC_OK;
 }
 
+ErrorCode SimpleKVCacheBackend::BuildItem(const CacheValue &current,
+                                          const CacheLocationMap &locations,
+                                          const std::unordered_map<LocationId, InternedLocationId> &ids,
+                                          CacheValue &item) {
+    Cache::ObjectPtr value = nullptr;
+    const auto ec = current ? SimpleKVCacheItem::Merge(*current, locations, spec_name_, ids, value)
+                            : SimpleKVCacheItem::Create(locations, spec_name_, ids, value);
+    if (ec == EC_OK) {
+        item = CacheValue(static_cast<SimpleKVCacheItem *>(value),
+                          [](SimpleKVCacheItem *ptr) { SimpleKVCacheItem::Deleter(ptr, nullptr); });
+    }
+    return ec;
+}
+
 std::vector<ErrorCode> SimpleKVCacheBackend::Write(const KeyTypeVec &keys,
                                                    const CacheLocationMapVector &locations,
                                                    const PropertyMapVector &properties,
@@ -225,18 +239,12 @@ std::vector<ErrorCode> SimpleKVCacheBackend::Write(const KeyTypeVec &keys,
                 continue;
             }
         }
-        Cache::ObjectPtr value = nullptr;
-        if (mode == WriteMode::Upsert && current) {
-            results[i] = SimpleKVCacheItem::Merge(*current, locations[i], spec_name_, ids, value);
-        } else {
-            results[i] = SimpleKVCacheItem::Create(locations[i], spec_name_, ids, value);
+        const CacheValue empty;
+        CacheValue item;
+        results[i] = BuildItem(mode == WriteMode::Upsert ? current : empty, locations[i], ids, item);
+        if (results[i] == EC_OK) {
+            results[i] = PublishItem(keys[i], item, static_cast<bool>(current));
         }
-        if (results[i] != EC_OK) {
-            continue;
-        }
-        const CacheValue item(static_cast<SimpleKVCacheItem *>(value),
-                              [](SimpleKVCacheItem *ptr) { SimpleKVCacheItem::Deleter(ptr, nullptr); });
-        results[i] = PublishItem(keys[i], item, static_cast<bool>(current));
     }
     return results;
 }
@@ -779,12 +787,8 @@ std::vector<ErrorCode> SimpleKVCacheBackend::UpsertWithStats(RequestContext * /*
         if (results[i] != EC_OK) {
             continue;
         }
-        Cache::ObjectPtr value = nullptr;
-        results[i] = current ? SimpleKVCacheItem::Merge(*current, locations[i], spec_name_, ids, value)
-                             : SimpleKVCacheItem::Create(locations[i], spec_name_, ids, value);
+        results[i] = BuildItem(current, locations[i], ids, prepared[i]);
         if (results[i] == EC_OK) {
-            prepared[i] = CacheValue(static_cast<SimpleKVCacheItem *>(value),
-                                     [](SimpleKVCacheItem *ptr) { SimpleKVCacheItem::Deleter(ptr, nullptr); });
             candidates[i] = {!current, prepared[i]->LocationCount() - (current ? current->LocationCount() : 0)};
         }
     }
