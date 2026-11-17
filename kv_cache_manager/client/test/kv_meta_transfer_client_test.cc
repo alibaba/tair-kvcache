@@ -200,7 +200,7 @@ std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory
     }])";
     auto wrapper = std::make_unique<SdkWrapper>();
     wrapper->sdk_factory_ = &factory;
-    EXPECT_EQ(ER_OK, wrapper->Init(config, params));
+    EXPECT_EQ(ER_OK, wrapper->Init(config, params, nullptr, /*wait_for_completion=*/true));
     recording = factory.sdk.get();
 
     auto client = std::make_unique<KvMetaTransferClientImpl>();
@@ -280,11 +280,56 @@ TEST(KvMetaTransferClientTest, BackendErrorsCannotMasqueradeAsPreIoRejections) {
     }
 }
 
+TEST(KvMetaTransferClientTest, CompletedBufferSafeFailuresKeepReadAndWriteReusable) {
+    for (const bool save : {false, true}) {
+        for (const auto ec : {ER_SDK_TIMEOUT_BUFFER_SAFE, ER_SDK_ERROR_BUFFER_SAFE}) {
+            SCOPED_TRACE(save ? "save" : "load");
+            SCOPED_TRACE(static_cast<int>(ec));
+            RecordingSdkFactory factory;
+            RecordingSdk *recording = nullptr;
+            auto client = MakeTransferClient(factory, recording, 32, 100);
+            ASSERT_NE(nullptr, recording);
+            auto *wrapper = client->sdk_wrapper_.get();
+            recording->save_result = recording->load_result = ec;
+            std::promise<void> started;
+            auto began = started.get_future();
+            std::promise<void> release;
+            auto released = release.get_future().share();
+            recording->before_io = [&](const std::vector<DataStorageUri> &) {
+                started.set_value();
+                released.wait();
+            };
+            char value[5]{};
+            const UriStrVec uris{"pace://pace/1?media_type=0&node_id=1&range_id=0&size=5"};
+            BlockBuffer buffer;
+            buffer.iovs.push_back({MemoryType::CPU, value, sizeof(value), false});
+            const BlockBuffers buffers{buffer};
+            auto operation = std::async(std::launch::async, [&] {
+                return save ? client->SaveObjects(uris, {sizeof(value)}, buffers).first
+                            : client->LoadObjects(uris, {sizeof(value)}, buffers);
+            });
+            const bool dispatched = began.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+            EXPECT_TRUE(dispatched);
+            if (dispatched) {
+                EXPECT_EQ(std::future_status::timeout, operation.wait_for(std::chrono::milliseconds(150)));
+            }
+            release.set_value();
+            EXPECT_EQ(ec, operation.get());
+            EXPECT_EQ(wrapper, client->sdk_wrapper_.get());
+            recording->before_io = {};
+            recording->save_result = recording->load_result = ER_OK;
+            EXPECT_EQ(ER_OK, client->LoadObjects(uris, {sizeof(value)}, buffers));
+            EXPECT_EQ(ER_OK, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
+        }
+    }
+}
+
 TEST(KvMetaTransferClientTest, TimeoutDrainsBackendAndClosesDataPlane) {
     RecordingSdkFactory factory;
     RecordingSdk *recording = nullptr;
     auto client = MakeTransferClient(factory, recording, 32, 10);
     ASSERT_NE(nullptr, recording);
+    client->sdk_wrapper_->wait_for_completion_ = false; // Exercise the legacy advisory-timeout defense.
     recording->delay = std::chrono::milliseconds(50);
 
     char value[5]{};
