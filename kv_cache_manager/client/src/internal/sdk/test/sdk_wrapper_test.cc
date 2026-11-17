@@ -123,7 +123,7 @@ TEST_F(SdkWrapperTest, CompletionPolicyReachesBackendWithoutChangingOrdinaryClie
         ASSERT_EQ(ER_OK, wrapper.Init(config, init_params_, nullptr, wait));
         const auto backend = config->sdk_wrapper_config()->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
         ASSERT_NE(nullptr, backend);
-        EXPECT_EQ(wait, backend->wait_for_completion());
+        EXPECT_EQ(wait ? 2000 : 0, backend->completion_wait_timeout_ms());
     }
 }
 

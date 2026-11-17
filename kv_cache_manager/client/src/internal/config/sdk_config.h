@@ -68,8 +68,8 @@ public:
 
     // Registered-buffer clients retain memory until transfer completion. This
     // runtime policy is injected by SdkWrapper, not read from user JSON.
-    bool wait_for_completion() const { return wait_for_completion_; }
-    void set_wait_for_completion(bool value) { wait_for_completion_ = value; }
+    int completion_wait_timeout_ms() const { return completion_wait_timeout_ms_; }
+    void set_completion_wait_timeout_ms(int value) { completion_wait_timeout_ms_ = value; }
 
 private:
     DataStorageType type_;
@@ -77,7 +77,7 @@ private:
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
     SdkTimeoutConfig timeout_config_;
-    bool wait_for_completion_{false};
+    int completion_wait_timeout_ms_{0};
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {
