@@ -1366,6 +1366,27 @@ ErrorCode KvMetaManager::LoadExactLocations(RequestContext *request_context,
     return overall;
 }
 
+bool KvMetaManager::LocationMightExist(const CacheLocation &location) const {
+    // Reuse the ordinary cache's topology-only probe. A healthy backend
+    // reports false only for a confirmed missing provider; outages stay unknown.
+    if (location.location_specs().size() != 1) {
+        return true;
+    }
+    const DataStorageUri uri(location.location_specs().front().uri());
+    const auto storage = registry_manager_->data_storage_manager();
+    if (!storage || !uri.Valid()) {
+        return true;
+    }
+    try {
+        const auto exists = storage->Exist(uri.GetHostName(), {uri}, /*fastpath=*/true);
+        return exists.size() != 1 || exists.front();
+    } catch (const std::exception &error) {
+        KVCM_LOG_ERROR("KVMeta topology probe failed storage[%s] error[%s]",
+                       uri.GetHostName().c_str(), error.what());
+        return true;
+    }
+}
+
 std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
     RequestContext *request_context, const std::string &instance_id, const std::vector<std::string> &keys) const {
     if (const ErrorCode ec = CheckReady(request_context); ec != EC_OK) {
@@ -1396,7 +1417,7 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
             ec != EC_OK) {
             return {ec, {}};
         }
-        if (exact[i].location->status() != CLS_SERVING) {
+        if (exact[i].location->status() != CLS_SERVING || !LocationMightExist(*exact[i].location)) {
             continue;
         }
         if (!ToValueLocation(*exact[i].location, result[i].location)) {
@@ -1754,6 +1775,30 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     std::vector<ExactLocation> existing;
     if (const ErrorCode ec = LoadExactLocations(request_context, internal_instance_id, keys, existing); ec != EC_OK) {
         return {ec, {}};
+    }
+    std::vector<SessionItem> stale;
+    for (const auto &item : existing) {
+        if (item.ec != EC_OK || !item.location || item.location->status() != CLS_SERVING) {
+            continue;
+        }
+        std::uint64_t size = 0;
+        if (ValidateLocation(request_context, item.internal_key, item.location_id, *item.location, size) == EC_OK &&
+            !LocationMightExist(*item.location)) {
+            stale.push_back({item.internal_key, item.location_id, item.location, size});
+        }
+    }
+    if (!stale.empty()) {
+        // The provider is gone. Remove only the observed generation and refund
+        // its usage, without submitting a physical delete to a replacement.
+        const auto ec = DeleteItems(request_context, internal_instance_id, stale, false, true);
+        if (ec != EC_OK) {
+            return {ec, {}};
+        }
+        AddReclaimCounter(instance->instance_group_name(), "missing_provider_candidates_total", stale.size());
+        if (const auto load_ec = LoadExactLocations(request_context, internal_instance_id, keys, existing);
+            load_ec != EC_OK) {
+            return {load_ec, {}};
+        }
     }
     response.key_mask.assign(keys.size(), false);
     std::vector<std::size_t> missing;

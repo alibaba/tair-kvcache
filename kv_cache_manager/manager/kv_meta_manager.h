@@ -142,6 +142,7 @@ private:
                           bool maintenance_read,
                           std::vector<SessionItem> *deleted_items = nullptr,
                           bool refresh_cache_from_persistent = false);
+    bool LocationMightExist(const CacheLocation &location) const;
     bool DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
     void
     ObserveReclaimStage(const std::string &group, const std::string &stage, const std::string &status) const noexcept;

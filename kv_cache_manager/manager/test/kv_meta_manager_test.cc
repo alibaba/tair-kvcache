@@ -361,6 +361,10 @@ public:
     std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
         return std::vector<bool>(uris.size(), true);
     }
+    std::vector<bool> MightExist(const std::vector<DataStorageUri> &uris) override {
+        return probe ? probe(uris) : std::vector<bool>(uris.size(), true);
+    }
+    std::function<std::vector<bool>(const std::vector<DataStorageUri> &)> probe;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
         return std::vector<ErrorCode>(uris.size(), EC_OK);
     }
@@ -539,6 +543,48 @@ protected:
     std::shared_ptr<TestPaceBackend> pace_backend_;
     std::unique_ptr<KvMetaManager> manager_;
 };
+
+TEST_F(KvMetaManagerTest, MissingProviderIsAMissAndSameKeyCanBeRewritten) {
+    const auto old = Start(kDefaultInstance, {"object"}, {31});
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, old.write_session_id, {true}));
+    const auto old_uri = old.locations[0].specs.front().second;
+    pace_backend_->probe = [old_uri](const std::vector<DataStorageUri> &uris) {
+        std::vector<bool> result;
+        for (const auto &uri : uris) {
+            result.push_back(uri.ToUriString() != old_uri);
+        }
+        return result;
+    };
+    const auto [get_ec, miss] = manager_->Get(&context_, kDefaultInstance, {"object"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, miss.size());
+    EXPECT_FALSE(miss[0].found);
+    const auto fresh = Start(kDefaultInstance, {"object"}, {31});
+    ASSERT_EQ((std::vector<bool>{false}), fresh.key_mask);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, fresh.write_session_id, {true}));
+    EXPECT_NE(old_uri, fresh.locations[0].specs.front().second);
+    const auto [ec, hit] = manager_->Get(&context_, kDefaultInstance, {"object"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_TRUE(hit[0].found);
+    EXPECT_EQ(fresh.locations[0].specs.front().second, hit[0].location.specs.front().second);
+    EXPECT_EQ(31u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_EQ(0, pace_backend_->delete_count());
+}
+
+TEST_F(KvMetaManagerTest, UnknownTopologyPreservesServingMetadata) {
+    const auto initial = Start(kDefaultInstance, {"object"}, {31});
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, initial.write_session_id, {true}));
+    pace_backend_->probe = [](const std::vector<DataStorageUri> &) -> std::vector<bool> {
+        throw std::runtime_error("topology unavailable");
+    };
+    const auto [ec, hit] = manager_->Get(&context_, kDefaultInstance, {"object"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_TRUE(hit[0].found);
+    const auto duplicate = Start(kDefaultInstance, {"object"}, {31});
+    EXPECT_EQ((std::vector<bool>{true}), duplicate.key_mask);
+    EXPECT_EQ(1, pace_backend_->create_count());
+    EXPECT_EQ(0, pace_backend_->delete_count());
+}
 
 TEST_F(KvMetaManagerTest, VariableSizesBecomeVisibleOnlyAfterFinish) {
     const std::vector<std::string> keys{"emb-a", "emb-b"};
