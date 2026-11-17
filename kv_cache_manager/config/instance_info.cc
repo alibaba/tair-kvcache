@@ -20,6 +20,7 @@ bool InstanceInfo::FromRapidValue(const rapidjson::Value &rapid_value) {
         return false;
     }
     state_ = state == "serving" ? State::kServing : State::kDeleting;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "disable_write_session", disable_write_session_, false);
     SortLocationSpecGroups();
     return true;
 }
@@ -33,6 +34,7 @@ void InstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
     Put(writer, "default_query_type", default_query_type_);
+    Put(writer, "disable_write_session", disable_write_session_);
     Put(writer, "state", std::string(state_ == State::kServing ? "serving" : "deleting"));
 }
 

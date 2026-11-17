@@ -4,7 +4,6 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
-#include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/test/meta_indexer_test_base.h"
 
@@ -41,10 +40,6 @@ TEST_F(MetaIndexerRedisTest, TestInit) {
                                             redis_test::kMetaIndexerDb,
                                             "timeout_ms=1000&retry_count=3&client_max_pool_size=2") +
                             R"("
-        },
-        "meta_cache_policy_config" : {
-            "type" : "lru",
-            "capacity" : 1024
         }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
@@ -75,10 +70,6 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
                                             redis_test::kMetaIndexerDb,
                                             "timeout_ms=1000&retry_count=3&client_max_pool_size=2") +
                             R"("
-        },
-        "meta_cache_policy_config" : {
-            "type" : "lru",
-            "capacity" : 1024
         }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
@@ -123,10 +114,6 @@ TEST_F(MetaIndexerRedisTest, TestMultiThread) {
                                             redis_test::kMetaIndexerDb,
                                             "timeout_ms=1000&retry_count=3&client_max_pool_size=16") +
                             R"("
-        },
-        "meta_cache_policy_config" : {
-            "type" : "lru",
-            "capacity" : 1024
         }
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));

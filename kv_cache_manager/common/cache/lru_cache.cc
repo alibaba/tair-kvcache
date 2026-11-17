@@ -818,6 +818,11 @@ bool LRUCacheShard::Exists(const std::string_view &key, uint32_t hash) {
     return table_.Lookup(key, hash) != nullptr;
 }
 
+size_t LRUCacheShard::GetAvailableCapacity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !strict_capacity_limit_ ? SIZE_MAX : (usage_ < capacity_ ? capacity_ - usage_ : 0);
+}
+
 size_t LRUCacheShard::GetUsage() const {
     std::lock_guard<std::mutex> l(mutex_);
     return usage_;

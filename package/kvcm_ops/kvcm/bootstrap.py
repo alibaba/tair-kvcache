@@ -12,7 +12,6 @@ from .instance_group.util import (
     CacheConfig,
     InstanceGroup,
     InstanceGroupQuota,
-    MetaCachePolicyConfig,
     MetaIndexerConfig,
     MetaStorageBackendConfig,
     ReclaimStrategy,
@@ -463,17 +462,9 @@ def parse_environment(environ=None):
     config.batch_key_size = _integer(
         value, "batch_key_size", DEFAULT_BATCH_KEY_SIZE, INSTANCE_GROUP_ENV)
     config.search_cache_capacity = _integer(
-        value, "search_cache_capacity", DEFAULT_SEARCH_CACHE_CAPACITY, INSTANCE_GROUP_ENV)
+        value, "search_cache_capacity", DEFAULT_SEARCH_CACHE_CAPACITY, INSTANCE_GROUP_ENV, allow_zero=True)
     config.search_cache_shard_bits = _integer(
-        value,
-        "search_cache_shard_bits",
-        DEFAULT_SEARCH_CACHE_SHARD_BITS,
-        INSTANCE_GROUP_ENV,
-        allow_zero=True,
-    )
-    if config.search_cache_shard_bits >= CACHE_SHARD_BITS_UPPER_BOUND:
-        raise BootstrapError("KVCM_INSTANCE_GROUP.search_cache_shard_bits must be less than 20")
-
+        value, "search_cache_shard_bits", DEFAULT_SEARCH_CACHE_SHARD_BITS, INSTANCE_GROUP_ENV, allow_zero=True)
     config.reclaim_policy = _optional_string(
         value, "reclaim_policy", DEFAULT_RECLAIM_POLICY, INSTANCE_GROUP_ENV).upper()
     if config.reclaim_policy not in ("POLICY_LRU", "POLICY_LFU", "POLICY_TTL"):
@@ -725,17 +716,14 @@ def _build_new_instance_group(config):
     meta_storage = MetaStorageBackendConfig(
         config.meta_storage_type, config.meta_storage_uri, config.memory_primary,
         config.force_deleting_async_enqueue)
-    meta_cache = MetaCachePolicyConfig(
-        capacity=config.search_cache_capacity,
-        cache_shard_bits=config.search_cache_shard_bits,
-    )
     meta_indexer = MetaIndexerConfig(
         max_key_count=config.max_key_count,
         mutex_shard_num=config.mutex_shard_num,
         batch_key_size=config.batch_key_size,
         meta_storage_backend_config=meta_storage,
-        meta_cache_policy_config=meta_cache,
     )
+    meta_indexer._legacy_search_cache_capacity = config.search_cache_capacity
+    meta_indexer._legacy_search_cache_shard_bits = config.search_cache_shard_bits
     cache_config = CacheConfig(
         data_storage_strategy=config.data_storage_strategy,
         reclaim_strategy=reclaim_strategy,
@@ -812,10 +800,10 @@ def _apply_managed_group_fields(current, config):
         "memory_primary": config.memory_primary,
         "force_deleting_async_enqueue": config.force_deleting_async_enqueue,
     }
-    meta_cache = meta_indexer.setdefault("meta_cache_policy_config", {})
-    meta_cache["capacity"] = config.search_cache_capacity
-    meta_cache["cache_shard_bits"] = config.search_cache_shard_bits
     extra_info = _extra_info_object(updated.get("extra_info", ""))
+    legacy = meta_indexer.setdefault("meta_cache_policy_config", {})
+    legacy["capacity"] = config.search_cache_capacity
+    legacy["cache_shard_bits"] = config.search_cache_shard_bits
     if config.metadata_backend_mode is not None:
         extra_info["metadata_backend_mode"] = config.metadata_backend_mode
     else:
@@ -828,20 +816,18 @@ def _meta_indexer_view(group):
     cache_config = group.get("cache_config", {})
     meta_indexer = cache_config.get("meta_indexer_config", {})
     meta_storage = meta_indexer.get("meta_storage_backend_config", {})
-    meta_cache = meta_indexer.get("meta_cache_policy_config", {})
     return {
         "max_key_count": _as_int(meta_indexer.get("max_key_count")),
         "mutex_shard_num": _as_int(meta_indexer.get("mutex_shard_num")),
         "batch_key_size": _as_int(meta_indexer.get("batch_key_size")),
         "meta_storage_type": meta_storage.get("storage_type"),
         "meta_storage_uri": meta_storage.get("storage_uri"),
-        "search_cache_capacity": _as_int(meta_cache.get("capacity")),
-        "search_cache_shard_bits": _as_int(meta_cache.get("cache_shard_bits")),
     }
 
 
 def _managed_group_view(group, config):
     cache_config = group.get("cache_config", {})
+    legacy = cache_config.get("meta_indexer_config", {}).get("meta_cache_policy_config", {})
     reclaim_strategy = cache_config.get("reclaim_strategy", {})
     trigger_strategy = reclaim_strategy.get("trigger_strategy", {})
     quota = group.get("quota", {})
@@ -866,6 +852,8 @@ def _managed_group_view(group, config):
         "reclaim_used_percentage": trigger_strategy.get("used_percentage"),
     }
     view.update(_meta_indexer_view(group))
+    view["search_cache_capacity"] = _as_int(legacy.get("capacity"))
+    view["search_cache_shard_bits"] = _as_int(legacy.get("cache_shard_bits"))
     view["metadata_backend_mode"] = _extra_info_object(
         group.get("extra_info", "")).get("metadata_backend_mode")
     return view

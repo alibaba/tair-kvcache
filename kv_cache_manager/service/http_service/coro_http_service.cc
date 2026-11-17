@@ -11,6 +11,8 @@ namespace kv_cache_manager {
 
 namespace {
 
+constexpr size_t kHttpBodyShrinkThreshold = 8 * 1024 * 1024;
+
 void LogDebugHttpRequest(coro_http::coro_http_request &req) {
     KVCM_LOG_DEBUG("[REQ] method=%.*s path=%.*s body=%.*s",
                    (int)req.get_method().size(),
@@ -104,6 +106,9 @@ CoroHttpService::HandlerType CoroHttpService::WrapWithLogger(const std::string &
                           coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
         LogDebugHttpRequest(req);
 
+        // cinatra shrinks after replying; reset the flag for each request to preserve small-buffer reuse.
+        const bool shrink_body = req.get_body().size() >= kHttpBodyShrinkThreshold;
+        req.get_conn()->set_shrink_to_fit(shrink_body);
         co_await handler(req, res);
 
         LogDebugHttpResponse(res);

@@ -13,5 +13,6 @@ py_test(
         "report_event_load_test.py",
     ],
     main = "report_event_load_test.py",
+    imports = ["."],
     deps = ["@pip_cpu//requests"],
 )
