@@ -1370,6 +1370,10 @@ TEST_F(SchedulePlanExecutorTest, TestMetaDeleteDeduplicatesKeysForOrdinaryAndSim
         std::vector<ErrorCode> seed_results;
         ASSERT_EQ(EC_OK, searcher.BatchReplaceLocationSpecs(&context, keys, tasks, seed_results, nullptr));
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), seed_results);
+        EXPECT_EQ(3u, indexer->GetKeyCount());
+        EXPECT_EQ(3u, indexer->GetLocationCount());
+        // EventReport byte usage is unmeasured; key/location counts still track deletion.
+        EXPECT_EQ(0u, indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
         SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
         CacheMetaDelRequest request{.instance_id = instance, .block_keys = {2, 1, 2, 1}};
@@ -1389,7 +1393,7 @@ TEST_F(SchedulePlanExecutorTest, TestMetaDeleteDeduplicatesKeysForOrdinaryAndSim
         EXPECT_EQ(1u, locations[2].count(location_id));
         EXPECT_EQ(1u, indexer->GetKeyCount());
         EXPECT_EQ(1u, indexer->GetLocationCount());
-        EXPECT_EQ(7u, indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        EXPECT_EQ(0u, indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     }
 }
 

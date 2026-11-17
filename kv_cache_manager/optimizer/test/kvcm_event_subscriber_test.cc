@@ -362,8 +362,11 @@ TEST_F(KvcmEventSubscriberTest, InstanceConflictDoesNotBlockOtherInstancesOrLead
     second.event_service_.SetConfiguration(configuration);
     first.meta_service_.SetLeader("127.0.0.1", second.port());
     subscriber.RefreshLeader();
-    ASSERT_TRUE(WaitUntil([&] { return second.event_service_.active_subscribers_ == 1; }));
-    EXPECT_EQ(0, first.event_service_.active_subscribers_);
+    // Client cancellation does not wait for the old server handler to observe it.
+    ASSERT_TRUE(WaitUntil([&] {
+        return first.event_service_.active_subscribers_.load() == 0 &&
+               second.event_service_.active_subscribers_.load() == 1;
+    }));
     EXPECT_TRUE(IsRegistered("new"));
     subscriber.ProcessEvent(MakeEvent("conflict", "blocked", 1), "127.0.0.1");
     EXPECT_EQ(0, TotalQueries("conflict"));
