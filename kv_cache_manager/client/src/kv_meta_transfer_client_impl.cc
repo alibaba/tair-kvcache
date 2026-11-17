@@ -168,12 +168,11 @@ ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_v
         sdk_wrapper_.reset();
         throw;
     }
-    if (ec == ER_SDK_TIMEOUT) {
-        // SdkWrapper's deadline is advisory: its backend task can still own
-        // the caller's buffer after Get returns. Destroying the private
-        // wrapper joins that task before this API returns and permanently
-        // closes this data-plane client, preventing a later batch from
-        // mutating its size config while the timed-out task is still running.
+    if (ec == ER_SDK_TIMEOUT && !sdk_wrapper_->WaitsForCompletion()) {
+        // Advisory deadlines may return while a local worker still uses the
+        // size config. Drain that legacy mode. KVMeta normally waits for every
+        // worker's result: a backend timeout can still mean unknown remote DMA,
+        // so retain its registration while the caller quarantines the buffer.
         sdk_wrapper_.reset();
     }
     return ec;
@@ -197,7 +196,7 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
         sdk_wrapper_.reset();
         throw;
     }
-    if (ec == ER_SDK_TIMEOUT) {
+    if (ec == ER_SDK_TIMEOUT && !sdk_wrapper_->WaitsForCompletion()) {
         sdk_wrapper_.reset();
     }
     if (ec != ER_OK) {

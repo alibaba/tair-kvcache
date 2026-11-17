@@ -54,10 +54,9 @@ private:
     // TairMempoolSdk's existing fixed-spec guard reads its SdkBackendConfig
     // during I/O. KVMeta updates only its private config with this batch's
     // exact sizes, so config update and SDK access must stay in one critical
-    // section. On a wrapper timeout the private wrapper is destroyed while
-    // holding this mutex, which drains its backend task before returning and
-    // makes subsequent calls fail closed. Ordinary TransferClient instances
-    // are untouched.
+    // section. An advisory wrapper timeout drains and closes the data plane;
+    // a completed backend timeout retains the consumer/MR for caller-managed
+    // buffer quarantine. Ordinary TransferClient instances are untouched.
     std::mutex io_mutex_;
 };
 

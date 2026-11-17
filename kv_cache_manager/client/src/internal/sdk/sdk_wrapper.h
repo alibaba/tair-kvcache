@@ -27,6 +27,8 @@ public:
                          const ClientMemoryRegistrations *memory_registrations = nullptr,
                          bool wait_for_completion = false);
 
+    bool WaitsForCompletion() const { return wait_for_completion_; }
+
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,

@@ -280,9 +280,9 @@ TEST(KvMetaTransferClientTest, BackendErrorsCannotMasqueradeAsPreIoRejections) {
     }
 }
 
-TEST(KvMetaTransferClientTest, CompletedBufferSafeFailuresKeepReadAndWriteReusable) {
+TEST(KvMetaTransferClientTest, CompletedBackendFailuresPreserveRegistrationForReadAndWrite) {
     for (const bool save : {false, true}) {
-        for (const auto ec : {ER_SDK_TIMEOUT_BUFFER_SAFE, ER_SDK_ERROR_BUFFER_SAFE}) {
+        for (const auto ec : {ER_SDK_TIMEOUT_BUFFER_SAFE, ER_SDK_ERROR_BUFFER_SAFE, ER_SDK_TIMEOUT}) {
             SCOPED_TRACE(save ? "save" : "load");
             SCOPED_TRACE(static_cast<int>(ec));
             RecordingSdkFactory factory;
@@ -315,6 +315,8 @@ TEST(KvMetaTransferClientTest, CompletedBufferSafeFailuresKeepReadAndWriteReusab
             }
             release.set_value();
             EXPECT_EQ(ec, operation.get());
+            // Unknown remote completion must still be reported to the caller;
+            // preserving the MR is distinct from declaring its buffer safe.
             EXPECT_EQ(wrapper, client->sdk_wrapper_.get());
             recording->before_io = {};
             recording->save_result = recording->load_result = ER_OK;
