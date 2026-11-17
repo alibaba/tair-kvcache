@@ -102,6 +102,9 @@ kvcm.service.grpc_max_threads=0
 # 仅约束 gRPC 纳入配额管理的内存，不是进程 RSS 上限；Meta/Admin 分端口时配额各自独立。
 # 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
 kvcm.service.grpc_memory_quota_bytes=0
+# gRPC 单条请求的接收上限固定为 8 MiB（8,388,608 字节），独立于上述内存配额。
+# 主服务和独立 Admin 服务使用相同上限；超过上限返回 RESOURCE_EXHAUSTED。
+# ReportEvent 增量及完整 snapshot 均受此限制；HTTP 接口不受此 gRPC 限制影响。
 
 # 是否开启DebugService服务，可以通过DebugService直接操作集群内部状态
 kvcm.service.enable_debug_service=false

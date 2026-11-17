@@ -32,6 +32,13 @@ constexpr const char *kAdminCacheMetaMethod = "AdminService/GetCacheMeta";
 
 class TestMetaService final : public proto::meta::MetaService::Service {
 public:
+    grpc::Status ReportEvent(grpc::ServerContext *,
+                             const proto::meta::ReportEventRequest *,
+                             proto::meta::ReportEventResponse *) override {
+        ++report_event_calls;
+        return grpc::Status::OK;
+    }
+
     grpc::Status GetCacheMeta(grpc::ServerContext *,
                               const proto::meta::GetCacheMetaRequest *,
                               proto::meta::GetCacheMetaResponse *) override {
@@ -71,6 +78,7 @@ public:
     }
 
     std::atomic<int> query_calls{0};
+    std::atomic<int> report_event_calls{0};
 
 private:
     std::mutex mutex_;
@@ -205,6 +213,19 @@ protected:
             .Get();
     }
 
+    grpc::Status ReportEventOfSize(std::size_t request_bytes) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(std::string(request_bytes, 'x'));
+        const auto encoding_overhead = request.ByteSizeLong() - request_bytes;
+        request.mutable_instance_id()->resize(request_bytes - encoding_overhead);
+        EXPECT_EQ(request_bytes, request.ByteSizeLong());
+
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+        proto::meta::ReportEventResponse response;
+        return stub_->ReportEvent(&context, request, &response);
+    }
+
     TestMetaService service_;
     TestAdminService admin_service_;
     std::shared_ptr<MetricsRegistry> registry_;
@@ -215,6 +236,25 @@ protected:
     std::future<grpc::Status> blocked_;
     int max_threads_ = -1;
 };
+
+TEST_P(GrpcServerOptionsTest, EnforcesEightMiBReceiveLimit) {
+    StartServer(-1);
+    ASSERT_NE(nullptr, stub_);
+
+    // Reproduce the ReportEvent size rejected by the previous 4 MiB default,
+    // then exercise the exact new protobuf message boundary.
+    constexpr std::size_t kMaxRequestBytes = 8 * 1024 * 1024;
+    for (const std::size_t request_bytes : {std::size_t{4411599}, kMaxRequestBytes}) {
+        const auto status = ReportEventOfSize(request_bytes);
+        EXPECT_TRUE(status.ok()) << status.error_message();
+    }
+    EXPECT_EQ(2, service_.report_event_calls.load());
+
+    const auto status = ReportEventOfSize(kMaxRequestBytes + 1);
+    EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, status.error_code());
+    EXPECT_EQ(2, service_.report_event_calls.load()); // rejected before the handler
+    EXPECT_TRUE(Query(*stub_).ok());
+}
 
 TEST_P(GrpcServerOptionsTest, CountsEveryGrpcStatusWithDefaultThreadQuota) {
     StartServer(-1);

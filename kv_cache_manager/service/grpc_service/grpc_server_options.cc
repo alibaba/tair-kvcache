@@ -157,6 +157,10 @@ int ConfigureGrpcServer(grpc::ServerBuilder &builder,
                         const std::shared_ptr<MetricsRegistry> &metrics_registry,
                         const std::shared_ptr<MetricsReporter> &metrics_reporter,
                         std::size_t reserved_stream_threads) {
+    // Batched ReportEvent requests can exceed gRPC's 4 MiB default. Keep a
+    // bounded per-message limit independently of the server's memory quota.
+    builder.SetMaxReceiveMessageSize(8 * 1024 * 1024);
+
     const int max_threads =
         ResolveGrpcMaxThreads(configured_max_threads, std::thread::hardware_concurrency(), reserved_stream_threads);
     if (max_threads >= 2 && reserved_stream_threads > static_cast<std::size_t>(max_threads - 2)) {

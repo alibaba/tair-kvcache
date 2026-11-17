@@ -20,8 +20,9 @@ int ResolveGrpcMaxThreads(int configured_max_threads,
                           unsigned int hardware_threads,
                           std::size_t reserved_stream_threads = 0);
 
-// Apply per-server quotas and count the final status prepared for each RPC,
-// including thread quota rejections. A zero memory quota keeps the framework default.
+// Apply an 8 MiB per-message receive limit and per-server quotas, and count the
+// final status prepared for each RPC, including thread quota rejections.
+// A zero memory quota keeps the framework default.
 // Returns the resolved thread limit, or -1 for the framework default.
 int ConfigureGrpcServer(grpc::ServerBuilder &builder,
                         int configured_max_threads,
