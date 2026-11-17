@@ -82,7 +82,7 @@ ErrorCode MetaIndexerManagerTest::CreateMetaIndexer(const std::string &instance_
     auto backend_config = std::make_shared<MetaStorageBackendConfig>();
     backend_config->storage_type_ = storage_type;
     meta_indexer_config->meta_storage_backend_config_ = backend_config;
-    return manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+    return manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr);
 }
 
 TEST_F(MetaIndexerManagerTest, TestSingleThreadCreateAndGet) {
@@ -118,9 +118,11 @@ TEST_F(MetaIndexerManagerTest, DifferentInstancesInitializeConcurrentlyWithoutBl
         return EC_OK;
     };
     auto config = std::make_shared<MetaIndexerConfig>();
-    auto first = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("first", config); });
+    auto first =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("first", config, {}, nullptr); });
     const bool first_entered = gate.WaitForEntered(1);
-    auto second = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("second", config); });
+    auto second =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("second", config, {}, nullptr); });
     const bool both_entered = gate.WaitForEntered(2);
     auto read = std::async(std::launch::async, [&] { return manager.GetMetaIndexer("first"); });
     const auto read_status = read.wait_for(std::chrono::seconds(1));
@@ -138,10 +140,10 @@ TEST_F(MetaIndexerManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
     ControlledMetaIndexerManager manager;
     manager.initialize = [](const std::string &) { return EC_ERROR; };
     auto config = std::make_shared<MetaIndexerConfig>();
-    EXPECT_EQ(EC_ERROR, manager.CreateMetaIndexer("retry", config));
+    EXPECT_EQ(EC_ERROR, manager.CreateMetaIndexer("retry", config, {}, nullptr));
     EXPECT_EQ(nullptr, manager.GetMetaIndexer("retry"));
     manager.initialize = [](const std::string &) { return EC_OK; };
-    EXPECT_EQ(EC_OK, manager.CreateMetaIndexer("retry", config));
+    EXPECT_EQ(EC_OK, manager.CreateMetaIndexer("retry", config, {}, nullptr));
     EXPECT_NE(nullptr, manager.GetMetaIndexer("retry"));
     EXPECT_EQ(2, manager.init_count.load());
 }
@@ -160,7 +162,7 @@ TEST_F(MetaIndexerManagerTest, TestConfigureQueryExecutorBeforeCreatingIndexers)
     EXPECT_EQ(128u, manager_->query_executor_->chunk_size());
 
     ASSERT_EQ(EC_OK, CreateMetaIndexer("configured", META_LOCAL_BACKEND_TYPE_STR));
-    const auto indexer = manager_->GetMetaIndexer("configured");
+    const std::shared_ptr<MetaIndexer> indexer = manager_->GetMetaIndexer("configured");
     ASSERT_TRUE(indexer);
     EXPECT_EQ(manager_->query_executor_, indexer->query_executor_);
     EXPECT_FALSE(manager_->ConfigureQueryExecutor(2, 64, 32));
@@ -281,7 +283,7 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithDefaultBoundaries) {
 
     // Create indexer without per-instance boundaries (uses default)
     ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_default", META_LOCAL_BACKEND_TYPE_STR));
-    auto indexer = manager_->GetMetaIndexer("inst_default");
+    std::shared_ptr<MetaIndexer> indexer = manager_->GetMetaIndexer("inst_default");
     ASSERT_NE(indexer, nullptr);
 
     // Verify histogram was created with default boundaries
@@ -305,9 +307,10 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithPerInstanceBoundaries) {
     auto backend_config = std::make_shared<MetaStorageBackendConfig>();
     backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
     meta_indexer_config->meta_storage_backend_config_ = backend_config;
-    ASSERT_EQ(ErrorCode::EC_OK, manager_->CreateMetaIndexer("inst_custom", meta_indexer_config, custom_boundaries));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              manager_->CreateMetaIndexer("inst_custom", meta_indexer_config, custom_boundaries, nullptr));
 
-    auto indexer = manager_->GetMetaIndexer("inst_custom");
+    std::shared_ptr<MetaIndexer> indexer = manager_->GetMetaIndexer("inst_custom");
     ASSERT_NE(indexer, nullptr);
 
     // Verify histogram uses per-instance boundaries, NOT the default
@@ -333,9 +336,10 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
     backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
     meta_indexer_config->meta_storage_backend_config_ = backend_config;
     std::vector<double> empty_boundaries;
-    ASSERT_EQ(ErrorCode::EC_OK, manager_->CreateMetaIndexer("inst_fallback", meta_indexer_config, empty_boundaries));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              manager_->CreateMetaIndexer("inst_fallback", meta_indexer_config, empty_boundaries, nullptr));
 
-    auto indexer = manager_->GetMetaIndexer("inst_fallback");
+    std::shared_ptr<MetaIndexer> indexer = manager_->GetMetaIndexer("inst_fallback");
     ASSERT_NE(indexer, nullptr);
 
     // Verify histogram falls back to default boundaries
@@ -356,7 +360,7 @@ TEST_F(MetaIndexerManagerTest, TestExistingInstanceUnaffectedByConfigChange) {
     ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_stable", META_LOCAL_BACKEND_TYPE_STR));
 
     // Verify initial boundaries
-    auto *backend_before = dynamic_cast<MetaLocalBackend *>(
+    MetaLocalBackend *backend_before = dynamic_cast<MetaLocalBackend *>(
         manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
     ASSERT_NE(backend_before, nullptr);
     ASSERT_NE(backend_before->revisit_histogram_, nullptr);
@@ -368,7 +372,7 @@ TEST_F(MetaIndexerManagerTest, TestExistingInstanceUnaffectedByConfigChange) {
     manager_->SetRevisitHistogramConfig(registry, new_boundaries);
 
     // Existing instance's histogram MUST still use the original boundaries
-    auto *backend_after = dynamic_cast<MetaLocalBackend *>(
+    MetaLocalBackend *backend_after = dynamic_cast<MetaLocalBackend *>(
         manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
     ASSERT_NE(backend_after, nullptr);
     ASSERT_NE(backend_after->revisit_histogram_, nullptr);

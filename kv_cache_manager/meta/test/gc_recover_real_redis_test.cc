@@ -104,7 +104,8 @@ private:
     std::shared_ptr<RedisSchedule> schedule_;
 };
 
-template <typename Backend> class SnapshotRedisBackend : public Backend {
+template <typename Backend>
+class SnapshotRedisBackend : public Backend {
 public:
     explicit SnapshotRedisBackend(std::shared_ptr<RedisSchedule> schedule) : schedule_(std::move(schedule)) {}
 
@@ -176,9 +177,8 @@ protected:
         return location;
     }
 
-    std::shared_ptr<MetaStorageBackendConfig> Config(const std::string &type,
-                                                    bool memory_primary = false,
-                                                    int queue_capacity = 100) {
+    std::shared_ptr<MetaStorageBackendConfig>
+    Config(const std::string &type, bool memory_primary = false, int queue_capacity = 100) {
         auto config = std::make_shared<MetaStorageBackendConfig>(type);
         config->SetMemoryPrimary(memory_primary);
         config->SetStorageUri(redis_test::Uri(
@@ -273,11 +273,17 @@ protected:
 
     MetaIndexer::LocationResult Remove(const KeyVector &keys, const LocationIdsPerKey &ids) {
         return indexer_->ReadModifyWriteLocationsForMaintenance(
-            context_.get(), keys, ids, [](const std::vector<ErrorCode> &ecs,
-                                         const LocationIdVector &,
-                                         size_t,
-                                         CacheLocationVector &,
-                                         PropertyMap &) -> LocationModifierResult { return {MA_DELETE, ecs}; });
+            context_.get(),
+            keys,
+            ids,
+            [](const std::vector<ErrorCode> &ecs,
+               const LocationIdVector &,
+               size_t,
+               CacheLocationVector &,
+               PropertyMap &) -> LocationModifierResult {
+                return {MA_DELETE, ecs};
+            },
+            true);
     }
 
     void RunPausedDeleteRecreation(bool memory_primary, bool block_rmw) {
@@ -302,30 +308,34 @@ protected:
         EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, Manager().GetLocationIds(nullptr, {42}, ids));
 
         if (block_rmw) {
-            const auto result = indexer_->ReadModifyWriteBlock(
-                context_.get(), {42}, [added](const LocationIdVector &existing,
-                                              ErrorCode ec,
-                                              size_t,
-                                              PropertyMap &,
-                                              CacheLocationMap &locations) -> ModifierResult {
-                    EXPECT_EQ(EC_NOENT, ec);
-                    EXPECT_TRUE(existing.empty());
-                    locations.emplace("L2", added);
-                    return {MA_OK, EC_OK};
-                });
+            const auto result = indexer_->ReadModifyWriteBlock(context_.get(),
+                                                               {42},
+                                                               [added](const LocationIdVector &existing,
+                                                                       ErrorCode ec,
+                                                                       size_t,
+                                                                       PropertyMap &,
+                                                                       CacheLocationMap &locations) -> ModifierResult {
+                                                                   EXPECT_EQ(EC_NOENT, ec);
+                                                                   EXPECT_TRUE(existing.empty());
+                                                                   locations.emplace("L2", added);
+                                                                   return {MA_OK, EC_OK};
+                                                               });
             ASSERT_EQ(EC_OK, result.ec);
         } else {
-            const auto result = indexer_->ReadModifyWriteTargetLocations(
-                context_.get(), {42}, {{"L2"}}, [added](const std::vector<ErrorCode> &ecs,
-                                                       const LocationIdVector &,
-                                                       size_t,
-                                                       CacheLocationVector &locations,
-                                                       PropertyMap &) -> LocationModifierResult {
-                    EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, ecs);
-                    EXPECT_EQ(nullptr, locations[0]);
-                    locations[0] = added;
-                    return {MA_OK, {EC_OK}};
-                });
+            const auto result =
+                indexer_->ReadModifyWriteTargetLocations(context_.get(),
+                                                         {42},
+                                                         {{"L2"}},
+                                                         [added](const std::vector<ErrorCode> &ecs,
+                                                                 const LocationIdVector &,
+                                                                 size_t,
+                                                                 CacheLocationVector &locations,
+                                                                 PropertyMap &) -> LocationModifierResult {
+                                                             EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, ecs);
+                                                             EXPECT_EQ(nullptr, locations[0]);
+                                                             locations[0] = added;
+                                                             return {MA_OK, {EC_OK}};
+                                                         });
             ASSERT_EQ(EC_OK, result.ec);
         }
         EXPECT_EQ(1u, indexer_->GetKeyCount());
@@ -345,19 +355,21 @@ protected:
 
         // Filling a normal cold key must still work: only the deleted key is
         // suppressed. This independent Redis key has no recovery tombstone.
-        ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-                  redis_->Put(nullptr, {43}, {{{"L1", old}}}, PropertyMapVector(1)));
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, redis_->Put(nullptr, {43}, {{{"L1", old}}}, PropertyMapVector(1)));
         indexer_->key_count_.store(2); // Include the separately seeded existing key.
-        const auto cold_result = indexer_->ReadModifyWriteTargetLocations(
-            context_.get(), {43}, {{"L2"}}, [added](const std::vector<ErrorCode> &ecs,
-                                                   const LocationIdVector &,
-                                                   size_t,
-                                                   CacheLocationVector &locations,
-                                                   PropertyMap &) -> LocationModifierResult {
-                EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, ecs);
-                locations[0] = added;
-                return {MA_OK, {EC_OK}};
-            });
+        const auto cold_result =
+            indexer_->ReadModifyWriteTargetLocations(context_.get(),
+                                                     {43},
+                                                     {{"L2"}},
+                                                     [added](const std::vector<ErrorCode> &ecs,
+                                                             const LocationIdVector &,
+                                                             size_t,
+                                                             CacheLocationVector &locations,
+                                                             PropertyMap &) -> LocationModifierResult {
+                                                         EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, ecs);
+                                                         locations[0] = added;
+                                                         return {MA_OK, {EC_OK}};
+                                                     });
         ASSERT_EQ(EC_OK, cold_result.ec);
         EXPECT_EQ(2u, indexer_->GetKeyCount());
         EXPECT_EQ(0u, Manager().deleted_keys_.count(43));
@@ -435,8 +447,7 @@ TEST_P(GcRecoverRealRedisTest, PartialDeletePreservesSiblingAndSkipsOnlyColdKey)
               Manager().cache_backend_->GetLastAccessTimesForMaintenance(nullptr, {43}, before));
     const auto result = Remove({42, 43, 44}, {{"L1"}, {"L1"}, {"L1"}});
     EXPECT_EQ(EC_OK, result.ec);
-    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}, {EC_OK}, {EC_OK}}),
-              result.per_location_error_codes);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}, {EC_OK}, {EC_OK}}), result.per_location_error_codes);
     EXPECT_EQ(2u, indexer_->GetKeyCount());
     EXPECT_EQ(0u, Manager().deleted_keys_.count(42));
     EXPECT_EQ(0u, Manager().deleted_keys_.count(43));
@@ -468,27 +479,34 @@ TEST_P(GcRecoverRealRedisTest, HotUpdateRejectsOldExpectedValueWhileRedisConsump
     ASSERT_NO_FATAL_FAILURE(HotPut({42}, {{{"L1", old}}}));
     schedule_->paused_command = "HSET";
     schedule_->pipeline.Arm();
-    const auto updated = indexer_->ReadModifyWriteTargetLocations(
-        context_.get(), {42}, {{"L1"}}, [replacement](const std::vector<ErrorCode> &ecs,
-                                                     const LocationIdVector &,
-                                                     size_t,
-                                                     CacheLocationVector &locations,
-                                                     PropertyMap &) -> LocationModifierResult {
-            locations[0] = replacement;
-            return {MA_OK, ecs};
-        });
+    const auto updated =
+        indexer_->ReadModifyWriteTargetLocations(context_.get(),
+                                                 {42},
+                                                 {{"L1"}},
+                                                 [replacement](const std::vector<ErrorCode> &ecs,
+                                                               const LocationIdVector &,
+                                                               size_t,
+                                                               CacheLocationVector &locations,
+                                                               PropertyMap &) -> LocationModifierResult {
+                                                     locations[0] = replacement;
+                                                     return {MA_OK, ecs};
+                                                 });
     ASSERT_EQ(EC_OK, updated.ec);
     ASSERT_TRUE(schedule_->pipeline.WaitUntilEntered());
     auto result = std::async(std::launch::async, [this, old] {
         return indexer_->ReadModifyWriteLocationsForMaintenance(
-            context_.get(), {42}, {{"L1"}}, [old](const std::vector<ErrorCode> &ecs,
-                                                  const LocationIdVector &,
-                                                  size_t,
-                                                  CacheLocationVector &locations,
-                                                  PropertyMap &) -> LocationModifierResult {
+            context_.get(),
+            {42},
+            {{"L1"}},
+            [old](const std::vector<ErrorCode> &ecs,
+                  const LocationIdVector &,
+                  size_t,
+                  CacheLocationVector &locations,
+                  PropertyMap &) -> LocationModifierResult {
                 EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
                 return {MA_DELETE, {locations[0]->ToJsonString() == old->ToJsonString() ? EC_OK : EC_MISMATCH}};
-            });
+            },
+            true);
     });
     const auto ready = result.wait_for(std::chrono::seconds(1));
     EXPECT_EQ(std::future_status::ready, ready);
@@ -556,16 +574,21 @@ TEST_P(GcRecoverRealRedisTest, OrdinaryGcDoesNotRestoreEventReportDeletedSibling
     auto deleting = std::make_shared<CacheLocation>(*second);
     deleting->set_status(CLS_DELETING);
     const auto marked = indexer_->ReadModifyWriteLocation(
-        context_.get(), {42}, {{"L2"}}, [second, deleting](const std::vector<ErrorCode> &ecs,
-                                                         const LocationIdVector &,
-                                                         size_t,
-                                                         CacheLocationVector &locations,
-                                                         PropertyMap &) -> LocationModifierResult {
+        context_.get(),
+        {42},
+        {{"L2"}},
+        [second, deleting](const std::vector<ErrorCode> &ecs,
+                           const LocationIdVector &,
+                           size_t,
+                           CacheLocationVector &locations,
+                           PropertyMap &) -> LocationModifierResult {
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
             EXPECT_EQ(second->ToJsonString(), locations[0]->ToJsonString());
             locations[0] = deleting;
             return {MA_OK, {EC_OK}};
-        }, true, true);
+        },
+        true,
+        true);
     EXPECT_EQ(EC_OK, marked.ec);
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), marked.per_location_error_codes);
     ExpectLocations(*Manager().cache_backend_, 42, {{"L2", deleting}});
@@ -594,16 +617,21 @@ TEST_P(GcRecoverRealRedisTest, OrdinaryGcFillsCompleteColdRecoverKeyBeforeChecki
     auto deleting = std::make_shared<CacheLocation>(*second);
     deleting->set_status(CLS_DELETING);
     const auto marked = indexer_->ReadModifyWriteLocation(
-        context_.get(), {42}, {{"L2"}}, [second, deleting](const std::vector<ErrorCode> &ecs,
-                                                         const LocationIdVector &,
-                                                         size_t,
-                                                         CacheLocationVector &locations,
-                                                         PropertyMap &) -> LocationModifierResult {
+        context_.get(),
+        {42},
+        {{"L2"}},
+        [second, deleting](const std::vector<ErrorCode> &ecs,
+                           const LocationIdVector &,
+                           size_t,
+                           CacheLocationVector &locations,
+                           PropertyMap &) -> LocationModifierResult {
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
             EXPECT_EQ(second->ToJsonString(), locations[0]->ToJsonString());
             locations[0] = deleting;
             return {MA_OK, {EC_OK}};
-        }, true, true);
+        },
+        true,
+        true);
     EXPECT_EQ(EC_OK, marked.ec);
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), marked.per_location_error_codes);
     ExpectLocations(*Manager().cache_backend_, 42, {{"L1", first}, {"L2", deleting}});
@@ -619,12 +647,10 @@ TEST_P(GcRecoverRealRedisTest, PersistentQueueAdmissionFailureKeepsHotCopyAndNoT
     ASSERT_NO_FATAL_FAILURE(HotPut({42}, {{{"L1", old}}}));
     schedule_->paused_command = "HSET";
     schedule_->pipeline.Arm();
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              async_->Upsert(nullptr, {43}, {{{"L1", old}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, async_->Upsert(nullptr, {43}, {{{"L1", old}}}, PropertyMapVector(1)));
     ASSERT_TRUE(schedule_->pipeline.WaitUntilEntered());
     // The first write is in flight; the second occupies the sole queue slot.
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              async_->Upsert(nullptr, {44}, {{{"L1", old}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, async_->Upsert(nullptr, {44}, {{{"L1", old}}}, PropertyMapVector(1)));
     int32_t reclaimed = -1;
     EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT},
               Manager().DeleteLocationsForMaintenance(

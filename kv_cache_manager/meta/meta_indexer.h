@@ -22,8 +22,8 @@
 
 namespace kv_cache_manager {
 
+class InstanceInfo;
 class MetaIndexerConfig;
-class MetaSearchCache;
 class RequestContext;
 class MetricsCollector;
 class MetricsRegistry;
@@ -33,6 +33,11 @@ public:
     // Immutable after Init; observation must use the runtime configuration,
     // not a subsequently replaced InstanceGroup configuration.
     const std::pair<std::string, std::string> &GetStorageBackendConfig() const { return storage_backend_config_; }
+
+    MetaIndexer() = default;
+    explicit MetaIndexer(std::shared_ptr<const InstanceInfo> instance_info);
+    ~MetaIndexer();
+
     // Per-key result.
     struct Result {
         ErrorCode ec = EC_OK;
@@ -63,36 +68,25 @@ public:
     };
 
     struct PrefixLocationResult {
-        // terminal_ec is the first backend error that precedes the visitor's
-        // stop point. EC_NOENT is a normal metadata-prefix terminator; other
-        // values must be propagated by the caller. EC_OK can also mean the
-        // visitor proved that keys at valid_key_count and beyond are no longer
-        // needed, allowing already queued suffix reads to be cancelled.
+        // First backend error before the visitor stop point; NOENT terminates a normal prefix.
         ErrorCode terminal_ec = EC_OK;
         size_t valid_key_count = 0;
         size_t read_key_count = 0;
         bool stopped_by_visitor = false;
     };
 
-    // Called once per successfully read compact chunk. valid_key_count can be
-    // smaller than locations.size() when the chunk ends at a backend error.
-    // Return the first absolute key index that no longer needs to be read, or
-    // the request key count to continue. Chunks after the first can arrive out
-    // of order and concurrently; the first chunk is always visited before
-    // any parallel work starts so callers can initialize candidate state.
-    // locations and every view/iterator obtained from it are callback-scoped;
-    // callers must copy any state that needs to outlive the invocation.
+    // Callback-scoped compact view; return the absolute index where reading may stop.
     using PrefixLocationVisitor =
         std::function<size_t(size_t begin, const CompactLocationsPerKey &locations, size_t valid_key_count)>;
-
-public:
-    MetaIndexer() = default;
-    ~MetaIndexer();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
 
     // Read-only snapshot of the backend recovery state; deletion still revalidates it.
     bool IsRecovering() const noexcept;
+    bool SupportsWriteSession() const noexcept;
+
+    // Preserve the global RMW shard boundaries when materializing write payloads lazily.
+    std::vector<std::vector<int32_t>> GetWriteBatches(const KeyVector &keys) const;
 
     // Set revisit interval histogram for tracking cache access patterns.
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
@@ -109,7 +103,10 @@ public:
     Result ReadModifyWriteBlock(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const BlockIdsOnlyModifierFunc &modifier) noexcept;
-    // Location-level RMW: modifier sees per-key CacheLocation vector.
+    // Location-level RMW for updates and deletes of existing keys.
+    // Use targeted RMW for upserts that can create keys.
+    // Simple DELETING transitions remove metadata immediately; explicit
+    // deletes retain the caller's storage-usage accounting contract.
     // fill_missing_cache requests complete-key filling only for
     // missing Recover keys; existing hot data is never overwritten. The
     // modifier then sees actual hot values (or the sole backend without cache).
@@ -117,13 +114,13 @@ public:
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier,
-                                           bool adjust_reclaimed_key_count = true,
-                                           bool fill_missing_cache = false) noexcept;
+                                           bool adjust_reclaimed_key_count,
+                                           bool fill_missing_cache) noexcept;
     LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
                                                           const KeyVector &keys,
                                                           const LocationIdsPerKey &location_ids,
                                                           const LocationModifierFunc &modifier,
-                                                          bool adjust_reclaimed_key_count = true) noexcept;
+                                                          bool adjust_reclaimed_key_count) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -150,15 +147,17 @@ public:
     Result GetLocations(RequestContext *request_context,
                         const KeyVector &keys,
                         CacheLocationMapVector &out_location_maps) noexcept;
-    // Lightweight all-location view used by GetHostCacheState. For a single
-    // local backend, VisitLocationValuesForPrefix performs a bounded first
-    // probe and then reads the still-needed suffix through the shared query
-    // executor. Other backend modes remain one batched call.
+    // GetHostCacheState uses bounded prefix reads for pure local and simple cached modes.
+    // Pure local additionally reads the needed suffix through the shared query executor.
     Result
     GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
+    Result GetLocationValues(RequestContext *request_context,
+                             const KeyVector &keys,
+                             CompactLocationsPerKey &out_locations) noexcept;
     PrefixLocationResult VisitLocationValuesForPrefix(RequestContext *request_context,
                                                       const KeyVector &keys,
-                                                      const PrefixLocationVisitor &visitor) noexcept;
+                                                      const PrefixLocationVisitor &visitor,
+                                                      bool allow_read_views) noexcept;
     // Source-of-truth read used by maintenance admission. It never backfills
     // or touches the optional hot-cache backend.
     Result GetLocationsFromPrimary(RequestContext *request_context,
@@ -191,7 +190,7 @@ public:
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
-                                      bool require_read_success = false) const noexcept;
+                                      bool require_read_success) const noexcept;
     // A complete local sampling source does not need parallel I/O fragments.
     bool PreferSingleTaskReclaimSampling() const noexcept;
     size_t TouchKeysForMaintenance(const KeyVector &keys) const noexcept;
@@ -207,9 +206,10 @@ public:
     ErrorCode Retire() noexcept;
     size_t GetKeyCount() const noexcept;
     // Local container occupancy for monitoring, independent of the persisted logical count.
-    size_t GetLocalKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;
+    // Logical location count, maintained with the same consistency boundary as key_count.
+    size_t GetLocationCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
@@ -229,6 +229,14 @@ public:
 private:
     class ScopedBatchLock;
 
+    ErrorCode ValidateSimpleLocation(const CacheLocationReadView &location, bool validate_uri) const noexcept;
+    void ValidateSimpleReadResults(size_t key_count,
+                                   CacheLocationMapVector &locations,
+                                   std::vector<ErrorCode> &errors) const noexcept;
+    void ValidateSimpleReadResults(size_t key_count,
+                                   LocationsPerKey &locations,
+                                   std::vector<ErrorCode> &errors) const noexcept;
+
     LocationResult ReadModifyWriteLocationImpl(RequestContext *request_context,
                                                const KeyVector &keys,
                                                const LocationIdsPerKey &location_ids,
@@ -247,7 +255,9 @@ private:
     std::vector<IndexBatch> MakeBatches(const KeyVector &keys) const noexcept;
 
     ErrorCode RecoverMetaData() noexcept;
+    ErrorCode SaveMetaData() noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
+    void AdjustLocationCountMeta(int64_t delta) noexcept;
     int32_t ProcessErrorCodes(const std::string &trace_id,
                               const std::vector<ErrorCode> &error_codes,
                               const std::vector<int32_t> &indexs,
@@ -277,6 +287,9 @@ private:
         int64_t put_key_count = 0;    // brand-new keys created by upsert
         int64_t update_key_count = 0; // existing keys updated by upsert
         int64_t delete_key_count = 0; // keys deleted by whole-key delete
+        // Per-key deltas aligned with the current write sub-batches.
+        std::vector<int64_t> upsert_location_deltas;
+        std::vector<int64_t> delete_location_counts;
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,
@@ -286,7 +299,7 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result,
-                                                 bool preserve_existing_updates_when_full = false) noexcept;
+                                                 bool preserve_existing_updates_when_full) noexcept;
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
                                                  RequestContext *request_context,
@@ -294,17 +307,19 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result,
-                                                 bool maintenance_no_touch = false,
-                                                 bool maintenance_write_local_primary = false) noexcept;
+                                                 bool maintenance_no_touch,
+                                                 bool maintenance_write_local_primary) noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 
 private:
+    std::shared_ptr<const InstanceInfo> instance_info_;
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
     std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
+    std::atomic<int64_t> location_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;

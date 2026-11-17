@@ -253,57 +253,18 @@ def meta_storage_backend_config_value(value: str):
         f"'type,uri,true|false,true|false', got '{value}'")
 
 
-class MetaCachePolicyConfig(JsonData):
-    def __init__(self,
-                 capacity: int = 10 * 1024,  # MB
-                 m_type: str = "LRU",
-                 cache_shard_bits: int = 6,
-                 high_pri_pool_ratio: float = 0.0):
-        self._capacity = capacity
-        self._type = m_type
-        self._cache_shard_bits = cache_shard_bits
-        self._high_pri_pool_ratio = high_pri_pool_ratio
-        self.check()
-
-    def to_json_data(self) -> dict:
-        return {
-            "capacity": self._capacity,
-            "type": self._type,
-            "cache_shard_bits": self._cache_shard_bits,
-            "high_pri_pool_ratio": self._high_pri_pool_ratio
-        }
-
-    def check(self) -> bool:
-        _type = self._type.upper()
-        if _type != "LRU":
-            raise RuntimeError(f"MetaCachePolicyConfig type {_type} invalid, only support LRU now")
-        self._type = _type
-
-    @classmethod
-    def from_json_data(cls, json_data: dict):
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        if JsonData.expect_exist("type", json_data, str):
-            m_type = json_data["type"]
-        if JsonData.expect_exist("cache_shard_bits", json_data, (str, int)):
-            cache_shard_bits = int(json_data["cache_shard_bits"])
-        if JsonData.expect_exist("high_pri_pool_ratio", json_data, (float, int)):
-            high_pri_pool_ratio = json_data["high_pri_pool_ratio"]
-        return cls(capacity, m_type, cache_shard_bits, high_pri_pool_ratio)
-
-
 class MetaIndexerConfig(JsonData):
     def __init__(self,
                  max_key_count: int = 1 * 1000 * 1000 * 1000,
                  mutex_shard_num: int = 512,
                  batch_key_size: int = 128,
-                 meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig(),
-                 meta_cache_policy_config: MetaCachePolicyConfig = MetaCachePolicyConfig()):
+                 meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig()):
         self._max_key_count = max_key_count
         self._mutex_shard_num = mutex_shard_num
         self._batch_key_size = batch_key_size
         self._meta_storage_backend_config = meta_storage_backend_config
-        self._meta_cache_policy_config = meta_cache_policy_config
+        self._legacy_search_cache_capacity = 10 * 1024
+        self._legacy_search_cache_shard_bits = 6
         self.check()
 
     def to_json_data(self) -> dict:
@@ -312,12 +273,16 @@ class MetaIndexerConfig(JsonData):
             "mutex_shard_num": self._mutex_shard_num,
             "batch_key_size": self._batch_key_size,
             "meta_storage_backend_config": self._meta_storage_backend_config.to_json_data(),
-            "meta_cache_policy_config": self._meta_cache_policy_config.to_json_data()
+            "meta_cache_policy_config": {
+                "type": "LRU",
+                "capacity": self._legacy_search_cache_capacity,
+                "cache_shard_bits": self._legacy_search_cache_shard_bits,
+                "high_pri_pool_ratio": 0.0,
+            }
         }
 
     def check(self) -> bool:
         self._meta_storage_backend_config.check()
-        self._meta_cache_policy_config.check()
 
     @classmethod
     def from_json_data(cls, json_data: dict):
@@ -330,14 +295,15 @@ class MetaIndexerConfig(JsonData):
         if JsonData.expect_exist("meta_storage_backend_config", json_data, dict):
             meta_storage_backend_config = MetaStorageBackendConfig.from_json_data(
                 json_data["meta_storage_backend_config"])
-        if JsonData.expect_exist("meta_cache_policy_config", json_data, dict):
-            meta_cache_policy_config = MetaCachePolicyConfig.from_json_data(json_data["meta_cache_policy_config"])
-        return cls(
+        config = cls(
             max_key_count,
             mutex_shard_num,
             batch_key_size,
-            meta_storage_backend_config,
-            meta_cache_policy_config)
+            meta_storage_backend_config)
+        legacy = json_data.get("meta_cache_policy_config") or {}
+        config._legacy_search_cache_capacity = int(legacy.get("capacity", config._legacy_search_cache_capacity))
+        config._legacy_search_cache_shard_bits = int(legacy.get("cache_shard_bits", config._legacy_search_cache_shard_bits))
+        return config
 
 
 class CacheConfig(JsonData):
@@ -637,14 +603,14 @@ def parse_instance_group_args(is_create: bool):
         "--search_cache_capacity",
         type=int,
         default=10 * 1024 if is_create else argparse.SUPPRESS,  # 10 * 1024 MB
-        help="search_cache_capacity(MB)"
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
     )
 
     parser.add_argument(
         "--search_cache_shard_bits",
         type=int,
         default=6 if is_create else argparse.SUPPRESS,
-        help="search_cache_shard_bits"
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
     )
 
     parser.add_argument(

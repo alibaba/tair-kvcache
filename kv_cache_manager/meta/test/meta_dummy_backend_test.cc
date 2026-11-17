@@ -416,7 +416,7 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     };
     const auto lru_times_before = snapshot_lru_times();
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates, false));
     ASSERT_EQ(2, candidates.size());
     for (const auto &candidate : candidates) {
         ASSERT_TRUE(lru_times_before.count(candidate.key) > 0);
@@ -443,7 +443,7 @@ TEST_F(MetaDummyBackendTest, TestSampleReclaimCandidatesDegradesMalformedTimesta
         3, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "-9223372036854775809"; }));
 
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates));
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates, false));
     ASSERT_EQ(3, candidates.size());
     for (const auto &candidate : candidates) {
         EXPECT_EQ(0, candidate.last_access_time_us) << candidate.key;

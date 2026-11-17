@@ -56,7 +56,8 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
     // Empty vector means "use server-level default" — resolved inside CreateMetaIndexer.
     const auto &group_boundaries = group_ptr->revisit_interval_buckets();
 
-    ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config(), group_boundaries);
+    ec = meta_indexer_manager_->CreateMetaIndexer(
+        instance_id, cache_config->meta_indexer_config(), group_boundaries, instance_info);
     if (ec == ErrorCode::EC_OK) {
         std::scoped_lock write_guard(mutex_);
         if (auto pair = meta_searcher_map_.emplace(

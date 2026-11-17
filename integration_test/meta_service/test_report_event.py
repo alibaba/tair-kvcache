@@ -322,7 +322,6 @@ class EventReportFunctionalTest(unittest.TestCase):
                         "mutex_shard_num": 16,
                         "batch_key_size": 16,
                         "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
-                        "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                     },
                 },
                 "event_report_storage_candidates": [
@@ -1121,7 +1120,6 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_keys": [block_key],
             "block_mask": {"offset": 0},
         })
-        # MetaSearchCache may still serve stale entry; not a hard assertion.
 
         # Step 3: heartbeat resumes within grace -> node recovers.
         self._report_event("l2", host, [_ev_heartbeat({})], "t20a_hb")
@@ -1157,7 +1155,6 @@ class EventReportFunctionalTest(unittest.TestCase):
         wait_ms = HEARTBEAT_TIMEOUT_MS + CLEANUP_GRACE_MS + 1500
         time.sleep(wait_ms / 1000.0)
 
-        # Soft check: MetaSearchCache TTL may delay eviction.
         resp = self.client.get_cache_location({
             "trace_id": "t20b_q",
             "instance_id": self.instance_id,

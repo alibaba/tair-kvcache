@@ -254,15 +254,12 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
                 origin_meta_storage_backend_config->GetForceDeletingAsyncEnqueue());
         }
 
-        // 转换meta_cache_policy_config
-        auto origin_meta_cache_policy_config = origin_meta_indexer_config->GetMetaCachePolicyConfig();
-        if (cache_config_info.meta_indexer_config()->GetMetaCachePolicyConfig()) {
-            auto *meta_cache_policy_config = meta_indexer_config->mutable_meta_cache_policy_config();
-            meta_cache_policy_config->set_capacity(origin_meta_cache_policy_config->GetCapacity());
-            meta_cache_policy_config->set_type(origin_meta_cache_policy_config->GetCachePolicyType());
-            meta_cache_policy_config->set_cache_shard_bits(origin_meta_cache_policy_config->GetCacheShardBits());
-            meta_cache_policy_config->set_high_pri_pool_ratio(origin_meta_cache_policy_config->GetHighPriPoolRatio());
-        }
+        // Preserve only the values compared by legacy bootstrap; search cache remains disabled.
+        proto::admin::MetaCachePolicyConfig *legacy_policy = meta_indexer_config->mutable_meta_cache_policy_config();
+        legacy_policy->set_type("LRU");
+        legacy_policy->set_capacity(origin_meta_indexer_config->GetLegacySearchCacheCapacity());
+        legacy_policy->set_cache_shard_bits(origin_meta_indexer_config->GetLegacySearchCacheShardBits());
+        legacy_policy->set_high_pri_pool_ratio(0.0);
     }
 
     // 转换migration_config
@@ -401,15 +398,11 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     }
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
 
-    // 转换meta_cache_policy_config（仅当 proto 中实际配置了时才填充）
-    const auto &proto_cache_policy = proto_cache_config->meta_indexer_config().meta_cache_policy_config();
-    if (!proto_cache_policy.type().empty()) {
-        auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-        meta_cache_policy_config->SetCapacity(proto_cache_policy.capacity());
-        meta_cache_policy_config->SetType(proto_cache_policy.type());
-        meta_cache_policy_config->SetCacheShardBits(proto_cache_policy.cache_shard_bits());
-        meta_cache_policy_config->SetHighPriPoolRatio(proto_cache_policy.high_pri_pool_ratio());
-        meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    if (proto_cache_config->meta_indexer_config().has_meta_cache_policy_config()) {
+        const proto::admin::MetaCachePolicyConfig &legacy =
+            proto_cache_config->meta_indexer_config().meta_cache_policy_config();
+        meta_indexer_config->SetLegacySearchCacheCapacity(legacy.capacity());
+        meta_indexer_config->SetLegacySearchCacheShardBits(legacy.cache_shard_bits());
     }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);

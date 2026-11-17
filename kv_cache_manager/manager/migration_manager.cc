@@ -321,6 +321,11 @@ ErrorCode MigrationManager::CheckTargetStorageAdmission(const std::string &trace
                                                         const std::string &instance_group_name,
                                                         const std::string &instance_id,
                                                         const std::string &target_storage_name) const {
+    const std::shared_ptr<MetaIndexer> operation_indexer = GetIndexer(instance_id);
+    if (operation_indexer && !operation_indexer->SupportsWriteSession()) {
+        return EC_UNIMPLEMENTED;
+    }
+
     if (data_storage_manager_ == nullptr || target_storage_name.empty()) {
         return EC_BADARGS;
     }
@@ -481,6 +486,10 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     if (!indexer) {
         KVCM_LOG_WARN("[%s] MetaIndexer not found for instance %s", trace_id.c_str(), request.instance_id.c_str());
         return EC_INSTANCE_NOT_EXIST;
+    }
+
+    if (!indexer->SupportsWriteSession()) {
+        return EC_UNIMPLEMENTED;
     }
 
     // 1. 读取源 location specs + create_time。
@@ -1045,7 +1054,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     // 收集 eligible requests 的 src_specs → 构建 dst_key 列表 → 按 (dst_storage, size) 分组 batch Create。
     // 每个 item 的 src_uris/dst_uris 按原 request 的 spec 顺序保存。
     auto indexer = meta_indexer_manager_ ? meta_indexer_manager_->GetMetaIndexer(first_req.instance_id) : nullptr;
-    if (!indexer) {
+    if (!indexer || !indexer->SupportsWriteSession()) {
         release_all_preparing();
         return collect_results();
     }
@@ -1751,6 +1760,10 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     if (dst_storage_name.empty() || block_keys.empty()) {
         return EC_OK;
     }
+    const std::shared_ptr<MetaIndexer> operation_indexer = GetIndexer(instance_id);
+    if (operation_indexer && !operation_indexer->SupportsWriteSession()) {
+        return EC_UNIMPLEMENTED;
+    }
     // 新 Mark 只写入当前可分配的 target；已存在 Mark 遇到 quota 满或 unavailable 时由消费
     // 路径暂时忽略并保留，待容量/可用性恢复后自愈。
     const auto target_ec = CheckTargetStorageAdmission("mark_for_tiered_write", "", instance_id, dst_storage_name);
@@ -1824,9 +1837,9 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
 }
 
 bool MigrationManager::ClearTieredWriteMarkIfMatch(const std::string &instance_id,
-                                                    int64_t block_key,
-                                                    const std::string &expected_target,
-                                                    int64_t expected_deadline_ms) {
+                                                   int64_t block_key,
+                                                   const std::string &expected_target,
+                                                   int64_t expected_deadline_ms) {
     if (expected_target.empty() || expected_deadline_ms <= 0) {
         return false;
     }
@@ -2259,8 +2272,8 @@ bool MigrationManager::HasActiveTaskLocked(const std::string &instance_id, int64
 }
 
 MigrationManager::ClaimResult MigrationManager::ClaimForCompletionLocked(const std::string &instance_id,
-                                                                        int64_t block_key,
-                                                                        CopyTaskContext &out_ctx) {
+                                                                         int64_t block_key,
+                                                                         CopyTaskContext &out_ctx) {
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
     if (instance_iter == active_tasks_by_instance_.end()) {
         return ClaimResult::kNotFound;
@@ -2287,7 +2300,7 @@ MigrationManager::ClaimResult MigrationManager::ClaimForCompletionLocked(const s
 }
 
 MigrationManager::CancelResult MigrationManager::MarkCancellingLocked(const std::string &instance_id,
-                                                                     int64_t block_key) {
+                                                                      int64_t block_key) {
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
     if (instance_iter == active_tasks_by_instance_.end()) {
         return CancelResult::kNotFound;
@@ -2575,7 +2588,9 @@ bool MigrationManager::SubmitAsyncMigrationPrepare(AsyncMigrationPrepareJob job)
             self->RunAsyncMigrationPrepare(std::move(job), key.generation);
         } catch (const std::exception &e) {
             KVCM_LOG_ERROR("async migration prepare threw exception: %s", e.what());
-        } catch (...) { KVCM_LOG_ERROR("async migration prepare threw unknown exception"); }
+        } catch (...) {
+            KVCM_LOG_ERROR("async migration prepare threw unknown exception");
+        }
         self->FinishAsyncMigrationPrepare(key);
     };
     auto cancel_task = [weak_self, key]() {
@@ -2696,12 +2711,12 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
         params.mark_timeout_ms = current_strategy->methods().mark().timeout_ms();
         params.dedup_marks = true;
         return DispatchMigrationBatchWithLifecycleLockHeld(job.trace_id,
-                                                            job.instance_id,
-                                                            job.source_storage_name,
-                                                            job.target_storage_name,
-                                                            job.block_keys,
-                                                            loc_maps,
-                                                            params);
+                                                           job.instance_id,
+                                                           job.source_storage_name,
+                                                           job.target_storage_name,
+                                                           job.block_keys,
+                                                           loc_maps,
+                                                           params);
     };
 
     const auto dispatch = prepare_and_dispatch();
@@ -2714,22 +2729,24 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
         job.on_dispatched(dispatch);
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("async migration dispatch callback threw exception: %s", e.what());
-    } catch (...) { KVCM_LOG_ERROR("async migration dispatch callback threw unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_ERROR("async migration dispatch callback threw unknown exception");
+    }
 }
 
 MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *request_context,
-                                                              const std::string &trace_id,
-                                                              const std::string &instance_group_name,
-                                                              const std::string &instance_id,
-                                                              const std::shared_ptr<MetaIndexer> &meta_indexer,
-                                                              const std::string &src_name,
-                                                              const std::string &dst_name,
-                                                              bool do_copy,
-                                                              bool do_mark,
-                                                              const std::vector<int64_t> &explicit_block_keys,
-                                                              int64_t sample_count,
-                                                              std::size_t copy_max_concurrency,
-                                                              int64_t mark_timeout_ms) {
+                                                               const std::string &trace_id,
+                                                               const std::string &instance_group_name,
+                                                               const std::string &instance_id,
+                                                               const std::shared_ptr<MetaIndexer> &meta_indexer,
+                                                               const std::string &src_name,
+                                                               const std::string &dst_name,
+                                                               bool do_copy,
+                                                               bool do_mark,
+                                                               const std::vector<int64_t> &explicit_block_keys,
+                                                               int64_t sample_count,
+                                                               std::size_t copy_max_concurrency,
+                                                               int64_t mark_timeout_ms) {
     MigrateResult result;
 
     // meta_indexer 由 facade 保证非空（instance 存在性已前置校验）；防御性再查一次。
