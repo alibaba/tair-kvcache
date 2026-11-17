@@ -66,11 +66,17 @@ public:
     const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
     void set_timeout_config(const SdkTimeoutConfig &value) { timeout_config_ = value; }
 
+    // Registered-buffer clients retain memory until transfer completion. This
+    // runtime policy is injected by SdkWrapper, not read from user JSON.
+    int completion_wait_timeout_ms() const { return completion_wait_timeout_ms_; }
+    void set_completion_wait_timeout_ms(int value) { completion_wait_timeout_ms_ = value; }
+
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
+    int completion_wait_timeout_ms_{0};
     SdkTimeoutConfig timeout_config_;
 };
 

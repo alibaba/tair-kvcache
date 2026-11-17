@@ -116,6 +116,17 @@ TEST_F(SdkWrapperTest, TestInit) {
     ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
 }
 
+TEST_F(SdkWrapperTest, CompletionPolicyReachesBackendWithoutChangingOrdinaryClients) {
+    for (const bool wait : {false, true}) {
+        auto config = CreateTestClientConfig();
+        SdkWrapper wrapper;
+        ASSERT_EQ(ER_OK, wrapper.Init(config, init_params_, nullptr, wait));
+        const auto backend = config->sdk_wrapper_config()->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        ASSERT_NE(nullptr, backend);
+        EXPECT_EQ(wait ? 2000 : 0, backend->completion_wait_timeout_ms());
+    }
+}
+
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
     SdkWrapper sdk_wrapper;
     ASSERT_EQ(ER_INVALID_CLIENT_CONFIG, sdk_wrapper.Init(nullptr, init_params_));

@@ -116,6 +116,9 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
+        const auto &timeouts = wrapper_config_->timeout_config();
+        sdk_backend_config->set_completion_wait_timeout_ms(
+            wait_for_completion_ ? std::max(timeouts.get_timeout_ms(), timeouts.put_timeout_ms()) : 0);
         // 注入静态超时预算：后端用它从自身任务起点起算 deadline 并自律（内部取消）。
         // 不读取该字段的后端（tair_mempool 等）行为不受影响。
         sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
