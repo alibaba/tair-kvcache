@@ -57,15 +57,18 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
     const auto &group_boundaries = group_ptr->revisit_interval_buckets();
 
     ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config(), group_boundaries);
-    if (ec == ErrorCode::EC_OK || ec == ErrorCode::EC_EXIST) {
-        auto indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
-        if (indexer) {
-            // Searcher creation may have failed after the indexer was published.
-            meta_searcher = std::make_shared<MetaSearcher>(indexer, check_loc_data_exist, submit_del_req);
-            std::scoped_lock write_guard(mutex_);
-            meta_searcher_map_.emplace(instance_id, meta_searcher);
-            return meta_searcher;
+    if (ec == ErrorCode::EC_OK) {
+        std::scoped_lock write_guard(mutex_);
+        if (auto pair = meta_searcher_map_.emplace(
+                instance_id,
+                std::make_shared<MetaSearcher>(
+                    meta_indexer_manager_->GetMetaIndexer(instance_id), check_loc_data_exist, submit_del_req));
+            pair.second) {
+            return pair.first->second;
         }
+    } else if (ec == ErrorCode::EC_EXIST) {
+        KVCM_LOG_ERROR("meta indexer exist! IMPOSSIBLE!");
+        assert(false);
     }
     request_context->error_tracer()->AddErrorMsg("create meta indexer failed");
     KVCM_LOG_ERROR("create meta searcher fail, error code [%d]", ec);

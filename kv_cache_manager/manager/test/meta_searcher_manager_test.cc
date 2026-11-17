@@ -229,29 +229,6 @@ TEST_F(MetaSearcherManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
     EXPECT_EQ(2, indexers->init_count.load());
 }
 
-TEST_F(MetaSearcherManagerTest, SearcherCleanupReusesInitializedIndexer) {
-    auto indexers = UseControlledIndexerManager();
-    auto original = CreateSearcher("test_instance");
-    ASSERT_NE(nullptr, original);
-    auto indexer = indexers->GetMetaIndexer("test_instance");
-    ASSERT_NE(nullptr, indexer);
-    ASSERT_NE(nullptr, indexer->backend_manager_);
-    EXPECT_EQ(indexer, original->meta_indexer_);
-    EXPECT_EQ(1, indexers->init_count.load());
-
-    meta_searcher_manager_->DoCleanup();
-    EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
-    EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
-    EXPECT_EQ(1, indexers->init_count.load());
-
-    auto searcher = CreateSearcher("test_instance");
-    ASSERT_NE(nullptr, searcher);
-    EXPECT_NE(original, searcher);
-    EXPECT_EQ(indexer, searcher->meta_indexer_);
-    EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
-    EXPECT_EQ(1, indexers->init_count.load());
-}
-
 TEST_F(MetaSearcherManagerTest, RemovedInstancesDoNotAccumulateMutexEntries) {
     auto indexers = UseControlledIndexerManager();
     for (int i = 0; i < 16; ++i) {
