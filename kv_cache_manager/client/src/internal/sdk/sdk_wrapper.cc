@@ -119,6 +119,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
         // 保留后端的静态阶段上限；调用方传入期限时，再透传绝对 deadline。
         sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
+        sdk_backend_config->set_wait_for_completion(wait_for_completion_);
 
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
         if (!sdk) {

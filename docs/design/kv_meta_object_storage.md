@@ -429,3 +429,20 @@ PACE 接口尚无写入隔离机制。KVMeta 无法安全自动回收未获客�
 | Python 注册 owner 晚于原生 teardown 释放 | `MakePythonOwnedClient`、内源 `TairMempoolSdk` | host owner 生命周期、GPU 注销失败时保留 owner |
 
 这些约定面向 EMB 专用、旁路回源的使用范围，不把极端故障恢复、严格容量事务或零中断切主作为本版本承诺。
+
+### Bounded completion after a data-plane deadline
+
+For registered-buffer KVMeta clients, a data-plane deadline is not permission
+for the backend to continue using a released GPU buffer. The SDK forwards its
+completion-wait policy to the backend. A backend can retain the descriptor and
+buffers for a bounded completion window after the short deadline. A completed
+transfer may then be reported as a buffer-safe timeout, allowing the same client
+and arena to serve subsequent requests. The completion window is bounded by the
+larger of the backend synchronize budget and the SDK operation budget.
+
+Only successful synchronization proves this timeout safe. Backend failures and
+an exhausted completion window still use the backend's original buffer-safety
+classification. In particular, unknown failures must never be converted to safe
+errors merely because their public statuses are terminal. This policy is
+runtime-only and does not change ordinary KVCache clients or authorize aborting
+remote write allocations.
