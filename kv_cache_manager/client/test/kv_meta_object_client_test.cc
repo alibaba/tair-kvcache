@@ -130,6 +130,9 @@ public:
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override {
         ++finish_calls;
+        if (finish_hook) {
+            finish_hook();
+        }
         ThrowIfRequested(finish_throw);
         finish_trace = trace_id;
         finished_session = write_session_id;
@@ -150,6 +153,7 @@ public:
     int update_calls{0};
     std::vector<std::string> updated_addresses;
     std::function<void()> update_hook;
+    std::function<void()> finish_hook;
     ClientErrorCode start_ec{ER_OK};
     ClientErrorCode finish_ec{ER_OK};
     ClientErrorCode remove_ec{ER_OK};
@@ -1024,6 +1028,75 @@ TEST(KvMetaObjectClientDependencyTest, ExplicitCloseWaitsForAnAdmittedOperation)
     EXPECT_EQ(std::future_status::ready, close.wait_for(2s));
     close.get();
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("after-close", keys, sizes, buffers));
+}
+
+TEST(KvMetaObjectClientDependencyTest, CompletedTransferUnlocksBeforeFinishAndCloseDrainsEveryOutcome) {
+    using namespace std::chrono_literals;
+    struct FinishCase {
+        ClientErrorCode result;
+        ThrowMode exception;
+        bool rewrite_uri;
+        ClientErrorCode expected;
+    };
+    for (const auto &test : {FinishCase{ER_OK, ThrowMode::NONE, false, ER_OK},
+                             FinishCase{ER_SERVICE_IO_ERROR, ThrowMode::NONE, false, ER_SERVICE_IO_ERROR},
+                             FinishCase{ER_OK, ThrowMode::STANDARD, false, ER_INVALID_GRPCSTATUS},
+                             FinishCase{ER_OK, ThrowMode::UNKNOWN, false, ER_INVALID_GRPCSTATUS},
+                             FinishCase{ER_OK, ThrowMode::NONE, true, ER_SDKWRITE_ERROR}}) {
+        SCOPED_TRACE(static_cast<int>(test.expected));
+        char payload = 0, destination = 0;
+        auto control = std::make_shared<BlockingStartControl>();
+        auto metadata = std::make_unique<FakeKvMetaClient>();
+        metadata->start_result.key_mask = {false};
+        metadata->start_result.write_session_id = "session";
+        metadata->start_result.locations = {MakeLocation(PaceUri(1, 1), 1)};
+        metadata->get_result.hit_mask = {true};
+        metadata->get_result.locations = {MakeLocation(PaceUri(2, 1), 1)};
+        metadata->finish_ec = test.result;
+        metadata->finish_throw = test.exception;
+        metadata->finish_hook = [control]() {
+            std::unique_lock<std::mutex> lock(control->mutex);
+            control->entered = true;
+            control->condition.notify_all();
+            control->condition.wait(lock, [&]() { return control->released; });
+        };
+        auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+        transfer->actual_uris = {PaceUri(test.rewrite_uri ? 3 : 1, 1)};
+        KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 1024, 30);
+
+        auto save = std::async(std::launch::async, [&]() {
+            return client.SaveObjectsWithTransferState("save", {"write"}, {1}, {MakeBuffer(&payload, 1)});
+        });
+        bool finishing = false;
+        {
+            std::unique_lock<std::mutex> lock(control->mutex);
+            finishing = control->condition.wait_for(lock, 2s, [&]() { return control->entered; });
+        }
+        EXPECT_TRUE(finishing);
+        auto load = std::async(std::launch::async, [&]() {
+            return client.LoadObjects("read", {"read"}, {1}, {MakeBuffer(&destination, 1)});
+        });
+        EXPECT_EQ(std::future_status::ready, load.wait_for(1s));
+        std::promise<void> close_entered;
+        auto close = std::async(std::launch::async, [&]() {
+            close_entered.set_value();
+            client.Close();
+        });
+        close_entered.get_future().wait();
+        EXPECT_EQ(std::future_status::timeout, close.wait_for(20ms));
+        {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            control->released = true;
+            control->condition.notify_all();
+        }
+        const auto result = save.get();
+        EXPECT_EQ(test.expected, result.ec);
+        EXPECT_FALSE(result.data_transfer_may_be_inflight);
+        EXPECT_EQ(ER_OK, load.get());
+        EXPECT_EQ(std::future_status::ready, close.wait_for(2s));
+        close.get();
+        EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.Remove("closed", {"write"}));
+    }
 }
 
 TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartingTheirWriteLeases) {

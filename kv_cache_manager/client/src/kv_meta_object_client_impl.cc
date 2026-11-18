@@ -245,7 +245,7 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjectsImpl(const std::string &trace
     if (!operation.admitted()) {
         return ER_CLIENT_NOT_EXISTS;
     }
-    std::lock_guard<std::mutex> data_plane_lock(data_plane_mutex_);
+    std::unique_lock<std::mutex> data_plane_lock(data_plane_mutex_);
 
     ClientErrorCode start_ec = ER_INVALID_GRPCSTATUS;
     KvMetaStartWriteResult start_result;
@@ -323,6 +323,10 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjectsImpl(const std::string &trace
         return save_ec;
     }
     data_transfer_may_be_inflight = false;
+    // The transfer is complete; commit/rollback uses metadata only. Keep the
+    // operation admitted so Close still drains it, without holding up the
+    // next transfer while waiting for the metadata acknowledgement.
+    data_plane_lock.unlock();
     if (!SameStorageUris(requested_uris, actual_uris)) {
         return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), ER_SDKWRITE_ERROR);
     }

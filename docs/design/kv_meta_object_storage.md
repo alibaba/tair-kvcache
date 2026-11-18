@@ -145,7 +145,7 @@ PACE URI 的 size
 
 三者必须一致。`KvMetaTransferClient` 持有私有 PACE SDK client，每批 I/O 前按本批对象长度更新 `spec_byte_sizes_per_block`。该配置不影响普通定长 TransferClient，也不需要修改 TairMempool provider。
 
-同一个 object client 的 Save/Load 串行执行，并在 `PutStart` 前取得 data-plane mutex，避免本地排队消耗 write lease。不同 client 仍可并发，由服务端条件写协调。
+同一个 object client 的 `Get` / `PutStart` 与数据传输在 data-plane mutex 内串行执行，避免地址或 write lease 在本地传输排队期间失效。确认传输成功结束后释放该锁，再执行 metadata-only 的 `PutFinish` 或 URI 不匹配回滚；OperationGuard 仍覆盖完整操作，使 `Close` 等待提交/回滚结束。不同 client 仍可并发，由服务端条件写协调。
 
 原始 `ER_SDK_TIMEOUT` 或 SDK 抛异常时，transfer client 销毁私有 wrapper 并等待后台任务退出，该 data-plane client 随后不再可用。`ER_SDK_ERROR_BUFFER_SAFE` / `ER_SDK_TIMEOUT_BUFFER_SAFE` 则允许复用本地 buffer 和 client；它们不证明远端 allocation 可以释放，不能据此发送失败 `PutFinish`。
 
