@@ -39,9 +39,11 @@ pending 从 Executor 接纳任务算到任务收尾，包括读者宽限期、�
 
 ## 3. 只让水位驱逐识别 busy
 
-Meta 在 `HandleDeleteGAs` 对带协议头的请求先校验完整 GA 列表。空列表或任一 GA 非法都返回参数错误，KVCM 在发送前也跳过空批。
+**灰度顺序。** 混部期间显式关闭 KVCM 的协议开关。旧 follower 转发时可能把新 leader 的 429 写为 501 并保留原正文，默认本地执行的 Meta 不经过这次转发。所有可能服务、转发或接任 leader 的 Meta 升级完成后，逐实例核对实际额度，并通过实际路由确认完整回包。启用自动重试还需满足第 4 节的 GA 身份和时长前提。
 
-对合法列表，Meta 在调用 `FreeGAs` 前按正在处理的 Free 批数和 GA 数检查额度。超过限制就立即返回 `FREE_BUSY_NOT_ACCEPTED`，此时整批还未向任何 Provider 下发。接纳的请求占用额度，处理结束时归还。所有显式列表 Free 都计入负载，只有带协议头的请求参与拒收。已下发的请求即使超时或部分失败，也按实际结果返回。
+Meta 在 `HandleDeleteGAs` 对带协议头的请求先校验完整 GA 列表。空列表或任一 GA 非法都返回参数错误，KVCM 发前逐 URI 校验路径完整解析为非零十进制 uint64，按十进制串和逗号组装 GA 列表，跳过空批。非法 spec 按 `(key, location_id, 原 URI)` 记录并保留所属 Location 的元数据，其他可独立完成的 Location 继续处理。一个 Location 有多个 spec 时，记录各 spec 的处理结果，避免过滤一项后把整个 Location 当作成功 CAD。
+
+对合法列表，Meta 在调用 `FreeGAs` 前按正在处理的 Free 批数和 GA 数检查额度。单批能容纳、已有占用使本批加入后超限时，立即返回 `FREE_BUSY_NOT_ACCEPTED`，整批还未向任何 Provider 下发。若单批自身已超过 GA 硬上限，优先返回 HTTP 400 和 `{"protocol_version":1,"code":"FREE_BATCH_TOO_LARGE","status":"error","accepted":false,"rejection_scope":"whole_request","max_gas":1000}`，其中 1000 为示例。KVCM 校验 HTTP 状态和整份协议字段。这类错误直接按未发出失败收尾，保留受影响的 `DELETING`，记录实际项数和该 Meta 的上限供调整组批或配置。接纳的请求占用额度，处理结束时归还。所有显式列表 Free 都计入负载，只有带协议头的请求参与拒收。已下发的请求即使超时或部分失败，也按实际结果返回。
 
 盘侧的 `pending_keys`、`pending_bytes` 若以后能汇总到 Meta，也可用于上述下发前判断，KVCM 仍只消费同一个 busy 信号。
 
@@ -58,7 +60,7 @@ Meta 可按下列格式返回 HTTP 429。
 }
 ```
 
-**入口与接口。** 由 `CacheReclaimer::SubmitDelReq` 给启用协议的任务加标记，随 `PrepareDeleteTask` 生成的实际任务传下去。GC 也用 `SubmitAsync` 和 `kReclaim`，任务类别不能识别来源。复用 `DataStorageManager` 已有的具体 Tair backend 依赖，只加水位驱逐专用的调用。开源 Tair 桩和内源实现对齐这个入口，内源为该次 HTTP 请求带上 `X-TairMempool-Free-Protocol: 1`，在错误归并前识别约定的 429、协议版本、业务码和整批未接纳保证。返回原删除结果或明确 busy 及可选等待时间。公共 `DataStorageBackend::Delete`、共享错误码和其他后端继续按原接口工作。[现有 Tair 装配](../../kv_cache_manager/data_storage/data_storage_manager.cc) · [公共 Delete 接口](../../kv_cache_manager/data_storage/data_storage_backend.h)
+**入口与接口。** 由 `CacheReclaimer::SubmitDelReq` 给启用协议的任务加标记，随 `PrepareDeleteTask` 生成的实际任务传下去。GC 也用 `SubmitAsync` 和 `kReclaim`，任务类别不能识别来源。复用 `DataStorageManager` 已有的具体 Tair backend 依赖，只加水位驱逐专用的调用。开源 Tair 桩和内源实现对齐这个入口，内源为该次 HTTP 请求带上 `X-TairMempool-Free-Protocol: 1`，在错误归并前识别约定的 429、协议版本、业务码和整批未接纳保证。返回原删除结果、明确 busy 及可选等待时间，或单批过大及本机 GA 上限。公共 `DataStorageBackend::Delete`、共享错误码和其他后端继续按原接口工作。[现有 Tair 装配](../../kv_cache_manager/data_storage/data_storage_manager.cc) · [公共 Delete 接口](../../kv_cache_manager/data_storage/data_storage_backend.h)
 
 **存储访问。** 首发和重试都在 `DataStorageManager` 现有删除读锁内查找并调用后端。退避等待期间释放锁，重试时在锁内核对仍是原后端实例，避免注销存储时的 `Close` 和 Delete 同时执行。[存储的删除与注销](../../kv_cache_manager/data_storage/data_storage_manager.cc)
 
@@ -76,6 +78,7 @@ Meta 可按下列格式返回 HTTP 429。
 
 | 该批最后得到的结果 | KVCM 如何收尾 |
 |---|---|
+| 收到匹配的 400 和 `FREE_BATCH_TOO_LARGE` | 终止原批次的自动重发及降速反馈，保留未释放目标供调整组批或配置 |
 | Free 已发出并成功 | 按条件删除对应的 Location 元数据 |
 | Free 已发出，但超时、返回无协议的 429/5xx 或部分失败 | 首发和重发都沿用已有错误及 CAD 规则。停止自动重发，记录可能未释放的 GA |
 | 持续明确拒收直到截止，或再次发送前读取、投递失败，原实例或后端失效 | 失败收尾。对仍存在的原目标保留 `DELETING`，记录实例、key、Location、storage 和原因，供与 mempool 核对。GC V1 会跳过这类残留 |
@@ -108,6 +111,7 @@ KVCM 为 Tair 新建的 Location ID 通常是 8 字符。上表只作量级参�
 |---|---|
 | 开关关闭，或启用后预算充足且对接健康或旧 Meta | 关闭时无新协议头和预算预留。启用后健康请求按原额度提交，旧 Meta 回包走原成功、错误及 CAD 规则。GC、主动删除、回滚和非 Tair 删除一直走原入口 |
 | 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
+| 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
 | 同组多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
 | 同一任务的 Location A、B 分属两个 storage，A 成功，B 明确 busy | A 及时 CAD。只重发 B 的原批次，原 pending 最后释放一次。若重发返回普通错误，按既有规则收尾并记录可能未释放的对象 |
 | KVCM 重发前读到 RemoveCache、Trim 或 RemoveInstance 已处理同一目标 | 跳过已删除、已换 URI 或已注销实例的目标，无需对它再执行 Free 或 CAD。剩余为空时零次 HTTP |
