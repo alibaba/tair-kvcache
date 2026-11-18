@@ -48,18 +48,17 @@ private:
 class CommandLine {
 public:
     int Run(int argc, const char *argv[]);
-    CommandLine *GetNext() { return next_; };
     void Terminate();
 
 private:
     void InitLogger(const std::string &log_config_file);
     void UpdateLogLevel(uint32_t log_level);
     void RegisterSignal();
+    void WaitForTerminationSignal();
     bool StartDaemon();
 
 private:
     std::shared_ptr<Server> server_;
-    CommandLine *next_ = nullptr;
 };
 
 } // namespace kv_cache_manager

@@ -110,7 +110,13 @@ def git_deps():
             "https://codeload.github.com/grpc/grpc/tar.gz/109c570727c3089fef655edcdd0dd02cc5958010",
             "https://github.com/grpc/grpc/archive/109c570727c3089fef655edcdd0dd02cc5958010.tar.gz",
         ],
-        patches = ["//patches/grpc:0001-Rename-gettid-functions.patch"],
+        patches = [
+            "//patches/grpc:0001-Rename-gettid-functions.patch",
+            "//patches/grpc:0002-shutdown-server-on-first-bind-failure.patch",
+            "//patches/grpc:0003-match-pending-calls-before-publishing-receives.patch",
+            "//patches/grpc:0004-queue-transport-writes-before-later-arrivals.patch",
+            "//patches/grpc:0005-refresh-clock-for-incoming-deadlines.patch",
+        ],
     )
 
     http_archive(

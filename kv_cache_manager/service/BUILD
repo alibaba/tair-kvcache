@@ -22,6 +22,7 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
+        ":service_request_executor",
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
@@ -50,6 +51,13 @@ cc_library(
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:service_call_guard",
     ],
+)
+
+cc_library(
+    name = "service_request_executor",
+    srcs = ["service_request_executor.cc"],
+    hdrs = ["service_request_executor.h"],
+    deps = ["//kv_cache_manager/common"],
 )
 
 cc_library(

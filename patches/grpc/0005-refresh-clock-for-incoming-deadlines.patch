@@ -1,0 +1,12 @@
+--- src/core/ext/transport/chttp2/transport/parsing.cc
++++ src/core/ext/transport/chttp2/transport/parsing.cc
+@@ -451,6 +451,9 @@
+         }
+       }
+       if (timeout != GRPC_MILLIS_INF_FUTURE) {
++        // Transport work can outlive the ExecCtx time cache. A new relative
++        // timeout must start at receipt, not at an earlier callback's time.
++        grpc_core::ExecCtx::Get()->InvalidateNow();
+         grpc_chttp2_incoming_metadata_buffer_set_deadline(
+             &s->metadata_buffer[0], grpc_core::ExecCtx::Get()->Now() + timeout);
+       }

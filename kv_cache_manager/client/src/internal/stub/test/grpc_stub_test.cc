@@ -1,4 +1,5 @@
 #include <atomic>
+#include <future>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <netinet/in.h>
@@ -26,6 +27,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/service_request_executor.h"
 using namespace kv_cache_manager;
 
 namespace {
@@ -68,11 +70,18 @@ private:
 class GrpcStubTest : public TESTBASE {
 public:
     void SetUp() override {
+        executor_ = std::make_shared<ServiceRequestExecutor>();
+        ASSERT_TRUE(executor_->Init(2));
         StartService();
         InitStub();
     }
 
-    void TearDown() override { rpc_server_->Shutdown(); }
+    void TearDown() override {
+        StopService();
+        executor_->CloseAdmission(ServiceRequestExecutor::ShutdownMode::kDrain);
+        executor_->Drain();
+        executor_->Join();
+    }
     static void ExpectLocationsEq(const Locations &a, const Locations &b) {
         EXPECT_EQ(a.size(), b.size());
         size_t location_size = std::min(a.size(), b.size());
@@ -99,6 +108,15 @@ public:
 private:
     int GetFreePort();
     void StartService(int port = -1);
+    void StopService() {
+        meta_service_->StopAccepting();
+        if (rpc_server_) {
+            rpc_server_->Shutdown();
+        }
+        meta_service_->WaitForCalls();
+        meta_service_->ShutdownCompletionQueueAndJoin();
+        rpc_server_.reset();
+    }
     void InitStub();
     ModelDeployment createModelDeployment(int32_t tp_size = 1, int32_t pp_size = 1);
     Stub::LocationSpecInfoMap createLocationSpecInfos(int32_t spec_size = 1);
@@ -110,6 +128,7 @@ private:
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
     std::shared_ptr<MetaServiceGRpc> meta_service_;
+    std::shared_ptr<ServiceRequestExecutor> executor_;
     std::unique_ptr<grpc::Server> rpc_server_;
     std::shared_ptr<GrpcStub> stub_;
 };
@@ -159,7 +178,8 @@ void GrpcStubTest::StartService(int port) {
     metrics_reporter_ = std::make_shared<DummyMetricsReporter>();
     metrics_reporter_->Init(cache_manager_, metrics_registry_, "");
     meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, nullptr);
-    meta_service_ = std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_);
+    meta_service_ =
+        std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_, executor_);
     meta_service_->Init();
     grpc::ServerBuilder builder;
     port_ = port < 0 ? GetFreePort() : port;
@@ -167,8 +187,10 @@ void GrpcStubTest::StartService(int port) {
     std::string server_spec = std::string("0.0.0.0:") + std::to_string(port_);
     builder.AddListeningPort(server_spec, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
+    ASSERT_TRUE(meta_service_->PrepareCompletionQueue(builder));
     rpc_server_ = builder.BuildAndStart();
     ASSERT_TRUE(rpc_server_ != nullptr);
+    meta_service_->StartAccepting();
     KVCM_LOG_INFO("start service");
 }
 
@@ -227,25 +249,34 @@ TEST_F(GrpcStubTest, TestRetry) {
               stub_->RegisterInstance(
                   "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
 
-    // Helper: 只重启/关闭 gRPC server，复用 meta_service_ 保持业务状态
+    // AsyncService 只能注册到一个 server；重建接入层，保留业务实现和缓存状态。
     auto restartGrpcServer = [this]() {
+        executor_ = std::make_shared<ServiceRequestExecutor>();
+        ASSERT_TRUE(executor_->Init(2));
+        meta_service_ =
+            std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_, executor_);
+        meta_service_->Init();
         grpc::ServerBuilder builder;
         std::string server_spec = "0.0.0.0:" + std::to_string(port_);
         builder.AddListeningPort(server_spec, grpc::InsecureServerCredentials());
         builder.RegisterService(meta_service_.get());
+        ASSERT_TRUE(meta_service_->PrepareCompletionQueue(builder));
         rpc_server_ = builder.BuildAndStart();
+        ASSERT_TRUE(rpc_server_ != nullptr);
+        meta_service_->StartAccepting();
     };
-    auto shutdownGrpcServer = [this]() {
-        rpc_server_->Shutdown();
-        rpc_server_->Wait();
-        rpc_server_.reset();
-    };
+    auto shutdownGrpcServer = [this]() { StopService(); };
     // gRPC v1.19.1 bug workaround (grpc/grpc#28827):
     // 每次断连后首次RPC会因subchannel状态异常而立即失败，用dummy call触发subchannel重连。
     // 升级到grpc1.45.0+后可以去掉所有dummyCall调用。
     auto dummyCall = [this]() {
-        stub_->GetCacheLocation(
-            "trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {});
+        // Some polling engines retry instead of failing immediately. Keep the
+        // reconnect probe bounded independently of the RPC under test.
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+        proto::meta::GetCacheLocationRequest request;
+        proto::meta::GetCacheLocationResponse response;
+        stub_->GetStub()->GetCacheLocation(&context, request, &response);
     };
 
     // Helper: 关停server后执行rpcOp，验证RPC被阻塞，再重启server验证retry成功
@@ -263,10 +294,11 @@ TEST_F(GrpcStubTest, TestRetry) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        ASSERT_TRUE(rpc_started.load());
+        const bool started_before_restart = rpc_started.load();
         restartGrpcServer();
-        ASSERT_TRUE(rpc_server_ != nullptr);
         t.join();
+        EXPECT_TRUE(started_before_restart);
+        EXPECT_TRUE(rpc_server_ != nullptr);
     };
 
     std::string write_session_id;
@@ -920,6 +952,37 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
     }
 }
 
+TEST_F(GrpcStubTest, FullQueueReturnsServiceBusy) {
+    StopService();
+    executor_->CloseAdmission();
+    executor_->Drain();
+    executor_->Join();
+    executor_ = std::make_shared<ServiceRequestExecutor>();
+    ASSERT_TRUE(executor_->Init(1, 1));
+    StartService();
+    InitStub();
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto ready = entered.get_future();
+    auto gate = release.get_future().share();
+    executor_->TrySubmit({[&entered, gate](ServiceRequestExecutor::CompletionToken) {
+                              entered.set_value();
+                              gate.wait_for(std::chrono::seconds(10));
+                          },
+                          [](ServiceRequestExecutor::CompletionToken) {}});
+    ASSERT_EQ(std::future_status::ready, ready.wait_for(std::chrono::seconds(5)));
+    ASSERT_EQ(ServiceRequestExecutor::SubmitResult::kAccepted,
+              executor_->TrySubmit(
+                  {[](ServiceRequestExecutor::CompletionToken) {}, [](ServiceRequestExecutor::CompletionToken) {}}));
+    const auto result = stub_->GetClusterInfo("busy", "");
+    release.set_value();
+    EXPECT_EQ(ER_SERVICE_BUSY, result.first);
+    EXPECT_EQ(1u, executor_->GetSnapshot().rejected);
+    executor_->Drain();
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, stub_->GetClusterInfo("recovered", "").first);
+}
+
 TEST_F(GrpcStubTest, TestGetClusterInfoNoLeaderElector) {
     // Test-only scenario: MetaServiceImpl was created with leader_elector=nullptr.
     // GetClusterInfo should return SERVICE_NOT_READY which maps to ER_SERVICE_INTERNAL_ERROR.
@@ -929,8 +992,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoNoLeaderElector) {
 
 TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     // Shut down the server created by SetUp (no leader elector).
-    rpc_server_->Shutdown();
-    rpc_server_.reset();
+    StopService();
 
     // Create a memory-based coordination backend and leader elector.
     auto backend = std::make_shared<CoordinationMemoryBackend>();
@@ -949,7 +1011,8 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
 
     // Recreate MetaServiceImpl with the leader elector.
     meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector);
-    meta_service_ = std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_);
+    meta_service_ =
+        std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_, executor_);
     meta_service_->Init();
 
     // Restart gRPC server on the same port.
@@ -957,8 +1020,10 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     std::string server_spec = "0.0.0.0:" + std::to_string(port_);
     builder.AddListeningPort(server_spec, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
+    ASSERT_TRUE(meta_service_->PrepareCompletionQueue(builder));
     rpc_server_ = builder.BuildAndStart();
     ASSERT_TRUE(rpc_server_ != nullptr);
+    meta_service_->StartAccepting();
 
     // Reconnect stub.
     stub_ = std::make_shared<GrpcStub>(1, 5000);

@@ -1,5 +1,7 @@
 #include "kv_cache_manager/service/command_line.h"
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <fcntl.h>
 #include <getopt.h>
@@ -12,8 +14,10 @@
 #include "kv_cache_manager/service/server_config.h"
 namespace kv_cache_manager {
 
-static std::mutex G_CMD_LOCK;
-static CommandLine *G_CMD_LIST = nullptr;
+// A termination signal may arrive on a business worker or a network thread.
+// Only notify here; the Run thread owns blocking shutdown and joins.
+static std::atomic<int> G_STOP_SIGNAL{0};
+static_assert(std::atomic<int>::is_always_lock_free);
 
 void CommandArgs::ParseCmdLine(int argc, char *const argv[]) {
     int opt;
@@ -101,12 +105,6 @@ int CommandLine::Run(int argc, const char *argv[]) {
 
     fprintf(stdout, "Start run command %p.\n", this);
 
-    {
-        std::unique_lock<std::mutex> lock(G_CMD_LOCK);
-        next_ = G_CMD_LIST;
-        G_CMD_LIST = this;
-    }
-
     CommandArgs args;
     args.ParseCmdLine(argc, const_cast<char **>(argv));
 
@@ -131,24 +129,28 @@ int CommandLine::Run(int argc, const char *argv[]) {
     server_.reset(new Server);
     if (!server_->Init(config)) {
         fprintf(stderr, "Server init failed.\n");
+        server_.reset();
+        LoggerBroker::DestroyLogger();
         return -1;
     }
     if (!server_->Start()) {
         fprintf(stderr, "Server start failed.\n");
         server_->Stop();
         server_->Wait();
+        server_.reset();
+        LoggerBroker::DestroyLogger();
         return -1;
     }
+    WaitForTerminationSignal();
+    KVCM_LOG_INFO("received signal %d, stopping server", G_STOP_SIGNAL.load(std::memory_order_relaxed));
+    server_->Stop();
     server_->Wait();
     server_.reset();
     LoggerBroker::DestroyLogger();
     return 0;
 }
 
-void CommandLine::Terminate() {
-    // TODO
-    server_->Stop();
-}
+void CommandLine::Terminate() { G_STOP_SIGNAL.store(SIGTERM, std::memory_order_relaxed); }
 
 bool CommandLine::StartDaemon() {
     if (daemon(1, 1) == -1) {
@@ -164,18 +166,20 @@ bool CommandLine::StartDaemon() {
 }
 
 void __sign_handler__(int sig) {
-    std::unique_lock<std::mutex> lock(G_CMD_LOCK);
     switch (sig) {
     case SIGUSR1:
     case SIGUSR2:
     case SIGTERM:
     case SIGINT: {
-        fprintf(stdout, "received singnal %d, try stop server.", sig);
-        for (CommandLine *p = G_CMD_LIST; p; p = p->GetNext()) {
-            p->Terminate();
-        }
+        G_STOP_SIGNAL.store(sig, std::memory_order_relaxed);
         break;
     }
+    }
+}
+
+void CommandLine::WaitForTerminationSignal() {
+    while (G_STOP_SIGNAL.load(std::memory_order_relaxed) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -189,6 +193,7 @@ void CommandLine::UpdateLogLevel(uint32_t log_level) {
 }
 
 void CommandLine::RegisterSignal() {
+    G_STOP_SIGNAL.store(0, std::memory_order_relaxed);
     CrashHandler::Install();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, __sign_handler__);
