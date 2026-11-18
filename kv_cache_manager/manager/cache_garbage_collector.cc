@@ -351,8 +351,8 @@ ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
     out.Clear();
     auto &buffer = entry.buffered_scan;
     if (buffer.keys.empty()) {
-        const ErrorCode ec =
-            indexer.ScanLocationsForMaintenance(round_context_.get(), entry.cursor, config_.scan_batch_size, buffer);
+        const ErrorCode ec = indexer.ScanLocationsForMaintenance(
+            round_context_.get(), entry.cursor, config_.scan_batch_size, buffer);
         if (ec != EC_OK) {
             buffer = {};
             return ec;
@@ -544,8 +544,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                 return false;
             } catch (...) {
                 RecordOperationError("submit_exception");
-                KVCM_LOG_ERROR(
-                    "cache gc %s SubmitAsync threw unknown exception, instance[%s]", action_name, instance_id.c_str());
+                KVCM_LOG_ERROR("cache gc %s SubmitAsync threw unknown exception, instance[%s]",
+                               action_name,
+                               instance_id.c_str());
                 return false;
             }
             if (!submit_result.accepted) {
@@ -588,8 +589,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                     pending_locations_.erase(target);
                 }
                 RecordOperationError("track_accepted_action");
-                KVCM_LOG_ERROR(
-                    "cache gc failed to track accepted %s action, instance[%s]", action_name, instance_id.c_str());
+                KVCM_LOG_ERROR("cache gc failed to track accepted %s action, instance[%s]",
+                               action_name,
+                               instance_id.c_str());
                 return false;
             }
             METRICS_(cache_gc, delete_target_count) += request_targets.size();
@@ -618,8 +620,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         if (!event_report_targets.empty() && inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
             for (const auto &targets : actions.event_report_request.targets) {
                 for (const auto &target : targets) {
-                    RecordCandidateDropped(
-                        CandidateReasonName(EventReportTokenReason(target.cleanup_token)), "inflight_limit", 1);
+                    RecordCandidateDropped(CandidateReasonName(EventReportTokenReason(target.cleanup_token)),
+                                           "inflight_limit",
+                                           1);
                 }
             }
         } else {
@@ -678,7 +681,7 @@ CacheGarbageCollector::LookupEventReportBackend(const std::string &instance_id, 
         return route;
     }
     route.status = route.backend->Available() ? EventReportBackendRouteStatus::kResolved
-                                              : EventReportBackendRouteStatus::kUnavailable;
+                                               : EventReportBackendRouteStatus::kUnavailable;
     return route;
 }
 
@@ -877,8 +880,9 @@ void CacheGarbageCollector::AdvanceInstance(bool completed_current) noexcept {
         // Finish this backend batch across ticks before rotating Instances.
         return;
     }
-    if (std::all_of(
-            instances_.begin(), instances_.end(), [](const InstanceScanEntry &entry) { return entry.completed; })) {
+    if (std::all_of(instances_.begin(), instances_.end(), [](const InstanceScanEntry &entry) {
+            return entry.completed;
+        })) {
         CompleteRound();
         return;
     }
@@ -969,7 +973,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                             route.status == EventReportBackendRouteStatus::kAmbiguous
                                 ? "backend_ambiguous"
                                 : (route.status == EventReportBackendRouteStatus::kUnavailable ? "backend_unavailable"
-                                                                                               : "backend_missing");
+                                                                                              : "backend_missing");
                         if (route.status == EventReportBackendRouteStatus::kAmbiguous) {
                             KVCM_LOG_WARN("cache gc skips ambiguous EventReport owner, round[%lu] instance[%s] "
                                           "storage_type[%d]",
@@ -980,9 +984,8 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                     }
                 }
                 if (!probe_batch.backend) {
-                    RecordEventReportProbe("unknown",
-                                           probe_batch.route_unknown_cause ? probe_batch.route_unknown_cause
-                                                                           : "backend_missing");
+                    RecordEventReportProbe(
+                        "unknown", probe_batch.route_unknown_cause ? probe_batch.route_unknown_cause : "backend_missing");
                     continue;
                 }
                 EventReportBackend::MaintenanceLocationProbe probe{

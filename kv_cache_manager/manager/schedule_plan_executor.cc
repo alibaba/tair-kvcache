@@ -349,7 +349,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                 }
             }
             std::uint64_t size = 0;
-            if (iter->second->location_specs().size() == 1) {
+            if (IsTairMempoolStorageType(iter->second->type()) && iter->second->location_specs().size() == 1) {
                 IsValidKvMetaLocation(iter->second->location_specs().front().uri(), size);
             }
             location_sizes.push_back(size);
