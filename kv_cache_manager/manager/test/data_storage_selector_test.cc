@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -857,8 +858,8 @@ TEST_F(DataStorageSelectorTest, QuotaResolutionKeepsTheCapturedConfigurationDuri
     registry->instance_group_configs_[captured->name()] = updated;
     // Both versions have a 100-byte budget. Mixing the old ratio with the new
     // pool would invent a 50-byte shrink and could incorrectly evict data.
-    EXPECT_EQ(100, registry->ResolveQuota(*captured).reference_capacity);
-    EXPECT_EQ(100, registry->ResolveQuota(*updated).reference_capacity);
+    EXPECT_EQ(100, ResolveEffectiveQuota(*captured, registry->data_storage_manager().get()).reference_capacity);
+    EXPECT_EQ(100, ResolveEffectiveQuota(*updated, registry->data_storage_manager().get()).reference_capacity);
 }
 
 TEST_F(DataStorageSelectorTest, ExplicitAutoQuotaRequiresCapacityForExplicitTargets) {
@@ -924,7 +925,8 @@ TEST_F(DataStorageSelectorTest, UnlimitedTotalUsesDynamicTypeQuotaForNormalAndEx
     admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
     EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[0].status);
-    EXPECT_EQ(100, registry->ResolveQuota(*instance_group_g).types.at(DataStorageType::DATA_STORAGE_TYPE_NFS).capacity);
+    const auto quota = ResolveEffectiveQuota(*instance_group_g, data_storage_manager_g.get());
+    EXPECT_EQ(100, quota.types.at(DataStorageType::DATA_STORAGE_TYPE_NFS).capacity);
     instance_group_g->set_quota(InstanceGroupQuota(-1, {hf3fs}));
     admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00", "3fs_storage_01"});

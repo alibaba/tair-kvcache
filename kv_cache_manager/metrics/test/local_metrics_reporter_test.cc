@@ -933,6 +933,8 @@ TEST_F(LocalMetricsReporterTest, UnlimitedQuotaMetricsUseReferenceAndExposeUnkno
     registry_manager_->instance_group_configs_[group.name()]->set_quota(
         InstanceGroupQuota(-1, {QuotaConfig(50, dram)}));
     ASSERT_TRUE(sample());
+    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get()));
+    EXPECT_DOUBLE_EQ(0.4, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", dram_tags).Get());
     const auto metrics = metrics_registry_->GetMetricsData("cache_manager_group_storage.effective_quota");
     ASSERT_NE(nullptr, metrics);
     const auto values = metrics->GetMetricsValues();

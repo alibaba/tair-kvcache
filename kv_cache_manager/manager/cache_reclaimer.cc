@@ -28,6 +28,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -830,25 +831,6 @@ void CacheReclaimer::SetSleepIntervalMs(const RequestContext *request_context,
 
 std::shared_ptr<CacheReclaimer::WaterLevelExceed>
 CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
-                                    const std::string &ins_gr,
-                                    const InstanceGroupQuota &instance_group_quota,
-                                    const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
-    if (!IsRunning() || IsPaused()) {
-        return nullptr;
-    }
-    const auto configured_group = registry_manager_->GetInstanceGroupConfig(ins_gr);
-    InstanceGroup group;
-    if (configured_group) {
-        group = *configured_group;
-    }
-    group.set_name(ins_gr);
-    group.set_quota(instance_group_quota);
-    return GetWaterLevelExceed(request_context, group, reclaim_strategy, instance_infos);
-}
-
-std::shared_ptr<CacheReclaimer::WaterLevelExceed>
-CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
                                     const InstanceGroup &instance_group,
                                     const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
                                     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
@@ -892,7 +874,8 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
 
     // 2.1. results for each storage type
-    const auto effective_quota = registry_manager_->ResolveQuota(instance_group).ForReclaim();
+    const auto storage_manager = registry_manager_->data_storage_manager();
+    const auto effective_quota = ResolveEffectiveQuota(instance_group, storage_manager.get()).ForReclaim();
     for (const auto &storage_quota : effective_quota.quota_config()) {
         const auto &type = storage_quota.storage_spec();
         if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
@@ -1889,7 +1872,8 @@ void CacheReclaimer::TryMigrateOnGroup(
         return;
     }
 
-    const auto quota = registry_manager_->ResolveQuota(*instance_group).ForReclaim();
+    const auto storage_manager = registry_manager_->data_storage_manager();
+    const auto quota = ResolveEffectiveQuota(*instance_group, storage_manager.get()).ForReclaim();
     struct CachedMigrationBatch {
         bool built = false;
         bool ok = false;

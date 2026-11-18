@@ -9,6 +9,8 @@
 
 namespace kv_cache_manager {
 
+class DataStorageManager;
+
 struct EffectiveTypeQuota {
     QuotaConfig config;
     int64_t capacity = -1;
@@ -34,6 +36,7 @@ std::set<std::string> GetQuotaStorageNames(const InstanceGroup &group);
 EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
                                           const std::map<std::string, StorageCapacitySnapshot> &snapshots,
                                           int64_t now_steady_us);
+EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group, const DataStorageManager *storage_manager);
 double QuotaUsageRatio(uint64_t usage, int64_t capacity);
 
 } // namespace kv_cache_manager

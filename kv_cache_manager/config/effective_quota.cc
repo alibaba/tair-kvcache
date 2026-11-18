@@ -5,6 +5,9 @@
 #include <limits>
 #include <set>
 
+#include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
+
 namespace kv_cache_manager {
 namespace {
 constexpr int64_t kCapacityMaxAgeUs = 30000000;
@@ -59,12 +62,31 @@ std::set<std::string> GetQuotaStorageNames(const InstanceGroup &group) {
     return associated;
 }
 
+EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group, const DataStorageManager *storage_manager) {
+    std::set<std::string> names;
+    if (storage_manager) {
+        for (const auto &config : group.quota().quota_config()) {
+            if (!config.automatic()) {
+                continue;
+            }
+            if (config.storage_names().empty()) {
+                const auto associated = GetQuotaStorageNames(group);
+                names.insert(associated.begin(), associated.end());
+            } else {
+                names.insert(config.storage_names().begin(), config.storage_names().end());
+            }
+        }
+    }
+    const auto snapshots = names.empty() ? std::map<std::string, StorageCapacitySnapshot>{}
+                                         : storage_manager->GetCapacitySnapshots(names);
+    return ResolveEffectiveQuota(group, snapshots, TimestampUtil::GetSteadyTimeUs());
+}
+
 EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
                                           const std::map<std::string, StorageCapacitySnapshot> &snapshots,
                                           int64_t now_steady_us) {
     EffectiveGroupQuota result;
     result.configured_capacity = group.quota().capacity();
-    const auto associated = GetQuotaStorageNames(group);
     const auto &configs = group.quota().quota_config();
     bool complete = !configs.empty();
     int64_t reference = 0;
@@ -75,12 +97,15 @@ EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
         std::string invalid;
         if (!config.ValidateRequiredFields(invalid)) {
             value.status = "invalid_config";
+        } else if (!config.automatic()) {
+            value.capacity = config.capacity();
+            value.known = value.usable = true;
+            value.status = "fixed";
         } else {
-            std::set<std::string> names = associated;
             const bool explicit_scope = !config.storage_names().empty();
-            if (explicit_scope) {
-                names = std::set<std::string>(config.storage_names().begin(), config.storage_names().end());
-            }
+            const auto names = explicit_scope
+                                   ? std::set<std::string>(config.storage_names().begin(), config.storage_names().end())
+                                   : GetQuotaStorageNames(group);
             std::map<std::string, StorageCapacitySnapshot> pools;
             bool missing = false;
             bool unsupported = false;
@@ -139,11 +164,6 @@ EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
                 if (unsupported) {
                     value.status = "unsupported";
                 }
-            }
-            if (!config.automatic()) {
-                value.capacity = config.capacity();
-                value.known = value.usable = true;
-                value.status = "fixed";
             }
         }
         if (!value.known || value.capacity < 0 || value.capacity > std::numeric_limits<int64_t>::max() - reference) {

@@ -1,4 +1,5 @@
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
@@ -24,8 +25,12 @@ class CapacityDummyBackend : public DummyBackend {
 public:
     using DummyBackend::DummyBackend;
     bool SupportsStorageCapacity() const override { return true; }
-    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot GetStorageCapacity() const override {
+        ++capacity_reads;
+        return snapshot;
+    }
     StorageCapacitySnapshot snapshot;
+    mutable int capacity_reads = 0;
 };
 }
 
@@ -65,10 +70,9 @@ public:
 TEST_F(RegistryManagerQuotaTest, RejectsUnsupportedAutoBeforePersistingButAllowsFixed) {
     auto group = Group();
     std::string error;
-    EXPECT_FALSE(registry->ValidateAutomaticQuota(group, error));
+    EXPECT_EQ(EC_BADARGS, registry->CreateInstanceGroup(&context, group, &error));
     EXPECT_NE(std::string::npos, error.find("unsupported"));
     EXPECT_NE(std::string::npos, error.find("fixed"));
-    EXPECT_EQ(EC_BADARGS, registry->CreateInstanceGroup(&context, group));
     EXPECT_EQ(EC_NOENT, registry->GetInstanceGroup(&context, group.name()).first);
     group = Group(false);
     EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
@@ -85,7 +89,7 @@ TEST_F(RegistryManagerQuotaTest, UnlimitedTotalRequiresNoCapacitySupport) {
     auto group = Group();
     group.set_quota(InstanceGroupQuota(-1, {}));
     EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
-    EXPECT_TRUE(registry->ResolveQuota(group).types.empty());
+    EXPECT_TRUE(ResolveEffectiveQuota(group, registry->data_storage_manager().get()).types.empty());
     group.set_version(2);
     group.set_storage_candidates({"supported", "nfs"});
     group.set_quota(InstanceGroupQuota(-1, {QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
@@ -96,12 +100,29 @@ TEST_F(RegistryManagerQuotaTest, CapacityFailuresDoNotChangeSupportOrBlockConfig
     auto group = Group();
     group.set_storage_candidates({"supported"});
     EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
-    EXPECT_FALSE(registry->ResolveQuota(group).types.begin()->second.usable);
-    EXPECT_TRUE(registry->ResolveQuota(group).ForReclaim().quota_config().empty());
+    EXPECT_FALSE(ResolveEffectiveQuota(group, registry->data_storage_manager().get()).types.begin()->second.usable);
+    EXPECT_TRUE(ResolveEffectiveQuota(group, registry->data_storage_manager().get()).ForReclaim().quota_config().empty());
     capacity_backend->snapshot = {100, 1, 1, EC_ERROR};
     group.set_version(2);
     EXPECT_EQ(EC_OK, registry->UpdateInstanceGroup(&context, group, 1));
-    EXPECT_FALSE(registry->ResolveQuota(group).types.begin()->second.usable);
+    EXPECT_FALSE(ResolveEffectiveQuota(group, registry->data_storage_manager().get()).types.begin()->second.usable);
+}
+
+TEST_F(RegistryManagerQuotaTest, ResolvesAutoFromScopedBackendsAndSkipsCapacityForFixedGroups) {
+    const auto manager = registry->data_storage_manager();
+    auto unrelated = std::make_shared<CapacityDummyBackend>(metrics);
+    manager->storage_map_["another_group"] = unrelated;
+    auto group = Group(false);
+    group.set_storage_candidates({"supported"});
+    EXPECT_EQ(100, ResolveEffectiveQuota(group, manager.get()).reference_capacity);
+    EXPECT_EQ(0, capacity_backend->capacity_reads);
+
+    auto quota = group.quota().quota_config().front();
+    quota.set_mode("auto");
+    group.set_quota(InstanceGroupQuota(-1, {quota}));
+    EXPECT_EQ(-1, ResolveEffectiveQuota(group, manager.get()).reference_capacity);
+    EXPECT_EQ(1, capacity_backend->capacity_reads);
+    EXPECT_EQ(0, unrelated->capacity_reads);
 }
 
 TEST_F(RegistryManagerQuotaTest, ValidatesMigrationScopeButExcludesEventReportAndExplicitlyExcludedBackends) {
@@ -109,22 +130,24 @@ TEST_F(RegistryManagerQuotaTest, ValidatesMigrationScopeButExcludesEventReportAn
     group.set_storage_candidates({"supported"});
     group.set_event_report_storage_candidates({"unsupported"});
     std::string error;
-    EXPECT_TRUE(registry->ValidateAutomaticQuota(group, error));
+    EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
+    group.set_version(2);
     auto migration = std::make_shared<MigrationStrategy>();
     migration->set_source_storage_name("supported");
     migration->set_target_storage_name("unsupported");
     auto cache = std::make_shared<CacheConfig>();
     cache->set_migration_strategies({migration});
     group.set_cache_config(cache);
-    EXPECT_FALSE(registry->ValidateAutomaticQuota(group, error));
+    EXPECT_EQ(EC_BADARGS, registry->UpdateInstanceGroup(&context, group, 1, &error));
     auto quota = group.quota().quota_config().front();
     quota.set_storage_names({"supported"});
     group.set_quota(InstanceGroupQuota(-1, {quota}));
-    EXPECT_TRUE(registry->ValidateAutomaticQuota(group, error));
+    EXPECT_EQ(EC_OK, registry->UpdateInstanceGroup(&context, group, 1));
+    group.set_version(3);
     group.set_storage_candidates({"not_registered_yet"});
     group.set_cache_config(std::make_shared<CacheConfig>());
     quota.set_storage_names({"not_registered_yet"});
     group.set_quota(InstanceGroupQuota(-1, {quota}));
-    EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
-    EXPECT_EQ(-1, registry->ResolveQuota(group).reference_capacity);
+    EXPECT_EQ(EC_OK, registry->UpdateInstanceGroup(&context, group, 2));
+    EXPECT_EQ(-1, ResolveEffectiveQuota(group, registry->data_storage_manager().get()).reference_capacity);
 }

@@ -572,16 +572,6 @@ private:
                         const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
                         const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
-    // Standalone quota evaluation against the current registry associations.
-    // Production rounds pass their captured InstanceGroup to the overload above
-    // so a concurrent configuration update cannot mix old ratios with new pools.
-    [[nodiscard]] std::shared_ptr<WaterLevelExceed>
-    GetWaterLevelExceed(const RequestContext *request_context,
-                        const std::string &instance_group_name,
-                        const InstanceGroupQuota &instance_group_quota,
-                        const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
-
     /**
      * @brief Determine if a reclamation should be triggered for an
      * instance group based on the passed-in WaterLevelExceed instance

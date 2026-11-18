@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -30,7 +31,7 @@ public:
     std::vector<std::shared_ptr<DataStorageBackend>> GetAvailableStorages();
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
     std::vector<StorageConfig> ListStorageConfig();
-    std::map<std::string, StorageCapacitySnapshot> GetCapacitySnapshots() const;
+    std::map<std::string, StorageCapacitySnapshot> GetCapacitySnapshots(const std::set<std::string> &names) const;
 
     ErrorCode EnableStorage(const std::string &name);
     ErrorCode DisableStorage(const std::string &name);

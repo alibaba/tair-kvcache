@@ -68,7 +68,7 @@ TairMempool 复用原有探活/节点同步循环，每轮读取一次 memnode�
 
 ## 消费与观测
 
-`RegistryManager::ResolveQuota` 复用其持有的 DataStorageManager 收集快照，转调 `ResolveEffectiveQuota` 纯函数；解析算法位于 `config/effective_quota`，RegistryManager 不保存动态额度或维护刷新线程。普通写入和显式迁移目标使用 `ForAdmission()`；回收和迁移源水位使用 `ForReclaim()`。未知/过期容量在两条路径分别转换为拒绝分配、跳过容量回收，不修改展示值。沿用原有水位准入，不新增并发字节 reservation。
+`config/effective_quota` 提供 `ResolveEffectiveQuota`，接收调用方持有的 Group 配置快照和 DataStorageManager。固定额度直接使用配置，显式 auto 只读取其关联范围内的后端快照。RegistryManager 在写入配置时校验后端是否支持 auto。普通写入和显式迁移目标使用 `ForAdmission()`，回收和迁移源水位使用 `ForReclaim()`。容量未知或过期时，暂停该类型的新分配及按类型 quota 触发的回收。
 
 每次解析使用调用方持有的同一份 InstanceGroup 配置快照，比例和后端范围不会分别读取不同配置版本，避免更新时拼接“旧比例 + 新后端”而制造一次不存在的缩容。
 
@@ -78,9 +78,9 @@ Group 参考容量为已配置类型的有效 quota 之和，包含固定与自�
 
 - `quota.capacity=-1`、`total_bytes_limit_enabled=false` 表示“Group 总容量上限：无限”。
 - `reference_capacity` 表示“汇总参考容量”，只供观测。
-- `storage_types` 提供模式、比例、有效 quota、后端容量、known、usable、刷新状态及成功时间。
+- `storage_types` 提供模式、比例、有效 quota、known、usable 和刷新状态。Auto 额度另外提供后端容量和最近成功时间。
 
-`cache_manager_group.usage_ratio` 在固定正数总 quota 下沿用原分母，总量 `-1` 时使用参考容量。未知使用率为 NaN；确认零容量且有用量为 +Inf，空用量为 0，通过容量和 known 区分无容量状态。后端原有 `data_storage.storage_usage_ratio` 含义不变。
+`cache_manager_group.usage_ratio` 在固定正数总 quota 下沿用原分母。总量为 `-1` 时，仅当参考容量覆盖此次采样的全部 Group 字节用量时才计算汇总水位，否则为 NaN。分类型水位始终按各自的用量和有效额度计算。确认零容量且有用量时为 +Inf，空用量为 0。后端 `data_storage.storage_usage_ratio` 仍表示后端水位。
 
 `data_storage.total_capacity_bytes` 按 `type, unique_name` 上报每个后端的容量基数，使用同一内存快照，不新增采集请求。它未应用 Group 比例，也不汇总多个 Group；未知/不支持为 -1，失败或过期保留最近成功值，成功的零容量为 0。透明分层取两层总量的 max，主动分层按后端类型取对应介质。现有 TairMempool `storage_usage_ratio` 保留物理 DRAM 水位口径及原有过滤规则，新总量不保证是旧 ratio 的分母，不能据此相乘推算用量。同池别名各自上报，求物理总量时需避免重复相加。follower 省略该指标，降级和卸载沿用存储指标的清理机制。
 

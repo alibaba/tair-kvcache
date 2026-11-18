@@ -106,6 +106,7 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
         GroupUsageRatioMap group_usage_ratio_map;
         GroupQuotaMetricMap group_quota_metric_map;
         GroupInstanceIdMetricMap group_instance_id_metric_map;
+        const auto storage_manager = registry_manager_->data_storage_manager();
         for (const auto &instance_group : instance_groups) {
             const std::string &instance_group_name = instance_group->name();
             const auto [ec, instance_infos] =
@@ -116,7 +117,7 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
             }
             std::size_t group_byte_size = 0;
             auto &quota_metric = group_quota_metric_map[instance_group_name];
-            quota_metric.quota = registry_manager_->ResolveQuota(*instance_group);
+            quota_metric.quota = ResolveEffectiveQuota(*instance_group, storage_manager.get());
             for (const auto &instance_info : instance_infos) {
                 if (instance_info == nullptr) {
                     KVCM_LOG_WARN("instance is nullptr");
@@ -157,10 +158,25 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                                    meta_indexer->GetMemUsage(),
                                    meta_indexer->GetLocationCount()};
             }
-            int64_t capacity = instance_group->quota().capacity();
-            group_usage_ratio_map[instance_group_name] =
-                capacity == -1 ? QuotaUsageRatio(group_byte_size, quota_metric.quota.reference_capacity)
-                               : (capacity > 0 ? (static_cast<double>(group_byte_size) / capacity) : 0);
+            const int64_t capacity = instance_group->quota().capacity();
+            if (capacity == -1) {
+                // Compare the same storage usage with its configured quota.
+                // Group byte usage excludes EventReport storage.
+                auto uncovered_bytes = group_byte_size;
+                bool covered = true;
+                for (const auto &[type, bytes] : quota_metric.usage) {
+                    if (IsEventReportStorageType(type) || bytes > uncovered_bytes) {
+                        covered = false;
+                        break;
+                    }
+                    uncovered_bytes -= bytes;
+                }
+                const auto reference = covered && uncovered_bytes == 0 ? quota_metric.quota.reference_capacity : -1;
+                group_usage_ratio_map[instance_group_name] = QuotaUsageRatio(group_byte_size, reference);
+            } else {
+                group_usage_ratio_map[instance_group_name] =
+                    capacity > 0 ? static_cast<double>(group_byte_size) / capacity : 0;
+            }
         }
         {
             std::scoped_lock write_guard(mutex_);

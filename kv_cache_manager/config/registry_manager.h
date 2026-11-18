@@ -12,7 +12,6 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
-#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/registry_storage_backend.h"
 
 namespace kv_cache_manager {
@@ -51,9 +50,13 @@ public:
     ErrorCode UpdateStorage(RequestContext *request_context, const StorageConfig &storage_config, bool force_update);
     std::pair<ErrorCode, std::vector<StorageConfig>> ListStorage(RequestContext *request_context);
 
-    ErrorCode CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group);
-    ErrorCode
-    UpdateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group, int64_t current_version);
+    ErrorCode CreateInstanceGroup(RequestContext *request_context,
+                                  const InstanceGroup &instance_group,
+                                  std::string *validation_error = nullptr);
+    ErrorCode UpdateInstanceGroup(RequestContext *request_context,
+                                  const InstanceGroup &instance_group,
+                                  int64_t current_version,
+                                  std::string *validation_error = nullptr);
     ErrorCode RemoveInstanceGroup(RequestContext *request_context, const std::string &name);
     std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> GetInstanceGroup(RequestContext *request_context,
                                                                                 const std::string &name);
@@ -101,11 +104,10 @@ public:
     std::shared_ptr<const InstanceGroup> GetInstanceGroupConfig(const std::string &instance_group_name) const;
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
-    EffectiveGroupQuota ResolveQuota(const InstanceGroup &group) const;
-    bool ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:
+    bool ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const;
     static bool ValidateSimpleInstanceConfig(const InstanceGroup &instance_group,
                                              const std::vector<LocationSpecInfo> &location_spec_infos,
                                              std::string &error_message);

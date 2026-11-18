@@ -8,8 +8,8 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
-#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/account.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -132,12 +132,6 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
     : registry_storage_uri_(registry_storage_uri), metrics_registry_(std::move(metrics_registry)) {}
 
 RegistryManager::~RegistryManager() { DoCleanup(); }
-
-EffectiveGroupQuota RegistryManager::ResolveQuota(const InstanceGroup &group) const {
-    const auto manager = data_storage_manager();
-    const auto snapshots = manager ? manager->GetCapacitySnapshots() : std::map<std::string, StorageCapacitySnapshot>{};
-    return ResolveEffectiveQuota(group, snapshots, TimestampUtil::GetSteadyTimeUs());
-}
 
 bool RegistryManager::ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const {
     const auto manager = data_storage_manager();
@@ -263,11 +257,16 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
     return {EC_OK, storages};
 }
 
-ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
+ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context,
+                                               const InstanceGroup &instance_group,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
     std::string invalid_fields;
     if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
         PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
         return EC_BADARGS;
     }
@@ -285,11 +284,15 @@ ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, 
 
 ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                const InstanceGroup &instance_group,
-                                               int64_t current_version) {
+                                               int64_t current_version,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
     std::string invalid_fields;
     if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
         PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
         return EC_BADARGS;
     }

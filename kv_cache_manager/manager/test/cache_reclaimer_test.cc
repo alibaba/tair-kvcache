@@ -1644,8 +1644,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
     ins_group->quota_.set_capacity(2048);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1672,8 +1671,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
     ins_group->quota_.set_capacity(2048);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1692,8 +1690,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.5);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1727,8 +1724,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1762,8 +1758,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1797,8 +1792,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
     const auto &ins_group = instance_groups.at(0);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1824,8 +1818,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.0);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1859,8 +1852,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
     const auto &ins_group = instance_groups.at(0);
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1884,8 +1876,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
     instance_infos.clear();
     cache_reclaimer_->job_state_flag_ = true;
     auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
+                                                     *ins_group,
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1915,8 +1906,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         const auto &ins_group = instance_groups.at(0);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1943,8 +1933,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         const auto &ins_group = instance_groups.at(0);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1963,8 +1952,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         ins_group->quota_.set_capacity(0);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -1993,8 +1981,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         ins_group->quota_.set_capacity(0);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2014,8 +2001,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2043,8 +2029,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         ins_group->quota_.set_capacity(-1);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2081,8 +2066,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2113,8 +2097,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2142,8 +2125,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                         ins_group->name(),
-                                                         ins_group->quota(),
+                                                         *ins_group,
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
@@ -2175,8 +2157,7 @@ TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerByteWaterLevel) {
 
     cache_reclaimer_->job_state_flag_ = true;
     const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                   instance_group->name(),
-                                                                   instance_group->quota(),
+                                                                   *instance_group,
                                                                    instance_group->cache_config()->reclaim_strategy(),
                                                                    instance_infos);
     ASSERT_NE(nullptr, water_level);
@@ -2198,8 +2179,7 @@ TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotInflateMixedGroupByteWater
     cache_reclaimer_->job_state_flag_ = true;
 
     auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                             instance_group->name(),
-                                                             instance_group->quota(),
+                                                             *instance_group,
                                                              instance_group->cache_config()->reclaim_strategy(),
                                                              instance_infos);
     ASSERT_NE(nullptr, water_level);
@@ -2208,8 +2188,7 @@ TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotInflateMixedGroupByteWater
 
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 80);
     water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                        instance_group->name(),
-                                                        instance_group->quota(),
+                                                        *instance_group,
                                                         instance_group->cache_config()->reclaim_strategy(),
                                                         instance_infos);
     ASSERT_NE(nullptr, water_level);
@@ -2233,8 +2212,7 @@ TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevel
 
     cache_reclaimer_->job_state_flag_ = true;
     const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                   instance_group->name(),
-                                                                   instance_group->quota(),
+                                                                   *instance_group,
                                                                    instance_group->cache_config()->reclaim_strategy(),
                                                                    instance_infos);
     ASSERT_NE(nullptr, water_level);
@@ -2254,8 +2232,7 @@ TEST_F(CacheReclaimerTest, UnlimitedBytesStillEnforcesTypeAndKeyWaterLevels) {
     max_key_count = 100;
     cache_reclaimer_->job_state_flag_ = true;
     auto water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                       group->name(),
-                                                       group->quota(),
+                                                       *group,
                                                        group->cache_config()->reclaim_strategy(),
                                                        instance_infos);
     ASSERT_NE(nullptr, water);
@@ -2265,8 +2242,7 @@ TEST_F(CacheReclaimerTest, UnlimitedBytesStillEnforcesTypeAndKeyWaterLevels) {
     EXPECT_FALSE(water->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
     key_count = 100;
     water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                  group->name(),
-                                                  group->quota(),
+                                                  *group,
                                                   group->cache_config()->reclaim_strategy(),
                                                   instance_infos);
     EXPECT_TRUE(water->GetGroupKeysWaterLevelExceed());
@@ -2290,8 +2266,7 @@ TEST_F(CacheReclaimerTest, UnknownAndExpiredAutoQuotaNeverTriggerTypeEviction) {
     cache_reclaimer_->job_state_flag_ = true;
     auto check = [&]() {
         return cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     group->name(),
-                                                     group->quota(),
+                                                     *group,
                                                      group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
     };
@@ -4423,8 +4398,7 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
         std::numeric_limits<std::uint64_t>::max();
     cache_reclaimer_->job_state_flag_ = true;
     const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                   instance_group->name(),
-                                                                   instance_group->quota(),
+                                                                   *instance_group,
                                                                    instance_group->cache_config()->reclaim_strategy(),
                                                                    instance_infos);
     ASSERT_NE(nullptr, water_level);
@@ -4438,8 +4412,7 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
     key_count = 90;
     const auto key_water_level =
         cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                              instance_group->name(),
-                                              instance_group->quota(),
+                                              *instance_group,
                                               instance_group->cache_config()->reclaim_strategy(),
                                               instance_infos);
     ASSERT_NE(nullptr, key_water_level);
@@ -4455,8 +4428,7 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
         std::numeric_limits<std::uint64_t>::max();
     const auto byte_water_level =
         cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                              instance_group->name(),
-                                              instance_group->quota(),
+                                              *instance_group,
                                               instance_group->cache_config()->reclaim_strategy(),
                                               instance_infos);
     ASSERT_NE(nullptr, byte_water_level);
@@ -4471,8 +4443,7 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
     cache_reclaimer_->credited_delete_bytes_by_group_[instance_group->name()] = credit;
     const auto zero_effective_usage =
         cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                              instance_group->name(),
-                                              instance_group->quota(),
+                                              *instance_group,
                                               instance_group->cache_config()->reclaim_strategy(),
                                               instance_infos);
     ASSERT_NE(nullptr, zero_effective_usage);
@@ -5751,8 +5722,7 @@ TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenTriggerScopeChanges) {
     EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
 
     const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                           group->name(),
-                                                                           group->quota(),
+                                                                           *group,
                                                                            group->cache_config()->reclaim_strategy(),
                                                                            instance_infos);
     ASSERT_NE(nullptr, current_water_level);
@@ -5808,8 +5778,7 @@ TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenStorageTypeBecomesExceeded) {
     EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
 
     const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                           group->name(),
-                                                                           group->quota(),
+                                                                           *group,
                                                                            group->cache_config()->reclaim_strategy(),
                                                                            instance_infos);
     ASSERT_NE(nullptr, current_water_level);
@@ -5859,8 +5828,7 @@ TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenGroupBytesBecomesExceededDuri
     EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
 
     const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                                           group->name(),
-                                                                           group->quota(),
+                                                                           *group,
                                                                            group->cache_config()->reclaim_strategy(),
                                                                            instance_infos);
     ASSERT_NE(nullptr, current_water_level);
