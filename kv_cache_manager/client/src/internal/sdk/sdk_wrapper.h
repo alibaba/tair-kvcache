@@ -25,7 +25,8 @@ public:
     ClientErrorCode Init(const std::unique_ptr<ClientConfig> &client_config,
                          const InitParams &init_params,
                          const ClientMemoryRegistrations *memory_registrations = nullptr,
-                         bool wait_for_completion = false);
+                         bool wait_for_completion = false,
+                         bool exact_object_sizes = false);
 
     bool WaitsForCompletion() const { return wait_for_completion_; }
 

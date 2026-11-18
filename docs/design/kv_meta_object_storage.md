@@ -143,11 +143,11 @@ PACE URI 的 size
 本地 tensor/buffer 的总字节数
 ```
 
-三者必须一致。`KvMetaTransferClient` 持有私有 PACE SDK client，每批 I/O 前按本批对象长度更新 `spec_byte_sizes_per_block`。该配置不影响普通定长 TransferClient，也不需要修改 TairMempool provider。
+三者必须一致。`KvMetaTransferClient` 在初始化时启用 exact-object 模式，之后只读 SDK 配置；每次传输独立校验本次 URI 的长度及完整 IOV 长度，不再改写共享 `spec_byte_sizes_per_block`。普通定长 TransferClient 保留固定 spec 校验，不需要修改 TairMempool provider。
 
-同一个 object client 的 `Get` / `PutStart` 与数据传输在 data-plane mutex 内串行执行，避免地址或 write lease 在本地传输排队期间失效。确认传输成功结束后释放该锁，再执行 metadata-only 的 `PutFinish` 或 URI 不匹配回滚；OperationGuard 仍覆盖完整操作，使 `Close` 等待提交/回滚结束。不同 client 仍可并发，由服务端条件写协调。
+同一个 object client 可同时读写不同对象，调用方必须使用互不重叠的 buffer。SDK 复用既有有界线程池和任务 deadline，队列满或任务开始前已过期时不发起 I/O；线程数控制实际后端并发度，读删宽限期仍须覆盖 metadata Get 到传输完成的全部耗时。写会话由服务端条件写仲裁。OperationGuard 覆盖 metadata、传输及提交/回滚全过程，`Close` 停止准入并等待所有已接收操作结束，再销毁 wrapper 和注册。
 
-原始 `ER_SDK_TIMEOUT` 或 SDK 抛异常时，transfer client 销毁私有 wrapper 并等待后台任务退出，该 data-plane client 随后不再可用。`ER_SDK_ERROR_BUFFER_SAFE` / `ER_SDK_TIMEOUT_BUFFER_SAFE` 则允许复用本地 buffer 和 client；它们不证明远端 allocation 可以释放，不能据此发送失败 `PutFinish`。
+SDK 抛异常时，仅停止并排空本次请求已提交的任务，不销毁其他请求正在使用的 wrapper。原始 `ER_SDK_TIMEOUT` 或未知异常仍不能证明远端 DMA 已停止，调用方应隔离对应 buffer；独立 buffer 的其他请求可继续执行。`ER_SDK_ERROR_BUFFER_SAFE` / `ER_SDK_TIMEOUT_BUFFER_SAFE` 允许复用本地 buffer 和 client，但不证明远端 allocation 可以释放，不能据此发送失败 `PutFinish`。
 
 Python 注册的 host/GPU owner 由原生 holder 保活至 `Close` / SDK teardown 完成；注销 GPU 注册失败时保留相关 owner，并要求重启 worker。不能仅依赖 Python 动态属性的析构顺序。GPU 注销保护依赖配套的外源 SDK release-state 接口，PACE 适配与该 SDK 必须配对构建，不能用缺少接口的基线绕过保护。
 

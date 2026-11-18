@@ -68,6 +68,11 @@ public:
 
     // Registered-buffer clients retain memory until transfer completion. This
     // runtime policy is injected by SdkWrapper, not read from user JSON.
+    // Set once before SDK creation. Exact objects validate URI/IOV sizes per
+    // request instead of changing the shared fixed-spec table during I/O.
+    bool exact_object_sizes() const { return exact_object_sizes_; }
+    void set_exact_object_sizes(bool value) { exact_object_sizes_ = value; }
+
     int completion_wait_timeout_ms() const { return completion_wait_timeout_ms_; }
     void set_completion_wait_timeout_ms(int value) { completion_wait_timeout_ms_ = value; }
 
@@ -77,6 +82,7 @@ private:
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
     int completion_wait_timeout_ms_{0};
+    bool exact_object_sizes_{false};
     SdkTimeoutConfig timeout_config_;
 };
 

@@ -31,7 +31,8 @@ SdkWrapper::~SdkWrapper() {
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
                                  const ClientMemoryRegistrations *memory_registrations,
-                                 bool wait_for_completion) {
+                                 bool wait_for_completion,
+                                 bool exact_object_sizes) {
     wait_for_completion_ = wait_for_completion;
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
@@ -116,6 +117,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
+        sdk_backend_config->set_exact_object_sizes(exact_object_sizes);
         const auto &timeouts = wrapper_config_->timeout_config();
         sdk_backend_config->set_completion_wait_timeout_ms(
             wait_for_completion_ ? std::max(timeouts.get_timeout_ms(), timeouts.put_timeout_ms()) : 0);
@@ -308,95 +310,116 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
 
-    for (auto &task : tasks) {
-        auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
-            if (stop->load()) {
-                // No backend I/O was started. drain treats this as a known
-                // terminal state and preserves the original peer error.
-                return ER_TASK_CANCELLED;
+    try {
+        for (auto &task : tasks) {
+            auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
+                if (stop->load()) {
+                    // No backend I/O was started. drain treats this as a known
+                    // terminal state and preserves the original peer error.
+                    return ER_TASK_CANCELLED;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    auto overdue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - deadline)
+                                          .count();
+                    KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
+                    return ER_SDK_TIMEOUT_BUFFER_SAFE;
+                }
+                return task();
+            };
+            futures.push_back(wait_task_thread_pool_->async(wrapped));
+        }
+
+        // Ordinary KVCache keeps its advisory deadline. KVMeta is already called
+        // from a deadline-bounded worker and retains buffers while this call runs:
+        // wait for the backend's actual result instead of turning a late success
+        // into client teardown and permanent GPU registration quarantine.
+        auto wait_ready = [&](std::future<ClientErrorCode> &future) {
+            if (wait_for_completion_) {
+                future.wait();
+                return true;
             }
-            if (std::chrono::steady_clock::now() >= deadline) {
+            return future.wait_until(deadline) == std::future_status::ready;
+        };
+
+        // SAFE survives only when every
+        // submitted host returned success, explicit SAFE, or cancellation before I/O.
+        bool all_buffer_safe = true;
+        auto drain = [&](size_t from) {
+            stop->store(true);
+            bool timed_out = false;
+            for (size_t j = from; j < futures.size(); ++j) {
+                if (!wait_ready(futures[j])) {
+                    all_buffer_safe = false;
+                    timed_out = true;
+                    continue;
+                }
+                const auto ec = futures[j].get();
+                all_buffer_safe =
+                    all_buffer_safe && (ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+                                        ec == ER_SDK_ERROR_BUFFER_SAFE);
+                timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
+            }
+            return timed_out;
+        };
+
+        for (size_t i = 0; i < futures.size(); ++i) {
+            if (!wait_ready(futures[i])) {
                 auto overdue_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
                         .count();
-                KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
-                return ER_SDK_TIMEOUT_BUFFER_SAFE;
+                KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu), overdue_ms: %lld, "
+                              "return immediately (in-flight I/O is not cancelled and may still write caller buffer)",
+                              getOpTypeString(op_type).c_str(),
+                              timeout_ms,
+                              i + 1,
+                              futures.size(),
+                              static_cast<long long>(overdue_ms));
+                (void)drain(i + 1);
+                return ER_SDK_TIMEOUT;
             }
-            return task();
-        };
-        futures.push_back(wait_task_thread_pool_->async(wrapped));
-    }
 
-    // Ordinary KVCache keeps its advisory deadline. KVMeta is already called
-    // from a deadline-bounded worker and retains buffers while this call runs:
-    // wait for the backend's actual result instead of turning a late success
-    // into client teardown and permanent GPU registration quarantine.
-    auto wait_ready = [&](std::future<ClientErrorCode> &future) {
+            auto ec = futures[i].get();
+            if (ec != ER_OK) {
+                KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
+                              getOpTypeString(op_type).c_str(),
+                              static_cast<int>(ec));
+                all_buffer_safe =
+                    ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || ec == ER_SDK_ERROR_BUFFER_SAFE;
+                const bool peer_timed_out = drain(i + 1);
+                if (ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || peer_timed_out) {
+                    return all_buffer_safe ? ER_SDK_TIMEOUT_BUFFER_SAFE : ER_SDK_TIMEOUT;
+                }
+                if (all_buffer_safe) {
+                    return ER_SDK_ERROR_BUFFER_SAFE;
+                }
+                // A SAFE first error cannot conceal an unknown peer failure.
+                return ec == ER_SDK_ERROR_BUFFER_SAFE || ec == ER_TASK_CANCELLED
+                           ? (op_type == OpType::GET ? ER_SDKREAD_ERROR : ER_SDKWRITE_ERROR)
+                           : ec;
+            }
+        }
+
+        return ER_OK;
+    } catch (...) {
+        // Only this operation's tasks are ours to stop/drain. In KVMeta mode
+        // keep the shared wrapper and registrations alive for unrelated I/O.
+        // A thrown task may still have submitted remote DMA, so preserve the
+        // exception; draining host workers alone does not prove BufferSafe.
         if (wait_for_completion_) {
-            future.wait();
-            return true;
-        }
-        return future.wait_until(deadline) == std::future_status::ready;
-    };
-
-    // SAFE survives only when every
-    // submitted host returned success, explicit SAFE, or cancellation before I/O.
-    bool all_buffer_safe = true;
-    auto drain = [&](size_t from) {
-        stop->store(true);
-        bool timed_out = false;
-        for (size_t j = from; j < futures.size(); ++j) {
-            if (!wait_ready(futures[j])) {
-                all_buffer_safe = false;
-                timed_out = true;
-                continue;
+            stop->store(true);
+            for (auto &future : futures) {
+                if (future.valid()) {
+                    try {
+                        (void)future.get();
+                    } catch (...) {
+                        // Continue draining every submitted peer before rethrow.
+                    }
+                }
             }
-            const auto ec = futures[j].get();
-            all_buffer_safe = all_buffer_safe && (ec == ER_OK || ec == ER_TASK_CANCELLED ||
-                                                  ec == ER_SDK_TIMEOUT_BUFFER_SAFE || ec == ER_SDK_ERROR_BUFFER_SAFE);
-            timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
         }
-        return timed_out;
-    };
-
-    for (size_t i = 0; i < futures.size(); ++i) {
-        if (!wait_ready(futures[i])) {
-            auto overdue_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
-                    .count();
-            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu), overdue_ms: %lld, "
-                          "return immediately (in-flight I/O is not cancelled and may still write caller buffer)",
-                          getOpTypeString(op_type).c_str(),
-                          timeout_ms,
-                          i + 1,
-                          futures.size(),
-                          static_cast<long long>(overdue_ms));
-            (void)drain(i + 1);
-            return ER_SDK_TIMEOUT;
-        }
-
-        auto ec = futures[i].get();
-        if (ec != ER_OK) {
-            KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
-                          getOpTypeString(op_type).c_str(),
-                          static_cast<int>(ec));
-            all_buffer_safe =
-                ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || ec == ER_SDK_ERROR_BUFFER_SAFE;
-            const bool peer_timed_out = drain(i + 1);
-            if (ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || peer_timed_out) {
-                return all_buffer_safe ? ER_SDK_TIMEOUT_BUFFER_SAFE : ER_SDK_TIMEOUT;
-            }
-            if (all_buffer_safe) {
-                return ER_SDK_ERROR_BUFFER_SAFE;
-            }
-            // A SAFE first error cannot conceal an unknown peer failure.
-            return ec == ER_SDK_ERROR_BUFFER_SAFE || ec == ER_TASK_CANCELLED
-                       ? (op_type == OpType::GET ? ER_SDKREAD_ERROR : ER_SDKWRITE_ERROR)
-                       : ec;
-        }
+        throw;
     }
-
-    return ER_OK;
 }
 
 ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,

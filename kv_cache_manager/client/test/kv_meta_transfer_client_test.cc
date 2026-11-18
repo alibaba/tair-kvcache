@@ -1,17 +1,26 @@
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
 #include <thread>
+#include <unistd.h>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/client/src/kv_meta_object_client_impl.h"
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
@@ -101,6 +110,11 @@ public:
     ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &config,
                          const std::shared_ptr<StorageConfig> &) override {
         config_ = config;
+        const auto pace = std::dynamic_pointer_cast<TairMempoolSdkConfig>(config);
+        if (pace) {
+            registered_base = pace->client_base();
+            registered_size = pace->shm_size();
+        }
         return ER_OK;
     }
 
@@ -111,9 +125,10 @@ public:
             before_io(uris);
         }
         std::this_thread::sleep_for(delay);
+        std::lock_guard<std::mutex> lock(records_mutex_);
         loaded = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
-        return load_result;
+        return result_for ? result_for(uris) : load_result;
     }
 
     ClientErrorCode Put(const std::vector<DataStorageUri> &uris,
@@ -123,18 +138,23 @@ public:
             before_io(uris);
         }
         std::this_thread::sleep_for(delay);
+        std::lock_guard<std::mutex> lock(records_mutex_);
         saved = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
-        if (save_result == ER_OK) {
+        const auto result = result_for ? result_for(uris) : save_result;
+        if (result == ER_OK) {
             *actual_uris = uris;
         }
-        return save_result;
+        return result;
     }
 
+    void *registered_base{nullptr};
+    std::size_t registered_size{0};
     ClientErrorCode load_result = ER_OK;
     ClientErrorCode save_result = ER_OK;
     std::chrono::milliseconds delay{0};
     std::function<void(const std::vector<DataStorageUri> &)> before_io;
+    std::function<ClientErrorCode(const std::vector<DataStorageUri> &)> result_for;
     UriStrVec loaded;
     UriStrVec saved;
     std::map<std::string, std::int64_t> seen_sizes;
@@ -154,6 +174,7 @@ private:
     }
 
     std::shared_ptr<SdkBackendConfig> config_;
+    std::mutex records_mutex_;
 };
 
 class RecordingSdkFactory final : public SdkFactory {
@@ -172,7 +193,8 @@ std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory
                                                              RecordingSdk *&recording,
                                                              std::uint64_t max_object_bytes = 32,
                                                              int timeout_ms = 1000,
-                                                             std::size_t thread_count = 1) {
+                                                             std::size_t thread_count = 1,
+                                                             const ClientMemoryRegistrations *registrations = nullptr) {
     auto config = std::make_unique<ClientConfig>();
     EXPECT_TRUE(config->FromJsonString(R"({
         "instance_group": "group",
@@ -200,7 +222,8 @@ std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory
     }])";
     auto wrapper = std::make_unique<SdkWrapper>();
     wrapper->sdk_factory_ = &factory;
-    EXPECT_EQ(ER_OK, wrapper->Init(config, params, nullptr, /*wait_for_completion=*/true));
+    EXPECT_EQ(ER_OK,
+              wrapper->Init(config, params, registrations, /*wait_for_completion=*/true, /*exact_object_sizes=*/true));
     recording = factory.sdk.get();
 
     auto client = std::make_unique<KvMetaTransferClientImpl>();
@@ -210,7 +233,7 @@ std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory
     return client;
 }
 
-TEST(KvMetaTransferClientTest, ValidatesAndAppliesOnlyTheCurrentBatchSizes) {
+TEST(KvMetaTransferClientTest, ValidatesEachRequestWithoutMutatingTheFixedSpecTable) {
     RecordingSdkFactory factory;
     RecordingSdk *recording = nullptr;
     auto client = MakeTransferClient(factory, recording);
@@ -231,12 +254,12 @@ TEST(KvMetaTransferClientTest, ValidatesAndAppliesOnlyTheCurrentBatchSizes) {
 
     EXPECT_EQ(ER_OK, client->LoadObjects(uris, sizes, buffers));
     EXPECT_EQ(uris, recording->loaded);
-    EXPECT_EQ((std::map<std::string, std::int64_t>{{"5", 5}, {"9", 9}}), recording->seen_sizes);
+    EXPECT_EQ((std::map<std::string, std::int64_t>{{"value", 1}}), recording->seen_sizes);
     const auto [save_ec, actual] = client->SaveObjects(uris, sizes, buffers);
     EXPECT_EQ(ER_OK, save_ec);
     EXPECT_EQ(uris, actual);
     EXPECT_EQ(uris, recording->saved);
-    EXPECT_EQ((std::map<std::string, std::int64_t>{{"5", 5}, {"9", 9}}), recording->seen_sizes);
+    EXPECT_EQ((std::map<std::string, std::int64_t>{{"value", 1}}), recording->seen_sizes);
 
     EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(uris, {5, 8}, buffers));
     auto short_buffers = buffers;
@@ -326,27 +349,22 @@ TEST(KvMetaTransferClientTest, CompletedBackendFailuresPreserveRegistrationForRe
     }
 }
 
-TEST(KvMetaTransferClientTest, TimeoutDrainsBackendAndClosesDataPlane) {
+TEST(KvMetaTransferClientTest, RejectsAdvisoryModeBeforeSubmittingAnyIo) {
     RecordingSdkFactory factory;
     RecordingSdk *recording = nullptr;
-    auto client = MakeTransferClient(factory, recording, 32, 10);
-    ASSERT_NE(nullptr, recording);
-    client->sdk_wrapper_->wait_for_completion_ = false; // Exercise the legacy advisory-timeout defense.
-    recording->delay = std::chrono::milliseconds(50);
-
+    auto client = MakeTransferClient(factory, recording);
+    client->sdk_wrapper_->wait_for_completion_ = false;
     char value[5]{};
     const UriStrVec uris{"pace://pace/1?media_type=0&node_id=1&range_id=0&size=5"};
     BlockBuffer buffer;
     buffer.iovs.push_back({MemoryType::CPU, value, sizeof(value), false});
-    const BlockBuffers buffers{buffer};
-
-    const auto begin = std::chrono::steady_clock::now();
-    EXPECT_EQ(ER_SDK_TIMEOUT, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
-    EXPECT_GE(std::chrono::steady_clock::now() - begin, std::chrono::milliseconds(40));
-    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {sizeof(value)}, buffers));
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {5}, {buffer}));
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->SaveObjects(uris, {5}, {buffer}).first);
+    EXPECT_TRUE(recording->loaded.empty());
+    EXPECT_TRUE(recording->saved.empty());
 }
 
-TEST(KvMetaTransferClientTest, ExceptionDrainsPendingPeerBeforeReturningAndClosesDataPlane) {
+TEST(KvMetaTransferClientTest, ExceptionDrainsItsOwnPeersAndPreservesTheSharedWrapper) {
     for (const bool save : {false, true}) {
         SCOPED_TRACE(save ? "save" : "load");
         RecordingSdkFactory factory;
@@ -387,8 +405,233 @@ TEST(KvMetaTransferClientTest, ExceptionDrainsPendingPeerBeforeReturningAndClose
         EXPECT_EQ(std::future_status::timeout, operation.wait_for(std::chrono::milliseconds(50)));
         release_peer.set_value();
         EXPECT_THROW((void)operation.get(), std::runtime_error);
-        EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {1, 1}, buffers));
-        EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->SaveObjects(uris, {1, 1}, buffers).first);
+        recording->before_io = {};
+        EXPECT_EQ(ER_OK, client->LoadObjects(uris, {1, 1}, buffers));
+        EXPECT_EQ(ER_OK, client->SaveObjects(uris, {1, 1}, buffers).first);
+    }
+}
+
+// The object API below uses the real transfer client, wrapper, and SDK task
+// pool. Barriers are inside the backend Get/Put, not at Python/API entry.
+class ConcurrentMetadata final : public KvMetaClient {
+public:
+    std::pair<ClientErrorCode, std::string>
+    RegisterInstance(const std::string &, const std::string &, const std::string &) override {
+        return {ER_OK, "[]"};
+    }
+    std::pair<ClientErrorCode, KvMetaInstanceInfo> GetInstanceInfo(const std::string &) override { return {ER_OK, {}}; }
+    std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &,
+                                                    const std::vector<std::string> &keys) override {
+        KvMetaGetResult result;
+        for (const auto &key : keys) {
+            result.hit_mask.push_back(true);
+            result.locations.push_back(LocationFor(std::stoull(key)));
+        }
+        return {ER_OK, std::move(result)};
+    }
+    std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace,
+                                                                  const std::vector<std::string> &keys,
+                                                                  const std::vector<std::uint64_t> &sizes,
+                                                                  std::int32_t) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto &key : keys) {
+            if (active_keys.count(key)) {
+                return {ER_SERVICE_WRITE_IN_PROGRESS, {}};
+            }
+        }
+        KvMetaStartWriteResult result;
+        result.write_session_id = trace;
+        result.key_mask.assign(keys.size(), false);
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            active_keys.insert(keys[i]);
+            result.locations.push_back(LocationFor(sizes[i]));
+        }
+        sessions[trace] = keys;
+        return {ER_OK, std::move(result)};
+    }
+    ClientErrorCode FinishWrite(const std::string &, const std::string &session, const std::vector<bool> &) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++finish_count;
+        for (const auto &key : sessions[session]) {
+            active_keys.erase(key);
+        }
+        sessions.erase(session);
+        return ER_OK;
+    }
+    ClientErrorCode Remove(const std::string &, const std::vector<std::string> &) override { return ER_OK; }
+    static KvMetaValueLocation LocationFor(std::uint64_t size) {
+        KvMetaValueLocation location;
+        location.type = KvMetaStorageType::TAIR_MEMPOOL;
+        location.value_size = size;
+        location.location_specs.push_back({"value",
+                                           "pace://pace/" + std::to_string(size) +
+                                               "?media_type=0&node_id=1&range_id=0&size=" + std::to_string(size)});
+        return location;
+    }
+    std::atomic<int> finish_count{0};
+
+private:
+    std::mutex mutex;
+    std::set<std::string> active_keys;
+    std::map<std::string, std::vector<std::string>> sessions;
+};
+
+BlockBuffer RegionBuffer(char *base, std::size_t size) {
+    BlockBuffer buffer;
+    buffer.iovs.push_back({MemoryType::CPU, base, size, false});
+    return buffer;
+}
+
+TEST(KvMetaTransferClientConcurrencyTest, SingleClientHasMultipleDifferentSizeReadsAndWritesInFlight) {
+    using namespace std::chrono_literals;
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(std::tmpfile(), &std::fclose);
+    ASSERT_NE(nullptr, file);
+    ASSERT_EQ(0, ftruncate(fileno(file.get()), 17));
+    void *mapping = mmap(nullptr, 17, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file.get()), 0);
+    ASSERT_NE(MAP_FAILED, mapping);
+    const auto unmap = [](char *base) { munmap(base, 17); };
+    std::unique_ptr<char, decltype(unmap)> region(static_cast<char *>(mapping), unmap);
+    ClientMemoryRegistrations registrations;
+    registrations.host = {region.get(), 17, fileno(file.get())};
+    RecordingSdkFactory factory;
+    RecordingSdk *recording = nullptr;
+    auto transfer = MakeTransferClient(factory, recording, 32, 5000, 4, &registrations);
+    ASSERT_EQ(region.get(), recording->registered_base);
+    ASSERT_EQ(17, recording->registered_size);
+    auto metadata = std::make_unique<ConcurrentMetadata>();
+    KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 32, 30);
+    std::mutex mutex;
+    std::condition_variable condition;
+    int active = 0;
+    bool released = false;
+    recording->before_io = [&](const auto &) {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++active;
+        condition.notify_all();
+        condition.wait(lock, [&] { return released; });
+    };
+    std::vector<std::future<ClientErrorCode>> operations;
+    std::size_t offset = 0;
+    for (const std::size_t size : {2, 3, 5, 7}) {
+        char *base = region.get() + offset;
+        offset += size;
+        const bool write = size > 3;
+        operations.push_back(std::async(std::launch::async, [&, size, base, write] {
+            const auto key = std::to_string(size);
+            return write ? client.SaveObjects(key, {key}, {size}, {RegionBuffer(base, size)})
+                         : client.LoadObjects(key, {key}, {size}, {RegionBuffer(base, size)});
+        }));
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        EXPECT_TRUE(condition.wait_for(lock, 2s, [&] { return active == 4; }));
+    }
+    auto close = std::async(std::launch::async, [&] { client.Close(); });
+    EXPECT_EQ(std::future_status::timeout, close.wait_for(50ms));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        condition.notify_all();
+    }
+    for (auto &operation : operations) {
+        EXPECT_EQ(ER_OK, operation.get());
+    }
+    EXPECT_EQ(std::future_status::ready, close.wait_for(2s));
+    close.get();
+    EXPECT_EQ((std::map<std::string, std::int64_t>{{"value", 1}}), recording->seen_sizes);
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.LoadObjects("closed", {"2"}, {2}, {RegionBuffer(region.get(), 2)}));
+}
+
+TEST(KvMetaTransferClientConcurrencyTest, SameKeyWritesAreArbitratedBeforeASecondDataTransfer) {
+    using namespace std::chrono_literals;
+    RecordingSdkFactory factory;
+    RecordingSdk *recording = nullptr;
+    auto transfer = MakeTransferClient(factory, recording, 32, 5000, 2);
+    KvMetaObjectClientImpl client(std::make_unique<ConcurrentMetadata>(), std::move(transfer), 32, 30);
+    char region[10]{};
+    std::promise<void> entered, release;
+    auto began = entered.get_future();
+    auto released = release.get_future().share();
+    std::atomic<int> transfers{0};
+    recording->before_io = [&](const auto &) {
+        ++transfers;
+        entered.set_value();
+        released.wait();
+    };
+    auto first = std::async(std::launch::async,
+                            [&] { return client.SaveObjects("first", {"5"}, {5}, {RegionBuffer(region, 5)}); });
+    EXPECT_EQ(std::future_status::ready, began.wait_for(2s));
+    auto conflict = std::async(std::launch::async,
+                               [&] { return client.SaveObjects("second", {"5"}, {5}, {RegionBuffer(region + 5, 5)}); });
+    EXPECT_EQ(std::future_status::ready, conflict.wait_for(2s));
+    release.set_value();
+    EXPECT_EQ(ER_SERVICE_WRITE_IN_PROGRESS, conflict.get());
+    EXPECT_EQ(ER_OK, first.get());
+    EXPECT_EQ(1, transfers);
+}
+
+TEST(KvMetaTransferClientConcurrencyTest, TimeoutOrExceptionDoesNotDrainAnUnrelatedOperation) {
+    using namespace std::chrono_literals;
+    for (const bool write : {false, true}) {
+        for (int mode = 0; mode < 3; ++mode) {
+            SCOPED_TRACE(write);
+            SCOPED_TRACE(mode);
+            RecordingSdkFactory factory;
+            RecordingSdk *recording = nullptr;
+            auto transfer = MakeTransferClient(factory, recording, 32, 5000, 3);
+            auto metadata = std::make_unique<ConcurrentMetadata>();
+            auto *meta = metadata.get();
+            KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 32, 30);
+            std::promise<void> other_started, release;
+            auto began = other_started.get_future().share();
+            auto released = release.get_future().share();
+            recording->before_io = [&](const auto &uris) {
+                const auto size = uris.front().GetParam("size");
+                if (size == "7") {
+                    other_started.set_value();
+                    released.wait();
+                }
+                if (size == "5" && mode == 2) {
+                    throw std::runtime_error("injected task exception");
+                }
+            };
+            recording->result_for = [&](const auto &uris) {
+                return uris.front().GetParam("size") != "5" ? ER_OK
+                       : mode == 0                          ? ER_SDK_TIMEOUT_BUFFER_SAFE
+                                                            : ER_SDK_TIMEOUT;
+            };
+            char region[15]{};
+            auto other = std::async(std::launch::async,
+                                    [&] { return client.LoadObjects("other", {"7"}, {7}, {RegionBuffer(region, 7)}); });
+            EXPECT_EQ(std::future_status::ready, began.wait_for(2s));
+            auto failure = std::async(std::launch::async, [&] {
+                return write
+                           ? client.SaveObjectsWithTransferState("failure", {"5"}, {5}, {RegionBuffer(region + 7, 5)})
+                           : client.LoadObjectsWithTransferState("failure", {"5"}, {5}, {RegionBuffer(region + 7, 5)});
+            });
+            const bool completed = failure.wait_for(2s) == std::future_status::ready;
+            EXPECT_TRUE(completed);
+            if (completed) {
+                const auto result = failure.get();
+                EXPECT_EQ(mode == 0   ? ER_SDK_TIMEOUT_BUFFER_SAFE
+                          : mode == 1 ? ER_SDK_TIMEOUT
+                          : write     ? ER_SDKWRITE_ERROR
+                                      : ER_SDKREAD_ERROR,
+                          result.ec);
+                EXPECT_EQ(mode != 0, result.data_transfer_may_be_inflight);
+                EXPECT_EQ(0, meta->finish_count);
+                EXPECT_EQ(ER_OK, client.LoadObjects("next", {"3"}, {3}, {RegionBuffer(region + 12, 3)}));
+            }
+            EXPECT_EQ(std::future_status::timeout, other.wait_for(20ms));
+            auto close = std::async(std::launch::async, [&] { client.Close(); });
+            EXPECT_EQ(std::future_status::timeout, close.wait_for(20ms));
+            release.set_value();
+            if (!completed) {
+                (void)failure.get();
+            }
+            EXPECT_EQ(ER_OK, other.get());
+            close.get();
+        }
     }
 }
 

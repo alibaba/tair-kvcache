@@ -85,9 +85,6 @@ private:
     std::unique_ptr<KvMetaTransferClient> transfer_client_;
     std::uint64_t max_object_bytes_{0};
     std::int32_t write_timeout_seconds_{0};
-    // Transfer I/O is already serialized; acquire the same logical gate
-    // before metadata calls so queueing cannot consume a write lease.
-    std::mutex data_plane_mutex_;
     std::mutex mutex_;
     std::condition_variable lifecycle_condition_;
     std::size_t active_operations_{0};

@@ -1099,7 +1099,7 @@ TEST(KvMetaObjectClientDependencyTest, CompletedTransferUnlocksBeforeFinishAndCl
     }
 }
 
-TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartingTheirWriteLeases) {
+TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesReachServerArbitrationIndependently) {
     using namespace std::chrono_literals;
     char payload = 0;
     auto control = std::make_shared<BlockingStartControl>();
@@ -1115,8 +1115,7 @@ TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartin
     bool first_entered = false;
     {
         std::unique_lock<std::mutex> lock(control->mutex);
-        first_entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered_count == 1; });
-        EXPECT_FALSE(control->condition.wait_for(lock, 50ms, [&]() { return control->entered_count == 2; }));
+        first_entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered_count == 2; });
         control->released = true;
         control->condition.notify_all();
     }
@@ -1127,7 +1126,7 @@ TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartin
     EXPECT_EQ(2, control->entered_count);
 }
 
-TEST(KvMetaObjectClientDependencyTest, AQueuedSaveDoesNotStartItsLeaseBehindAnActiveLoad) {
+TEST(KvMetaObjectClientDependencyTest, AnActiveLoadDoesNotBlockAnIndependentStartWrite) {
     using namespace std::chrono_literals;
     char payload = 0;
     auto control = std::make_shared<BlockingStartControl>();
@@ -1159,7 +1158,7 @@ TEST(KvMetaObjectClientDependencyTest, AQueuedSaveDoesNotStartItsLeaseBehindAnAc
     }
     ASSERT_TRUE(entered);
     auto save = std::async(std::launch::async, [&]() { return client.SaveObjects("save", keys, sizes, buffers); });
-    EXPECT_EQ(std::future_status::timeout, save.wait_for(50ms));
+    EXPECT_EQ(std::future_status::ready, save.wait_for(2s));
     {
         std::lock_guard<std::mutex> lock(control->mutex);
         control->released = true;

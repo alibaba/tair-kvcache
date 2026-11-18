@@ -54,6 +54,7 @@ cc_test(
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/client:kv_meta_object_client_impl",
     ],
 )
 

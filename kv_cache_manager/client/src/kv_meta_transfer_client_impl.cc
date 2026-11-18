@@ -1,7 +1,6 @@
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 
 #include <limits>
-#include <map>
 #include <sys/stat.h>
 #include <utility>
 
@@ -138,7 +137,8 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
     const auto ec = sdk_wrapper_->Init(client_config_,
                                        init_params,
                                        memory_registrations,
-                                       /*wait_for_completion=*/true);
+                                       /*wait_for_completion=*/true,
+                                       /*exact_object_sizes=*/true);
     if (ec != ER_OK) {
         sdk_wrapper_.reset();
         client_config_.reset();
@@ -154,27 +154,12 @@ ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_v
     if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
         return ec;
     }
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    if (!sdk_wrapper_) {
+    if (!sdk_wrapper_ || !sdk_wrapper_->WaitsForCompletion()) {
         return ER_INVALID_SDKWRAPPER_CONFIG;
     }
-    SetAllowedObjectSizes(value_sizes);
-    ClientErrorCode ec;
-    try {
-        ec = sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
-    } catch (...) {
-        // A failed future can leave peer tasks running. Join them before
-        // the caller reuses buffers or reports the write session finished.
-        sdk_wrapper_.reset();
-        throw;
-    }
-    if (ec == ER_SDK_TIMEOUT && !sdk_wrapper_->WaitsForCompletion()) {
-        // Advisory deadlines may return while a local worker still uses the
-        // size config. Drain that legacy mode. KVMeta normally waits for every
-        // worker's result: a backend timeout can still mean unknown remote DMA,
-        // so retain its registration while the caller quarantines the buffer.
-        sdk_wrapper_.reset();
-    }
+    // Init selects completion-wait mode. The wrapper remains immutable and
+    // drains this operation's host tasks on exceptions without closing peers.
+    const auto ec = sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
     return ec;
 }
 
@@ -183,22 +168,11 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
         return {ec, {}};
     }
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    if (!sdk_wrapper_) {
+    if (!sdk_wrapper_ || !sdk_wrapper_->WaitsForCompletion()) {
         return {ER_INVALID_SDKWRAPPER_CONFIG, {}};
     }
-    SetAllowedObjectSizes(value_sizes);
     auto actual_locations = std::make_shared<std::vector<DataStorageUri>>();
-    ClientErrorCode ec;
-    try {
-        ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
-    } catch (...) {
-        sdk_wrapper_.reset();
-        throw;
-    }
-    if (ec == ER_SDK_TIMEOUT && !sdk_wrapper_->WaitsForCompletion()) {
-        sdk_wrapper_.reset();
-    }
+    const auto ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
     if (ec != ER_OK) {
         // Reserve these codes for this client's pre-I/O validation above.
         // A backend can report the same code after submitting work; do not
@@ -255,20 +229,6 @@ ClientErrorCode KvMetaTransferClientImpl::ValidateObjects(const UriStrVec &uri_s
         }
     }
     return ER_OK;
-}
-
-void KvMetaTransferClientImpl::SetAllowedObjectSizes(const std::vector<std::uint64_t> &value_sizes) {
-    std::map<std::string, std::int64_t> sizes;
-    for (const std::uint64_t size : value_sizes) {
-        sizes.emplace(std::to_string(size), static_cast<std::int64_t>(size));
-    }
-    const auto wrapper_config = client_config_->sdk_wrapper_config();
-    for (const auto type :
-         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
-        if (const auto config = wrapper_config->GetSdkBackendConfig(type)) {
-            config->set_spec_byte_sizes_per_block(sizes);
-        }
-    }
 }
 
 std::vector<DataStorageUri> KvMetaTransferClientImpl::ParseLocations(const UriStrVec &uri_str_vec) {

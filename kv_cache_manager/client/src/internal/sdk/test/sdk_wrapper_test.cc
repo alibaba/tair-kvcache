@@ -111,6 +111,19 @@ private:
     std::string root_path_;
 };
 
+TEST_F(SdkWrapperTest, ExactObjectPolicyIsOnlyInjectedWhenRequested) {
+    for (const bool exact : {false, true}) {
+        auto config = CreateTestClientConfig();
+        SdkWrapper wrapper;
+        ASSERT_EQ(ER_OK, wrapper.Init(config, init_params_, nullptr, true, exact));
+        const auto backend = config->sdk_wrapper_config()->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        ASSERT_NE(nullptr, backend);
+        EXPECT_EQ(exact, backend->exact_object_sizes());
+        EXPECT_EQ(config->location_spec_infos(), backend->spec_byte_sizes_per_block());
+        EXPECT_EQ(std::string::npos, backend->ToJsonString().find("exact_object_sizes"));
+    }
+}
+
 TEST_F(SdkWrapperTest, TestInit) {
     SdkWrapper sdk_wrapper;
     ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
