@@ -144,13 +144,13 @@ bool RegistryManager::ValidateAutomaticQuota(const InstanceGroup &group, std::st
     if (!manager) {
         return true; // Missing backends remain unknown during recovery.
     }
-    const auto effective = ResolveQuota(group);
     const auto associated = GetQuotaStorageNames(group);
-    for (const auto &[type, value] : effective.types) {
-        if (!value.config.automatic()) {
+    for (const auto &quota : group.quota().quota_config()) {
+        if (!quota.automatic()) {
             continue;
         }
-        const auto &scope = value.config.storage_names();
+        const auto type = ToBaseType(quota.storage_spec());
+        const auto &scope = quota.storage_names();
         const auto names = scope.empty() ? associated : std::set<std::string>(scope.begin(), scope.end());
         for (const auto &name : names) {
             const auto backend = manager->GetDataStorageBackend(name);

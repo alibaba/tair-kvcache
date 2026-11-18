@@ -19,7 +19,8 @@ TEST_F(InstanceGroupTest, DynamicQuotaProtoAndPersistenceRoundTrip) {
     proto::admin::InstanceGroup wire;
     InstanceGroup defaults;
     ProtoConvert::InstanceGroupFromProto(&wire, defaults);
-    EXPECT_EQ(-1, defaults.quota().capacity());
+    EXPECT_EQ(0, defaults.quota().capacity());
+    EXPECT_TRUE(defaults.quota().quota_config().empty());
     wire.mutable_quota()->set_capacity(0);
     InstanceGroup zero;
     ProtoConvert::InstanceGroupFromProto(&wire, zero);

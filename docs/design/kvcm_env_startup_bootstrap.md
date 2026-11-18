@@ -115,7 +115,7 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `name` | 是 | 无 |
 | `meta_storage_backend_config` | 是 | 无 |
 | `user_data` | 否 | Group 名称 |
-| `quota_capacity` | 否 | `-1`，总字节不限额、分类型自动 100%；升级同步未显式配置时保留已有 quota |
+| `quota_capacity` | 否 | 新建默认 1000000000 字节，主存储类型使用相同的固定额度。显式 `-1` 关闭总字节限制。Reconcile 省略时保留已有 quota，设为 `-1` 时保留已有分类型额度 |
 | `max_instance_count` | 否 | 512 |
 | `reclaim_policy` | 否 | `POLICY_LRU` |
 | `reclaim_used_percentage` | 否 | 0.8 |

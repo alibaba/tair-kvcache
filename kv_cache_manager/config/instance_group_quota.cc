@@ -27,6 +27,10 @@ bool InstanceGroupQuota::ValidateRequiredFields(std::string &invalid_fields) con
     std::set<DataStorageType> types;
     for (const auto &config : quota_config_) {
         valid = config.ValidateRequiredFields(local_invalid_fields) && valid;
+        if (!config.automatic() && config.capacity() < 0) {
+            valid = false;
+            local_invalid_fields += "{fixed quota capacity must be non-negative}";
+        }
         if (!types.insert(ToBaseType(config.storage_spec())).second) {
             valid = false;
             local_invalid_fields += "{duplicate storage_type}";

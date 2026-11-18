@@ -406,8 +406,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     using UsageArray = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
     UsageArray usage_by_type{};
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> quota_type_needed{};
-    const auto effective_quota = registry_manager_->ResolveQuota(*group);
-    const auto quota = effective_quota.ForAdmission();
+    const auto quota = registry_manager_->ResolveQuota(*group).ForAdmission();
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
         if (type_idx < quota_type_needed.size()) {
@@ -449,9 +448,6 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
         quota.capacity() != -1 &&
         (quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity()));
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> type_quota_exceeded{};
-    // Unlimited groups default associated types to auto. An arbitrary explicit
-    // target with no association must not inherit legacy unlimited-by-type admission.
-    type_quota_exceeded.fill(effective_quota.automatic_defaults);
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
         if (type_idx >= type_quota_exceeded.size()) {

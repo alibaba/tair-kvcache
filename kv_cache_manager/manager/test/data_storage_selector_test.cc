@@ -861,7 +861,7 @@ TEST_F(DataStorageSelectorTest, QuotaResolutionKeepsTheCapturedConfigurationDuri
     EXPECT_EQ(100, registry->ResolveQuota(*updated).reference_capacity);
 }
 
-TEST_F(DataStorageSelectorTest, AutomaticDefaultsRequireAnAssociationForExplicitTargetTypes) {
+TEST_F(DataStorageSelectorTest, ExplicitAutoQuotaRequiresCapacityForExplicitTargets) {
     const auto registry = data_storage_selector_->registry_manager_;
     registry->data_storage_manager_ = data_storage_manager_g;
     registry->instance_group_configs_[instance_group_g->name()] = instance_group_g;
@@ -869,12 +869,12 @@ TEST_F(DataStorageSelectorTest, AutomaticDefaultsRequireAnAssociationForExplicit
         data_storage_manager_g->storage_map_[backend->GetStorageConfig().global_unique_name()] = backend;
     }
     instance_group_g->set_storage_candidates({"3fs_storage_01"});
-    instance_group_g->set_quota(InstanceGroupQuota(-1, {QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_HF3FS)}));
+    QuotaConfig nfs(0, DataStorageType::DATA_STORAGE_TYPE_NFS);
+    nfs.set_mode("auto");
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {nfs}));
     auto admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
     EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[0].status);
-    // Adding NFS to the group automatically creates its quota, even though the
-    // only explicit override is the fixed HF3FS entry.
     instance_group_g->set_storage_candidates({"3fs_storage_01", "nfs_storage_00"});
     std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot = {
         200, 1000, TimestampUtil::GetSteadyTimeUs(), EC_OK};
@@ -925,6 +925,12 @@ TEST_F(DataStorageSelectorTest, UnlimitedTotalUsesDynamicTypeQuotaForNormalAndEx
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
     EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[0].status);
     EXPECT_EQ(100, registry->ResolveQuota(*instance_group_g).types.at(DataStorageType::DATA_STORAGE_TYPE_NFS).capacity);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {hf3fs}));
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00", "3fs_storage_01"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[1].status);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {nfs, hf3fs}));
     snapshot = {50, 1001, TimestampUtil::GetSteadyTimeUs(), EC_OK};
     admitted = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});

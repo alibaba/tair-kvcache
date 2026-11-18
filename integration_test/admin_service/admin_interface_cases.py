@@ -328,12 +328,13 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         listed = self._client.list_instance_group({"trace_id": self._trace_id})["instance_group"]
         self.assertTrue(any(item["name"] == group["name"] and "runtime_quota" in item for item in listed))
 
-    def test_new_group_defaults_to_unlimited_auto_and_rejects_invalid_ratio(self):
+    def test_new_group_defaults_to_legacy_quota_and_rejects_invalid_values(self):
         group = self.make_sample_instance_group()
         del group["quota"]
         self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
         result = self._client.get_instance_group({"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
-        self.assertEqual(-1, int(result["quota"]["capacity"]))
+        self.assertEqual(0, int(result["quota"].get("capacity", 0)))
+        self.assertEqual([], result["runtime_quota"].get("storage_types", []))
         for ratio in (0, -0.1, 1.1):
             group["name"] = "invalid_quota_group"
             group["quota"] = {"capacity": -1, "quota_config": [
@@ -341,31 +342,44 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
             response = self._client.create_instance_group(
                 {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
             self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+        group["name"] = "negative_fixed_quota_group"
+        group["quota"] = {"capacity": -1, "quota_config": [
+            {"storage_type": "ST_NFS", "capacity": -1}]}
+        response = self._client.create_instance_group(
+            {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+        self.assertIn("fixed quota capacity", response["header"]["status"]["message"])
 
     def test_unsupported_capacity_rejects_auto_create_and_update_but_allows_fixed(self):
         storage = self.make_sample_storage()
         self._client.add_storage({"trace_id": self._trace_id, "storage": storage})
         group = self.make_sample_instance_group()
         group["storage_candidates"] = [storage["global_unique_name"]]
-        for quota in ({"capacity": -1}, {"capacity": -1, "quota_config": [
-                {"storage_type": "ST_NFS", "mode": "auto"}]}):
-            group["quota"] = quota
-            response = self._client.create_instance_group(
-                {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
-            self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
-            self.assertIn(storage["global_unique_name"], response["header"]["status"]["message"])
-            self.assertIn("fixed", response["header"]["status"]["message"])
+        group["quota"] = {"capacity": -1, "quota_config": [
+            {"storage_type": "ST_NFS", "mode": "auto"}]}
+        response = self._client.create_instance_group(
+            {"trace_id": self._trace_id, "instance_group": group}, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
+        self.assertIn(storage["global_unique_name"], response["header"]["status"]["message"])
+        self.assertIn("fixed", response["header"]["status"]["message"])
+        group["quota"] = {"capacity": -1}
+        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        stored = self._client.get_instance_group(
+            {"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
+        self.assertEqual([], stored["runtime_quota"].get("storage_types", []))
         group["quota"] = {"capacity": -1, "quota_config": [
             {"storage_type": "ST_NFS", "capacity": 1000}]}
-        self._client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
         group["version"] = 2
+        self._client.update_instance_group(
+            {"trace_id": self._trace_id, "instance_group": group, "current_version": 1})
+        group["version"] = 3
         group["quota"]["quota_config"][0]["mode"] = "auto"
         response = self._client.update_instance_group(
-            {"trace_id": self._trace_id, "instance_group": group, "current_version": 1}, check_response=False)
+            {"trace_id": self._trace_id, "instance_group": group, "current_version": 2}, check_response=False)
         self.assertEqual("INVALID_ARGUMENT", response["header"]["status"]["code"])
         stored = self._client.get_instance_group(
             {"trace_id": self._trace_id, "name": group["name"]})["instance_group"]
-        self.assertEqual(1, int(stored["version"]))
+        self.assertEqual(2, int(stored["version"]))
         self.assertEqual("fixed", stored["quota"]["quota_config"][0]["mode"])
 
     def test_register_get_list_remove_instance(self):

@@ -22,13 +22,13 @@
 
 独立池容量相加，重复 storage name 只计一次。同物理池的别名通过后端 capacity identity 去重；TairMempool 使用规范化的 domain 或 service discovery URL 加介质。相同物理池应使用相同发现标识；不同 URL 指向同一池时无法自动推断，应通过 `storage_names` 明确选择一次。不会累加多个 meta 副本的容量。共享后端的份额通过比例表达，不要求独占后端。
 
-新建 Group 省略整个 `quota` 时默认总量 `-1`；总量 `-1` 时，没有显式覆盖的关联类型默认自动 100%，因此只调整 DRAM 比例不会使 SSD 意外变成无类型限额。旧的显式固定总量和分类型配置保持不变。已有固定总量下，未配置的类型沿用不限制该类型的旧语义；自动默认模式下，未关联的显式写目标不能绕过类型 quota。
+Group 总量和分类型额度独立配置。Admin API 省略总量时仍取 `0`。分类型只有显式配置 `mode=auto` 才根据后端容量计算额度，未配置的类型没有独立额度。固定分类型额度须大于等于 `0`。
 
 ## 容量口径与失败保护
 
 `DataStorageBackend::GetStorageCapacity()` 读取指定介质**总字节数**的内存快照，包含最近成功容量、成功时间和最近刷新结果。接口禁止网络/磁盘 I/O，不触发同步刷新，不等待首次采集或正在执行的刷新。后端负责异步采集及保留最近成功值；首次未知立即返回未知，未实现时立即返回 `EC_UNIMPLEMENTED`，不能以成功零值代替。`DataStorageManager` 只汇集各后端快照，不保存第二份容量缓存，也不创建采集线程。
 
-`SupportsStorageCapacity()` 单独声明后端是否实现容量查询，默认 `false`，与 Meta 连通性、首次采样和刷新结果无关。Create/Update Group 会拒绝已注册但未实现容量查询的后端使用 auto，包括总量 `-1` 隐式产生的 auto；错误中给出存储名称并提示改用 fixed。Group 总量仍可配置 `-1`，同时为这些类型显式配置固定 quota。尚未注册的后端在恢复期间保持未知，不能将未知当作成功零容量；已持久化配置的恢复不因容量故障被阻塞。支持容量查询的后端在冷启动或 Meta 故障时仍可配置 auto，运行时继续执行未知/过期保护。
+`SupportsStorageCapacity()` 单独声明后端是否实现容量查询，默认 `false`，与 Meta 连通性、首次采样和刷新结果无关。Create/Update Group 会拒绝已注册但未实现容量查询的后端使用 auto，并在错误中给出存储名称。可为这些类型配置固定 quota，也可省略类型额度。尚未注册的后端在恢复期间保持未知。支持容量查询的后端在冷启动或 Meta 故障时仍可配置 auto，运行时继续执行未知和过期保护。
 
 TairMempool 从完整成功的 memnode 响应聚合健康且运行中的 provider，排除 consumer、下线/draining 节点及 tiering mode mismatch 节点。DRAM 使用 `total_bytes`；SSD 使用显式分层模式下的 `ssd_total_bytes`，明确禁用 tiering 的节点不提供 SSD 容量。启用 tiering 却报告 SSD 容量为零是初始化/上报未完成，按查询失败处理，不作为真实零容量。旧 meta 缺失 SSD/tiering 信息时，SSD 容量未知，不能使用 DRAM 容量替代。缺失字段、负值、数值溢出、重复 provider、HTTP 或解析失败都不提交部分和。成功的空 memnode 集合，或 API 对空集群省略集合并明确返回全零 aggregate，是确认的零容量。
 
@@ -72,7 +72,7 @@ TairMempool 复用原有探活/节点同步循环，每轮读取一次 memnode�
 
 每次解析使用调用方持有的同一份 InstanceGroup 配置快照，比例和后端范围不会分别读取不同配置版本，避免更新时拼接“旧比例 + 新后端”而制造一次不存在的缩容。
 
-Group 参考容量为各类型有效 quota 之和，包含固定与自动模式；任一类型未知或求和溢出时为未知 `-1`，不发布部分和。过期但已知的容量保留参考贡献，并标明陈旧性。DRAM 100 GiB × 50% 和 SSD 200 GiB × 80% 的参考容量为 210 GiB；用量 20、80 GiB 对应总使用率约 47.62%，分类型为 40%、50%。
+Group 参考容量为已配置类型的有效 quota 之和，包含固定与自动模式。没有配置分类型 quota、任一已配置额度未知或求和溢出时，参考容量为 `-1`。过期但已知的容量仍计入参考容量。DRAM 100 GiB × 50% 和 SSD 200 GiB × 80% 的参考容量为 210 GiB。用量 20、80 GiB 对应总使用率约 47.62%，分类型为 40%、50%。
 
 `getInstanceGroup` / `listInstanceGroup` 的只读 `runtime_quota` 与配置分开：
 
@@ -84,6 +84,8 @@ Group 参考容量为各类型有效 quota 之和，包含固定与自动模式�
 
 `data_storage.total_capacity_bytes` 按 `type, unique_name` 上报每个后端的容量基数，使用同一内存快照，不新增采集请求。它未应用 Group 比例，也不汇总多个 Group；未知/不支持为 -1，失败或过期保留最近成功值，成功的零容量为 0。透明分层取两层总量的 max，主动分层按后端类型取对应介质。现有 TairMempool `storage_usage_ratio` 保留物理 DRAM 水位口径及原有过滤规则，新总量不保证是旧 ratio 的分母，不能据此相乘推算用量。同池别名各自上报，求物理总量时需避免重复相加。follower 省略该指标，降级和卸载沿用存储指标的清理机制。
 
-CLI 新建默认总量 `-1`，支持 `--quota_configs 'ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8'`，显式范围格式为 `type,auto,ratio,backend1|backend2`。Bootstrap 新建采用相同默认；升级同步未显式配置 quota 时保留已有配置，显式 `quota_capacity=-1` 才改为默认自动模式。不支持容量查询的后端需要显式固定 quota。
+CLI 新建沿用固定默认额度。可以使用 `--quota_capacity -1 --quota_configs 'ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8'` 同时启用总量不限额和分类型 auto，显式范围的格式为 `type,auto,ratio,backend1|backend2`。Bootstrap 新建默认总量为 1,000,000,000 字节，并给主存储类型相同的固定额度。Reconcile 在省略 `quota_capacity` 时保留已有 Group 的 quota，显式设置 `-1` 时只关闭总字节限制。使用 Admin API 或 CLI 配置分类型 auto。
+
+Optimizer 订阅按真实布局同步时，首次注册不限额 Group 使用理论最大命中率分析。已有 Group 保留已经注册的模拟容量档位及统计状态。模拟布局继续使用订阅中配置的容量档位。
 
 启用自动模式或总量 `-1` 后，回滚到不支持此功能的旧二进制前，应先恢复正数固定总 quota 和固定分类型 quota；旧版本无法正确解释这些新配置语义。

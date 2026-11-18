@@ -640,6 +640,13 @@ TEST_F(OptimizerServiceImplTest, RealCacheLayoutUsesKvcmCapacitySpecsAndConfigur
     multiple_groups.add_location_spec_groups()->set_name("linear");
     *source.add_instances() = multiple_groups;
 
+    auto *unlimited_group = source.add_instance_groups();
+    unlimited_group->set_name("unlimited");
+    unlimited_group->set_capacity_bytes(-1);
+    no_group.set_instance_group_name("unlimited");
+    no_group.set_instance_id("unlimited-instance");
+    *source.add_instances() = no_group;
+
     ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
     EXPECT_EQ((std::vector<double>{2}), registry_->GetInstanceGroup("kvcm")->capacity_gb());
     EXPECT_EQ((std::vector<int64_t>{10, 30}), registry_->GetInstanceGroup("kvcm")->ttl_seconds_list());
@@ -651,7 +658,18 @@ TEST_F(OptimizerServiceImplTest, RealCacheLayoutUsesKvcmCapacitySpecsAndConfigur
         }));
     }
     EXPECT_EQ(EC_INSTANCE_NOT_EXIST, manager_->GetInstanceState("multi-group_bs128", [](const InstanceState &) {}));
+    const auto unlimited = registry_->GetInstanceGroup("unlimited");
+    ASSERT_NE(nullptr, unlimited);
+    EXPECT_TRUE(unlimited->capacity_gb().empty());
+    EXPECT_TRUE(unlimited->enable_theoretical_max_cache());
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("unlimited-instance_bs128", [](const InstanceState &state) {
+        EXPECT_TRUE(state.instance_group->capacity_gb().empty());
+        EXPECT_TRUE(state.instance_group->enable_theoretical_max_cache());
+    }));
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    source.mutable_instance_groups(0)->set_capacity_bytes(-1);
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(source, config));
+    EXPECT_EQ((std::vector<double>{2}), registry_->GetInstanceGroup("kvcm")->capacity_gb());
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenAbsent) {

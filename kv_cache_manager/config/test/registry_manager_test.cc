@@ -81,13 +81,15 @@ TEST_F(RegistryManagerQuotaTest, RejectsUnsupportedAutoBeforePersistingButAllows
     EXPECT_FALSE(stored->quota().quota_config().front().automatic());
 }
 
-TEST_F(RegistryManagerQuotaTest, RejectsImplicitAutoAndSupportsMixedFixedOverrides) {
+TEST_F(RegistryManagerQuotaTest, UnlimitedTotalRequiresNoCapacitySupport) {
     auto group = Group();
     group.set_quota(InstanceGroupQuota(-1, {}));
-    EXPECT_EQ(EC_BADARGS, registry->CreateInstanceGroup(&context, group));
+    EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
+    EXPECT_TRUE(registry->ResolveQuota(group).types.empty());
+    group.set_version(2);
     group.set_storage_candidates({"supported", "nfs"});
     group.set_quota(InstanceGroupQuota(-1, {QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
-    EXPECT_EQ(EC_OK, registry->CreateInstanceGroup(&context, group));
+    EXPECT_EQ(EC_OK, registry->UpdateInstanceGroup(&context, group, 1));
 }
 
 TEST_F(RegistryManagerQuotaTest, CapacityFailuresDoNotChangeSupportOrBlockConfiguration) {

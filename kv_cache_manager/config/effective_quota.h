@@ -22,7 +22,6 @@ struct EffectiveTypeQuota {
 struct EffectiveGroupQuota {
     int64_t configured_capacity = -1;
     int64_t reference_capacity = -1;
-    bool automatic_defaults = false;
     std::map<DataStorageType, EffectiveTypeQuota> types;
 
     // Unknown/expired auto quotas reject new allocations, while reclamation

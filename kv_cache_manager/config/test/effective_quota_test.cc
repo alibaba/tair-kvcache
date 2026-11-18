@@ -45,8 +45,8 @@ TEST_F(EffectiveQuotaTest, MixedMediaExampleAndMonitoring) {
     EXPECT_DOUBLE_EQ(0.5, QuotaUsageRatio(80000, quota.types.at(kSsd).capacity));
 }
 
-TEST_F(EffectiveQuotaTest, DefaultsAndMigrationOnlyTarget) {
-    auto group = Group();
+TEST_F(EffectiveQuotaTest, ExplicitAutoIncludesMigrationOnlyTarget) {
+    auto group = Group({Auto(kDram), Auto(kSsd)});
     group.set_storage_candidates({"dram", "dram"});
     auto strategy = std::make_shared<MigrationStrategy>();
     strategy->set_source_storage_name("dram");
@@ -98,14 +98,15 @@ TEST_F(EffectiveQuotaTest, ExplicitScopeDoesNotCountUnrelatedBackends) {
     EXPECT_EQ(100, quota.reference_capacity);
 }
 
-TEST_F(EffectiveQuotaTest, UnlimitedPartialOverridesKeepOtherAssociatedTypesAutomatic) {
+TEST_F(EffectiveQuotaTest, UnlimitedTotalDoesNotAddQuotasForUnconfiguredTypes) {
     const auto quota = ResolveEffectiveQuota(
         Group({QuotaConfig(50, kDram)}), {{"dram", Capacity(kDram, 100)}, {"ssd", Capacity(kSsd, 200)}}, kNow);
-    EXPECT_EQ(250, quota.reference_capacity);
+    EXPECT_EQ(50, quota.reference_capacity);
     EXPECT_EQ(50, quota.types.at(kDram).capacity);
     EXPECT_EQ("fixed", quota.types.at(kDram).config.mode());
-    EXPECT_EQ(200, quota.types.at(kSsd).capacity);
-    EXPECT_EQ("auto", quota.types.at(kSsd).config.mode());
+    EXPECT_EQ(0u, quota.types.count(kSsd));
+    EXPECT_EQ(-1, quota.ForAdmission().capacity());
+    EXPECT_EQ(1u, quota.ForAdmission().quota_config().size());
 }
 
 TEST_F(EffectiveQuotaTest, FixedAndAutoMixAndExplicitTotalRemainIndependent) {

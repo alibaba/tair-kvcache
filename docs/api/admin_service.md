@@ -122,7 +122,7 @@ curl -g -vvv -X POST http://localhost:6492/api/listStorage \
 
 ## Create Instance Group
 
-Per-type quota supports `mode: "auto"` with `ratio` (default 1.0) and optional `storage_names`. Omitted mode keeps fixed bytes. Total `quota.capacity=-1` disables the Group total byte limit; `0` retains its existing meaning. Omitted quota defaults to unlimited total bytes and automatic per-type quotas. Create/Update rejects auto quotas, including these defaults, for registered backends without capacity support; configure fixed per-type quotas for those backends. Temporary capacity-query failures do not make a supported backend unsupported. See [dynamic quota](../design/dynamic_backend_quota.md) for scope and failure handling.
+Set `mode: "auto"` on a storage type to use a fraction of backend capacity. Set `ratio` in `(0, 1]` (default 1.0) and optionally set `storage_names`. Omitted mode uses fixed bytes and requires a non-negative capacity. Omitted Group capacity defaults to 0. Set `quota.capacity=-1` to disable the Group total byte limit. Storage types without an entry in `quota_config` have no per-type quota. Create and Update reject auto quotas for registered backends that lack capacity support. See [dynamic quota](../design/dynamic_backend_quota.md) for scope and failure handling.
 
 `reclaim_strategy.instance_reclaim_budget_policy` 可选 `GROUP_LRU`（默认，跨 Instance 按访问时间逐出）、`USAGE_PROPORTIONAL`（用量比例预算加跨轮轮转）和 `FIXED_PER_INSTANCE`（旧固定预算）。已有显式配置不会被新默认值覆盖。Group LRU 仅支持 `POLICY_LRU` 或 `POLICY_UNSPECIFIED`；升级、旧客户端零值和回滚约束见[配置指南](../configuration.md)。以下示例显式选择容量比例模式。
 

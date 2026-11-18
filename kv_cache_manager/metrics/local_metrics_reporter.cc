@@ -283,7 +283,15 @@ void LocalMetricsReporter::ReportInterval() {
             }
             for (const auto &tags : quota_storage_tags_) {
                 if (current_quota_tags.count(tags) == 0) {
-                    metrics_registry_->RemoveByTagFilter(tags);
+                    for (const auto *name : {"cache_manager_group_storage.usage_bytes",
+                                             "cache_manager_group_storage.effective_quota",
+                                             "cache_manager_group_storage.usage_ratio",
+                                             "cache_manager_group_storage.capacity_known",
+                                             "cache_manager_group_storage.capacity_usable",
+                                             "cache_manager_group_storage.refresh_success",
+                                             "cache_manager_group_storage.last_success_time_s"}) {
+                        metrics_registry_->Remove(name, tags);
+                    }
                 }
             }
             quota_storage_tags_ = std::move(current_quota_tags);

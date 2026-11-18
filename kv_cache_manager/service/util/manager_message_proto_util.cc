@@ -480,7 +480,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
     instance_group_info.set_max_instance_count(proto_instance_group->max_instance_count());
 
     InstanceGroupQuota quota;
-    quota.set_capacity(proto_instance_group->has_quota() ? proto_instance_group->quota().capacity() : -1);
+    quota.set_capacity(proto_instance_group->quota().capacity());
 
     // 处理quota_config - proto中是repeated字段
     std::vector<QuotaConfig> quota_configs;

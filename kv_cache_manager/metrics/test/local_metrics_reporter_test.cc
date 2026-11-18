@@ -928,10 +928,17 @@ TEST_F(LocalMetricsReporterTest, UnlimitedQuotaMetricsUseReferenceAndExposeUnkno
     EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get()));
     EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get()));
     EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.capacity_known", ssd_tags).Get());
+    const std::string reclaimer_counter = "cache_reclaimer.pending_limit_reject_count";
+    metrics_registry_->GetCounter(reclaimer_counter, ssd_tags) += 7;
     registry_manager_->instance_group_configs_[group.name()]->set_quota(
         InstanceGroupQuota(-1, {QuotaConfig(50, dram)}));
     ASSERT_TRUE(sample());
-    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("storage_type=\"pace_ssd\""));
+    const auto metrics = metrics_registry_->GetMetricsData("cache_manager_group_storage.effective_quota");
+    ASSERT_NE(nullptr, metrics);
+    const auto values = metrics->GetMetricsValues();
+    ASSERT_EQ(1u, values.size());
+    EXPECT_EQ(dram_tags, values.front().first);
+    EXPECT_EQ(7u, metrics_registry_->GetCounter(reclaimer_counter, ssd_tags).Get());
 }
 
 TEST_F(LocalMetricsReporterTest, InstanceLocalMetadataMetricsTrackEntriesAndLifecycle) {

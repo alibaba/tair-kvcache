@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 import sys
 import unittest
@@ -37,12 +38,15 @@ class DynamicQuotaTest(unittest.TestCase):
         self.assertEqual(0, quota._capacity)
         self.assertEqual("fixed", quota._storage_qoutas[0]._mode)
         self.assertEqual(0, quota._storage_qoutas[0]._capacity)
+        self.assertEqual(0, split_storage_quotas_value("ST_NFS,0")[0]._capacity)
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "non-negative"):
+            split_storage_quotas_value("ST_NFS,-1")
 
     def test_new_group_default_and_update_arguments(self):
         with patch("sys.argv", ["prog", "--name", "group", "--storage_candidates", "pool"]):
             args = parse_instance_group_args(is_create=True)
-        self.assertEqual(-1, args.quota_capacity)
-        self.assertEqual([], args.quota_configs)
+        self.assertEqual(30000000000, args.quota_capacity)
+        self.assertEqual(["fixed"] * 3, [quota._mode for quota in args.quota_configs])
         with patch("sys.argv", ["prog", "--name", "group"]):
             args = parse_instance_group_args(is_create=False)
         self.assertFalse(hasattr(args, "quota_capacity"))
@@ -55,13 +59,15 @@ class DynamicQuotaTest(unittest.TestCase):
         }
         config = parse_environment(environment)
         group = _build_new_instance_group(config)
-        self.assertEqual({"capacity": -1, "quota_config": []}, group["quota"])
+        self.assertEqual(1000000000, group["quota"]["capacity"])
+        self.assertEqual("fixed", group["quota"]["quota_config"][0]["mode"])
         group["quota"] = {"capacity": 123, "quota_config": [{"storage_type": "ST_TAIRMEMPOOL", "capacity": 100}]}
         self.assertEqual(group["quota"], _apply_managed_group_fields(group, config)["quota"])
         environment["KVCM_INSTANCE_GROUP"] = (
             '{"name":"group","quota_capacity":-1,"meta_storage_backend_config":"local"}')
         updated = _apply_managed_group_fields(group, parse_environment(environment))
-        self.assertEqual({"capacity": -1, "quota_config": []}, updated["quota"])
+        self.assertEqual(-1, updated["quota"]["capacity"])
+        self.assertEqual(group["quota"]["quota_config"], updated["quota"]["quota_config"])
 
 
 if __name__ == "__main__":

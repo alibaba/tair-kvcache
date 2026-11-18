@@ -76,7 +76,10 @@ def split_storage_quotas_value(value: str):
         else:
             if len(storage_quota_str_split) != 2:
                 raise argparse.ArgumentTypeError("fixed quota expects type,capacity")
-            result.append(StorageQuota(s_type, int(capacity_str)))
+            capacity = int(capacity_str)
+            if capacity < 0:
+                raise argparse.ArgumentTypeError("fixed storage quota capacity must be non-negative")
+            result.append(StorageQuota(s_type, capacity))
     return result
 
 
@@ -106,7 +109,7 @@ class InstanceGroupQuota(JsonData):
 
     @classmethod
     def from_json_data(cls, json_data: dict):
-        capacity = int(json_data.get("capacity", -1))
+        capacity = int(json_data.get("capacity", 0))
         storage_qoutas = [StorageQuota.from_json_data(item) for item in json_data.get("quota_config", [])]
         return cls(capacity, storage_qoutas)
 
@@ -533,19 +536,27 @@ def parse_instance_group_args(is_create: bool):
         "--quota_capacity",
         "-q",
         type=int,
-        default=-1 if is_create else argparse.SUPPRESS,
-        help="Group byte limit; -1 disables the total byte limit (default)"
+        default=30000000000 if is_create else argparse.SUPPRESS,
+        help="Group byte limit in bytes (-1 disables the total byte limit)"
     )
 
     parser.add_argument(
         "--quota_configs",
         type=split_storage_quotas_value,
-        default=[] if is_create else argparse.SUPPRESS,
+        default=[
+            StorageQuota(
+                "ST_NFS",
+                10000000000),
+            StorageQuota(
+                "ST_3FS",
+                10000000000),
+            StorageQuota(
+                "ST_TAIRMEMPOOL",
+                10000000000)] if is_create else argparse.SUPPRESS,
         help=(
             "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
             "ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8. "
-            "Auto scope can be specified as type,auto,ratio,backend1|backend2; "
-            "with total=-1, associated types without an override use auto 100%."))
+            "Auto scope can be specified as type,auto,ratio,backend1|backend2."))
 
     parser.add_argument(
         "--reclaim_policy",

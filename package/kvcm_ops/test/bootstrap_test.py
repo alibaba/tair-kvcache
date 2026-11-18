@@ -148,7 +148,7 @@ class EnvironmentParsingTest(unittest.TestCase):
             "KVCM_INSTANCE_GROUP": group_env(),
         })
 
-        self.assertEqual(-1, config.quota_capacity)
+        self.assertEqual(1000000000, config.quota_capacity)
         self.assertEqual(512, config.max_instance_count)
         self.assertEqual("POLICY_LRU", config.reclaim_policy)
         self.assertEqual(0.8, config.reclaim_used_percentage)
@@ -474,8 +474,8 @@ class DesiredConfigurationTest(unittest.TestCase):
 
         self.assertEqual([PACE_NAME], group["storage_candidates"])
         self.assertEqual([L1P5_NAME, L2_NAME], group["event_report_storage_candidates"])
-        self.assertEqual(-1, group["quota"]["capacity"])
-        self.assertEqual([], group["quota"]["quota_config"])
+        self.assertEqual(1000000000, group["quota"]["capacity"])
+        self.assertEqual("ST_TAIRMEMPOOL", group["quota"]["quota_config"][0]["storage_type"])
         self.assertEqual(PACE_NAME, group["cache_config"]["reclaim_strategy"]["storage_unique_name"])
         self.assertEqual("CPS_PREFER_TAIR_MEMPOOL", group["cache_config"]["data_storage_strategy"])
 
@@ -703,6 +703,20 @@ class BootstrapReconciliationTest(unittest.TestCase):
         self.assertEqual(1, client.update_group_calls)
         self.assertEqual(1, client.list_instance_calls)
 
+    def test_reconcile_preserves_unmanaged_quota_and_verifies_managed_fields(self):
+        client = FakeAdminClient()
+        legacy_env = dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(quota_capacity=1234))
+        bootstrap_once(parse_environment(legacy_env), client)
+        original_quota = copy.deepcopy(client.groups[0]["quota"])
+        environ = dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(user_data="updated"))
+        config = parse_environment(environ)
+
+        self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=True))
+        self.assertEqual(original_quota, client.groups[0]["quota"])
+        self.assertEqual("updated", client.groups[0]["user_data"])
+        self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=True))
+        self.assertEqual(1, client.update_group_calls)
+
     def test_reconcile_redis_to_local_updates_group_and_requires_restart(self):
         client = FakeAdminClient()
         bootstrap_once(parse_environment(dict(BASE_ENV)), client)
@@ -825,7 +839,9 @@ class BootstrapReconciliationTest(unittest.TestCase):
         client.groups[0]["max_instance_count"] = 1
         client.version_conflicts_remaining = 1
 
-        self.assertFalse(ensure_instance_group(client, config))
+        restart_required, desired_group = ensure_instance_group(client, config)
+        self.assertFalse(restart_required)
+        self.assertEqual(desired_group, client.groups[0])
         self.assertEqual(2, client.update_group_calls)
         self.assertEqual(512, client.groups[0]["max_instance_count"])
 

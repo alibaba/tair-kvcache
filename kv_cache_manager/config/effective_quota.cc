@@ -65,36 +65,8 @@ EffectiveGroupQuota ResolveEffectiveQuota(const InstanceGroup &group,
     EffectiveGroupQuota result;
     result.configured_capacity = group.quota().capacity();
     const auto associated = GetQuotaStorageNames(group);
-    auto configs = group.quota().quota_config();
-    // Unlimited mode defaults every associated type to auto 100%, including
-    // types without an override when another type has a fixed/custom quota.
-    // Existing positive fixed totals retain their legacy missing-type semantics.
-    bool associations_complete = true;
-    if (result.configured_capacity == -1) {
-        result.automatic_defaults = true;
-        std::set<DataStorageType> types;
-        std::set<DataStorageType> configured_types;
-        for (const auto &config : configs) {
-            configured_types.insert(ToBaseType(config.storage_spec()));
-        }
-        for (const auto &name : associated) {
-            const auto it = snapshots.find(name);
-            if (it != snapshots.end()) {
-                types.insert(ToBaseType(it->second.type));
-            } else {
-                associations_complete = false;
-            }
-        }
-        for (const auto type : types) {
-            if (configured_types.count(type) != 0) {
-                continue;
-            }
-            QuotaConfig config(0, type);
-            config.set_mode("auto");
-            configs.push_back(config);
-        }
-    }
-    bool complete = !configs.empty() && associations_complete;
+    const auto &configs = group.quota().quota_config();
+    bool complete = !configs.empty();
     int64_t reference = 0;
     for (const auto &config : configs) {
         const auto type = ToBaseType(config.storage_spec());
