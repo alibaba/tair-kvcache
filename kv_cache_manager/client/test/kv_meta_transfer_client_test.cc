@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <map>
@@ -120,11 +121,14 @@ public:
 
     SdkType Type() override { return SdkType::TAIR_MEMPOOL; }
 
-    ClientErrorCode Get(const std::vector<DataStorageUri> &uris, const BlockBuffers &) override {
+    ClientErrorCode Get(const std::vector<DataStorageUri> &uris, const BlockBuffers &buffers) override {
         if (before_io) {
             before_io(uris);
         }
         std::this_thread::sleep_for(delay);
+        if (read_data) {
+            read_data(uris, buffers);
+        }
         std::lock_guard<std::mutex> lock(records_mutex_);
         loaded = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
@@ -132,12 +136,15 @@ public:
     }
 
     ClientErrorCode Put(const std::vector<DataStorageUri> &uris,
-                        const BlockBuffers &,
+                        const BlockBuffers &buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_uris) override {
         if (before_io) {
             before_io(uris);
         }
         std::this_thread::sleep_for(delay);
+        if (write_data) {
+            write_data(uris, buffers);
+        }
         std::lock_guard<std::mutex> lock(records_mutex_);
         saved = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
@@ -155,6 +162,8 @@ public:
     std::chrono::milliseconds delay{0};
     std::function<void(const std::vector<DataStorageUri> &)> before_io;
     std::function<ClientErrorCode(const std::vector<DataStorageUri> &)> result_for;
+    std::function<void(const std::vector<DataStorageUri> &, const BlockBuffers &)> read_data;
+    std::function<void(const std::vector<DataStorageUri> &, const BlockBuffers &)> write_data;
     UriStrVec loaded;
     UriStrVec saved;
     std::map<std::string, std::int64_t> seen_sizes;
@@ -510,12 +519,37 @@ TEST(KvMetaTransferClientConcurrencyTest, SingleClientHasMultipleDifferentSizeRe
         condition.notify_all();
         condition.wait(lock, [&] { return released; });
     };
+    // Simulate payload copies after the in-flight barrier. Recording API entry
+    // alone would miss size/config races or writes to another slot's buffer.
+    std::mutex payload_mutex;
+    std::map<std::size_t, std::vector<char>> remote_values;
+    recording->read_data = [&](const auto &uris, const auto &buffers) {
+        for (std::size_t i = 0; i < uris.size(); ++i) {
+            const auto size = std::stoull(uris[i].GetParam("size"));
+            for (const auto &iov : buffers[i].iovs) {
+                std::memset(iov.base, size, iov.size);
+            }
+        }
+    };
+    recording->write_data = [&](const auto &uris, const auto &buffers) {
+        for (std::size_t i = 0; i < uris.size(); ++i) {
+            const auto size = std::stoull(uris[i].GetParam("size"));
+            std::vector<char> payload;
+            for (const auto &iov : buffers[i].iovs) {
+                const auto *base = static_cast<const char *>(iov.base);
+                payload.insert(payload.end(), base, base + iov.size);
+            }
+            std::lock_guard<std::mutex> lock(payload_mutex);
+            remote_values.emplace(size, std::move(payload));
+        }
+    };
     std::vector<std::future<ClientErrorCode>> operations;
     std::size_t offset = 0;
     for (const std::size_t size : {2, 3, 5, 7}) {
         char *base = region.get() + offset;
         offset += size;
         const bool write = size > 3;
+        std::memset(base, write ? size : 0x7f, size);
         operations.push_back(std::async(std::launch::async, [&, size, base, write] {
             const auto key = std::to_string(size);
             return write ? client.SaveObjects(key, {key}, {size}, {RegionBuffer(base, size)})
@@ -538,6 +572,15 @@ TEST(KvMetaTransferClientConcurrencyTest, SingleClientHasMultipleDifferentSizeRe
     }
     EXPECT_EQ(std::future_status::ready, close.wait_for(2s));
     close.get();
+    offset = 0;
+    for (const std::size_t size : {2, 3, 5, 7}) {
+        EXPECT_EQ(std::vector<char>(size, static_cast<char>(size)),
+                  std::vector<char>(region.get() + offset, region.get() + offset + size));
+        if (size > 3) {
+            EXPECT_EQ(std::vector<char>(size, static_cast<char>(size)), remote_values.at(size));
+        }
+        offset += size;
+    }
     EXPECT_EQ((std::map<std::string, std::int64_t>{{"value", 1}}), recording->seen_sizes);
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.LoadObjects("closed", {"2"}, {2}, {RegionBuffer(region.get(), 2)}));
 }
