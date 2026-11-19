@@ -224,6 +224,11 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
 ```
 
 ## Update Instance Group
+
+Clients can send back the full `instance_group` object from Get or List with their configuration changes and the usual version fields. The server ignores `instance_group.runtime_quota` on update and uses `instance_group.quota` for the configured limits.
+
+When updating a group that uses `mode=auto` or a total limit of `-1`, use a kvcmops version that supports these settings.
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
   -H "Content-Type: application/json" \
@@ -288,7 +293,7 @@ curl -g -vvv -X POST http://localhost:6492/api/removeInstanceGroup \
 
 ## Get Instance Group
 
-Get/List responses include read-only `runtime_quota`: `total_bytes_limit_enabled`, `reference_capacity`, and `storage_types` (mode, ratio, effective/backend capacity, known, usable, refresh status, last successful Unix timestamp). Reference capacity is a monitoring denominator. Unknown capacity is `-1`; failed refreshes retain the last successful value. Runtime fields are never persisted or used as input configuration.
+Get and List populate the read-only `instance_group.runtime_quota` alongside `instance_group.quota`. It contains `total_bytes_limit_enabled`, `reference_capacity`, and `storage_types` (mode, ratio, effective/backend capacity, known, usable, refresh status, last successful Unix timestamp). Reference capacity is a monitoring denominator. Unknown capacity is `-1`. Failed refreshes retain the last successful value.
 
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/getInstanceGroup \
