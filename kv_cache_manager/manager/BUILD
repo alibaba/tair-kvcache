@@ -140,8 +140,8 @@ cc_library(
 
 cc_library(
     name = "schedule_plan_executor",
-    srcs = ["schedule_plan_executor.cc"],
-    hdrs = ["schedule_plan_executor.h"],
+    srcs = ["schedule_plan_executor.cc", "tair_reclaim_delete.cc"],
+    hdrs = ["free_busy.h", "schedule_plan_executor.h", "tair_reclaim_delete.h"],
     deps = [
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",

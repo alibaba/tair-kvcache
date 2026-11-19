@@ -569,6 +569,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         BytesByStorageType bytes{};
         CountsByStorageType counts{};
         std::uint64_t predicted_keys = 0;
+        uint64_t retry_bytes = 0;
         AgeStats ages;
         if (!FilterLocIDImpl(request_context.get(),
                              info,
@@ -580,7 +581,8 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
                              predicted_keys,
                              ages,
                              false,
-                             true)) {
+                             true,
+                             &retry_bytes)) {
             continue;
         }
         const auto nonempty_blocks = std::count_if(request.location_ids.begin(),
@@ -594,7 +596,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         }
         ++attempted_requests;
         METRICS_(cache_reclaimer, group_lru_delete_request_count) += 1;
-        if (SubmitDelReq(request_context, info, request, bytes, counts, predicted_keys)) {
+        if (SubmitDelReq(request_context, info, request, bytes, counts, predicted_keys, retry_bytes)) {
             // These gauges describe the last accepted request, not the whole
             // candidate pool. Blocks removed by the final Location filter do
             // not contribute; creation ages already cover its selected Locations.

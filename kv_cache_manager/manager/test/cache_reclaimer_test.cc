@@ -3808,6 +3808,99 @@ TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHar
     EXPECT_EQ(0, cache_reclaimer_->pending_delete_bytes_);
 }
 
+TEST_F(CacheReclaimerTest, FreeBusyShrinksOnlyCurrentAdmissionsAndRecoversOnNewSuccess) {
+    CacheReclaimerAsyncDeleteConfig config;
+    config.pending_location_limit_per_group_type = 8;
+    config.pending_bytes_limit_per_group_type = 800;
+    ReplaceReclaimer(config);
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    auto instance = InstanceInfoFactory();
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const CacheReclaimer::GroupStorageTypeKey key{instance->instance_group_name(), type};
+    auto submit = [&](int64_t block, size_t count) {
+        CacheReclaimer::BytesByStorageType bytes{};
+        CacheReclaimer::CountsByStorageType counts{};
+        bytes[ToIndex(type)] = count * 100;
+        counts[ToIndex(type)] = count;
+        std::vector<std::string> ids;
+        for (size_t i = 0; i < count; ++i) {
+            ids.push_back(std::to_string(i));
+        }
+        CacheLocationDelRequest req{instance->instance_id(), {block}, {ids}};
+        return cache_reclaimer_->SubmitDelReq(request_context_, instance, req, bytes, counts, 1, count * 2000);
+    };
+    ASSERT_TRUE(submit(10, 4));
+    auto old = cache_reclaimer_->delete_handlers_.front().free_busy_;
+    ASSERT_TRUE(submit(20, 4));
+    auto trigger = cache_reclaimer_->delete_handlers_.front().free_busy_;
+    old->Record(type, 80);
+    trigger->Record(type, 100);
+    cache_reclaimer_->HandleDelRes();
+    auto &w = cache_reclaimer_->free_busy_windows_.at(key);
+    EXPECT_EQ(4, w.limit.location_count);
+    EXPECT_EQ(400, w.limit.bytes);
+    old->Record(type, 300);
+    trigger->Record(type, 0);
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_EQ(100, w.interval.count());
+    EXPECT_FALSE(w.saw_success);
+    CompleteSubmittedDelete(0, {EC_OK, {}});
+    CompleteSubmittedDelete(1, {EC_OK, {}});
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_FALSE(submit(30, 1));
+    w.cooldown_end = FreeBusyTask::Clock::now();
+    EXPECT_TRUE(cache_reclaimer_->FitsFreeBusyWindow(key, {}, {1, 600}));
+    EXPECT_FALSE(cache_reclaimer_->FitsFreeBusyWindow(key, {}, {2, 600}));
+    ASSERT_TRUE(submit(30, 1));
+    w.observe_until = FreeBusyTask::Clock::now();
+    cache_reclaimer_->delete_handlers_.front().free_busy_->Record(type, 0);
+    CompleteSubmittedDelete(2, {EC_OK, {}});
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_EQ(8, w.limit.location_count);
+    EXPECT_EQ(800, w.limit.bytes);
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_TRUE(cache_reclaimer_->free_busy_windows_.empty());
+}
+
+TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsAreShared) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+    auto a = MakeCacheLocation("a", CLS_SERVING, type, "pace://ssd/1?size=8");
+    auto b = MakeCacheLocation("b", CLS_SERVING, type, "pace://ssd/2?size=8");
+    CacheReclaimerAsyncDeleteConfig config;
+    config.free_busy_retry_memory_limit_bytes =
+        FreeBusyTask::RecordBytes(*a, InstanceInfoFactory()->instance_id().size());
+    ReplaceReclaimer(config);
+    batch_get_loc_out_maps = {{{"a", a}, {"b", b}}};
+    std::vector<std::vector<std::string>> ids;
+    CacheReclaimer::BytesByStorageType bytes{};
+    CacheReclaimer::CountsByStorageType counts{};
+    CacheReclaimer::AgeStats ages;
+    uint64_t keys = 0, retry_bytes = 0;
+    auto instance = InstanceInfoFactory();
+    auto select = [&] {
+        retry_bytes = 0;
+        return cache_reclaimer_->FilterLocIDImpl(
+            request_context_.get(), instance, {1}, {}, ids, bytes, counts, keys, ages, false, false, &retry_bytes);
+    };
+    ASSERT_TRUE(select());
+    ASSERT_EQ(1u, ids.at(0).size());
+    auto resources = cache_reclaimer_->free_busy_resources_;
+    ASSERT_TRUE(resources->Reserve(retry_bytes));
+    EXPECT_FALSE(resources->Reserve(1));
+    ASSERT_TRUE(select());
+    EXPECT_TRUE(ids.at(0).empty());
+    EXPECT_EQ(0u, retry_bytes);
+    resources->reserved.fetch_sub(config.free_busy_retry_memory_limit_bytes);
+    for (const size_t n : {2, 8}) {
+        for (size_t i = 0; i < n / 2; ++i) {
+            EXPECT_TRUE(resources->TryStartRetry(n));
+        }
+        EXPECT_FALSE(resources->TryStartRetry(n));
+        resources->executing_retries.fetch_sub(n / 2);
+    }
+}
+
 TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuota) {
     cache_reclaimer_->job_state_flag_ = true;
     spe_submit_invalid_future = true;

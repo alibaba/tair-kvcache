@@ -138,6 +138,13 @@ kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
 kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
 
+# Tair 水位驱逐 Free Busy 协议。混部灰度期间可设为 false。
+kvcm.cache_reclaimer.free_busy_enabled=true
+# 首次本地退避（毫秒），取值 1 到 5000。Meta 可建议更长的等待时间。
+kvcm.cache_reclaimer.free_busy_initial_backoff_ms=50
+# 全进程共享的重试记录预留上限（字节），默认 64 MiB。
+kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes=67108864
+
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=4398046511104

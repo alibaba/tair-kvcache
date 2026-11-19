@@ -50,6 +50,9 @@ public:
     uint64_t GetCacheReclaimerPendingLocationLimitPerGroupType() const {
         return cache_reclaimer_pending_location_limit_per_group_type_;
     }
+    bool GetFreeBusyEnabled() const { return free_busy_enabled_; }
+    uint64_t GetFreeBusyInitialBackoffMs() const { return free_busy_initial_backoff_ms_; }
+    uint64_t GetFreeBusyRetryMemoryLimitBytes() const { return free_busy_retry_memory_limit_bytes_; }
     uint64_t GetCacheReclaimerPendingBytesLimitPerGroupType() const {
         return cache_reclaimer_pending_bytes_limit_per_group_type_;
     }
@@ -130,6 +133,9 @@ private:
     uint32_t cache_reclaimer_worker_size_ = 0;
     uint64_t cache_reclaimer_inflight_delete_timeout_ms_ = 0;
     uint64_t cache_reclaimer_pending_location_limit_per_group_type_ = 0;
+    bool free_busy_enabled_{true};
+    uint64_t free_busy_initial_backoff_ms_{50};
+    uint64_t free_busy_retry_memory_limit_bytes_{64ULL << 20};
     uint64_t cache_reclaimer_pending_bytes_limit_per_group_type_ = 0;
     uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
     uint64_t cache_reclaimer_pending_bytes_limit_ = 0;

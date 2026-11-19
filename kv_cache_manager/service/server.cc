@@ -74,6 +74,9 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.inflight_delete_timeout_ms = config_.GetCacheReclaimerInflightDeleteTimeoutMs();
     async_delete_config.pending_location_limit_per_group_type =
         config_.GetCacheReclaimerPendingLocationLimitPerGroupType();
+    async_delete_config.free_busy_enabled = config_.GetFreeBusyEnabled();
+    async_delete_config.free_busy_initial_backoff_ms = config_.GetFreeBusyInitialBackoffMs();
+    async_delete_config.free_busy_retry_memory_limit_bytes = config_.GetFreeBusyRetryMemoryLimitBytes();
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
