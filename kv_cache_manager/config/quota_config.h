@@ -25,10 +25,17 @@ public:
     // Setters
     void set_capacity(int64_t capacity) { capacity_ = capacity; }
     void set_storage_type(DataStorageType storage_type) { storage_type_ = storage_type; }
+    const std::string &mode() const { return mode_; }
+    double ratio() const { return ratio_; }
+    bool automatic() const { return mode_ == "auto"; }
+    void set_mode(const std::string &mode) { mode_ = mode; }
+    void set_ratio(double ratio) { ratio_ = ratio; }
 
 private:
-    int64_t capacity_;
-    DataStorageType storage_type_;
+    int64_t capacity_ = 0;
+    DataStorageType storage_type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    std::string mode_ = "fixed";
+    double ratio_ = 0.0;
 };
 
 } // namespace kv_cache_manager

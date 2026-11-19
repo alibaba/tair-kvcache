@@ -152,6 +152,7 @@ class BootstrapConfig:
         self.metadata_backend_mode = None
         self.max_instance_count = DEFAULT_MAX_INSTANCE_COUNT
         self.quota_capacity = DEFAULT_QUOTA_CAPACITY
+        self.quota_capacity_explicit = False
         self.reclaim_policy = DEFAULT_RECLAIM_POLICY
         self.reclaim_used_percentage = DEFAULT_RECLAIM_USED_PERCENTAGE
         self.max_key_count = DEFAULT_MAX_KEY_COUNT
@@ -236,14 +237,18 @@ def _optional_string(value, field, default, env_name):
     return result
 
 
-def _integer(value, field, default, env_name, allow_zero=False):
+def _integer(value, field, default, env_name, allow_zero=False, allow_unlimited=False):
     if field not in value:
         return default
     result = value[field]
     if type(result) is not int:
         raise BootstrapError("{}.{} must be an integer".format(env_name, field))
+    if allow_unlimited and result == -1:
+        return result
     if result < 0 or (result == 0 and not allow_zero):
         comparator = "non-negative" if allow_zero else "positive"
+        if allow_unlimited:
+            comparator += " or -1"
         raise BootstrapError("{}.{} must be {}".format(env_name, field, comparator))
     return result
 
@@ -450,7 +455,8 @@ def parse_environment(environ=None):
     config.user_data = _optional_string(
         value, "user_data", config.instance_group_name, INSTANCE_GROUP_ENV)
     config.quota_capacity = _integer(
-        value, "quota_capacity", DEFAULT_QUOTA_CAPACITY, INSTANCE_GROUP_ENV)
+        value, "quota_capacity", DEFAULT_QUOTA_CAPACITY, INSTANCE_GROUP_ENV, allow_zero=True, allow_unlimited=True)
+    config.quota_capacity_explicit = "quota_capacity" in value
     config.max_instance_count = _integer(
         value, "max_instance_count", DEFAULT_MAX_INSTANCE_COUNT, INSTANCE_GROUP_ENV)
     config.max_key_count = _integer(
@@ -706,7 +712,7 @@ def ensure_storages(client, config, reconcile=True):
 def _build_new_instance_group(config):
     quota = InstanceGroupQuota(
         config.quota_capacity,
-        [StorageQuota(config.primary_storage_type, config.quota_capacity)],
+        [] if config.quota_capacity == -1 else [StorageQuota(config.primary_storage_type, config.quota_capacity)],
     )
     reclaim_strategy = ReclaimStrategy(
         storage_unique_name=config.primary_storage_name,
@@ -774,15 +780,15 @@ def _apply_managed_group_fields(current, config):
     updated["storage_candidates"] = [config.primary_storage_name]
     updated["event_report_storage_candidates"] = config.event_report_storage_names
     updated["max_instance_count"] = config.max_instance_count
-    updated["quota"] = {
-        "capacity": config.quota_capacity,
-        "quota_config": [
-            {
-                "storage_type": config.primary_storage_type,
-                "capacity": config.quota_capacity,
-            }
-        ],
-    }
+    if config.quota_capacity_explicit and config.quota_capacity == -1 and "quota" in updated:
+        updated["quota"]["capacity"] = -1
+    elif config.quota_capacity_explicit or "quota" not in updated:
+        updated["quota"] = {
+            "capacity": config.quota_capacity,
+            "quota_config": [] if config.quota_capacity == -1 else [
+                {"storage_type": config.primary_storage_type, "capacity": config.quota_capacity}
+            ],
+        }
     cache_config = updated.setdefault("cache_config", {})
     cache_config["data_storage_strategy"] = config.data_storage_strategy
     reclaim_strategy = cache_config.setdefault("reclaim_strategy", {})
@@ -835,7 +841,9 @@ def _managed_group_view(group, config):
     for item in quota.get("quota_config", []):
         normalized_quota.append({
             "storage_type": item.get("storage_type"),
-            "capacity": _as_int(item.get("capacity")),
+            "capacity": _as_int(item.get("capacity", 0)),
+            "mode": item.get("mode") or "fixed",
+            "ratio": item.get("ratio", 1.0),
         })
     view = {
         "user_data": group.get("user_data"),
@@ -843,7 +851,7 @@ def _managed_group_view(group, config):
         "event_report_storage_candidates": group.get("event_report_storage_candidates", []),
         "max_instance_count": _as_int(group.get("max_instance_count")),
         "quota": {
-            "capacity": _as_int(quota.get("capacity")),
+            "capacity": _as_int(quota.get("capacity", 0)),
             "quota_config": normalized_quota,
         },
         "data_storage_strategy": cache_config.get("data_storage_strategy"),
@@ -895,7 +903,7 @@ def ensure_instance_group(client, config):
             try:
                 client.create_instance_group(desired_new)
                 LOGGER.info("created managed instance group %s", config.instance_group_name)
-                return False
+                return False, desired_new
             except NotLeaderError:
                 raise
             except BootstrapError:
@@ -914,7 +922,7 @@ def ensure_instance_group(client, config):
                 restart_required
                 or bool(client.list_instance_info(config.instance_group_name)))
         if _managed_group_view(current, config) == _managed_group_view(updated, config):
-            return restart_required
+            return restart_required, updated
         current_version = _as_int(current.get("version"))
         if not isinstance(current_version, int):
             raise BootstrapError("existing instance group version is invalid")
@@ -922,7 +930,7 @@ def ensure_instance_group(client, config):
         try:
             client.update_instance_group(updated, current_version)
             LOGGER.info("updated managed instance group %s", config.instance_group_name)
-            return restart_required
+            return restart_required, updated
         except NotLeaderError:
             raise
         except BootstrapError:
@@ -933,7 +941,7 @@ def ensure_instance_group(client, config):
     raise BootstrapError("instance group update retries exhausted")
 
 
-def verify_bootstrap(client, config):
+def verify_bootstrap(client, config, desired_group):
     storage_by_name = {
         storage.get("global_unique_name"): storage
         for storage in client.list_storage()
@@ -948,8 +956,7 @@ def verify_bootstrap(client, config):
     current = _find_group(client.list_instance_groups(), config.instance_group_name)
     if current is None:
         raise BootstrapError("managed instance group verification failed: group is missing")
-    desired = _build_new_instance_group(config)
-    if _managed_group_view(current, config) != _managed_group_view(desired, config):
+    if _managed_group_view(current, config) != _managed_group_view(desired_group, config):
         raise BootstrapError("managed instance group verification failed: fields differ")
 
 
@@ -973,17 +980,17 @@ def bootstrap_once(config, client, reconcile=False):
         ensure_storages(client, config, reconcile=False)
         if not create_instance_group_if_missing(client, config):
             return BootstrapOutcome.COMPLETE
-        verify_bootstrap(client, config)
+        verify_bootstrap(client, config, _build_new_instance_group(config))
     else:
         ensure_storages(client, config)
-        restart_required = ensure_instance_group(client, config)
+        restart_required, desired_group = ensure_instance_group(client, config)
         if restart_required:
             # Keep the restart instruction visible even if verification fails.
             LOGGER.warning(
                 "MetaIndexer configuration changed for group %s with existing instances; "
                 "restart KVCM to apply it",
                 config.instance_group_name)
-        verify_bootstrap(client, config)
+        verify_bootstrap(client, config, desired_group)
         if restart_required:
             return BootstrapOutcome.RESTART_REQUIRED
     if config.meta_storage_type == "local":

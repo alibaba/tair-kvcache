@@ -449,6 +449,10 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
         auto *proto_quota_config = quota->add_quota_config();
         proto_quota_config->set_storage_type(static_cast<proto::admin::StorageType>(quota_config.storage_spec()));
         proto_quota_config->set_capacity(quota_config.capacity());
+        if (quota_config.automatic()) {
+            proto_quota_config->set_mode(quota_config.mode());
+            proto_quota_config->set_ratio(quota_config.ratio());
+        }
     }
 
     // 处理cache_config
@@ -486,6 +490,8 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
         DataStorageTypeFromProto(storage_type, data_storage_type);
         quota_config.set_storage_type(data_storage_type);
         quota_config.set_capacity(proto_quota_config.capacity());
+        quota_config.set_mode(proto_quota_config.mode().empty() ? "fixed" : proto_quota_config.mode());
+        quota_config.set_ratio(proto_quota_config.ratio());
         quota_configs.push_back(quota_config);
     }
     quota.set_quota_config(quota_configs);

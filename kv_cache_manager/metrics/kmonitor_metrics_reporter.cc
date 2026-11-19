@@ -134,6 +134,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, writable_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
+    DECLARE_METRICS(data_storage, total_capacity_bytes);
     DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
@@ -231,6 +232,13 @@ struct KmonitorMetricsReporter::Context {
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
+    DECLARE_METRICS(cache_manager_group, reference_capacity);
+    DECLARE_METRICS(cache_manager_group, total_bytes_limit_enabled);
+    DECLARE_METRICS(cache_manager_group_storage, usage_bytes);
+    DECLARE_METRICS(cache_manager_group_storage, effective_quota);
+    DECLARE_METRICS(cache_manager_group_storage, usage_ratio);
+    DECLARE_METRICS(cache_manager_group_storage, refresh_success);
+    DECLARE_METRICS(cache_manager_group_storage, last_success_time_s);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, location_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
@@ -465,6 +473,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, writable_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
+    REGISTER_GAUGE_METRIC(data_storage, total_capacity_bytes);
     REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
@@ -564,6 +573,13 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
+    REGISTER_GAUGE_METRIC(cache_manager_group, reference_capacity);
+    REGISTER_GAUGE_METRIC(cache_manager_group, total_bytes_limit_enabled);
+    REGISTER_GAUGE_METRIC(cache_manager_group_storage, usage_bytes);
+    REGISTER_GAUGE_METRIC(cache_manager_group_storage, effective_quota);
+    REGISTER_GAUGE_METRIC(cache_manager_group_storage, usage_ratio);
+    REGISTER_GAUGE_METRIC(cache_manager_group_storage, refresh_success);
+    REGISTER_GAUGE_METRIC(cache_manager_group_storage, last_success_time_s);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, location_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
@@ -774,6 +790,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     double storage_usage_ratio_v;
                     GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                     REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                    double total_capacity_bytes_v;
+                    GET_METRICS_(p, data_storage, total_capacity_bytes, total_capacity_bytes_v);
+                    REPORT_METRICS(data_storage, total_capacity_bytes, total_capacity_bytes_v);
                 }
             }
         }
@@ -1148,6 +1167,20 @@ void KmonitorMetricsReporter::ReportInterval() {
                                "service.request_queue_wait_seconds_count");
 
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
+        report_registry_metric(ctx_->cache_manager_group_reference_capacity_metrics.get(),
+                               "cache_manager_group.reference_capacity");
+        report_registry_metric(ctx_->cache_manager_group_total_bytes_limit_enabled_metrics.get(),
+                               "cache_manager_group.total_bytes_limit_enabled");
+        report_registry_metric(ctx_->cache_manager_group_storage_usage_bytes_metrics.get(),
+                               "cache_manager_group_storage.usage_bytes");
+        report_registry_metric(ctx_->cache_manager_group_storage_effective_quota_metrics.get(),
+                               "cache_manager_group_storage.effective_quota");
+        report_registry_metric(ctx_->cache_manager_group_storage_usage_ratio_metrics.get(),
+                               "cache_manager_group_storage.usage_ratio");
+        report_registry_metric(ctx_->cache_manager_group_storage_refresh_success_metrics.get(),
+                               "cache_manager_group_storage.refresh_success");
+        report_registry_metric(ctx_->cache_manager_group_storage_last_success_time_s_metrics.get(),
+                               "cache_manager_group_storage.last_success_time_s");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");
         report_registry_metric(ctx_->cache_gc_candidate_count_metrics.get(), "cache_gc.candidate_count");
         report_registry_metric(ctx_->cache_gc_candidate_dropped_count_metrics.get(),

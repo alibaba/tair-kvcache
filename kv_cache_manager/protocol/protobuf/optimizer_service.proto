@@ -260,7 +260,7 @@ message KvcmConfigurationRequest {
 
 message KvcmInstanceGroupConfiguration {
     string name = 1;
-    int64 capacity_bytes = 2;
+    int64 capacity_bytes = 2; // -1 means the KVCM group has no total byte limit.
 }
 
 message KvcmInstanceConfiguration {

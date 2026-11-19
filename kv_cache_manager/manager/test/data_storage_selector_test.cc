@@ -6,7 +6,9 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -31,6 +33,14 @@
 #include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
 
 using namespace kv_cache_manager;
+
+template <typename Backend>
+class CapacityTestBackend : public Backend {
+public:
+    using Backend::Backend;
+    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot snapshot;
+};
 
 ErrorCode ec_g;
 
@@ -192,14 +202,14 @@ public:
             std::make_shared<MetaIndexerManager>(), std::make_shared<RegistryManager>("foo", metrics_registry_));
 
         // initially we have 2 backends, both opened and available
-        const auto sb0 = std::make_shared<NfsBackend>(metrics_registry_);
+        const auto sb0 = std::make_shared<CapacityTestBackend<NfsBackend>>(metrics_registry_);
         sb0->config_.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
         sb0->config_.set_global_unique_name("nfs_storage_00");
         sb0->is_open_ = true;
         sb0->is_available_ = true;
         avail_backends_g.emplace_back(sb0);
 
-        const auto sb1 = std::make_shared<Hf3fsBackend>(metrics_registry_);
+        const auto sb1 = std::make_shared<CapacityTestBackend<Hf3fsBackend>>(metrics_registry_);
         sb1->config_.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         sb1->config_.set_global_unique_name("3fs_storage_01");
         sb1->is_open_ = true;
@@ -685,9 +695,9 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota00) {
     }
 
     {
-        // test quota_capacity < 0
+        // Invalid negative totals remain blocked; -1 now explicitly means unlimited.
         InstanceGroupQuota quota;
-        quota.set_capacity(-1);
+        quota.set_capacity(-2);
         instance_group_g->set_quota(quota);
         const auto result =
             data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
@@ -822,4 +832,121 @@ TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabili
     admissions = data_storage_selector_->CheckExplicitWriteTargets(
         request_context_.get(), "default_test_group", {"3fs_storage_01"});
     EXPECT_EQ(StorageTargetAdmissionStatus::kReadError, admissions[0].status);
+}
+
+TEST_F(DataStorageSelectorTest, QuotaResolutionKeepsTheCapturedConfigurationDuringAnUpdate) {
+    const auto registry = data_storage_selector_->registry_manager_;
+    registry->data_storage_manager_ = data_storage_manager_g;
+    auto second = std::make_shared<CapacityTestBackend<Hf3fsBackend>>(metrics_registry_);
+    second->config_.set_global_unique_name("3fs_storage_02");
+    data_storage_manager_g->storage_map_["3fs_storage_01"] = avail_backends_g[1];
+    data_storage_manager_g->storage_map_["3fs_storage_02"] = second;
+    std::static_pointer_cast<CapacityTestBackend<Hf3fsBackend>>(avail_backends_g[1])->snapshot = {
+        100, 1000, EC_OK};
+    second->snapshot = {200, 1000, EC_OK};
+    QuotaConfig quota(0, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+    quota.set_mode("auto");
+    quota.set_ratio(0.5);
+    auto captured = InstanceGroupFactory();
+    captured->set_storage_candidates({"3fs_storage_02"});
+    captured->set_quota(InstanceGroupQuota(-1, {quota}));
+    auto updated = InstanceGroupFactory();
+    updated->set_storage_candidates({"3fs_storage_01"});
+    quota.set_ratio(1.0);
+    updated->set_quota(InstanceGroupQuota(-1, {quota}));
+    registry->instance_group_configs_[captured->name()] = updated;
+    // Both versions have a 100-byte budget. Mixing the old ratio with the new
+    // pool would invent a 50-byte shrink and could incorrectly evict data.
+    EXPECT_EQ(100, ResolveEffectiveQuota(*captured, registry->data_storage_manager().get()).reference_capacity);
+    EXPECT_EQ(100, ResolveEffectiveQuota(*updated, registry->data_storage_manager().get()).reference_capacity);
+}
+
+TEST_F(DataStorageSelectorTest, ExplicitAutoQuotaRequiresCapacityForExplicitTargets) {
+    const auto registry = data_storage_selector_->registry_manager_;
+    registry->data_storage_manager_ = data_storage_manager_g;
+    registry->instance_group_configs_[instance_group_g->name()] = instance_group_g;
+    for (const auto &backend : avail_backends_g) {
+        data_storage_manager_g->storage_map_[backend->GetStorageConfig().global_unique_name()] = backend;
+    }
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    QuotaConfig nfs(0, DataStorageType::DATA_STORAGE_TYPE_NFS);
+    nfs.set_mode("auto");
+    nfs.set_ratio(1.0);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {nfs}));
+    auto admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[0].status);
+    instance_group_g->set_storage_candidates({"3fs_storage_01", "nfs_storage_00"});
+    std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot = {
+        200, 1000, EC_OK};
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_TRUE(admitted[0].Allowed());
+}
+
+TEST_F(DataStorageSelectorTest, UnlimitedTotalUsesDynamicTypeQuotaForNormalAndExplicitWrites) {
+    const auto registry = data_storage_selector_->registry_manager_;
+    registry->data_storage_manager_ = data_storage_manager_g;
+    registry->instance_group_configs_[instance_group_g->name()] = instance_group_g;
+    for (const auto &backend : avail_backends_g) {
+        data_storage_manager_g->storage_map_[backend->GetStorageConfig().global_unique_name()] = backend;
+    }
+    auto nfs = QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS);
+    auto hf3fs = QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+    nfs.set_mode("auto");
+    nfs.set_ratio(1.0);
+    hf3fs.set_mode("auto");
+    hf3fs.set_ratio(1.0);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {nfs, hf3fs}));
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2000);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 10);
+    std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot = {100, 1000, EC_OK};
+    std::static_pointer_cast<CapacityTestBackend<Hf3fsBackend>>(avail_backends_g[1])->snapshot = {
+        100, 1000, EC_OK};
+
+    auto selected =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), instance_group_g->name());
+    EXPECT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ("nfs_storage_00", selected.name);
+    auto admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00", "3fs_storage_01"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[1].status);
+    EXPECT_EQ(-1, instance_group_g->quota().capacity());
+
+    // Normal and explicit writes keep enforcing the last known budget through a prolonged refresh failure.
+    auto &snapshot = std::static_pointer_cast<CapacityTestBackend<NfsBackend>>(avail_backends_g[0])->snapshot;
+    snapshot.refresh_code = EC_ERROR;
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    selected =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), instance_group_g->name());
+    EXPECT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ("nfs_storage_00", selected.name);
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[0].status);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 10);
+    const auto quota = ResolveEffectiveQuota(*instance_group_g, data_storage_manager_g.get());
+    EXPECT_EQ(100, quota.types.at(DataStorageType::DATA_STORAGE_TYPE_NFS).capacity);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {hf3fs}));
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00", "3fs_storage_01"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admitted[1].status);
+    instance_group_g->set_quota(InstanceGroupQuota(-1, {nfs, hf3fs}));
+    snapshot = {50, 1001, EC_OK};
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_TRUE(admitted[0].Allowed());
+    instance_group_g->quota_.set_capacity(500);
+    admitted = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), instance_group_g->name(), {"nfs_storage_00"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kGroupQuotaExceeded, admitted[0].status);
 }

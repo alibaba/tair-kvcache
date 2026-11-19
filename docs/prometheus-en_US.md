@@ -3,6 +3,8 @@
 KVCacheManager exposes a Prometheus-compatible metrics scrape endpoint
 at `GET /metrics` on the Admin HTTP service port (default 6492).
 
+Per storage backend, `data_storage.total_capacity_bytes` reports logical capacity in bytes (−1 before the first valid sample). For each group and storage type, `cache_manager_group_storage.usage_bytes`, `effective_quota` and `usage_ratio` expose usage, the current budget and their ratio. Automatic quotas also report `refresh_success` and `last_success_time_s`. With an unlimited group byte budget the group usage ratio uses the sum of effective type quotas.
+
 ## Quick Start
 
 With default settings, the endpoint is enabled automatically. Point
