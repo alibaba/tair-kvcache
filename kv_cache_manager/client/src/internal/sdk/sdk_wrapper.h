@@ -1,7 +1,10 @@
 #pragma once
 
 #include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "kv_cache_manager/client/include/common.h"
@@ -28,13 +31,17 @@ public:
 
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        int64_t parent_deadline_ms = 0);
+                        int64_t parent_deadline_ms = 0,
+                        const std::string &read_execution_id = {});
+    bool QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
                         int64_t parent_deadline_ms = 0);
 
 private:
+    using GroupFutures = std::vector<std::shared_future<ClientErrorCode>>;
+    struct ReadRecovery;
     enum class OpType : uint8_t {
         GET = 0,
         PUT = 1,
@@ -60,7 +67,8 @@ private:
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
                                            std::vector<std::function<ClientErrorCode()>> &&tasks,
                                            int timeout_ms,
-                                           int64_t deadline_ms = 0) const;
+                                           int64_t deadline_ms = 0,
+                                           GroupFutures *pending = nullptr) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);
@@ -77,6 +85,8 @@ private:
     // storage unique name -> storage_sdk
     std::map<std::string, std::shared_ptr<SdkInterface>> sdk_map_;
     int owned_shm_fd_{-1};
+    std::mutex read_recovery_mu_;
+    std::unordered_map<std::string, std::shared_ptr<ReadRecovery>> read_recovery_;
 };
 
 } // namespace kv_cache_manager

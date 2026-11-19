@@ -54,5 +54,10 @@ public:
 protected:
     TransferClient() = default;
     virtual ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) = 0;
+
+public:
+    virtual bool QueryReadBufferSafety(const std::string & /*read_execution_id*/, int64_t /*deadline_ms*/) {
+        return false;
+    }
 };
 } // namespace kv_cache_manager

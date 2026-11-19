@@ -36,6 +36,7 @@ public:
                              const BlockBuffers &block_buffers,
                              int64_t deadline_ms,
                              std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
+    bool QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
