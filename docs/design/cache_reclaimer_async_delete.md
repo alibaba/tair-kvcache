@@ -116,6 +116,8 @@ SchedulePlanExecutor::SubmitAsync(const CacheMetaDelRequest &request);
 首次入队失败返回 `accepted=false` 和无效 Future，Reclaimer 不建立任何 pending、credit 或
 `DeleteHandler`。现有 `SubmitNonBlocking` 不满足这一契约，因为它不会向调用方返回内部 Future。
 
+Tair 水位驱逐收到 Meta 明确的整批拒收时，通过同一 Executor 延后重试。其他 storage 已完成的 Location 可以先 CAD，原 Future 在各批都收尾后完成，Reclaimer 届时统一释放 pending。[Free Busy 退避](free_busy_backpressure.md)
+
 #### 4.1.1 两类请求的选择语义
 
 两类异步请求只在 Location selection 阶段分叉：

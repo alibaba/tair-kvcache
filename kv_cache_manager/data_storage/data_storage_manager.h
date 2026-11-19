@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -7,10 +8,10 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstdint>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
+#include "kv_cache_manager/data_storage/tair_reclaim_free.h"
 
 namespace kv_cache_manager {
 
@@ -58,6 +59,12 @@ public:
                                              const std::vector<DataStorageCreateRequest> &requests,
                                              std::function<void()> cb);
 
+    TairReclaimFreeResult DeleteTairForReclaim(const std::string &trace_id,
+                                               const std::string &unique_name,
+                                               const std::vector<uint64_t> &gas,
+                                               std::weak_ptr<DataStorageBackend> &original,
+                                               bool retry,
+                                               const std::function<bool()> &can_send);
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,

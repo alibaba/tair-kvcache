@@ -261,6 +261,27 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_reclaimer_pending_location_limit_per_group_type_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.cache_reclaimer.free_busy_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->free_busy_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.cache_reclaimer.free_busy_initial_backoff_ms",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         config->free_busy_initial_backoff_ms_ = std::stoull(value);
+         return config->free_busy_initial_backoff_ms_ > 0 && config->free_busy_initial_backoff_ms_ <= 5000;
+     }},
+    {"kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         config->free_busy_retry_memory_limit_bytes_ = std::stoull(value);
+         return config->free_busy_retry_memory_limit_bytes_ > 0;
+     }},
     {"kvcm.cache_reclaimer.pending_bytes_limit_per_group_type",
      [](const std::string &value, ServerConfig *config) {
          config->cache_reclaimer_pending_bytes_limit_per_group_type_ = std::stoull(value);
@@ -494,6 +515,9 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_del_batch_size_ = 100;
     cache_reclaimer_idle_interval_ms_ = 100;
     cache_reclaimer_worker_size_ = 16;
+    free_busy_enabled_ = true;
+    free_busy_initial_backoff_ms_ = 50;
+    free_busy_retry_memory_limit_bytes_ = 64ULL << 20;
     cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
     cache_reclaimer_pending_location_limit_per_group_type_ = 20000;
     cache_reclaimer_pending_bytes_limit_per_group_type_ = 1ULL * 1024 * 1024 * 1024 * 1024;
