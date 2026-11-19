@@ -253,6 +253,10 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecUInt64WrapperPresence) {
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecRejectsInvalidUInt64WrappersTransactionally) {
+    // Protobuf 3.8 converts overflowing unquoted integers through double and
+    // checks the result only after casting to uint64_t. That cast is undefined
+    // for 2^64, so protobuf's rejection is not a portable oracle for this test.
+    // Verify the fast codec's strict rejection and transactional behavior directly.
     const char *invalid_values[] = {"-1", "\"-1\"", "18446744073709551616", "\"18446744073709551616\""};
     ASSERT_TRUE(FastProtoJsonCodec::Supports(google::protobuf::UInt64Value::descriptor()));
     ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
@@ -260,8 +264,6 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecRejectsInvalidUInt64WrappersTransa
         SCOPED_TRACE(value);
         google::protobuf::UInt64Value wrapper;
         wrapper.set_value(42);
-        google::protobuf::UInt64Value protobuf_wrapper;
-        EXPECT_FALSE(ProtobufFromJson(value, &protobuf_wrapper));
         EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(value, &wrapper));
         EXPECT_EQ(42u, wrapper.value());
 
@@ -271,8 +273,6 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecRejectsInvalidUInt64WrappersTransa
         const std::string before = config.SerializeAsString();
         // Parse a valid sibling first: failure must not commit a partial message.
         const std::string input = std::string("{\"copy_max_concurrency\":9,\"copy_max_inflight_bytes\":") + value + "}";
-        proto::admin::MigrationConfig protobuf_config;
-        EXPECT_FALSE(ProtobufFromJson(input, &protobuf_config));
         EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(input, &config));
         EXPECT_EQ(before, config.SerializeAsString());
     }

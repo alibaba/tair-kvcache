@@ -1,10 +1,14 @@
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
 
+#include "async_simple/Promise.h"
+#include "async_simple/coro/FutureAwaiter.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
 namespace kv_cache_manager {
@@ -28,9 +32,92 @@ void LogDebugHttpResponse(coro_http::coro_http_response &res) {
         "[RES] status=%d body=%.*s", static_cast<int>(res.status()), (int)res.content().size(), res.content().data());
 }
 
+void LogDispatchException(const char *phase, const char *type, const RequestContext *context) {
+    KVCM_LOG_ERROR("Meta HTTP exception: request_type=%s phase=%s request_id=%s",
+                   type, phase, context ? context->request_id().c_str() : "");
+}
+
 } // namespace
 
-// Implementation is now in the header file
+async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult>
+CoroHttpService::DispatchHttpRequest(ServiceRequestExecutor &executor,
+                                    std::function<CachedJsonResponse()> run,
+                                    std::function<void(ServiceRequestExecutor::SubmitResult, const char *)> reject,
+                                    const char *request_type,
+                                    std::shared_ptr<const RequestContext> context) {
+    async_simple::Promise<HttpDispatchResult> promise;
+    auto future = promise.getFuture();
+    ServiceRequestExecutor::Request task;
+    task.run = [promise, run = std::move(run), request_type, context](
+                   ServiceRequestExecutor::CompletionToken completion) mutable {
+        HttpDispatchResult result;
+        result.completion = std::move(completion);
+        try {
+            result.cached_response = run();
+        } catch (...) {
+            LogDispatchException("worker", request_type, context.get());
+            result.failed = true;
+        }
+        promise.setValue(std::move(result));
+    };
+    task.on_discard = [promise, reject, request_type, context = std::move(context)](
+                          ServiceRequestExecutor::CompletionToken completion) mutable {
+        HttpDispatchResult result;
+        result.completion = std::move(completion);
+        try {
+            reject(ServiceRequestExecutor::SubmitResult::kClosed, "service is stopping");
+        } catch (...) {
+            LogDispatchException("discard", request_type, context.get());
+            result.failed = true;
+        }
+        promise.setValue(std::move(result));
+    };
+    const auto submitted = executor.TrySubmit(std::move(task));
+    if (submitted != ServiceRequestExecutor::SubmitResult::kAccepted) {
+        reject(submitted,
+               submitted == ServiceRequestExecutor::SubmitResult::kFull ? "service request queue is full"
+                                                                        : "service is stopping");
+        co_return HttpDispatchResult{};
+    }
+    // FutureAwaiter checks this Lazy back into its original IO executor.
+    // The result (including failures) retains its token until the HTTP handler
+    // has resumed; Promise::setException would release that token too early.
+    co_return co_await std::move(future);
+}
+
+void CoroHttpService::SetJsonResponse(coro_http::coro_http_response &res,
+                                      const google::protobuf::Message &message,
+                                      CachedJsonResponse cached,
+                                      bool failed) {
+    std::string json;
+    if (cached) {
+        json = std::move(*cached);
+    } else if (!failed) {
+        json.reserve(512);
+        failed = !ProtoMessageJsonUtil::ToJson(&message, json);
+    }
+    if (failed) {
+        res.set_status_and_content(coro_http::status_type::internal_server_error, "{}");
+        return;
+    }
+    res.add_header("Content-Type", "application/json");
+    res.set_status_and_content(coro_http::status_type::ok, std::move(json));
+}
+
+async_simple::coro::Lazy<void> CoroHttpService::WriteAcceptedReply(coro_http::coro_http_connection &connection,
+                                                                   coro_http::coro_http_response &res) {
+    // Await the write while the caller holds its completion token. A reader
+    // that stops consuming a response must not block shutdown indefinitely.
+    asio::steady_timer deadline(connection.tcp_socket().get_executor(), std::chrono::seconds(30));
+    deadline.async_wait([conn = connection.shared_from_this()](const std::error_code &error) {
+        if (!error) {
+            conn->close();
+        }
+    });
+    res.set_delay(true); // Cinatra must not send this response a second time.
+    co_await connection.reply();
+}
+
 void CoroHttpService::RegisterGetHandler(const std::string &api, HandlerType handler) {
     get_handlers_[api] = std::move(handler);
 }

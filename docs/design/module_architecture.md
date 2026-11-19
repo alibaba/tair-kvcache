@@ -41,7 +41,7 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 | 模块 | 目录 | 职责 |
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
-| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、Leader 请求门禁、调用守卫与访问日志。`OptimizerEventStreamService` 复用 Meta gRPC server 暴露订阅流，不新增端口。 |
+| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`ServiceRequestExecutor` 以共享有界 FIFO 将 Meta HTTP/gRPC Request 分发至工作线程；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、Leader 请求门禁、调用守卫与访问日志。`OptimizerEventStreamService` 复用 Meta gRPC server 暴露订阅流，不新增端口。 |
 | **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、`ReportEvent`/`GetHostCacheState`、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcherManager`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`ReclaimerTaskSupervisor`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor`、`StartupConfigLoader` 等子组件，同时把生成的 `SelectLocationPolicy` 传给 `MetaSearcher`。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 隔离管理 `MetaIndexer` 并共享 `QueryExecutor`；`MetaIndexer` 维护 cache key → `CacheLocation` 的索引，提供 Get/Put/CAS/Sample 与分片锁；`MetaStorageBackendManager` 组合 local、Redis、memory-primary + async Redis 等后端并负责恢复/备份。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义 Instance Group/Instance/Storage/Quota/回收/迁移等配置对象；`RegistryManager` 持久化实例注册信息（local/Redis registry backend）；`CoordinationBackend`（memory/file/redis）+ `LeaderElector` 提供一主多备的分布式选主。 |
@@ -137,7 +137,7 @@ flowchart TD
     main["main.cpp（入口）"]
 
     subgraph access["接入层"]
-        service["service<br/>Server / *ServiceImpl · 请求门禁<br/>grpc · http · util"]
+        service["service<br/>Server / ServiceRequestExecutor / *ServiceImpl<br/>grpc · http · util · 请求门禁"]
     end
 
     subgraph core["编排与业务核心"]
@@ -227,6 +227,9 @@ flowchart TD
 服务端内部流程都以 `RequestContext` 贯穿，指标采集在链路上逐层进行。HA 部署下只有 Leader 处理读写请求；client 先经 `GetClusterInfo` 发现 Leader 再直连（详见 [ha_leader_elector.md](ha_leader_elector.md)）。
 
 ### 4.1 服务端请求的通用路径
+
+Meta HTTP/gRPC 业务请求经 `Request` / `ServiceRequestExecutor` 分发到共享有界 FIFO 工作池，默认等待队列容量2048。gRPC 使用独立 CompletionQueue，HTTP 以协程挂起释放 IO 线程；业务与 Leader 门禁在 worker 执行。Admin、Debug、健康检查和 Optimizer stream 保持原路径。指标与停机顺序见 [MetaService Reactor 请求分发](service_request_dispatch.md)。
+
 
 一次元数据面请求进入 KVCM 后（C++ gRPC、Python HTTP、Java gRPC/HTTP 入口等价）：
 

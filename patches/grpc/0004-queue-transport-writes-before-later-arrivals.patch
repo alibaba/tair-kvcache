@@ -1,0 +1,48 @@
+--- src/core/ext/transport/chttp2/transport/chttp2_transport.cc
++++ src/core/ext/transport/chttp2/transport/chttp2_transport.cc
+@@ -922,26 +922,14 @@
+                       grpc_chttp2_initiate_write_reason_string(reason));
+       t->is_first_write_in_batch = true;
+       GRPC_CHTTP2_REF_TRANSPORT(t, "writing");
+-      /* Note that the 'write_action_begin_locked' closure is being scheduled
+-       * on the 'finally_scheduler' of t->combiner. This means that
+-       * 'write_action_begin_locked' is called only *after* all the other
+-       * closures (some of which are potentially initiating more writes on the
+-       * transport) are executed on the t->combiner.
+-       *
+-       * The reason for scheduling on finally_scheduler is to make sure we batch
+-       * as many writes as possible. 'write_action_begin_locked' is the function
+-       * that gathers all the relevant bytes (which are at various places in the
+-       * grpc_chttp2_transport structure) and append them to 'outbuf' field in
+-       * grpc_chttp2_transport thereby batching what would have been potentially
+-       * multiple write operations.
+-       *
+-       * Also, 'write_action_begin_locked' only gathers the bytes into outbuf.
+-       * It does not call the endpoint to write the bytes. That is done by the
+-       * 'write_action' (which is scheduled by 'write_action_begin_locked') */
++      // Queue write preparation with normal transport work. A finally closure
++      // waits for the combiner to drain and can starve under continuous reads
++      // or cancellations. FIFO still coalesces earlier work without letting
++      // later arrivals indefinitely postpone a pending response.
+       GRPC_CLOSURE_SCHED(
+           GRPC_CLOSURE_INIT(&t->write_action_begin_locked,
+                             write_action_begin_locked, t,
+-                            grpc_combiner_finally_scheduler(t->combiner)),
++                            grpc_combiner_scheduler(t->combiner)),
+           GRPC_ERROR_NONE);
+       break;
+     case GRPC_CHTTP2_WRITE_STATE_WRITING:
+@@ -1086,10 +1074,11 @@
+       set_write_state(t, GRPC_CHTTP2_WRITE_STATE_WRITING, "continue writing");
+       t->is_first_write_in_batch = false;
+       GRPC_CHTTP2_REF_TRANSPORT(t, "writing");
+-      GRPC_CLOSURE_RUN(
++      // Defer the next batch until the current write's cleanup completes.
++      GRPC_CLOSURE_SCHED(
+           GRPC_CLOSURE_INIT(&t->write_action_begin_locked,
+                             write_action_begin_locked, t,
+-                            grpc_combiner_finally_scheduler(t->combiner)),
++                            grpc_combiner_scheduler(t->combiner)),
+           GRPC_ERROR_NONE);
+       break;
+   }
