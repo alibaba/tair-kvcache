@@ -3865,6 +3865,9 @@ TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsA
     config.free_busy_retry_memory_limit_bytes =
         FreeBusyTask::RecordBytes(*a, InstanceInfoFactory()->instance_id().size());
     ReplaceReclaimer(config);
+    auto skipped =
+        mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, free_busy_budget_skip_location_count));
+    cache_reclaimer_->METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) = skipped;
     batch_get_loc_out_maps = {{{"a", a}, {"b", b}}};
     std::vector<std::vector<std::string>> ids;
     CacheReclaimer::BytesByStorageType bytes{};
@@ -3879,12 +3882,14 @@ TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsA
     };
     ASSERT_TRUE(select());
     ASSERT_EQ(1u, ids.at(0).size());
+    EXPECT_EQ(1u, skipped.Get());
     auto resources = cache_reclaimer_->free_busy_resources_;
     ASSERT_TRUE(resources->Reserve(retry_bytes));
     EXPECT_FALSE(resources->Reserve(1));
     ASSERT_TRUE(select());
     EXPECT_TRUE(ids.at(0).empty());
     EXPECT_EQ(0u, retry_bytes);
+    EXPECT_EQ(3u, skipped.Get());
     resources->reserved.fetch_sub(config.free_busy_retry_memory_limit_bytes);
     for (const size_t n : {2, 8}) {
         for (size_t i = 0; i < n / 2; ++i) {
@@ -3893,6 +3898,22 @@ TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsA
         EXPECT_FALSE(resources->TryStartRetry(n));
         resources->executing_retries.fetch_sub(n / 2);
     }
+}
+
+TEST_F(CacheReclaimerTest, DefaultFreeBusyBudgetAdmitsAFullGroupOfTwentySpecLocations) {
+    CacheReclaimerAsyncDeleteConfig config;
+    std::vector<LocationSpec> specs;
+    for (int i = 0; i < 20; ++i) {
+        specs.emplace_back("tp" + std::to_string(i),
+                           "pace://test-cluster/" + std::to_string(1000000000000000000ULL + i) +
+                               "?media_type=5&node_id=1234&range_id=12&size=1048576");
+    }
+    const CacheLocation location(
+        "12345678", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, specs.size(), specs);
+    const auto bytes = FreeBusyTask::RecordBytes(location, 30) * config.pending_location_limit_per_group_type;
+    FreeBusyResources budget(config.free_busy_retry_memory_limit_bytes);
+    EXPECT_TRUE(budget.Reserve(bytes));
+    EXPECT_FALSE(budget.Reserve(bytes));
 }
 
 TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuota) {

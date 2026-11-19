@@ -6,15 +6,20 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
 
+class MetricsRegistry;
+
 // Shared by watermark tasks from this Reclaimer, including delayed callbacks.
 struct FreeBusyResources {
-    explicit FreeBusyResources(uint64_t limit) : memory_limit(limit) {}
+    explicit FreeBusyResources(uint64_t limit, std::shared_ptr<MetricsRegistry> metrics = {})
+        : memory_limit(limit), metrics(std::move(metrics)) {}
     const uint64_t memory_limit;
+    const std::shared_ptr<MetricsRegistry> metrics;
     std::atomic<uint64_t> reserved{0};
     std::atomic<size_t> executing_retries{0};
     std::atomic<uint64_t> generation{0};

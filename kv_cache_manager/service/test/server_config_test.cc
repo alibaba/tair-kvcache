@@ -31,7 +31,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
         EXPECT_TRUE(config.GetFreeBusyEnabled());
         EXPECT_EQ(50, config.GetFreeBusyInitialBackoffMs());
-        EXPECT_EQ(64ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
+        EXPECT_EQ(128ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
         ASSERT_EQ(20000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(1ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());

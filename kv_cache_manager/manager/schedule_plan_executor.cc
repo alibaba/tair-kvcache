@@ -15,6 +15,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/tair_reclaim_delete.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -729,7 +730,8 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         &task.location_ids,
                                         expected_location_values,
                                         task.delay,
-                                        task.authoritative_read);
+                                        task.authoritative_read,
+                                        task.free_busy.get());
     result.actual_task.free_busy = task.free_busy;
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
@@ -742,7 +744,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
                                             std::chrono::microseconds delay,
-                                            bool authoritative_read) {
+                                            bool authoritative_read,
+                                            const FreeBusyTask *free_busy) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -861,6 +864,10 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                batch_cas_tasks.size());
     }
     if (batch_cas_block_keys.empty()) {
+        return admission_result;
+    }
+    if (free_busy && !free_busy->Active()) {
+        admission_result.result = MakeErrorResult(EC_ERROR, "Watermark eviction cancelled before metadata admission.");
         return admission_result;
     }
 

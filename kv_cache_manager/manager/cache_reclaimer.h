@@ -74,7 +74,7 @@ struct CacheReclaimerAsyncDeleteConfig {
     std::uint64_t pending_bytes_limit{4ULL * 1024 * 1024 * 1024 * 1024};
     bool free_busy_enabled{true};
     uint64_t free_busy_initial_backoff_ms{50};
-    uint64_t free_busy_retry_memory_limit_bytes{64ULL << 20};
+    uint64_t free_busy_retry_memory_limit_bytes{128ULL << 20};
 };
 
 struct CacheReclaimerGroupLruConfig {
@@ -863,6 +863,7 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_reject_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count)
