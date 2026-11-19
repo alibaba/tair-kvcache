@@ -549,24 +549,19 @@ class KvMetaObjectClient:
             begin = end
         return batches
 
-    def _native_buffers(
-        self, objects: Tuple[KvMetaObjectBuffer, ...]
-    ) -> Tuple[Any, ...]:
-        buffers = []
-        for obj in objects:
-            iov = self._pybind.Iov()
-            iov.type = (
-                self._pybind.MemoryType.GPU
-                if obj.memory == KvMetaObjectMemory.GPU
-                else self._pybind.MemoryType.CPU
-            )
-            iov.base = obj.pointer
-            iov.size = obj.nbytes
-            iov.ignore = False
-            block = self._pybind.BlockBuffer()
-            block.iovs = [iov]
-            buffers.append(block)
-        return tuple(buffers)
+    def _native_buffer(self, pointer, nbytes, memory):
+        iov = self._pybind.Iov()
+        iov.type = (
+            self._pybind.MemoryType.GPU
+            if memory == KvMetaObjectMemory.GPU
+            else self._pybind.MemoryType.CPU
+        )
+        iov.base = pointer
+        iov.size = nbytes
+        iov.ignore = False
+        block = self._pybind.BlockBuffer()
+        block.iovs = [iov]
+        return block
 
     def _invoke_buffers(
         self, operation: str, objects: Any, trace_id: Optional[str]
@@ -575,7 +570,10 @@ class KvMetaObjectClient:
         batches = self._partition(materialized)
         keys = tuple(obj.key for obj in materialized)
         sizes = tuple(obj.nbytes for obj in materialized)
-        native_buffers = self._native_buffers(materialized)
+        native_buffers = tuple(
+            self._native_buffer(obj.pointer, obj.nbytes, obj.memory)
+            for obj in materialized
+        )
         base_trace = self._resolve_trace_id(operation, trace_id)
         client = self._client_snapshot()
         try:
@@ -766,6 +764,25 @@ class KvMetaObjectClient:
         if not _is_ok_code(self._pybind, code):
             raise KvMetaObjectClientError("get_object_meta", code, data_transfer_may_be_inflight=False)
         return meta
+
+    def load_from_meta(self, meta, buffer: Any, *, trace_id: Optional[str] = None) -> None:
+        """Read the object location obtained from this client's get_object_meta."""
+        if not isinstance(meta, self._pybind.ObjectMeta):
+            raise TypeError("meta must be a KVCM ObjectMeta")
+        pointer, nbytes, memory = _tensor_layout(buffer)
+        if nbytes != meta.size_bytes:
+            raise ValueError("KVMeta read buffer must match ObjectMeta.size_bytes")
+        block = self._native_buffer(pointer, nbytes, memory)
+        trace_id = self._resolve_trace_id("load", trace_id)
+        client = self._client_snapshot()
+        try:
+            code, may_be_inflight = client.load_from_meta(meta, block, trace_id=trace_id)
+        except Exception as error:
+            raise KvMetaObjectClientError("load", type(error).__name__) from error
+        if not _is_ok_code(self._pybind, code):
+            raise KvMetaObjectClientError(
+                "load", code, data_transfer_may_be_inflight=may_be_inflight
+            )
 
     def update_addresses(self, addresses: Sequence[str]) -> None:
         """Replace metadata endpoints without recreating transfer resources.

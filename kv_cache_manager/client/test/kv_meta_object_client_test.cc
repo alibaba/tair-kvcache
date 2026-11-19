@@ -295,7 +295,7 @@ TEST_F(KvMetaObjectClientTest, MetadataReportsHitMissAndFailureWithoutPayloadIo)
     auto [hit_ec, hit] = client_->GetObjectMeta("first", 100, "meta-hit");
     ASSERT_EQ(ER_OK, hit_ec);
     ASSERT_TRUE(hit);
-    EXPECT_EQ(17, hit->size_bytes);
+    EXPECT_EQ(17, hit->SizeBytes());
     EXPECT_EQ("meta-hit", metadata_->get_trace);
 
     metadata_->get_result = {{false}, {{}}};
@@ -311,6 +311,38 @@ TEST_F(KvMetaObjectClientTest, MetadataReportsHitMissAndFailureWithoutPayloadIo)
 
     client_->Close();
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client_->GetObjectMeta("first", 100, "").first);
+}
+
+TEST_F(KvMetaObjectClientTest, LoadFromMetaOnlyTransfersTheValidatedLocation) {
+    const auto size = sizeof(first_);
+    const auto uri = PaceUri(1, size);
+    metadata_->get_result = {{true}, {MakeLocation(uri, size)}};
+    auto [ec, meta] = client_->GetObjectMeta("first", 100, "single-read");
+    ASSERT_EQ(ER_OK, ec);
+    ASSERT_TRUE(meta);
+    EXPECT_EQ("single-read", metadata_->get_trace);
+
+    EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client_->LoadFromMeta(*meta, buffers_[1], "wrong-size").ec);
+    auto other = std::make_unique<KvMetaObjectClientImpl>(
+        std::make_unique<FakeKvMetaClient>(), std::make_unique<FakeKvMetaTransferClient>(), 1024, 30);
+    EXPECT_EQ(ER_INVALID_PARAMS, other->LoadFromMeta(*meta, buffers_[0], "wrong-client").ec);
+    EXPECT_EQ(0, transfer_->load_calls);
+
+    metadata_->get_ec = ER_CONNECT_FAIL;
+    const auto loaded = client_->LoadFromMeta(*meta, buffers_[0], "single-read");
+    EXPECT_EQ(ER_OK, loaded.ec);
+    EXPECT_FALSE(loaded.data_transfer_may_be_inflight);
+    EXPECT_EQ(1, metadata_->get_calls);
+    EXPECT_EQ(1, transfer_->load_calls);
+    EXPECT_EQ((UriStrVec{uri}), transfer_->loaded_uris);
+
+    transfer_->load_ec = ER_SDK_TIMEOUT_BUFFER_SAFE;
+    const auto safe = client_->LoadFromMeta(*meta, buffers_[0], "safe-timeout");
+    EXPECT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, safe.ec);
+    EXPECT_FALSE(safe.data_transfer_may_be_inflight);
+    transfer_->load_ec = ER_SDKREAD_ERROR;
+    EXPECT_TRUE(client_->LoadFromMeta(*meta, buffers_[0], "unknown-timeout").data_transfer_may_be_inflight);
+    EXPECT_EQ(1, metadata_->get_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, MetadataAddressUpdateRetainsTheTransferClient) {

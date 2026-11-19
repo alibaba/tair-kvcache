@@ -37,6 +37,37 @@ bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
     return true;
 }
 
+ClientErrorCode ValidateBuffer(const BlockBuffer &buffer, std::uint64_t value_size) {
+    if (buffer.iovs.empty()) {
+        return ER_INVALID_PARAMS;
+    }
+    std::uint64_t buffer_size = 0;
+    for (const auto &iov : buffer.iovs) {
+        const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
+        if (iov.ignore || iov.size == 0 || iov.base == nullptr ||
+            (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) || buffer_size > value_size ||
+            iov.size > value_size - buffer_size || iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
+            return ER_INVALID_LOCAL_BUFFERS;
+        }
+        buffer_size += iov.size;
+    }
+    if (buffer_size != value_size) {
+        return ER_INVALID_LOCAL_BUFFERS;
+    }
+    return ER_OK;
+}
+
+ClientErrorCode ValidateLocation(const KvMetaValueLocation &location, std::uint64_t size) {
+    if (!IsKnownStorageType(location.type) || location.location_specs.size() != 1 ||
+        location.location_specs[0].spec_name != kKvMetaValueSpecName || location.location_specs[0].uri.empty()) {
+        return ER_SERVICE_INTERNAL_ERROR;
+    }
+    if (location.value_size != size) {
+        return ER_SERVICE_SIZE_MISMATCH;
+    }
+    return ValidateStorageUri(location.type, location.location_specs[0].uri, size) ? ER_OK : ER_SERVICE_INTERNAL_ERROR;
+}
+
 std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>
 CreateObjectClient(const std::string &trace_id,
                    const KvMetaObjectClientConfig &config,
@@ -149,19 +180,9 @@ ClientErrorCode KvMetaObjectClientImpl::ValidateRequest(const std::vector<std::s
             return ER_INVALID_PARAMS;
         }
         batch_bytes += value_sizes[i];
-        std::uint64_t buffer_size = 0;
-        for (const auto &iov : object_buffers[i].iovs) {
-            const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
-            if (iov.ignore || iov.size == 0 || iov.base == nullptr ||
-                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) || buffer_size > value_sizes[i] ||
-                iov.size > value_sizes[i] - buffer_size ||
-                iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
-                return ER_INVALID_LOCAL_BUFFERS;
-            }
-            buffer_size += iov.size;
-        }
-        if (buffer_size != value_sizes[i]) {
-            return ER_INVALID_LOCAL_BUFFERS;
+        const auto ec = ValidateBuffer(object_buffers[i], value_sizes[i]);
+        if (ec != ER_OK) {
+            return ec;
         }
     }
     return ER_OK;
@@ -177,18 +198,10 @@ ClientErrorCode KvMetaObjectClientImpl::ExtractUris(const std::vector<KvMetaValu
     uris.reserve(locations.size());
     for (std::size_t i = 0; i < locations.size(); ++i) {
         const auto &location = locations[i];
-        if (!IsKnownStorageType(location.type) || location.location_specs.size() != 1 ||
-            location.location_specs[0].spec_name != kKvMetaValueSpecName || location.location_specs[0].uri.empty()) {
+        const auto ec = ValidateLocation(location, value_sizes[i]);
+        if (ec != ER_OK) {
             uris.clear();
-            return ER_SERVICE_INTERNAL_ERROR;
-        }
-        if (location.value_size != value_sizes[i]) {
-            uris.clear();
-            return ER_SERVICE_SIZE_MISMATCH;
-        }
-        if (!ValidateStorageUri(location.type, location.location_specs[0].uri, value_sizes[i])) {
-            uris.clear();
-            return ER_SERVICE_INTERNAL_ERROR;
+            return ec;
         }
         uris.push_back(location.location_specs[0].uri);
     }
@@ -395,19 +408,28 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjectsImpl(const std::string &trace
     if (location_ec != ER_OK) {
         return location_ec;
     }
-    data_transfer_may_be_inflight = true;
+    const auto result = LoadPayload(trace_id, uris, expected_value_sizes, object_buffers);
+    data_transfer_may_be_inflight = result.data_transfer_may_be_inflight;
+    return result.ec;
+}
+
+KvMetaObjectResult KvMetaObjectClientImpl::LoadPayload(const std::string &trace_id,
+                                                       const UriStrVec &uris,
+                                                       const std::vector<std::uint64_t> &sizes,
+                                                       const BlockBuffers &buffers) {
+    ClientErrorCode ec = ER_SDKREAD_ERROR;
     try {
-        const auto ec = transfer_client_->LoadObjects(uris, expected_value_sizes, object_buffers);
-        // Buffer-safe failures establish caller-buffer quiescence even when
-        // the remote object cannot be read. Preserve that contract so a
-        // stale address does not permanently quarantine a healthy client.
-        data_transfer_may_be_inflight =
-            ec != ER_OK && ec != ER_SDK_ERROR_BUFFER_SAFE && ec != ER_SDK_TIMEOUT_BUFFER_SAFE;
-        return ec;
+        ec = transfer_client_->LoadObjects(uris, sizes, buffers);
     } catch (...) {
-        KVCM_LOG_WARN("KVMeta object data-plane load threw");
-        return ER_SDKREAD_ERROR;
+        KVCM_LOG_WARN("KVMeta object data-plane load threw, trace_id[%s]", trace_id.c_str());
+        return {ec, true};
     }
+    if (ec != ER_OK) {
+        KVCM_LOG_WARN(
+            "KVMeta object data-plane load failed, trace_id[%s] code[%d]", trace_id.c_str(), static_cast<int>(ec));
+    }
+    // Preserve the transfer SDK's buffer-safety contract on failure.
+    return {ec, ec != ER_OK && ec != ER_SDK_ERROR_BUFFER_SAFE && ec != ER_SDK_TIMEOUT_BUFFER_SAFE};
 }
 
 ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, const std::vector<std::string> &keys) {
@@ -443,7 +465,7 @@ KvMetaObjectClientImpl::GetObjectMeta(const std::string &key, std::uint32_t time
     if (!guard.admitted()) {
         return {ER_CLIENT_NOT_EXISTS, std::nullopt};
     }
-    const auto [ec, result] = metadata_client_->GetWithDeadline(trace_id, {key}, deadline);
+    auto [ec, result] = metadata_client_->GetWithDeadline(trace_id, {key}, deadline);
     if (ec != ER_OK) {
         return {ec, std::nullopt};
     }
@@ -457,7 +479,28 @@ KvMetaObjectClientImpl::GetObjectMeta(const std::string &key, std::uint32_t time
     if (size == 0 || size > max_object_bytes_) {
         return {ER_SERVICE_SIZE_MISMATCH, std::nullopt};
     }
-    return {ER_OK, ObjectMeta{size}};
+    return {ER_OK, ObjectMeta{metadata_owner_, std::move(result.locations.front())}};
+}
+
+KvMetaObjectResult
+KvMetaObjectClientImpl::LoadFromMeta(const ObjectMeta &meta, const BlockBuffer &buffer, const std::string &trace_id) {
+    if (meta.owner_.lock() != metadata_owner_) {
+        return {ER_INVALID_PARAMS, false};
+    }
+    const auto size = meta.SizeBytes();
+    const auto buffer_ec = ValidateBuffer(buffer, size);
+    if (buffer_ec != ER_OK) {
+        return {buffer_ec, false};
+    }
+    const auto location_ec = ValidateLocation(meta.location_, size);
+    if (location_ec != ER_OK) {
+        return {location_ec, false};
+    }
+    OperationGuard operation(this, /*require_transfer=*/true);
+    if (!operation.admitted()) {
+        return {ER_CLIENT_NOT_EXISTS, false};
+    }
+    return LoadPayload(trace_id, {meta.location_.location_specs.front().uri}, {size}, {buffer});
 }
 
 ClientErrorCode KvMetaObjectClientImpl::UpdateMetadataAddresses(const std::vector<std::string> &addresses) {

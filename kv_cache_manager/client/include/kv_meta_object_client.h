@@ -32,8 +32,18 @@ std::uint32_t GetKvMetaObjectTransferStateVersion() noexcept;
 std::uint32_t GetKvMetaObjectAddressUpdateVersion() noexcept;
 std::uint32_t GetKvMetaObjectMetadataVersion() noexcept;
 
-struct ObjectMeta {
-    std::uint64_t size_bytes;
+class ObjectMeta {
+public:
+    [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return location_.value_size; }
+
+private:
+    friend class KvMetaObjectClientImpl;
+    struct Owner {};
+    ObjectMeta(std::weak_ptr<const Owner> owner, KvMetaValueLocation location)
+        : owner_(std::move(owner)), location_(std::move(location)) {}
+
+    std::weak_ptr<const Owner> owner_;
+    KvMetaValueLocation location_;
 };
 
 struct KvMetaObjectResult {
@@ -131,10 +141,16 @@ public:
     virtual ClientErrorCode UpdateMetadataAddresses(const std::vector<std::string> &) { return ER_SERVICE_UNSUPPORTED; }
 
     // Metadata only. ER_OK with no ObjectMeta means miss. The returned size
-    // does not pin the object's location for a subsequent LoadObjects.
+    // does not pin the object's location for a subsequent read.
     virtual std::pair<ClientErrorCode, std::optional<ObjectMeta>>
     GetObjectMeta(const std::string &, std::uint32_t, const std::string & = "") {
         return {ER_SERVICE_UNSUPPORTED, std::nullopt};
+    }
+
+    // Reuse a location from this client for the current read. A stale location
+    // can fail; callers must still validate their object payload as usual.
+    virtual KvMetaObjectResult LoadFromMeta(const ObjectMeta &, const BlockBuffer &, const std::string & = "") {
+        return {ER_SERVICE_UNSUPPORTED, false};
     }
 
 protected:

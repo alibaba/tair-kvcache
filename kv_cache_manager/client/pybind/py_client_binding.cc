@@ -272,7 +272,8 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
 
-    py::class_<kvcm::ObjectMeta>(module, "ObjectMeta").def_readonly("size_bytes", &kvcm::ObjectMeta::size_bytes);
+    py::class_<kvcm::ObjectMeta>(module, "ObjectMeta")
+        .def_property_readonly("size_bytes", &kvcm::ObjectMeta::SizeBytes);
     py::class_<kvcm::KvMetaObjectClient, py::smart_holder>(module, "KvMetaObjectClient", py::dynamic_attr())
         .def_static(
             "Create",
@@ -338,6 +339,20 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::kw_only(),
              py::arg("trace_id") = "",
              py::call_guard<py::gil_scoped_release>())
+        .def(
+            "load_from_meta",
+            [](kvcm::KvMetaObjectClient &client,
+               const kvcm::ObjectMeta &meta,
+               const kvcm::BlockBuffer &buffer,
+               const std::string &trace_id) {
+                const auto result = client.LoadFromMeta(meta, buffer, trace_id);
+                return std::make_pair(result.ec, result.data_transfer_may_be_inflight);
+            },
+            py::arg("meta"),
+            py::arg("buffer"),
+            py::kw_only(),
+            py::arg("trace_id") = "",
+            py::call_guard<py::gil_scoped_release>())
         .def("UpdateMetadataAddresses",
              &kvcm::KvMetaObjectClient::UpdateMetadataAddresses,
              py::arg("addresses"),

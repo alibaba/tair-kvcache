@@ -34,6 +34,9 @@ public:
     std::pair<ClientErrorCode, std::optional<ObjectMeta>>
     GetObjectMeta(const std::string &key, std::uint32_t timeout_ms, const std::string &trace_id) override;
 
+    KvMetaObjectResult
+    LoadFromMeta(const ObjectMeta &meta, const BlockBuffer &buffer, const std::string &trace_id) override;
+
     KvMetaObjectResult SaveObjectsWithTransferState(const std::string &trace_id,
                                                     const std::vector<std::string> &keys,
                                                     const std::vector<std::uint64_t> &value_sizes,
@@ -54,6 +57,10 @@ private:
                                     const std::vector<std::uint64_t> &expected_value_sizes,
                                     const BlockBuffers &object_buffers,
                                     bool &data_transfer_may_be_inflight);
+    KvMetaObjectResult LoadPayload(const std::string &trace_id,
+                                   const UriStrVec &uris,
+                                   const std::vector<std::uint64_t> &sizes,
+                                   const BlockBuffers &buffers);
     class OperationGuard {
     public:
         OperationGuard(KvMetaObjectClientImpl *owner, bool require_transfer);
@@ -83,6 +90,7 @@ private:
     [[nodiscard]] bool TryBeginOperation(bool require_transfer);
     void EndOperation() noexcept;
 
+    const std::shared_ptr<const ObjectMeta::Owner> metadata_owner_{std::make_shared<const ObjectMeta::Owner>()};
     std::unique_ptr<KvMetaClient> metadata_client_;
     std::unique_ptr<KvMetaTransferClient> transfer_client_;
     std::uint64_t max_object_bytes_{0};
