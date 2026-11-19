@@ -23,6 +23,8 @@ KVCM server 进程收到退出信号后需要完成一次可预期、可完成�
 
 此外，信号处理器上下文只允许调用 async-signal-safe 函数，而关闭流程需要加锁、打日志、调用 gRPC/HTTP 的 Shutdown，本身就不适合放在 handler 里。`Server::Stop()` 当时只用一个 `stop_` 布尔表示「已停就直接返回」，并发调用者不会等待第一次关闭完成，可能在组件 Stop / join 进行中并发进入。
 
+main 上后来有一版折中实现（提交 `8f4048c7 [service] dispatch v9 Meta requests through a bounded worker pool`）：handler 只写一个 lock-free 的 `G_STOP_SIGNAL`，`Run()` 线程用 50ms 睡眠轮询到之后执行关闭。它消除了「handler 里加锁与清理」，但仍保留了 signal handler（执行线程仍由内核任意选择）、50ms 的退出延迟、没有「关闭中途再收信号即强退」的路径，`Stop()` 也仍不可重入等待。本文档描述的实现是它的后续演进：信号彻底不落 handler，通知与关闭执行分离，重复信号与并发退出统一在控制线程与 `call_once` 收敛。
+
 ## 3. 信号职责划分
 
 | 信号 | 处置方式 | 说明 |
@@ -97,7 +99,7 @@ graph TD
 
 ### 5.2 掩码继承与边界
 
-- 掩码在 `daemon()`、logger 初始化（alog 会创建 flush 线程）、Server 启动之前设置，之后创建的线程一律继承，包括日志库、gRPC、HTTP、选主与 Metrics 线程。
+- 掩码在 `daemon()`、logger 初始化（alog 会创建 flush 线程）、Server 启动之前设置，之后创建的线程一律继承，包括日志库、gRPC、HTTP、业务队列 `ServiceRequestExecutor` 的 worker、选主与 Metrics 线程。
 - 控制线程进入循环时会对自己再 `pthread_sigmask(SIG_BLOCK)` 一遍：即使调用方漏掉 `BlockExitSignals()`，退出信号也不会在该线程触发默认终止动作，而是被 `sigtimedwait` 取走。
 - `BlockExitSignals()` 只在 `CommandLine::Run()` 中调用，作用域限于 server 进程；客户端、压测工具与单元测试进程不受影响。
 - 控制线程创建失败时解除阻塞掩码，恢复「SIGTERM 直接终止进程」的默认语义，避免进程变成只能被 SIGKILL 杀掉。
@@ -125,8 +127,14 @@ graph TD
           Server::Stop()（std::call_once）
             两个 redis 健康探测 RequestStop()（先让探测循环退出，稍后再 join）
             → leader_elector_->Stop()（撤销资格 → 关门禁 → 排空 → 清理 → 释放锁）
-            → optimizer 订阅关闭 → gRPC Shutdown → HTTP Stop
+            → request_executor_->CloseAdmission（业务队列关门禁，drain / discard 由配置决定）
+            → meta_service_->StopAccepting() → optimizer 订阅关闭
+            → gRPC Shutdown → HTTP Stop
+            → request_executor_->Drain()（等待已接受请求把结果交还传输层）
+            → meta_service_->WaitForCalls() / ShutdownCompletionQueueAndJoin()
             → role_state / metrics_report / redis_health / coordination_redis_health 四个 LoopThread 依次 Stop
+            → request_executor_->Join()（业务 worker 线程 join）
+            → ReportMetrics(true)（最终一次指标采样）
           Server::Wait()（join HTTP 线程；gRPC Wait 立即返回）
           server_.reset()（销毁 service / manager，此时其依赖仍有效）
           controller_.Stop()（join 控制线程）
@@ -143,12 +151,14 @@ graph TD
 | 不变量 | 原因 |
 |---|---|
 | 门禁先于传输层关闭 | 新的 leader-only 请求要拿到门禁拒绝码而不是传输错误 |
+| 业务队列 `CloseAdmission` 早于 gRPC / HTTP Shutdown，`Drain` / `Join` 晚于 Shutdown | 已接受请求必须在 worker 与传输层都存活时完成并把结果交还传输层；`Drain` 还等待 HTTP 处理协程归还完成凭证 |
+| `request_executor_->Join()` 早于最终指标采样 | worker 线程 join 之后拒绝 / 丢弃计数不再变化，`ReportMetrics(true)` 才不会重复计数 |
 | `leader_elector_->Stop()` 在组件关闭最前 | 生命周期回调需要 service 门禁与 manager 仍然存活 |
 | `server_.reset()` 早于 `controller_.Stop()` | `server_.reset()` 里的析构会 join 各后台线程，是关闭流程中最可能阻塞的一段；控制线程活到它之后，「再收一个退出信号就强退」的兜底才覆盖得到这段，否则运维只能 SIGKILL |
 | `controller_.Stop()` 早于 `DestroyLogger()` | 控制线程在强制退出路径上还要打 WARN 日志 |
 | `Server::Stop()` 只执行一次完整关闭 | `std::call_once`：重复或并发的关闭请求（信号路径与启动失败路径同时触发）由其余调用者等待该次关闭完成后返回，不产生并发的组件 Stop / join |
 
-`Server::Stop()` 内部的组件关闭顺序与日志文案不属于本次改造范围（含 redis 健康探测的 `RequestStop()` 与四个 LoopThread 停止点），变的只是「谁来调用」与「只完整执行一次」。`Server::Wait()` / `Server::OnNoLongerLeader()` 同样未改动。
+`Server::Stop()` 内部的组件关闭顺序与日志文案不属于本次改造范围（含 redis 健康探测的 `RequestStop()`、业务队列 `ServiceRequestExecutor` 的关门禁 / Drain / Join 与四个 LoopThread 停止点），变的只是「谁来调用」与「只完整执行一次」。`Server::Wait()` / `Server::OnNoLongerLeader()` 同样未改动。
 
 ### 6.2 边界情况
 
@@ -187,6 +197,8 @@ graph TD
 | 在自身 loop 回调里调用 `Stop()` | 标志置真、抛 `std::system_error`；从其它线程调用时标志为假 | `common/test/loop_thread_test.cc` `TestStopFromOwnLoopThreadDetectsSelfJoin` / `TestStopFromOtherThreadDoesNotDetectSelfJoin` |
 | 真实二进制收到单次 SIGTERM | 退出码 0，关闭日志序列完整且只出现一份 | `service/test/command_line_shutdown_test.cc` `SingleSigtermShutsDownGracefullyWithExitCodeZero` |
 | 真实二进制在关闭进行中再收一个退出信号 | 退出码为 `128 + sig`，日志含 `force exit`，不含 `goodbye` | 同上 `SecondExitSignalDuringShutdownForcesImmediateExit` |
+| 工作线程 `raise()` 退出信号 / 进程级信号 | 前者只挂在该线程 pending、不进入关闭路径；后者由控制线程取走并唤醒主线程 | `service/test/command_line_test.cc` `TerminationSignalOnWorkerOnlyNotifiesMainThread` |
+| 真实二进制 SIGTERM（业务队列 e2e） | 退出码 0，日志含 `received signal 15` 与业务队列的最终指标汇总 | `integration_test/service_dispatch/service_dispatch_smoke.py` |
 | 集成测试停服务 | 优雅关闭卡住时 60s 超时后 SIGKILL 并返回失败，不再无限轮询挂死 CI | `integration_test/client_test/service_process_controller.h` `StopService()` |
 
 所有等待都有超时上限，无裸 `wait()` 与 sleep 掩盖。
