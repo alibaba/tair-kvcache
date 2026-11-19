@@ -346,7 +346,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
 
         const bool success = result.status == TairReclaimFreeResult::kSuccess;
-        if (success) {
+        if (success && result.provider_free_acknowledged) {
             std::set<DataStorageType> types;
             for (const auto &target : targets) {
                 types.insert(target.second->type());
@@ -354,7 +354,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
             for (auto type : types) {
                 task->Record(type, 0);
             }
-        } else {
+        } else if (!success) {
             for (const auto &[key, loc] : targets) {
                 for (const auto &spec : loc->location_specs()) {
                     KVCM_LOG_WARN("Tair Free failed, possible leak instance[%s] key[%ld] location[%s] uri[%s]",
