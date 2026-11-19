@@ -212,6 +212,11 @@ bool TransferClientImpl::QueryReadBufferSafety(const std::string &read_execution
     return sdk_wrapper_ && sdk_wrapper_->QueryReadBufferSafety(read_execution_id, deadline_ms);
 }
 
+void TransferClientImpl::DiscardReadRecovery(const std::string &read_execution_id) {
+    if (sdk_wrapper_)
+        sdk_wrapper_->DiscardReadRecovery(read_execution_id);
+}
+
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                        const BlockBuffers &block_buffers,
                                                                        std::shared_ptr<TransferTraceInfo> trace_info) {

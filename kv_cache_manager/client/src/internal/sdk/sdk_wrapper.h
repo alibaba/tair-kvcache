@@ -34,6 +34,7 @@ public:
                         int64_t parent_deadline_ms = 0,
                         const std::string &read_execution_id = {});
     bool QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms);
+    void DiscardReadRecovery(const std::string &read_execution_id);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,

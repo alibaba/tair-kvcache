@@ -286,6 +286,15 @@ bool SdkWrapper::QueryReadBufferSafety(const std::string &read_execution_id, int
     return safe;
 }
 
+void SdkWrapper::DiscardReadRecovery(const std::string &read_execution_id) {
+    // Release the old context outside the map lock.
+    decltype(read_recovery_)::node_type discarded;
+    {
+        std::lock_guard<std::mutex> lock(read_recovery_mu_);
+        discarded = read_recovery_.extract(read_execution_id);
+    }
+}
+
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
