@@ -94,6 +94,13 @@ struct ServiceRequestExecutor::CompletionLease {
 };
 
 bool ServiceRequestExecutor::Init(std::size_t worker_count, std::size_t queue_capacity) {
+    return InitWithThreadFactory(
+        worker_count, queue_capacity, [](std::function<void()> run) { return std::thread(std::move(run)); });
+}
+
+bool ServiceRequestExecutor::InitWithThreadFactory(std::size_t worker_count,
+                                                   std::size_t queue_capacity,
+                                                   const ThreadFactory &start_worker) {
     if (worker_count == 0 || state_) {
         return false;
     }
@@ -101,7 +108,7 @@ bool ServiceRequestExecutor::Init(std::size_t worker_count, std::size_t queue_ca
     workers_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
         try {
-            workers_.emplace_back([state = state_] { WorkerLoop(state); });
+            workers_.emplace_back(start_worker([state = state_] { WorkerLoop(state); }));
         } catch (const std::system_error &error) {
             KVCM_LOG_ERROR("create service request worker failed: %s", error.what());
             CloseAdmission();

@@ -1,18 +1,15 @@
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <future>
 #include <mutex>
 #include <numeric>
-#include <pthread.h>
-#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/service/service_request_executor.h"
-#include "stub.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -437,13 +434,24 @@ TEST(ServiceRequestExecutorTest, DrainIncludesInProgressDiscardCallback) {
     EXPECT_EQ(std::future_status::ready, draining.wait_for(2s));
 }
 
-int FailThreadCreation(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) { return EAGAIN; }
-
 TEST(ServiceRequestExecutorTest, ThreadCreationFailureReturnsFalseAndCanBeDestroyed) {
+    std::size_t creation_attempts = 0;
+    std::atomic<bool> first_worker_exited{false};
     Executor executor;
-    Stub stub;
-    stub.set(pthread_create, FailThreadCreation);
-    EXPECT_FALSE(executor.Init(2));
+    // Hooking pthread_create with cpp_stub requires making its code pages writable at runtime.
+    // That hook failed on ARM Linux, so inject the thread creation error through the factory.
+    const auto start_worker = [&](std::function<void()> run) {
+        if (++creation_attempts == 2) {
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        }
+        return std::thread([run = std::move(run), &first_worker_exited] {
+            run();
+            first_worker_exited = true;
+        });
+    };
+    EXPECT_FALSE(executor.InitWithThreadFactory(2, 1, start_worker));
+    EXPECT_EQ(2u, creation_attempts);
+    EXPECT_TRUE(first_worker_exited.load());
     EXPECT_EQ(Result::kClosed, executor.RejectIfUnavailable());
     EXPECT_EQ(0u, executor.GetSnapshot().running);
     executor.Drain();

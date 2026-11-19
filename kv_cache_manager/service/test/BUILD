@@ -49,10 +49,10 @@ cc_test(
 cc_test(
     name = "ServiceRequestExecutorTest",
     srcs = ["service_request_executor_test.cc"],
+    copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/service:service_request_executor",
-        "@cpp_stub",
     ],
 )
 
