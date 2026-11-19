@@ -4,7 +4,7 @@ Field defaults double as the documentation of every knob; unknown keys are
 rejected (typos in extra_config fail at startup instead of silently
 defaulting)."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
@@ -66,6 +66,13 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     # (not just the block count) to give hybrid deployments more in-flight
     # transfer concurrency.
     staging_pool_max_bytes_per_group: int = 2**30
+
+    # --- Data plane ---
+    # Import path of the module that provides the data-plane backend; empty
+    # keeps the built-in GPU one (pinned host staging + Triton
+    # gather/scatter). The named module must expose make_backend(**kwargs)
+    # returning a TransferBackend (see transfer_backend.py).
+    transfer_backend_module_path: Optional[str] = None
 
     # --- Manager queries ---
     async_get_cache_location: bool = True

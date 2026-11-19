@@ -48,3 +48,19 @@ py_test(
     tags = ["no-remote-exec"],
     deps = [":vllm_stubs"],
 )
+
+py_test(
+    name = "test_transfer_backend",
+    srcs = ["test_transfer_backend.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
+
+# The checks run in subprocesses that import the connector themselves, so the
+# stubs are only needed for the runfiles those children import from.
+py_test(
+    name = "test_lazy_triton_import",
+    srcs = ["test_lazy_triton_import.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)

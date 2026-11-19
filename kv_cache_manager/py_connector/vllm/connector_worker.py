@@ -27,12 +27,13 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     TpCoordinatorServer,
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
-from kv_cache_manager.py_connector.vllm.data_transfer import (
-    MultiResult,
-    DataTransferManager,
-    _get_device_module,
-)
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
+from kv_cache_manager.py_connector.vllm.transfer_backend import (
+    MultiResult,
+    TransferBackend,
+    get_device_module,
+    make_transfer_backend,
+)
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
@@ -89,6 +90,8 @@ class ConnectorWorker:
         # torch device module (torch.cuda / torch.musa / ...), set in
         # register_kv_caches; Any because the module surface is dynamic.
         self._device_mod: Any = None
+        # Built in register_kv_caches, once the KV tensors exist.
+        self._backend: Optional[TransferBackend] = None
         port = extra_config.coordinator_base_port
         if self._tp_rank == 0:
             self._coordinator_server = TpCoordinatorServer(
@@ -145,6 +148,14 @@ class ConnectorWorker:
             self._num_groups,
         )
 
+    def shutdown(self) -> None:
+        """Release the data plane.
+
+        The coordinator thread and the transfer client are process-scoped and
+        are not torn down here."""
+        if self._backend is not None:
+            self._backend.shutdown()
+
     # ------------------------------------------------------------------ #
     # Storage config plumbing
     # ------------------------------------------------------------------ #
@@ -182,7 +193,7 @@ class ConnectorWorker:
         )
         self._dtype = first_attn.dtype
         self._device = first_attn.device
-        self._device_mod = _get_device_module(self._device)
+        self._device_mod = get_device_module(self._device)
 
         groups: List[TransferGroup] = []
         for meta in self._group_metas:
@@ -202,12 +213,13 @@ class ConnectorWorker:
             device=self._device,
             dtype=self._dtype,
         )
-        self._data_transfer = DataTransferManager(
-            self._kvcache_info,
-            self._manager_block_size,
-            self._transfer_client,
-            self._coordinator_client,
-            self._extra_config,
+        self._backend = make_transfer_backend(
+            extra_config=self._extra_config,
+            kvcache_info=self._kvcache_info,
+            manager_block_size=self._manager_block_size,
+            transfer_client=self._transfer_client,
+            coordinator_client=self._coordinator_client,
+            device=self._device,
         )
 
         logger.warning(
@@ -478,6 +490,10 @@ class ConnectorWorker:
         for load_req in meta.to_load_requests:
             if not load_req.need_load_locations:
                 continue
+            assert self._backend is not None, (
+                "start_load_kv before register_kv_caches: the data plane only "
+                "exists once the KV tensors are known"
+            )
             num_blocks = len(load_req.manager_block_idxes)
             plans = self._plan_group_transfers(
                 load_req.need_load_locations,
@@ -532,7 +548,7 @@ class ConnectorWorker:
                     table[(mb * self._manager_block_size) // gbs]
                     for mb in load_req.manager_block_idxes
                 ]
-            done_cb = self._data_transfer.create_load_done_callback(
+            done_cb = self._backend.create_load_done_callback(
                 load_req.req_id,
                 self._tp_rank,
                 meta.epoch,
@@ -552,8 +568,8 @@ class ConnectorWorker:
             )
             multi_result = MultiResult(len(chunks), done_cb)
             for task_idx, chunk in enumerate(chunks):
-                self._data_transfer.submit_task(
-                    self._data_transfer.load_task, multi_result, task_idx, *chunk
+                self._backend.submit(
+                    self._backend.load_task, multi_result, task_idx, *chunk
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -571,6 +587,10 @@ class ConnectorWorker:
     def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
         if not meta.to_save_requests:
             return
+        assert self._backend is not None, (
+            "wait_for_save before register_kv_caches: the data plane only "
+            "exists once the KV tensors are known"
+        )
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
 
@@ -582,7 +602,7 @@ class ConnectorWorker:
                 save_req.all_block_ids,
             )
 
-            done_cb = self._data_transfer.create_save_done_callback(
+            done_cb = self._backend.create_save_done_callback(
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
 
@@ -596,8 +616,8 @@ class ConnectorWorker:
             )
             multi_result = MultiResult(len(chunks), done_cb)
             for task_idx, chunk in enumerate(chunks):
-                self._data_transfer.submit_task(
-                    self._data_transfer.save_task,
+                self._backend.submit(
+                    self._backend.save_task,
                     multi_result,
                     task_idx,
                     *chunk,
