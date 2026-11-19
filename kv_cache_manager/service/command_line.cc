@@ -138,7 +138,8 @@ int CommandLine::Run(int argc, const char *argv[]) {
     if (exit_code == 0) {
         controller_.WaitForShutdownRequest();
         if (controller_.IsShutdownRequested()) {
-            KVCM_LOG_INFO("received exit signal %d, stopping server", controller_.ReceivedSignal());
+            // 措辞与 main 的临时实现保持一致，integration_test/service_dispatch 会断言这一行。
+            KVCM_LOG_INFO("received signal %d, stopping server", controller_.ReceivedSignal());
         }
     }
 
