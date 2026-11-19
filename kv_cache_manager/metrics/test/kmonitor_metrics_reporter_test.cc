@@ -336,8 +336,13 @@ TEST_F(KmonitorMetricsReporterTest, KvMetaReclaimReportsCumulativeValuesAndNativ
         metrics_registry_->GetCounter(prefix + "stage_count", tags) += 3;
         expected[{prefix + "stage_count", tags}] = 3;
     }
-    for (const char *suffix :
-         {"usage_bytes", "target_bytes", "candidate_count", "selected_count", "deleted_count", "deleted_bytes"}) {
+    for (const char *suffix : {"capacity_bytes",
+                               "usage_bytes",
+                               "target_bytes",
+                               "candidate_count",
+                               "selected_count",
+                               "deleted_count",
+                               "deleted_bytes"}) {
         metrics_registry_->GetGauge(prefix + suffix, group_tags) = 7;
         metrics_registry_->GetGauge(prefix + suffix, other_tags) = 0;
         expected[{prefix + suffix, group_tags}] = 7;
@@ -360,7 +365,8 @@ TEST_F(KmonitorMetricsReporterTest, KvMetaReclaimReportsCumulativeValuesAndNativ
                                "deleted_bytes_total",
                                "physical_deleted_objects_total",
                                "physical_deleted_bytes_total",
-                               "maintenance_touch_keys_total"}) {
+                               "maintenance_touch_keys_total",
+                               "no_progress_rounds_total"}) {
         metrics_registry_->GetCounter(prefix + suffix, group_tags) += 23;
         expected[{prefix + suffix, group_tags}] = 23;
     }
@@ -375,6 +381,9 @@ TEST_F(KmonitorMetricsReporterTest, KvMetaReclaimReportsCumulativeValuesAndNativ
         metrics_registry_->GetGauge(name) = 64;
         expected[{name, {}}] = 64;
     }
+    const MetricsTags rejected_tags{{"instance_group", "emb_a"}, {"reason", "metadata_unavailable"}};
+    metrics_registry_->GetCounter(prefix + "rejected_keys_total", rejected_tags) += 41;
+    expected[{prefix + "rejected_keys_total", rejected_tags}] = 41;
     // Do not publish untouched series or names outside the explicit allowlist.
     metrics_registry_->GetCounter(prefix + "stage_count", {{"instance_group", "untouched"}});
     metrics_registry_->GetGauge(prefix + "unexpected", group_tags) = 99;

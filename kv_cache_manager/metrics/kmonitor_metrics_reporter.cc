@@ -541,6 +541,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // Registry counters remain cumulative GAUGEs; rate conversion belongs to the query.
     for (const std::string name : {"kv_meta.reclaim.stage_count",
+                                   "kv_meta.reclaim.capacity_bytes",
                                    "kv_meta.reclaim.usage_bytes",
                                    "kv_meta.reclaim.target_bytes",
                                    "kv_meta.reclaim.candidate_count",
@@ -562,6 +563,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
                                    "kv_meta.reclaim.physical_deleted_objects_total",
                                    "kv_meta.reclaim.physical_deleted_bytes_total",
                                    "kv_meta.reclaim.maintenance_touch_keys_total",
+                                   "kv_meta.reclaim.rejected_keys_total",
+                                   "kv_meta.reclaim.no_progress_rounds_total",
                                    "kv_meta.active_write_sessions",
                                    "kv_meta.write_session_capacity",
                                    "kv_meta.write_session_rejected_total",

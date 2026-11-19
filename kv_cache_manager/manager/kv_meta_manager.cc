@@ -1,6 +1,7 @@
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -747,6 +748,7 @@ private:
             return;
         }
         const std::uint64_t target = static_cast<std::uint64_t>(static_cast<long double>(capacity) * threshold);
+        owner_->ObserveReclaimGauge(group->name(), "capacity_bytes", capacity);
         owner_->ObserveReclaimGauge(group->name(), "usage_bytes", group_usage);
         owner_->ObserveReclaimGauge(group->name(), "target_bytes", target);
         std::uint64_t pending_bytes = 0, pending_credit_bytes = 0;
@@ -817,14 +819,26 @@ private:
         // Ordinary Cache also excludes pending locations before selecting
         // victims. Pending keys must not consume either metadata-read work or
         // the sampling window while their reader grace is outstanding.
+        enum Rejection {
+            kPending,
+            kMetadataUnavailable,
+            kNoServingLocation,
+            kInvalidLocation,
+            kUncertainCommit,
+            kCount
+        };
+        constexpr std::array<const char *, kCount> reasons{
+            "pending", "metadata_unavailable", "no_serving_location", "invalid_location", "uncertain_commit"};
+        std::array<std::uint64_t, kCount> rejection_counts{};
         std::map<std::string, KeyVector> rejected_keys;
         candidates.erase(std::remove_if(candidates.begin(),
                                         candidates.end(),
-                                        [this, &rejected_keys](const Candidate &candidate) {
+                                        [this, &rejected_keys, &rejection_counts](const Candidate &candidate) {
                                             if (!IsPendingKey(candidate)) {
                                                 return false;
                                             }
                                             rejected_keys[candidate.instance_id].push_back(candidate.key);
+                                            ++rejection_counts[kPending];
                                             return true;
                                         }),
                          candidates.end());
@@ -887,9 +901,12 @@ private:
                 const auto found = maps.find(candidate.key);
                 if (found == maps.end()) {
                     rejected_keys[candidate.instance_id].push_back(candidate.key);
+                    ++rejection_counts[kMetadataUnavailable];
                     continue;
                 }
                 const auto selected_before = selected_count;
+                // Prefer the reason from the furthest check reached by any location.
+                Rejection reason = kNoServingLocation;
                 for (const auto &[location_id, location] : found->second) {
                     if (!location || location->status() != CLS_SERVING ||
                         location_id.compare(0, kKvMetaLocationIdPrefix.size(), kKvMetaLocationIdPrefix) != 0 ||
@@ -898,12 +915,14 @@ private:
                     }
                     std::uint64_t size = 0;
                     if (owner_->ValidateLocation(&context, candidate.key, location_id, *location, size) != EC_OK) {
+                        reason = std::max(reason, kInvalidLocation);
                         continue;
                     }
                     KvMetaManager::SessionItem item{candidate.key, location_id, location, size};
                     // Do not compete with an in-progress/uncertain commit's
                     // accounting and cleanup ownership.
                     if (owner_->HasUncertainUsage(candidate.instance_id, item)) {
+                        reason = kUncertainCommit;
                         owner_->ObserveReclaimStage(group->name(), "uncertain_commit", "skipped");
                         continue;
                     }
@@ -916,6 +935,7 @@ private:
                 }
                 if (selected_count == selected_before) {
                     rejected_keys[candidate.instance_id].push_back(candidate.key);
+                    ++rejection_counts[reason];
                 }
             }
             offset = end;
@@ -929,6 +949,9 @@ private:
                 owner_->AddReclaimCounter(
                     group->name(), "maintenance_touch_keys_total", indexer->TouchKeysForMaintenance(keys));
             }
+        }
+        for (std::size_t i = 0; i < reasons.size(); ++i) {
+            owner_->AddReclaimCounter(group->name(), "rejected_keys_total", rejection_counts[i], reasons[i]);
         }
         owner_->ObserveReclaimGauge(group->name(), "selected_count", selected_count);
         std::uint64_t submitted_bytes = 0;
@@ -992,6 +1015,7 @@ private:
                 owner_->ObserveReclaimStage(group->name(), "delete_submit", "success");
             }
         }
+        owner_->AddReclaimCounter(group->name(), "no_progress_rounds_total", submitted_count == 0);
         owner_->AddReclaimCounter(group->name(), "submitted_objects_total", submitted_count);
         owner_->AddReclaimCounter(group->name(), "submitted_bytes_total", submitted_bytes);
         owner_->ObserveReclaimGauge(group->name(), "round_time_us", TimestampUtil::GetCurrentTimeUs() - round_us);
@@ -1566,10 +1590,15 @@ void KvMetaManager::ObserveReclaimStage(const std::string &group,
 
 void KvMetaManager::AddReclaimCounter(const std::string &group,
                                       const std::string &name,
-                                      std::uint64_t value) const noexcept {
+                                      std::uint64_t value,
+                                      const char *reason) const noexcept {
     try {
         if (const auto metrics = cache_manager_->metrics_registry()) {
-            metrics->GetCounter("kv_meta.reclaim." + name, {{"instance_group", group}}) += value;
+            MetricsTags tags{{"instance_group", group}};
+            if (reason) {
+                tags.emplace("reason", reason);
+            }
+            metrics->GetCounter("kv_meta.reclaim." + name, tags) += value;
         }
     } catch (...) { KVCM_LOG_ERROR("KVMeta reclaim counter reporting failed"); }
 }

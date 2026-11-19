@@ -1590,6 +1590,10 @@ TEST_F(KvMetaManagerTest, ReclaimerMovesPastAFullSampleOfStaleKeys) {
     EXPECT_EQ(1u, pace_backend_->delete_count());
     const MetricsTags tags{{"instance_group", kGroup}};
     EXPECT_GT(metrics_registry_->GetCounter("kv_meta.reclaim.maintenance_touch_keys_total", tags).Get(), 0u);
+    const MetricsTags unavailable{{"instance_group", kGroup}, {"reason", "metadata_unavailable"}};
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta.reclaim.rejected_keys_total", unavailable).Get(), 10u);
+    EXPECT_GT(metrics_registry_->GetCounter("kv_meta.reclaim.no_progress_rounds_total", tags).Get(), 0u);
+    EXPECT_EQ(1000, metrics_registry_->GetGauge("kv_meta.reclaim.capacity_bytes", tags).Get());
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerBatchesCandidateReadsAndReportsActualDeletedBytes) {

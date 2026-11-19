@@ -205,7 +205,7 @@ excess   = group_usage - target
 当扣除仍有效的在途回收额度后 `group_usage > target` 时，KvMetaReclaimer 执行：
 
 1. 复用普通 Cache 的采样入口；热缓存回填完成时在本地采样，恢复中从持久层采样。
-2. 排除已在途 key；复用维护性 touch 让这些 key 让出冷分片采样位置，避免等待宽限期的 key 占满下一轮候选。
+2. 排除已在途 key；复用维护性 touch 让已在途和此次无法选中的 key 让出冷分片采样位置。
 3. 合并候选并按访问时间排序，按需扩大批次读取 metadata，只保留合法且提交计量已确认的 SERVING generation。未确认提交的跳过次数见 `stage_count{stage=uncertain_commit,status=skipped}`。
 4. 复用普通 Cache 的单批大小、每轮请求数、pending 对象数/字节数和超时配置，向 SchedulePlanExecutor 提交有界异步删除任务。
 5. executor 校验预期 generation，将 metadata 标记为 DELETING，并按现有删除流程确认持久化。
@@ -213,11 +213,15 @@ excess   = group_usage - target
 7. 物理删除返回后条件清理 metadata、扣减 usage。删除失败不会恢复可读状态，也不会自动重试物理释放。
 8. 超时任务停止抵扣预测回收额度，但保留 pending 去重和限额占用，避免重复释放；后续完成时再移除 pending。
 
-这是异步采样 LRU，不是每轮全量扫描。普通 maintenance 读取不刷新业务访问时间；对已在途候选的维护性 touch 只调整本地采样顺序，不记录业务命中或写持久层。本地或 hot-cache 业务命中复用读取时已更新的访问时间，不重复 upsert；纯 Redis 命中仍更新持久化 LRU。
+这是异步采样 LRU，不是每轮全量扫描。普通 maintenance 读取不刷新业务访问时间；对被排除候选的维护性 touch 只调整本地采样顺序，不记录业务命中或写持久层。本地或 hot-cache 业务命中复用读取时已更新的访问时间，不重复 upsert；纯 Redis 命中仍更新持久化 LRU。
 
 回收指标分别记录提交对象/字节、实际成功删除 metadata 的对象/字节和物理删除成功的对象/字节；任务完成批数不能当作对象回收 QPS。pending 最老时长、额度超时及限额跳过可用于定位停滞。当前没有长期 DELETING 的自动修复或物理失败持久化重试队列，失败或取消仍可能留下孤儿 allocation。读取安全要求 grace 覆盖完整读取时间及调度抖动。
 
-关键观测项（`kv_meta.` 为 registry/KMonitor 名称前缀）：
+Registry 前缀为 `kv_meta.`，SG52 KMonitor 完整前缀为 `kvcm_service.kv_meta.`。
+
+- `reclaim.capacity_bytes` / `reclaim.usage_bytes` / `reclaim.target_bytes` 分别是配额、当前用量和 LRU 回收目标。
+- `reclaim.rejected_keys_total{reason}` 对每个已检查且未选中的 key 计一次。`pending` 表示已有任务，`metadata_unavailable` 涵盖缺失和读取失败，`no_serving_location` 表示没有可选 KVMeta SERVING location，`invalid_location` 表示 location 校验失败，`uncertain_commit` 表示尚未确认提交。
+- `reclaim.no_progress_rounds_total` 统计仍超出回收目标且进入采样阶段、但没有提交任何对象的轮数。水位以下和采样前的 pending 限额由 `stage_count` 单独观察。
 
 - `reclaim.deleted_objects_total` / `reclaim.deleted_bytes_total`：实际 metadata 删除累计量。
 - `reclaim.physical_deleted_objects_total` / `reclaim.physical_deleted_bytes_total`：物理删除成功累计量；与 metadata 删除量分开判断。

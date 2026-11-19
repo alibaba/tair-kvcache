@@ -146,7 +146,10 @@ private:
     bool DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
     void
     ObserveReclaimStage(const std::string &group, const std::string &stage, const std::string &status) const noexcept;
-    void AddReclaimCounter(const std::string &group, const std::string &name, std::uint64_t value) const noexcept;
+    void AddReclaimCounter(const std::string &group,
+                           const std::string &name,
+                           std::uint64_t value,
+                           const char *reason = nullptr) const noexcept;
     void ObserveReclaimGauge(const std::string &group, const std::string &name, std::uint64_t value) const noexcept;
     bool WaitForDeletionDelay(std::int32_t delay_ms);
     bool ExpireSession(const std::string &session_id,
