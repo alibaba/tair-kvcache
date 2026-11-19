@@ -34,6 +34,22 @@ redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
 - `db` 必须放在 query 参数中；未配置时使用 DB 0。`redis://host:port/1` 中的 `/1` 是 path，不能用于选择 DB。
 - `db > 0` 依赖 Redis 服务端支持 `SELECT`。Redis Cluster 不支持多逻辑 DB，此时应使用 DB 0，并通过 `cluster_name` 和 key 前缀隔离，或使用独立 Redis 实例。
 
+### Recommended sub-second multi-node leader election profile
+
+The following Valkey/Redis-backed profile is tested for multi-node deployments targeting leader lock acquisition within one second after the previous lease expires, when the coordination service is responsive and reachable:
+
+```TEXT
+kvcm.leader_elector.lease_ms=500
+kvcm.leader_elector.loop_interval_ms=25
+kvcm.coordination.uri=redis://your_auth_token@redis-host:6379/?db=2&cluster_name=kvcm_app_0&timeout_ms=100&retry_count=1
+```
+
+Use all four values together: `lease_ms=500`, `loop_interval_ms=25`, coordination URI `timeout_ms=100`, and coordination URI `retry_count=1`. The loop interval must remain below `lease_ms / 10`; for this profile, 25 ms is below 50 ms. The existing 10-second lease default is not a sub-second failover configuration.
+
+This bounds lock acquisition, not service failover. After acquiring the lock, the new leader runs `RegistryManager::DoRecover`, the startup config loader, and `CacheManager::DoRecover` before it reports `LEADER` and enables leader-only requests. Total failover time is therefore the lock-acquisition time plus recovery time, which grows with the amount of registry and cache metadata to recover.
+
+In this path, `timeout_ms=100` bounds connection establishment and connection-pool acquisition. It is not a hard read deadline for a command on an established Redis connection. `retry_count=1` means one attempt, not one retry after an initial attempt. A stalled established Redis command can therefore delay failover beyond one second. The sub-second profile assumes a responsive, reachable coordination service; connectivity failures, service latency, process stalls, or scheduling stalls can delay promotion or prevent it until coordination recovers.
+
 ## KVCacheManager Server Config
 
 ### 通用服务配置
