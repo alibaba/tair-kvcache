@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "kv_cache_manager/client/include/kv_meta_client.h"
@@ -30,6 +31,10 @@ public:
                                 const std::vector<bool> &success_keys) override;
     ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override;
     ClientErrorCode UpdateAddresses(const std::vector<std::string> &addresses) override;
+    std::pair<ClientErrorCode, KvMetaGetResult>
+    GetWithDeadline(const std::string &trace_id,
+                    const std::vector<std::string> &keys,
+                    std::chrono::steady_clock::time_point deadline) override;
 
 private:
     enum class TransportRetryPolicy {
@@ -41,8 +46,16 @@ private:
     ClientErrorCode Init(const KvMetaClientConfig &config);
 
     template <typename Response, typename Rpc>
-    ClientErrorCode
-    Call(const std::string &trace_id, Response *response, TransportRetryPolicy transport_retry_policy, Rpc &&rpc);
+    ClientErrorCode Call(const std::string &trace_id,
+                         Response *response,
+                         TransportRetryPolicy transport_retry_policy,
+                         Rpc &&rpc,
+                         std::optional<std::chrono::steady_clock::time_point> caller_deadline = std::nullopt);
+
+    std::pair<ClientErrorCode, KvMetaGetResult>
+    GetImpl(const std::string &trace_id,
+            const std::vector<std::string> &keys,
+            std::optional<std::chrono::steady_clock::time_point> caller_deadline);
 
     KvMetaClientConfig config_;
     struct EndpointSnapshot {

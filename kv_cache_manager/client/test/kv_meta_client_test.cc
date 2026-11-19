@@ -491,6 +491,30 @@ TEST(KvMetaClientTest, MapsWriteInProgressWithoutRetryingAnotherServer) {
     EXPECT_EQ(0, fallback.put_start_calls.load());
 }
 
+TEST(KvMetaClientTest, DeadlineIsSharedAcrossReadAttempts) {
+    FakeKvMetaService slow;
+    FakeKvMetaService fallback;
+    slow.set_get_delay(std::chrono::milliseconds(240));
+    RunningServer first(&slow);
+    RunningServer second(&fallback);
+    ASSERT_TRUE(first.valid() && second.valid());
+    auto client = KvMetaClient::Create({{first.address(), second.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+
+    using Clock = std::chrono::steady_clock;
+    EXPECT_EQ(ER_SDK_TIMEOUT, client->GetWithDeadline("expired", {"a"}, Clock::now()).first);
+    EXPECT_EQ(0, slow.get_calls.load());
+    EXPECT_EQ(ER_OK, client->GetWithDeadline("failover", {"a"}, Clock::now() + std::chrono::milliseconds(180)).first);
+    EXPECT_EQ(1, slow.get_calls.load());
+    EXPECT_EQ(1, fallback.get_calls.load());
+
+    fallback.set_get_delay(std::chrono::milliseconds(240));
+    const auto started = Clock::now();
+    EXPECT_EQ(ER_SDK_TIMEOUT,
+              client->GetWithDeadline("two-slow", {"a"}, started + std::chrono::milliseconds(100)).first);
+    EXPECT_LT(Clock::now() - started, std::chrono::milliseconds(200));
+}
+
 TEST(KvMetaClientTest, ReadFailsOverAfterTransportError) {
     FakeKvMetaService unavailable;
     unavailable.set_get_transport_error(true);

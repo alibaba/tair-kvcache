@@ -113,6 +113,12 @@ public:
         return {get_ec, get_result};
     }
 
+    std::pair<ClientErrorCode, KvMetaGetResult> GetWithDeadline(const std::string &trace_id,
+                                                                const std::vector<std::string> &keys,
+                                                                std::chrono::steady_clock::time_point) override {
+        return Get(trace_id, keys);
+    }
+
     std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
                                                                   const std::vector<std::string> &keys,
                                                                   const std::vector<std::uint64_t> &value_sizes,
@@ -283,6 +289,29 @@ protected:
     FakeKvMetaTransferClient *transfer_{nullptr};
     std::unique_ptr<KvMetaObjectClientImpl> client_;
 };
+
+TEST_F(KvMetaObjectClientTest, MetadataReportsHitMissAndFailureWithoutPayloadIo) {
+    metadata_->get_result = {{true}, {{KvMetaStorageType::TAIR_MEMPOOL, 17, {}}}};
+    auto [hit_ec, hit] = client_->GetObjectMeta("first", 100, "meta-hit");
+    ASSERT_EQ(ER_OK, hit_ec);
+    ASSERT_TRUE(hit);
+    EXPECT_EQ(17, hit->size_bytes);
+    EXPECT_EQ("meta-hit", metadata_->get_trace);
+
+    metadata_->get_result = {{false}, {{}}};
+    auto [miss_ec, miss] = client_->GetObjectMeta("absent", 100, "meta-miss");
+    EXPECT_EQ(ER_OK, miss_ec);
+    EXPECT_FALSE(miss);
+
+    metadata_->get_ec = ER_SDK_TIMEOUT;
+    auto [error_ec, failed] = client_->GetObjectMeta("first", 100, "meta-timeout");
+    EXPECT_EQ(ER_SDK_TIMEOUT, error_ec);
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->GetObjectMeta("first", 0, "").first);
+
+    client_->Close();
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client_->GetObjectMeta("first", 100, "").first);
+}
 
 TEST_F(KvMetaObjectClientTest, MetadataAddressUpdateRetainsTheTransferClient) {
     EXPECT_EQ(ER_OK, client_->UpdateMetadataAddresses({"new-metadata:50051"}));

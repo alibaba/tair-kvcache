@@ -62,6 +62,7 @@ class _FakeClient:
             "LoadObjects": [],
             "Remove": [],
             "UpdateMetadataAddresses": [],
+            "get_object_meta": [],
         }
         self.closed = False
         self.close_calls = 0
@@ -82,6 +83,11 @@ class _FakeClient:
         self.calls.append(("Remove", trace_id, keys))
         return self._result("Remove")
 
+    def get_object_meta(self, key, timeout_ms, *, trace_id):
+        self.calls.append(("get_object_meta", key, timeout_ms, trace_id))
+        queue = self.results["get_object_meta"]
+        return queue.pop(0) if queue else (_Code.ER_OK, None)
+
     def UpdateMetadataAddresses(self, addresses):
         self.calls.append(("UpdateMetadataAddresses", addresses))
         return self._result("UpdateMetadataAddresses")
@@ -97,6 +103,7 @@ class _FakeClient:
 class _FakePybind:
     KV_META_OBJECT_API_VERSION = KV_META_OBJECT_API_VERSION
     KV_META_OBJECT_ADDRESS_UPDATE_VERSION = 1
+    KV_META_OBJECT_METADATA_VERSION = 1
     ClientErrorCode = _Code
     MemoryType = _Memory
     RoleType = _Role
@@ -179,6 +186,25 @@ def _client(
         pybind,
     )
 
+
+class KvMetaObjectMetadataTest(unittest.TestCase):
+    def test_hit_miss_and_typed_timeout_use_the_existing_native_client(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        meta = SimpleNamespace(size_bytes=17)
+        native.results["get_object_meta"] = [
+            (_Code.ER_OK, meta),
+            (_Code.ER_OK, None),
+            (_Code.ER_SDK_TIMEOUT, None),
+        ]
+        self.assertIs(client.get_object_meta("hit", 50, trace_id="lookup"), meta)
+        self.assertEqual(native.calls[0], ("get_object_meta", "hit", 50, "lookup"))
+        self.assertIsNone(client.get_object_meta("miss", 50))
+        with self.assertRaises(KvMetaObjectClientError) as caught:
+            client.get_object_meta("slow", 50)
+        self.assertEqual(caught.exception.code, _Code.ER_SDK_TIMEOUT)
+        self.assertFalse(caught.exception.data_transfer_may_be_inflight)
+        self.assertEqual(native.close_calls, 0)
 
 class KvMetaTransferStateTest(unittest.TestCase):
     def test_native_error_keeps_mutation_uncertainty_separate_from_dma_safety(self):

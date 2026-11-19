@@ -190,7 +190,8 @@ template <typename Response, typename Rpc>
 ClientErrorCode KvMetaClientImpl::Call(const std::string &trace_id,
                                        Response *response,
                                        TransportRetryPolicy transport_retry_policy,
-                                       Rpc &&rpc) {
+                                       Rpc &&rpc,
+                                       std::optional<std::chrono::steady_clock::time_point> caller_deadline) {
     const auto endpoints = std::atomic_load_explicit(&endpoints_, std::memory_order_acquire);
     if (!response || !endpoints || endpoints->stubs.empty()) {
         return ER_INVALID_STUB;
@@ -198,9 +199,10 @@ ClientErrorCode KvMetaClientImpl::Call(const std::string &trace_id,
     const auto &stubs = endpoints->stubs;
     const std::size_t start = endpoints->preferred.load(std::memory_order_relaxed) % stubs.size();
     ClientErrorCode last_error = ER_INVALID_GRPCSTATUS;
-    const auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(config_.call_timeout_ms);
+    const auto deadline =
+        caller_deadline.value_or(std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.call_timeout_ms));
     for (std::size_t attempt = 0; attempt < stubs.size(); ++attempt) {
-        const auto now = std::chrono::system_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             // Reaching the overall budget between attempts is a local
             // pre-dispatch timeout. Unsafe mutations only reach this branch
@@ -211,7 +213,7 @@ ClientErrorCode KvMetaClientImpl::Call(const std::string &trace_id,
         const std::size_t index = (start + attempt) % stubs.size();
         response->Clear();
         grpc::ClientContext context;
-        auto attempt_deadline = deadline;
+        auto attempt_budget = deadline - now;
         if (transport_retry_policy == TransportRetryPolicy::kSafe && attempt + 1 < stubs.size()) {
             // Divide the remaining overall budget among the endpoints still
             // eligible for safe transport failover. A black-holed preferred
@@ -219,12 +221,14 @@ ClientErrorCode KvMetaClientImpl::Call(const std::string &trace_id,
             // deadline. Fast explicit failures leave their unused share for
             // subsequent attempts.
             const auto attempts_left = static_cast<std::int64_t>(stubs.size() - attempt);
-            attempt_deadline = now + (deadline - now) / attempts_left;
+            attempt_budget /= attempts_left;
         }
-        context.set_deadline(attempt_deadline);
+        context.set_deadline(std::chrono::system_clock::now() + attempt_budget);
         const grpc::Status grpc_status = rpc(*stubs[index], &context, response);
         if (!grpc_status.ok()) {
-            last_error = ER_INVALID_GRPCSTATUS;
+            last_error = caller_deadline && grpc_status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED
+                             ? ER_SDK_TIMEOUT
+                             : ER_INVALID_GRPCSTATUS;
             KVCM_LOG_WARN("KVMeta RPC trace_id[%s] endpoint[%zu] address[%s] failed with gRPC code[%d]",
                           trace_id.c_str(),
                           index,
@@ -304,6 +308,18 @@ std::pair<ClientErrorCode, KvMetaInstanceInfo> KvMetaClientImpl::GetInstanceInfo
 
 std::pair<ClientErrorCode, KvMetaGetResult> KvMetaClientImpl::Get(const std::string &trace_id,
                                                                   const std::vector<std::string> &keys) {
+    return GetImpl(trace_id, keys, std::nullopt);
+}
+
+std::pair<ClientErrorCode, KvMetaGetResult> KvMetaClientImpl::GetWithDeadline(
+    const std::string &trace_id, const std::vector<std::string> &keys, std::chrono::steady_clock::time_point deadline) {
+    return GetImpl(trace_id, keys, deadline);
+}
+
+std::pair<ClientErrorCode, KvMetaGetResult>
+KvMetaClientImpl::GetImpl(const std::string &trace_id,
+                          const std::vector<std::string> &keys,
+                          std::optional<std::chrono::steady_clock::time_point> caller_deadline) {
     if (!ValidateKeys(keys)) {
         return {ER_INVALID_PARAMS, {}};
     }
@@ -314,10 +330,12 @@ std::pair<ClientErrorCode, KvMetaGetResult> KvMetaClientImpl::Get(const std::str
         request.add_keys(key);
     }
     proto::kv_meta::GetResponse response;
-    const ClientErrorCode ec =
-        Call(trace_id, &response, TransportRetryPolicy::kSafe, [&request](auto &stub, auto *context, auto *output) {
-            return stub.Get(context, request, output);
-        });
+    const ClientErrorCode ec = Call(
+        trace_id,
+        &response,
+        TransportRetryPolicy::kSafe,
+        [&request](auto &stub, auto *context, auto *output) { return stub.Get(context, request, output); },
+        caller_deadline);
     if (ec != ER_OK) {
         return {ec, {}};
     }

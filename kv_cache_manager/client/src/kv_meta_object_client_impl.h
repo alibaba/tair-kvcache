@@ -31,6 +31,8 @@ public:
     ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override;
     void Close() noexcept override;
     ClientErrorCode UpdateMetadataAddresses(const std::vector<std::string> &addresses) override;
+    std::pair<ClientErrorCode, std::optional<ObjectMeta>>
+    GetObjectMeta(const std::string &key, std::uint32_t timeout_ms, const std::string &trace_id) override;
 
     KvMetaObjectResult SaveObjectsWithTransferState(const std::string &trace_id,
                                                     const std::vector<std::string> &keys,

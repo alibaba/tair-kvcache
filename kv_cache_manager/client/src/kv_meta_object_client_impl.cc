@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/kv_meta_object_client_impl.h"
 
+#include <chrono>
 #include <limits>
 #include <sys/stat.h>
 #include <unordered_set>
@@ -92,6 +93,8 @@ std::uint32_t GetKvMetaObjectClientApiVersion() noexcept { return kKvMetaObjectC
 std::uint32_t GetKvMetaObjectTransferStateVersion() noexcept { return 1; }
 
 std::uint32_t GetKvMetaObjectAddressUpdateVersion() noexcept { return 1; }
+
+std::uint32_t GetKvMetaObjectMetadataVersion() noexcept { return 1; }
 
 KvMetaObjectClientImpl::KvMetaObjectClientImpl(std::unique_ptr<KvMetaClient> metadata_client,
                                                std::unique_ptr<KvMetaTransferClient> transfer_client,
@@ -428,6 +431,33 @@ ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, cons
         KVCM_LOG_WARN("KVMeta object Remove threw; mutation outcome is unknown");
         return ER_INVALID_GRPCSTATUS;
     }
+}
+
+std::pair<ClientErrorCode, std::optional<ObjectMeta>>
+KvMetaObjectClientImpl::GetObjectMeta(const std::string &key, std::uint32_t timeout_ms, const std::string &trace_id) {
+    if (timeout_ms == 0 || timeout_ms > 600000) {
+        return {ER_INVALID_PARAMS, std::nullopt};
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    OperationGuard guard(this, /*require_transfer=*/false);
+    if (!guard.admitted()) {
+        return {ER_CLIENT_NOT_EXISTS, std::nullopt};
+    }
+    const auto [ec, result] = metadata_client_->GetWithDeadline(trace_id, {key}, deadline);
+    if (ec != ER_OK) {
+        return {ec, std::nullopt};
+    }
+    if (result.hit_mask.size() != 1 || result.locations.size() != 1) {
+        return {ER_SERVICE_INTERNAL_ERROR, std::nullopt};
+    }
+    if (!result.hit_mask.front()) {
+        return {ER_OK, std::nullopt};
+    }
+    const auto size = result.locations.front().value_size;
+    if (size == 0 || size > max_object_bytes_) {
+        return {ER_SERVICE_SIZE_MISMATCH, std::nullopt};
+    }
+    return {ER_OK, ObjectMeta{size}};
 }
 
 ClientErrorCode KvMetaObjectClientImpl::UpdateMetadataAddresses(const std::vector<std::string> &addresses) {

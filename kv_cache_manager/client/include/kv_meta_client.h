@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -101,6 +102,12 @@ public:
     // calls retain their original endpoint set and mutation retry policy.
     // Invalid/empty input leaves the previous working configuration intact.
     virtual ClientErrorCode UpdateAddresses(const std::vector<std::string> &) { return ER_SERVICE_UNSUPPORTED; }
+
+    // Uses one monotonic deadline across all endpoints.
+    virtual std::pair<ClientErrorCode, KvMetaGetResult>
+    GetWithDeadline(const std::string &, const std::vector<std::string> &, std::chrono::steady_clock::time_point) {
+        return {ER_SERVICE_UNSUPPORTED, {}};
+    }
 };
 
 } // namespace kv_cache_manager

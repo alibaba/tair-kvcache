@@ -746,6 +746,27 @@ class KvMetaObjectClient:
                 )
             completed += end - begin
 
+    def get_object_meta(
+        self, key: str, timeout_ms: int, *, trace_id: Optional[str] = None
+    ):
+        """Return ObjectMeta or None using the existing native metadata client."""
+        _bounded_text(key, "KVMeta object key", KV_META_MAX_KEY_BYTES)
+        _positive_int(timeout_ms, "KVMeta lookup timeout_ms", KV_META_MAX_CALL_TIMEOUT_MS)
+        trace_id = self._resolve_trace_id("get_object_meta", trace_id)
+        client = self._client_snapshot()
+        lookup = getattr(client, "get_object_meta", None)
+        if getattr(self._pybind, "KV_META_OBJECT_METADATA_VERSION", None) != 1 or not callable(lookup):
+            raise ImportError("installed kvcm_py_client lacks native object metadata lookup")
+        try:
+            code, meta = lookup(key, timeout_ms, trace_id=trace_id)
+        except Exception as error:
+            raise KvMetaObjectClientError(
+                "get_object_meta", type(error).__name__, data_transfer_may_be_inflight=False
+            ) from error
+        if not _is_ok_code(self._pybind, code):
+            raise KvMetaObjectClientError("get_object_meta", code, data_transfer_may_be_inflight=False)
+        return meta
+
     def update_addresses(self, addresses: Sequence[str]) -> None:
         """Replace metadata endpoints without recreating transfer resources.
 

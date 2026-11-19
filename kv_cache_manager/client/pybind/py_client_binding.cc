@@ -100,6 +100,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     module.attr("KV_META_OBJECT_API_VERSION") = kvcm::GetKvMetaObjectClientApiVersion();
     module.attr("KV_META_OBJECT_TRANSFER_STATE_VERSION") = kvcm::GetKvMetaObjectTransferStateVersion();
     module.attr("KV_META_OBJECT_ADDRESS_UPDATE_VERSION") = kvcm::GetKvMetaObjectAddressUpdateVersion();
+    module.attr("KV_META_OBJECT_METADATA_VERSION") = kvcm::GetKvMetaObjectMetadataVersion();
 
     // 绑定枚举
     py::native_enum<kvcm::ClientErrorCode>(module, "ClientErrorCode", "enum.Enum")
@@ -271,6 +272,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
 
+    py::class_<kvcm::ObjectMeta>(module, "ObjectMeta").def_readonly("size_bytes", &kvcm::ObjectMeta::size_bytes);
     py::class_<kvcm::KvMetaObjectClient, py::smart_holder>(module, "KvMetaObjectClient", py::dynamic_attr())
         .def_static(
             "Create",
@@ -329,6 +331,13 @@ PYBIND11_MODULE(kvcm_py_client, module) {
             },
             py::arg("trace_id"),
             py::arg("config"))
+        .def("get_object_meta",
+             &kvcm::KvMetaObjectClient::GetObjectMeta,
+             py::arg("key"),
+             py::arg("timeout_ms"),
+             py::kw_only(),
+             py::arg("trace_id") = "",
+             py::call_guard<py::gil_scoped_release>())
         .def("UpdateMetadataAddresses",
              &kvcm::KvMetaObjectClient::UpdateMetadataAddresses,
              py::arg("addresses"),

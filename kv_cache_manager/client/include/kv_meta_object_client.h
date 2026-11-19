@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +30,11 @@ std::uint32_t GetKvMetaObjectTransferStateVersion() noexcept;
 // Separate capability symbol prevents a new binding from calling an older
 // shared library's object-client vtable when address updates are unavailable.
 std::uint32_t GetKvMetaObjectAddressUpdateVersion() noexcept;
+std::uint32_t GetKvMetaObjectMetadataVersion() noexcept;
+
+struct ObjectMeta {
+    std::uint64_t size_bytes;
+};
 
 struct KvMetaObjectResult {
     ClientErrorCode ec;
@@ -123,6 +129,13 @@ public:
     // Changes only metadata channels, retaining transfer workers and memory
     // registrations. Close rejects new updates and drains admitted ones.
     virtual ClientErrorCode UpdateMetadataAddresses(const std::vector<std::string> &) { return ER_SERVICE_UNSUPPORTED; }
+
+    // Metadata only. ER_OK with no ObjectMeta means miss. The returned size
+    // does not pin the object's location for a subsequent LoadObjects.
+    virtual std::pair<ClientErrorCode, std::optional<ObjectMeta>>
+    GetObjectMeta(const std::string &, std::uint32_t, const std::string & = "") {
+        return {ER_SERVICE_UNSUPPORTED, std::nullopt};
+    }
 
 protected:
     KvMetaObjectClient() = default;
