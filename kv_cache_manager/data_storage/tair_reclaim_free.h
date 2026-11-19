@@ -18,6 +18,7 @@ struct TairReclaimFreeResult {
     Status status{kError};
     uint64_t retry_after_ms{0};
     uint64_t max_gas{0};
+    bool provider_free_acknowledged{false};
 };
 
 // The list endpoint also supports administrative cleanup. Only emit canonical,

@@ -64,7 +64,9 @@ Meta 可按下列格式返回 HTTP 429，其中 `retry_after_ms` 是 Meta 可选
 
 **存储访问。** 首发和重试都在 `DataStorageManager` 现有删除读锁内查找并调用后端。退避等待期间释放锁，重试时在锁内核对仍是原后端实例，避免注销存储时的 `Close` 和 Delete 同时执行。[存储的删除与注销](../../kv_cache_manager/data_storage/data_storage_manager.cc)
 
-**反馈时机。** Executor 在任务共享的线程安全状态中记录明确 busy、建议等待时间和实际 Free 成功。Reclaimer 的 `HandleDelRes` 在已有轮询中取走反馈，Future 就绪时，在移除 DeleteHandler 前取完最后的回包反馈。同一轮询按实例组和基础存储类型合并本轮准入任务的反馈，有 busy 优先收紧。跳过物理删除的任务不计入成功恢复。[Reclaimer 轮询与收尾](../../kv_cache_manager/manager/cache_reclaimer.cc)
+**反馈时机。** v1 的 HTTP 200 成功响应带布尔字段 `provider_free_acknowledged`。只要本批至少一个 Provider 对 Free RPC 返回业务成功，该值就是 `true`，包括同批另有 GA 缺路由的情况。整批因缺路由或节点断连被跳过时，该值为 `false`。KVCM 对成功回包照常执行 CAD，只有明确的布尔值 `true` 才计入额度恢复。旧 Meta 缺字段或字段类型异常时，成功收尾并保持当前额度。
+
+Executor 在任务共享的线程安全状态中记录明确 busy、建议等待时间和 Provider 确认的成功。Reclaimer 的 `HandleDelRes` 在已有轮询中取走反馈，Future 就绪时，在移除 DeleteHandler 前取完最后的回包反馈。同一轮询按实例组和基础存储类型合并本轮准入任务的反馈，有 busy 优先收紧。[Reclaimer 轮询与收尾](../../kv_cache_manager/manager/cache_reclaimer.cc)
 
 ## 4. 被拒的原批次如何重试
 
@@ -123,6 +125,7 @@ KVCM 为 Tair 新建的 Location ID 通常是 8 字符。上表只作量级参�
 | 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
 | 同组多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
 | 同一任务的 Location A、B 分属两个 storage，A 成功，B 明确 busy | A 及时 CAD。只重发 B 的原批次，原 pending 最后释放一次。若重发返回普通错误，按既有规则收尾并记录可能未释放的对象 |
+| 首发或重发收到 200 success | 照常 CAD。只有 `provider_free_acknowledged=true` 产生成功反馈。全批缺路由、全批断连和旧 Meta 缺字段均保持当前额度 |
 | 分别用 2、8 个 worker，让多组重试同时到期，并安排一批已就绪的首次 Free | 同时执行的重试最多分别为 1、4 批。重试名额占满时，空闲 worker 仍可执行首发。等待名额的批次只挂一次，Meta busy 计数和总截止时间不变，名额归还后可继续重试 |
 | KVCM 重发前读到 RemoveCache、Trim 或 RemoveInstance 已处理同一目标 | 跳过已删除、已换 URI 或已注销实例的目标，无需对它再执行 Free 或 CAD。剩余为空时零次 HTTP |
 | Meta 的建议等待时间超过剩余总时限，或延迟任务排队至截止、取消、停机切主、后端替换 | 停止重发，未发出且仍在的原目标可定位。截止前已发出的请求按实际结果收尾，重试内存预留和原任务 pending 各释放一次 |

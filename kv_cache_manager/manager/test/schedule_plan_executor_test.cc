@@ -451,7 +451,9 @@ public:
 
 TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailable) {
     auto first = Backend("a", {{TairReclaimFreeResult::kSuccess}});
-    auto second = Backend("b", {{TairReclaimFreeResult::kBusy, 20}, {TairReclaimFreeResult::kSuccess}});
+    TairReclaimFreeResult confirmed{TairReclaimFreeResult::kSuccess};
+    confirmed.provider_free_acknowledged = true;
+    auto second = Backend("b", {{TairReclaimFreeResult::kBusy, 20}, confirmed});
     SetLocation(1, "first", type, {"pace://a/11"});
     SetLocation(1, "second", type, {"pace://b/22", "pace://b/33"});
     std::atomic<bool> ran_between{false};
@@ -471,6 +473,26 @@ TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailabl
     auto feedback = req.free_busy->Drain().at(type);
     EXPECT_GE(feedback.busy_ms, 20);
     EXPECT_TRUE(feedback.success);
+}
+
+TEST_F(FreeBusyDeleteTest, SuccessWithoutProviderAcknowledgementCompletesCadWithoutRecoveryFeedback) {
+    auto backend = Backend("t", {{TairReclaimFreeResult::kSuccess},
+                                 {TairReclaimFreeResult::kBusy, 1},
+                                 {TairReclaimFreeResult::kSuccess}});
+    SetLocation(1, "first", type, {"pace://t/11"});
+    auto first = Evict(1, {"first"});
+    EXPECT_EQ(EC_OK, Run(first).status);
+    EXPECT_TRUE(Locations(1).empty());
+    EXPECT_TRUE(first.free_busy->Drain().empty());
+
+    SetLocation(2, "retry", type, {"pace://t/22"});
+    auto retry = Evict(2, {"retry"});
+    EXPECT_EQ(EC_OK, Run(retry).status);
+    EXPECT_TRUE(Locations(2).empty());
+    const auto feedback = retry.free_busy->Drain().at(type);
+    EXPECT_GT(feedback.busy_ms, 0u);
+    EXPECT_FALSE(feedback.success);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{11}, {22}, {22}}), backend->calls);
 }
 
 TEST_F(FreeBusyDeleteTest, RetainsInvalidTooLargeAndExpiredTargetsAndUsesOrdinaryCadForUnknown) {
