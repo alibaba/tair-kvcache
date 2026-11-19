@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+message StatusVersionPB {
+  int64 latest_cache_version = 1;
+  int64 latest_finished_version = 2;
+}
+
+message WorkerStatusPB {
+  // Fields 1-11 are reserved for other worker status information.
+  int64 status_version = 12;
+  bool alive = 13;
+  // Field 14 is reserved for precision in the authoritative schema.
+  int64 latest_finished_version = 15;
+}
+
+message KvCacheBlockListPB {
+  bytes raw_snapshot = 1;
+  int64 snapshot_version = 2;
+  int32 block_size = 3;
+}
+
+message KvCacheBlocksRequestPB {}
+
+enum KvEventBootstrapErrorCode {
+  KV_EVENT_BOOTSTRAP_OK = 0;
+  KV_EVENT_BOOTSTRAP_UNAVAILABLE = 1;
+  KV_EVENT_BOOTSTRAP_INCOMPATIBLE = 2;
+}
+
+message OptionalUInt64PB {
+  uint64 value = 1;
+}
+
+message OptionalInt64PB {
+  int64 value = 1;
+}
+
+message StringListPB {
+  repeated string values = 1;
+}
+
+message Int64ListPB {
+  repeated sint64 values = 1;
+}
+
+message UInt64ListPB {
+  repeated uint64 values = 1;
+}
+
+message DoubleListPB {
+  repeated double values = 1;
+}
+
+message BoolListPB {
+  repeated bool values = 1;
+}
+
+message TypedSettingPB {
+  string name = 1;
+  oneof value {
+    bool bool_value = 2;
+    sint64 int64_value = 3;
+    uint64 uint64_value = 4;
+    double double_value = 5;
+    string string_value = 6;
+    bytes bytes_value = 7;
+    StringListPB string_list = 8;
+    Int64ListPB int64_list = 9;
+    UInt64ListPB uint64_list = 10;
+    DoubleListPB double_list = 11;
+    BoolListPB bool_list = 12;
+  }
+}
+
+message EventTransportPB {
+  string live_endpoint = 1;
+  string topic = 2;
+  bool replay_supported = 3;
+  string replay_endpoint = 4;
+  string serialization = 5;
+}
+
+message RuntimeTopologyPB {
+  uint32 data_parallel_size = 1;
+  uint32 tensor_parallel_size = 2;
+  uint32 pipeline_parallel_size = 3;
+  uint32 data_parallel_rank = 4;
+  uint32 tensor_parallel_rank = 5;
+  uint32 pipeline_parallel_rank = 6;
+}
+
+message SnapshotCapabilityPB {
+  bool supported = 1;
+  bool versioned = 2;
+}
+
+message CacheGeometryPB {
+  uint64 block_size_tokens = 1;
+  OptionalUInt64PB page_size_tokens = 2;
+  OptionalUInt64PB block_count = 3;
+  OptionalUInt64PB group_payload_size_bytes = 4;
+  string cache_dtype = 5;
+  OptionalUInt64PB element_size_bytes = 6;
+  OptionalUInt64PB layer_count = 7;
+  string cache_layout = 8;
+  OptionalInt64PB sliding_window_tokens = 9;
+  OptionalUInt64PB checkpoint_alignment_tokens = 10;
+}
+
+message CacheComponentPB {
+  uint32 component_id = 1;
+  string component_kind = 2;
+  CacheGeometryPB geometry = 3;
+  repeated TypedSettingPB compatibility_settings = 4;
+  repeated TypedSettingPB diagnostic_settings = 5;
+}
+
+message VllmKvEventSchemaPB {
+  uint32 event_schema_version = 1;
+  bool use_eagle_pop = 2;
+  string mamba_cache_mode = 3;
+  string hash_algorithm = 4;
+  string hash_version = 5;
+  repeated TypedSettingPB cache_settings = 6;
+}
+
+message SglangKvEventSchemaPB {
+  string cache_key_mode = 1;
+  uint32 event_schema_version = 2;
+  string native_hash_algorithm = 3;
+  repeated TypedSettingPB cache_settings = 4;
+}
+
+message KvEventBootstrapInfoPB {
+  uint32 protocol_version = 1;
+  string engine_kind = 2;
+  EventTransportPB event_transport = 3;
+  RuntimeTopologyPB runtime_topology = 4;
+  SnapshotCapabilityPB snapshot = 5;
+  repeated CacheComponentPB components = 6;
+  KvEventBootstrapErrorCode err_code = 7;
+  string err_msg = 8;
+  repeated TypedSettingPB compatibility_settings = 9;
+  repeated TypedSettingPB diagnostic_settings = 10;
+  oneof engine_schema {
+    VllmKvEventSchemaPB vllm = 20;
+    SglangKvEventSchemaPB sglang = 21;
+  }
+}
+
+message KvEventBootstrapInfoRequestPB {}
+
+service RpcService {
+  rpc GetWorkerStatus(StatusVersionPB) returns (WorkerStatusPB);
+}
+
+service KvEventControlService {
+  rpc GetKvEventBootstrapInfo(KvEventBootstrapInfoRequestPB)
+      returns (KvEventBootstrapInfoPB);
+  rpc GetAllKvCacheBlocks(KvCacheBlocksRequestPB)
+      returns (KvCacheBlockListPB);
+}
