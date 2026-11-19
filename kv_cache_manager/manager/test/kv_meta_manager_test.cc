@@ -108,7 +108,13 @@ public:
         maintenance_calls.fetch_add(1);
         auto largest = max_batch.load();
         while (largest < keys.size() && !max_batch.compare_exchange_weak(largest, keys.size())) {}
-        const auto result = MetaLocalBackend::GetLocationMapsForMaintenance(context, keys, out);
+        auto result = MetaLocalBackend::GetLocationMapsForMaintenance(context, keys, out);
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (std::find(unavailable.begin(), unavailable.end(), keys[i]) != unavailable.end()) {
+                out[i].clear();
+                result[i] = EC_NOENT;
+            }
+        }
         for (const auto &locations : out) {
             for (const auto &[id, location] : locations) {
                 if (location && location->status() == CLS_DELETING) {
@@ -118,6 +124,7 @@ public:
         }
         return result;
     }
+    KeyVector unavailable;
     std::atomic<size_t> maintenance_calls{0}, max_batch{0}, deleting_reads{0};
 };
 
@@ -1554,6 +1561,35 @@ TEST_F(KvMetaManagerTest, PendingKeysAreSkippedBeforeReadingReclaimCandidateMeta
     EXPECT_TRUE(WaitUntil([&]() {
         return metrics_registry_->GetCounter("kv_meta.reclaim.deleted_objects_total", tags).Get() == 64;
     }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerMovesPastAFullSampleOfStaleKeys) {
+    constexpr const char *kGroup = "blocked-lru";
+    constexpr const char *kInstance = "blocked-lru-instance";
+    CreateGroup(kGroup, kInstance, 1000, 0.05);
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    auto backend = std::make_unique<CountingMaintenanceBackend>();
+    auto *local = backend.get();
+    ASSERT_EQ(EC_OK, backend->Init("blocked-lru", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+    Indexer(kInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    for (int i = 0; i < 20; ++i) {
+        const std::string key = "stale-" + std::to_string(i);
+        Commit(kInstance, key, 1);
+        local->unavailable.push_back(KvMetaManager::InternalKey(key));
+    }
+    Commit(kInstance, "serving", 80);
+    ASSERT_EQ(100u, Indexer(kInstance)->GetStorageUsage());
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&context_, 1));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&context_, 1));
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer(kInstance)->GetStorageUsage() == 20; }, std::chrono::seconds(3)));
+    EXPECT_EQ(1u, pace_backend_->delete_count());
+    const MetricsTags tags{{"instance_group", kGroup}};
+    EXPECT_GT(metrics_registry_->GetCounter("kv_meta.reclaim.maintenance_touch_keys_total", tags).Get(), 0u);
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerBatchesCandidateReadsAndReportsActualDeletedBytes) {

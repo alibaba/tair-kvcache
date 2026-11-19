@@ -817,23 +817,17 @@ private:
         // Ordinary Cache also excludes pending locations before selecting
         // victims. Pending keys must not consume either metadata-read work or
         // the sampling window while their reader grace is outstanding.
-        std::map<std::string, KeyVector> pending_keys;
-        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-            [this, &pending_keys](const Candidate &candidate) {
-                if (!IsPendingKey(candidate)) {
-                    return false;
-                }
-                pending_keys[candidate.instance_id].push_back(candidate.key);
-                return true;
-            }), candidates.end());
-        for (const auto &[instance_id, keys] : pending_keys) {
-            if (auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id)) {
-                // Yield rejected keys just like ordinary Cache. Otherwise an
-                // oldest-shard sample can repeatedly return only pending keys.
-                owner_->AddReclaimCounter(group->name(), "maintenance_touch_keys_total",
-                                         indexer->TouchKeysForMaintenance(keys));
-            }
-        }
+        std::map<std::string, KeyVector> rejected_keys;
+        candidates.erase(std::remove_if(candidates.begin(),
+                                        candidates.end(),
+                                        [this, &rejected_keys](const Candidate &candidate) {
+                                            if (!IsPendingKey(candidate)) {
+                                                return false;
+                                            }
+                                            rejected_keys[candidate.instance_id].push_back(candidate.key);
+                                            return true;
+                                        }),
+                         candidates.end());
         std::sort(candidates.begin(), candidates.end(), [](const Candidate &lhs, const Candidate &rhs) {
             if (lhs.last_access_time_us != rhs.last_access_time_us) {
                 return lhs.last_access_time_us < rhs.last_access_time_us;
@@ -892,8 +886,10 @@ private:
                 auto &maps = locations_by_instance[candidate.instance_id];
                 const auto found = maps.find(candidate.key);
                 if (found == maps.end()) {
+                    rejected_keys[candidate.instance_id].push_back(candidate.key);
                     continue;
                 }
+                const auto selected_before = selected_count;
                 for (const auto &[location_id, location] : found->second) {
                     if (!location || location->status() != CLS_SERVING ||
                         location_id.compare(0, kKvMetaLocationIdPrefix.size(), kKvMetaLocationIdPrefix) != 0 ||
@@ -918,11 +914,22 @@ private:
                         break;
                     }
                 }
+                if (selected_count == selected_before) {
+                    rejected_keys[candidate.instance_id].push_back(candidate.key);
+                }
             }
             offset = end;
             read_batch_size = std::min(batching_size, read_batch_size * 2);
         }
 
+        // Yield unusable cold keys like ordinary Cache Group LRU. A fixed
+        // oldest-key sample otherwise keeps returning the same stale entries.
+        for (const auto &[instance_id, keys] : rejected_keys) {
+            if (auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id)) {
+                owner_->AddReclaimCounter(
+                    group->name(), "maintenance_touch_keys_total", indexer->TouchKeysForMaintenance(keys));
+            }
+        }
         owner_->ObserveReclaimGauge(group->name(), "selected_count", selected_count);
         std::uint64_t submitted_bytes = 0;
         std::size_t submitted_count = 0;
