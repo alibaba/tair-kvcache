@@ -168,7 +168,8 @@ def check_logging_metrics(workdir, capacity, minimum_completed, timeout):
     raise AssertionError("executor Logging metrics were missing or incomplete")
 
 
-def run_case(binary, name, timeout, mode=None, conflict=None, shared_rpc=False, capacity=None, evidence=None):
+def run_case(binary, name, timeout, *, exit_timeout, mode=None, conflict=None, shared_rpc=False, capacity=None,
+             evidence=None):
     reservations = []
     process = None
     with tempfile.TemporaryDirectory(prefix="kvcm-dispatch-") as temporary:
@@ -240,10 +241,10 @@ def run_case(binary, name, timeout, mode=None, conflict=None, shared_rpc=False, 
                     minimum += check_mixed_concurrency(ports, bounded=capacity is not None)
                     check_logging_metrics(workdir, 2048 if capacity is None else capacity, minimum, timeout)
                     process.send_signal(signal.SIGTERM)
-                    code = process.wait(timeout=timeout)
+                    code = process.wait(timeout=exit_timeout)
                     check(code == 0, f"SIGTERM exit code={code}, expected 0")
                 else:
-                    code = process.wait(timeout=timeout)
+                    code = process.wait(timeout=exit_timeout)
                     check(code == 255, f"bind failure exit code={code}, expected main return -1 (255)")
             output = log_path.read_text(errors="replace")
             if conflict is None:
@@ -276,12 +277,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--timeout", type=float, default=20, help="startup/shutdown deadline in seconds")
+    parser.add_argument("--exit-timeout", type=float, help="override the process exit deadline in seconds")
     parser.add_argument("--evidence-dir", type=Path, help="retain per-case config, stdout and Logging metrics")
     args = parser.parse_args()
     binary = args.binary.resolve()
     check(binary.is_file() and os.access(binary, os.X_OK), f"not an executable: {binary}")
     check(args.timeout > 0, "--timeout must be positive")
-    common = {"evidence": args.evidence_dir.resolve() if args.evidence_dir else None}
+    exit_timeout = args.timeout if args.exit_timeout is None else args.exit_timeout
+    check(exit_timeout > 0, "--exit-timeout must be positive")
+    common = {
+        "exit_timeout": exit_timeout,
+        "evidence": args.evidence_dir.resolve() if args.evidence_dir else None,
+    }
     run_case(binary, "separate ports / default discard_pending / HTTP+gRPC / SIGTERM", args.timeout, **common)
     run_case(binary, "separate ports / drain / HTTP+gRPC / SIGTERM", args.timeout, mode="drain", **common)
     run_case(binary, "shared RPC port / discard_pending / HTTP+gRPC / SIGTERM", args.timeout, shared_rpc=True, **common)
