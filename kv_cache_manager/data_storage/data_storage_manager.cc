@@ -301,17 +301,14 @@ TairReclaimFreeResult DataStorageManager::DeleteTairForReclaim(const std::string
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     auto it = storage_map_.find(unique_name);
     if (it == storage_map_.end() || (retry && original.lock() != it->second)) {
-        return {retry ? TairReclaimFreeResult::kBackendChanged : TairReclaimFreeResult::kError};
+        return {retry ? TairReclaimFreeResult::kBackendChanged : TairReclaimFreeResult::kNotSent};
     }
     auto backend = std::dynamic_pointer_cast<TairMempoolBackend>(it->second);
-    if (!backend || gas.empty()) {
-        return {};
-    }
-    if (!can_send()) {
+    if (!backend || gas.empty() || !can_send()) {
         return {TairReclaimFreeResult::kNotSent};
     }
     original = backend;
-    return backend->DeleteForReclaim(gas, trace_id);
+    return backend->DeleteForReclaim(gas, trace_id, can_send);
 }
 
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,

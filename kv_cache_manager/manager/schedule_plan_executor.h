@@ -236,7 +236,8 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          const FreeBusyTask *free_busy = nullptr);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,

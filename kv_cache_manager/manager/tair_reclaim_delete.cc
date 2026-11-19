@@ -9,6 +9,7 @@
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -17,6 +18,16 @@ using Millis = std::chrono::milliseconds;
 // Operational limit for starting another attempt, measured from the first physical Free.
 constexpr auto kRetryDeadline = std::chrono::seconds(30);
 constexpr uint64_t kMaxLocalDelayMs = 5000;
+
+// Use fixed reason labels. Location IDs and exception details belong in logs.
+void RecordRetained(const FreeBusyResources &resources, const char *reason, size_t count) {
+    if (resources.metrics && count != 0) {
+        try {
+            resources.metrics->GetCounter("cache_reclaimer.free_busy_retained_location_count", {{"reason", reason}}) +=
+                count;
+        } catch (const std::exception &e) { KVCM_LOG_WARN("Failed to record retained Free locations: %s", e.what()); }
+    }
+}
 
 uint64_t Jitter(uint64_t base) {
     thread_local std::mt19937 random(std::random_device{}());
@@ -105,9 +116,9 @@ struct Batch : std::enable_shared_from_this<Batch> {
     uint64_t reserved = 0;
     uint64_t next_delay;
     Clock::time_point deadline;
-    bool was_busy = false;
     bool has_invalid_target = false;
     bool holds_slot = false;
+    bool retried_primary_read = false;
 
     void ReleaseSlot() {
         if (holds_slot) {
@@ -126,10 +137,11 @@ struct Batch : std::enable_shared_from_this<Batch> {
         completion->FinishBatch(ok && !has_invalid_target);
     }
 
-    void Stop(const char *reason) {
+    void Stop(const char *reason, const char *detail = nullptr) {
+        RecordRetained(*task->resources, reason, records.size());
         for (const auto &[id, uris] : records) {
             KVCM_LOG_WARN("Tair reclaim Free stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
-                          reason,
+                          detail ? detail : reason,
                           instance.c_str(),
                           id.first,
                           id.second.c_str(),
@@ -138,30 +150,48 @@ struct Batch : std::enable_shared_from_this<Batch> {
         Finish(false);
     }
 
-    void Schedule(uint64_t wait_ms) {
+    bool StopIfCancelledOrExpired(bool expired, const char *deadline_reason) {
+        if (!task->Active()) {
+            Stop("cancelled");
+            return true;
+        }
+        if (expired) {
+            Stop(deadline_reason);
+            return true;
+        }
+        return false;
+    }
+
+    void Schedule(uint64_t wait_ms, const char *deadline_reason) {
         ReleaseSlot();
         const auto left = std::chrono::duration_cast<Millis>(deadline - Clock::now()).count();
-        if (!task->Active() || left <= 0 || wait_ms >= static_cast<uint64_t>(left)) {
-            Stop("cancelled or retry deadline reached");
+        if (StopIfCancelledOrExpired(left <= 0 || wait_ms >= static_cast<uint64_t>(left), deadline_reason)) {
             return;
         }
         auto self = shared_from_this();
         if (!executor.SubmitTask(
                 ScheduleTaskClass::kReclaim,
-                [self]() {
+                [self, deadline_reason]() {
                     try {
-                        self->Retry();
-                    } catch (const std::exception &e) { self->Stop(e.what()); } catch (...) {
-                        self->Stop("retry exception");
+                        self->Retry(deadline_reason);
+                    } catch (const std::exception &e) { self->Stop("local_error", e.what()); } catch (...) {
+                        self->Stop("local_error", "retry exception");
                     }
                 },
                 Millis(wait_ms),
-                [self]() { self->Stop("executor stopped"); })) {
-            Stop("retry submission rejected");
+                [self]() { self->Stop("cancelled", "executor stopped"); })) {
+            Stop("local_error", "retry submission rejected");
         }
     }
 
-    bool ReadTargets(const std::shared_ptr<MetaIndexer> &idx, ReclaimFreeLocations &out, std::vector<uint64_t> &gas) {
+    enum class ReadResult {
+        kOk,
+        kRetryable,
+        kFailed
+    };
+
+    ReadResult
+    ReadTargets(const std::shared_ptr<MetaIndexer> &idx, ReclaimFreeLocations &out, std::vector<uint64_t> &gas) {
         std::string expected_storage = name;
         KeyVector keys;
         for (const auto &[id, _] : records) {
@@ -173,28 +203,38 @@ struct Batch : std::enable_shared_from_this<Batch> {
         CacheLocationMapVector maps;
         auto read = idx->GetLocationsFromPrimary(&ctx, keys, maps);
         if (read.error_codes.size() != keys.size() || maps.size() != keys.size()) {
-            return false;
+            return ReadResult::kFailed;
+        }
+        // Validate the entire read before dropping records or assembling a partial Free.
+        bool retryable_error = false;
+        for (auto ec : read.error_codes) {
+            if (ec == EC_ERROR || ec == EC_TIMEOUT || ec == EC_IO_ERROR) {
+                retryable_error = true;
+            } else if (ec != EC_OK && ec != EC_NOENT) {
+                return ReadResult::kFailed;
+            }
+        }
+        if (retryable_error) {
+            return ReadResult::kRetryable;
         }
         auto it = records.begin();
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (read.error_codes[i] != EC_NOENT && read.error_codes[i] != EC_OK) {
-                return false;
-            }
             while (it != records.end() && it->first.first == keys[i]) {
                 const auto found = maps[i].find(it->first.second);
                 const auto loc = found == maps[i].end() ? nullptr : found->second;
                 if (read.error_codes[i] == EC_NOENT || !loc || loc->status() != CacheLocationStatus::CLS_DELETING ||
                     !IsTairMempoolStorageType(loc->type()) || loc->location_specs().empty() ||
                     DataStorageUri(loc->location_specs().front().uri()).GetHostName() != name ||
-                    (was_busy && !std::equal(it->second.begin(),
-                                             it->second.end(),
-                                             loc->location_specs().begin(),
-                                             loc->location_specs().end(),
-                                             [](const auto &uri, const auto &spec) { return uri == spec.uri(); }))) {
+                    !std::equal(it->second.begin(),
+                                it->second.end(),
+                                loc->location_specs().begin(),
+                                loc->location_specs().end(),
+                                [](const auto &uri, const auto &spec) { return uri == spec.uri(); })) {
                     it = records.erase(it);
                     continue;
                 }
                 if (!AppendGAs(instance, keys[i], *loc, expected_storage, gas)) {
+                    RecordRetained(*task->resources, "invalid_uri", 1);
                     has_invalid_target = true;
                     it = records.erase(it);
                     continue;
@@ -203,28 +243,33 @@ struct Batch : std::enable_shared_from_this<Batch> {
                 ++it;
             }
         }
-        return true;
+        return ReadResult::kOk;
     }
 
-    void Retry() {
-        if (!task->Active() || Clock::now() >= deadline) {
-            Stop("cancelled or retry deadline reached");
+    void Retry(const char *deadline_reason) {
+        if (StopIfCancelledOrExpired(Clock::now() >= deadline, deadline_reason)) {
             return;
         }
         if (!task->resources->TryStartRetry(executor.GetWorkerCount())) {
-            Schedule(Jitter(task->initial_ms));
+            Schedule(Jitter(task->initial_ms), "slot_deadline");
             return;
         }
         holds_slot = true;
         auto idx = indexer.lock();
         if (!idx || meta->GetMetaIndexer(instance) != idx) {
-            Stop("instance changed");
+            Stop("instance_changed");
             return;
         }
         ReclaimFreeLocations current;
         std::vector<uint64_t> gas;
-        if (!ReadTargets(idx, current, gas)) {
-            Stop("primary read failed");
+        const auto read = ReadTargets(idx, current, gas);
+        if (read == ReadResult::kRetryable && !retried_primary_read) {
+            retried_primary_read = true;
+            Schedule(Jitter(task->initial_ms), "primary_read");
+            return;
+        }
+        if (read != ReadResult::kOk) {
+            Stop("primary_read", "primary read failed");
             return;
         }
         if (current.empty()) {
@@ -284,20 +329,24 @@ struct Batch : std::enable_shared_from_this<Batch> {
         if (needed > reserved) {
             const auto extra = needed - reserved;
             if (!(retry ? task->resources->Reserve(extra) : task->Take(extra))) {
-                if (!retry) {
-                    backend = storage->GetDataStorageBackend(name);
-                }
-                Schedule(Jitter(task->initial_ms));
+                // Without the original URI list a delayed callback cannot identify this allocation.
+                Stop("budget", "insufficient budget for original Free targets");
                 return;
             }
-            reserved = needed;
+        } else if (needed < reserved) {
+            // ReadTargets dropped locations. Their reservations are available to other batches now.
+            task->resources->reserved.fetch_sub(reserved - needed);
         }
-        if (gas.empty() || !task->Active() || (retry && Clock::now() >= deadline)) {
-            Stop("empty, cancelled or expired before Free");
+        reserved = needed;
+        if (StopIfCancelledOrExpired(retry && Clock::now() >= deadline, "dispatch_deadline")) {
+            return;
+        }
+        if (gas.empty()) {
+            Stop("invalid_uri", "empty Free");
             return;
         }
 
-        if (was_busy) {
+        if (retry) {
             ++task->resources->retry_attempts;
         }
         auto can_send = [&] { return task->Active() && (!retry || Clock::now() < deadline); };
@@ -305,7 +354,9 @@ struct Batch : std::enable_shared_from_this<Batch> {
             storage->DeleteTairForReclaim("location_del_task_trace", name, gas, backend, retry, can_send);
         ReleaseSlot();
         if (result.status == TairReclaimFreeResult::kNotSent) {
-            Stop("cancelled or expired before backend dispatch");
+            if (!StopIfCancelledOrExpired(retry && Clock::now() >= deadline, "dispatch_deadline")) {
+                Stop("backend_unavailable", "Free not sent by backend");
+            }
             return;
         }
         if (result.status == TairReclaimFreeResult::kBusy) {
@@ -315,7 +366,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
             std::set<DataStorageType> types;
             for (const auto &[key, loc] : targets) {
                 types.insert(loc->type());
-                if (!was_busy) {
+                if (!retry) {
                     auto &uris = records.at({key, loc->id()});
                     uris.reserve(loc->location_specs().size());
                     for (const auto &spec : loc->location_specs()) {
@@ -333,15 +384,14 @@ struct Batch : std::enable_shared_from_this<Batch> {
                            gas.size(),
                            retry,
                            wait);
-            was_busy = true;
-            Schedule(wait);
+            Schedule(wait, "busy_deadline");
             return;
         }
         if (result.status == TairReclaimFreeResult::kTooLarge ||
             result.status == TairReclaimFreeResult::kBackendChanged) {
             KVCM_LOG_WARN(
                 "Tair Free not sent storage[%s] gas[%zu] max_gas[%lu]", name.c_str(), gas.size(), result.max_gas);
-            Stop(result.status == TairReclaimFreeResult::kTooLarge ? "FREE_BATCH_TOO_LARGE" : "backend changed");
+            Stop(result.status == TairReclaimFreeResult::kTooLarge ? "batch_too_large" : "backend_changed");
             return;
         }
 
@@ -395,6 +445,7 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
         std::string name;
         location_gas.clear();
         if (!AppendGAs(request.instance_id, key, *loc, name, location_gas)) {
+            RecordRetained(*request.free_busy->resources, "invalid_uri", 1);
             result = {EC_PARTIAL_OK, "invalid Tair Location", true};
             continue;
         }
@@ -421,6 +472,7 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
             bytes += FreeBusyTask::IdBytes(loc->id(), request.instance_id.size(), name.size());
         }
         if (!request.free_busy->Take(bytes)) {
+            RecordRetained(*request.free_busy->resources, "budget", targets.size());
             for (const auto &[key, loc] : targets) {
                 KVCM_LOG_WARN("No retry ID budget instance[%s] key[%ld] location[%s] storage[%s]",
                               request.instance_id.c_str(),
@@ -442,8 +494,8 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
         try {
             const auto &group = groups.at(batch->name);
             batch->Send(group.locations, group.gas, indexer, false);
-        } catch (const std::exception &e) { batch->Stop(e.what()); } catch (...) {
-            batch->Stop("initial Free exception");
+        } catch (const std::exception &e) { batch->Stop("local_error", e.what()); } catch (...) {
+            batch->Stop("local_error", "initial Free exception");
         }
     }
     request.free_busy->ReleaseUnused();

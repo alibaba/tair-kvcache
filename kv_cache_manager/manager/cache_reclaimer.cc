@@ -114,6 +114,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credit_timeout_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_reject_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
@@ -604,7 +605,8 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , sleep_interval_ms_(sleep_interval_ms)
     , future_timeout_ms_(kFutureTimeoutMs)
     , async_delete_config_(std::move(async_delete_config))
-    , free_busy_resources_(std::make_shared<FreeBusyResources>(async_delete_config_.free_busy_retry_memory_limit_bytes))
+    , free_busy_resources_(std::make_shared<FreeBusyResources>(async_delete_config_.free_busy_retry_memory_limit_bytes,
+                                                               metrics_registry_))
     , worker_stop_(false) {
     if (worker_size == 0) {
         worker_size = 1;
@@ -672,6 +674,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_reject_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
@@ -1830,6 +1833,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                     const auto cost = FreeBusyTask::RecordBytes(loc, ins_id.size());
                     const auto available = free_busy_resources_->memory_limit - free_busy_resources_->reserved.load();
                     if (cost > available || *retry_bytes > available - cost) {
+                        ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
                         if (cost > free_busy_resources_->memory_limit) {
                             INTERVAL_LOG_WITH_ID(WARN,
                                                  10000,
@@ -2214,7 +2218,13 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
         }
         auto task =
             std::make_shared<FreeBusyTask>(free_busy_resources_, async_delete_config_.free_busy_initial_backoff_ms);
-        if (IsPaused() || !IsRunning() || !free_busy_resources_->Reserve(retry_bytes)) {
+        if (IsPaused() || !IsRunning()) {
+            return false;
+        }
+        if (!free_busy_resources_->Reserve(retry_bytes)) {
+            METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) +=
+                location_counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)] +
+                location_counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)];
             return false;
         }
         task->unassigned = retry_bytes;
