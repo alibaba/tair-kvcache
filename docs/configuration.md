@@ -297,7 +297,9 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 
 设置两层并发为 `1` 可回退逐 Instance、逐 consumer 建连；两类进程预算仍生效。
 连接数与 `async_queue_count` 不因并行而减少，队列 FIFO、失败回收和服务就绪门禁沿用原语义。
-首轮部分失败后仍沿用后台恢复重试；不会把未初始化 backend 发布给请求。
+首轮部分失败后仍沿用后台恢复重试；单个 Instance 的可传播异常不会阻断其他实例，已启动 worker 会被 join。
+Searcher 构造异常后的重试可复用同一 Registry 注册对象、配置和有效直方图边界下已初始化的 Indexer，避免重复建连。
+不会把未初始化 backend 发布给请求；底层既有 `noexcept` 函数内部终止行为不在异常恢复保证范围内。
 详细顺序及故障边界见 [HA 恢复设计](design/ha_leader_elector.md#43-有界并行恢复)。
 
 ### 恢复阶段的 jemalloc arena 轮换（进程环境变量）

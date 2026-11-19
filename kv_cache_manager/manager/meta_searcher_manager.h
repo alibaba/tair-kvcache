@@ -17,7 +17,7 @@ class MetaSearcherManager {
 public:
     MetaSearcherManager(std::shared_ptr<RegistryManager> registry_manager,
                         std::shared_ptr<MetaIndexerManager> meta_indexer_manager);
-    ~MetaSearcherManager();
+    virtual ~MetaSearcherManager();
     std::shared_ptr<MetaSearcher> TryCreateMetaSearcher(RequestContext *request_context,
                                                         const std::string &instance_id,
                                                         CheckLocDataExistFunc check_loc_data_exist,
@@ -27,6 +27,11 @@ public:
     void RestoreRetiringMetaSearcher(const std::string &instance_id, std::shared_ptr<MetaSearcher> searcher);
     // Callers drain creation and instance management before cleanup.
     void DoCleanup();
+
+protected:
+    virtual std::shared_ptr<MetaSearcher> CreateMetaSearcher(const std::shared_ptr<MetaIndexer> &indexer,
+                                                             const CheckLocDataExistFunc &check_loc_data_exist,
+                                                             const SubmitDelReqFunc &submit_del_req);
 
 private:
     std::shared_ptr<MetaSearcher> GetMetaSearcherUnsafe(const std::string &instance_id) const;

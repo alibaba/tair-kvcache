@@ -4,8 +4,11 @@
 #include <condition_variable>
 #include <dlfcn.h>
 #include <functional>
+#include <future>
 #include <mutex>
+#include <new>
 #include <pthread.h>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -27,6 +30,12 @@ namespace kv_cache_manager {
 class MockMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
 public:
     MOCK_METHOD(std::shared_ptr<RedisClient>, CreateRedisClient, (), (const));
+
+    autil::ThreadPtr CreateConsumerThread(int queue_id) override {
+        return consumer_thread_factory ? consumer_thread_factory(queue_id)
+                                       : MetaAsyncRedisBackend::CreateConsumerThread(queue_id);
+    }
+    std::function<autil::ThreadPtr(int)> consumer_thread_factory;
 };
 
 class TrackingOpenRedisClient : public RedisClient {
@@ -641,6 +650,101 @@ TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadStartupFailureCleansResource
     EXPECT_TRUE(backend_->consumer_threads_.empty());
     EXPECT_TRUE(backend_->queues_.empty());
     EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    EXPECT_EQ(EC_OK, backend_->Open());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestClientFactoryExceptionsCleanResourcesAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=2&client_min_pool_size=1");
+    for (int fail_at : {0, 2}) {
+        ASSERT_EQ(EC_OK, backend_->Init("client_factory_exception_instance", config_));
+        std::atomic<int> created{0};
+        std::atomic<int> destroyed{0};
+        EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() -> std::shared_ptr<RedisClient> {
+            if (created.fetch_add(1) == fail_at) {
+                if (fail_at == 0) {
+                    throw std::runtime_error("injected consumer client failure");
+                }
+                throw std::bad_alloc(); // Read pool startup, outside RunBoundedParallel.
+            }
+            return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+        }));
+        EXPECT_EQ(EC_ERROR, backend_->Open());
+        EXPECT_EQ(fail_at + 1, created.load());
+        EXPECT_EQ(fail_at, destroyed.load());
+        EXPECT_FALSE(backend_->is_running_.load());
+        EXPECT_TRUE(backend_->consumer_clients_.empty());
+        EXPECT_TRUE(backend_->consumer_threads_.empty());
+        EXPECT_TRUE(backend_->queues_.empty());
+        EXPECT_EQ(nullptr, backend_->read_client_pool_);
+        Mock::VerifyAndClearExpectations(backend_.get());
+        SetupMockRedisClients();
+        EXPECT_EQ(EC_OK, backend_->Open());
+        EXPECT_EQ(EC_OK, backend_->Close());
+        Mock::VerifyAndClearExpectations(backend_.get());
+    }
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadExceptionJoinsBeforeCleanupAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    ASSERT_EQ(EC_OK, backend_->Init("consumer_thread_exception_instance", config_));
+    std::atomic<int> destroyed{0};
+    std::atomic<int> exited{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+    }));
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool started = false;
+    bool failed = false;
+    bool release = false;
+    backend_->consumer_thread_factory = [&](int queue_id) -> autil::ThreadPtr {
+        if (queue_id == 0) {
+            return autil::Thread::createThread(
+                [&] {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    started = true;
+                    changed.notify_all();
+                    changed.wait(lock, [&] { return release; });
+                    ++exited;
+                },
+                "kvcm_test");
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] { return started || release; });
+        failed = true;
+        changed.notify_all();
+        throw std::runtime_error("injected consumer thread failure");
+    };
+    std::promise<ErrorCode> completion;
+    auto result = completion.get_future();
+    std::thread opener([&] { completion.set_value(backend_->Open()); });
+    bool saw_failure = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        saw_failure = changed.wait_for(lock, std::chrono::seconds(5), [&] { return failed; });
+    }
+    const auto status = result.wait_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(0, destroyed.load());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(saw_failure);
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(EC_ERROR, result.get());
+    EXPECT_EQ(1, exited.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    backend_->consumer_thread_factory = nullptr;
+    Mock::VerifyAndClearExpectations(backend_.get());
+    SetupMockRedisClients();
     EXPECT_EQ(EC_OK, backend_->Open());
 }
 

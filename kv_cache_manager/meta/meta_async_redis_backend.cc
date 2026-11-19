@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -40,6 +41,10 @@ std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC
 
 std::shared_ptr<RedisClient> MetaAsyncRedisBackend::CreateRedisClient() const {
     return std::make_shared<RedisClient>(storage_uri_);
+}
+
+autil::ThreadPtr MetaAsyncRedisBackend::CreateConsumerThread(int queue_id) {
+    return autil::Thread::createThread([this, queue_id] { ConsumerLoop(queue_id); }, "kvcm_consumer");
 }
 
 ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
@@ -123,85 +128,98 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
     if (is_running_.load(std::memory_order_acquire)) {
         return EC_OK;
     }
-    consumer_clients_.resize(queue_count_);
-    const auto open_ec = RunBoundedParallel(queue_count_, open_concurrency_, [this](size_t i) {
-        auto client = CreateRedisClient();
-        if (!client || !client->Open()) {
-            KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%zu], instance[%s]",
-                           i,
-                           instance_id_.c_str());
-            return EC_ERROR;
-        }
-        // Preallocated slots let workers publish their own clients without locking.
-        consumer_clients_[i] = std::move(client);
-        return EC_OK;
-    });
-    if (open_ec != EC_OK) {
-        KVCM_LOG_ERROR("async redis backend open failed during consumer connection startup, instance[%s], "
-                       "open concurrency[%d], ec[%d]",
-                       instance_id_.c_str(),
-                       open_concurrency_,
-                       open_ec);
-        CleanupResources();
-        return EC_ERROR;
-    }
-
-    constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
-    constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
-    int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
-    int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
-    int64_t tmp_client_max_pool_size = 0;
-    storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
-    if (tmp_client_max_pool_size > 0) {
-        client_max_pool_size = tmp_client_max_pool_size;
-    }
-    int64_t tmp_client_min_pool_size = 0;
-    storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
-    if (tmp_client_min_pool_size > 0) {
-        client_min_pool_size = tmp_client_min_pool_size;
-    }
-    read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
-        [this]() -> std::shared_ptr<RedisClient> {
-            auto client = this->CreateRedisClient();
+    try {
+        consumer_clients_.resize(queue_count_);
+        const auto open_ec = RunBoundedParallel(queue_count_, open_concurrency_, [this](size_t i) {
+            auto client = CreateRedisClient();
             if (!client || !client->Open()) {
-                return nullptr;
+                KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%zu], instance[%s]",
+                               i,
+                               instance_id_.c_str());
+                return EC_ERROR;
             }
-            return client;
-        },
-        client_min_pool_size,
-        client_max_pool_size);
-    if (!read_client_pool_->Initialize()) {
-        KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
-                       instance_id_.c_str());
-        CleanupResources();
-        return EC_ERROR;
-    }
-
-    queues_.resize(queue_count_);
-    for (int i = 0; i < queue_count_; ++i) {
-        queues_[i] = std::make_unique<MpscWriteQueue>();
-    }
-    consumer_threads_.reserve(queue_count_);
-    is_running_.store(true, std::memory_order_release);
-    for (int i = 0; i < queue_count_; ++i) {
-        auto consumer = autil::Thread::createThread([this, i] { ConsumerLoop(i); }, "kvcm_consumer");
-        if (!consumer) {
-            KVCM_LOG_ERROR(
-                "async redis backend consumer startup failed, instance[%s], consumer[%d]", instance_id_.c_str(), i);
-            [[maybe_unused]] const auto ec = Close();
+            // Preallocated slots let workers publish their own clients without locking.
+            consumer_clients_[i] = std::move(client);
+            return EC_OK;
+        });
+        if (open_ec != EC_OK) {
+            KVCM_LOG_ERROR("async redis backend open failed during consumer connection startup, instance[%s], "
+                           "open concurrency[%d], ec[%d]",
+                           instance_id_.c_str(),
+                           open_concurrency_,
+                           open_ec);
+            CleanupResources();
             return EC_ERROR;
         }
-        consumer_threads_.push_back(std::move(consumer));
-    }
 
-    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
-                  "read client pool size min[%d], max[%d], open concurrency[%d]",
-                  instance_id_.c_str(),
-                  queue_count_,
-                  client_min_pool_size,
-                  client_max_pool_size,
-                  open_concurrency_);
-    return EC_OK;
+        constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
+        constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
+        int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
+        int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
+        int64_t tmp_client_max_pool_size = 0;
+        storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
+        if (tmp_client_max_pool_size > 0) {
+            client_max_pool_size = tmp_client_max_pool_size;
+        }
+        int64_t tmp_client_min_pool_size = 0;
+        storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
+        if (tmp_client_min_pool_size > 0) {
+            client_min_pool_size = tmp_client_min_pool_size;
+        }
+        read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
+            [this]() -> std::shared_ptr<RedisClient> {
+                auto client = this->CreateRedisClient();
+                if (!client || !client->Open()) {
+                    return nullptr;
+                }
+                return client;
+            },
+            client_min_pool_size,
+            client_max_pool_size);
+        if (!read_client_pool_->Initialize()) {
+            KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
+                           instance_id_.c_str());
+            CleanupResources();
+            return EC_ERROR;
+        }
+
+        queues_.resize(queue_count_);
+        for (int i = 0; i < queue_count_; ++i) {
+            queues_[i] = std::make_unique<MpscWriteQueue>();
+        }
+        consumer_threads_.reserve(queue_count_);
+        is_running_.store(true, std::memory_order_release);
+        for (int i = 0; i < queue_count_; ++i) {
+            auto consumer = CreateConsumerThread(i);
+            if (!consumer) {
+                KVCM_LOG_ERROR(
+                    "async redis backend consumer startup failed, instance[%s], consumer[%d]", instance_id_.c_str(), i);
+                [[maybe_unused]] const auto ec = Close();
+                return EC_ERROR;
+            }
+            consumer_threads_.push_back(std::move(consumer));
+        }
+
+        KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
+                      "read client pool size min[%d], max[%d], open concurrency[%d]",
+                      instance_id_.c_str(),
+                      queue_count_,
+                      client_min_pool_size,
+                      client_max_pool_size,
+                      open_concurrency_);
+        return EC_OK;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("async redis backend open threw, instance[%s], error[%s]", instance_id_.c_str(), e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("async redis backend open threw, instance[%s]", instance_id_.c_str());
+    }
+    // Consumers must stop before their queues and clients can be released.
+    if (is_running_.load(std::memory_order_acquire)) {
+        [[maybe_unused]] const auto ec = Close();
+    } else {
+        CleanupResources();
+    }
+    return EC_ERROR;
 }
 
 ErrorCode MetaAsyncRedisBackend::Close() noexcept {

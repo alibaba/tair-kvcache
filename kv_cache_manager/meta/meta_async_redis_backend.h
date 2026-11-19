@@ -144,6 +144,7 @@ private:
 
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
+    virtual autil::ThreadPtr CreateConsumerThread(int queue_id);
 
 private:
     StandardUri storage_uri_;

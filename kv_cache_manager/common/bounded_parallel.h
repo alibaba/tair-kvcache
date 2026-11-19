@@ -12,10 +12,15 @@
 
 namespace kv_cache_manager {
 
+namespace detail {
+
 // Each call uses independent workers; the caller also executes tasks.
 // Failure stops new work on a best-effort basis; started work finishes before return.
-template <typename Function>
-ErrorCode RunBoundedParallel(size_t count, size_t concurrency, Function &&function) noexcept {
+template <typename Function, typename ThreadFactory>
+ErrorCode RunBoundedParallelWithFactory(size_t count,
+                                        size_t concurrency,
+                                        Function &&function,
+                                        ThreadFactory &&create_thread) noexcept {
     if (count == 0) {
         return EC_OK;
     }
@@ -35,29 +40,47 @@ ErrorCode RunBoundedParallel(size_t count, size_t concurrency, Function &&functi
             if (index >= count) {
                 return;
             }
-            const auto ec = function(index);
-            if (ec != EC_OK) {
-                record_error(ec);
+            try {
+                const auto ec = function(index);
+                if (ec != EC_OK) {
+                    record_error(ec);
+                }
+            } catch (...) {
+                record_error(EC_ERROR);
             }
         }
     };
 
     std::vector<autil::ThreadPtr> workers;
-    const size_t worker_count = std::min(count, concurrency);
-    workers.reserve(worker_count - 1);
-    for (size_t i = 1; i < worker_count; ++i) {
-        auto worker = autil::Thread::createThread(work, "kvcm_parallel");
-        if (!worker) {
-            record_error(EC_ERROR);
-            break;
+    try {
+        const size_t worker_count = std::min(count, concurrency);
+        workers.reserve(worker_count - 1);
+        for (size_t i = 1; i < worker_count; ++i) {
+            auto worker = create_thread(work);
+            if (!worker) {
+                record_error(EC_ERROR);
+                break;
+            }
+            workers.push_back(std::move(worker));
         }
-        workers.push_back(std::move(worker));
+        work();
+    } catch (...) {
+        record_error(EC_ERROR);
     }
-    work();
     for (auto &worker : workers) {
         worker->join();
     }
     return error.load(std::memory_order_acquire);
+}
+
+} // namespace detail
+
+template <typename Function>
+ErrorCode RunBoundedParallel(size_t count, size_t concurrency, Function &&function) noexcept {
+    return detail::RunBoundedParallelWithFactory(
+        count, concurrency, std::forward<Function>(function), [](const auto &work) {
+            return autil::Thread::createThread(work, "kvcm_parallel");
+        });
 }
 
 } // namespace kv_cache_manager

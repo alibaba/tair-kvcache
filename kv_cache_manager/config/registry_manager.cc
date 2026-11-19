@@ -779,6 +779,12 @@ size_t RegistryManager::RecoverInstanceInfoUnsafe() {
         return 1;
     }
     for (const auto &[id, val] : value_map) {
+        // Recovery is incremental: runtime registration/removal owns any already-loaded id.
+        // Preserve its object identity and pending-removal phase across partial-recovery retries.
+        // DoRecoverOnce and the mutation APIs serialize on mutex_; DoCleanup enables a full reload.
+        if (instance_infos_.count(id) != 0 || removing_instance_infos_.count(id) != 0) {
+            continue;
+        }
         if (val == id + kRegistryRetiredSuffix) {
             ec = DeleteRegistryField(id, id);
             if (ec == EC_OK) {

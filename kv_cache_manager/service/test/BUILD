@@ -17,7 +17,6 @@ cc_test(
     ],
 )
 
-
 cc_test(
     name = "ServiceImplBaseTest",
     srcs = ["service_impl_base_test.cc"],
@@ -27,6 +26,25 @@ cc_test(
         "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/service:service_impl_base",
+    ],
+)
+
+cc_test(
+    name = "ServerInstanceRemovalDrainTest",
+    srcs = ["server_instance_removal_drain_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:meta_searcher",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/service:admin_service_impl",
+        "//kv_cache_manager/service:meta_service_impl",
+        "@cpp_stub",
     ],
 )
 
@@ -159,8 +177,8 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
-        "//kv_cache_manager/service:grpc_wrapper",
         "//kv_cache_manager/service",
+        "//kv_cache_manager/service:grpc_wrapper",
         "//kv_cache_manager/service/grpc_service:grpc_server_options",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
     ],
@@ -192,7 +210,6 @@ cc_test(
     # Let cpp_stub patch the function entry used by the code under test.
     linkstatic = True,
     deps = [
-        "@cpp_stub",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
@@ -200,6 +217,7 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/service:admin_service_impl",
+        "@cpp_stub",
     ],
 )
 
@@ -251,7 +269,6 @@ cc_test(
         "//kv_cache_manager/service",
     ],
 )
-
 
 cc_test(
     name = "CoroHttpServiceTest",

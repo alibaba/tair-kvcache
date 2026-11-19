@@ -5,6 +5,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -62,6 +63,22 @@ protected:
         init_count.fetch_add(1);
         const auto ec = initialize ? initialize(instance_id) : EC_OK;
         return ec == EC_OK ? MetaIndexerManager::InitMetaIndexer(indexer, instance_id, config) : ec;
+    }
+};
+
+class FailingSearcherManager : public MetaSearcherManager {
+public:
+    using MetaSearcherManager::MetaSearcherManager;
+    size_t attempts = 0;
+
+protected:
+    std::shared_ptr<MetaSearcher> CreateMetaSearcher(const std::shared_ptr<MetaIndexer> &indexer,
+                                                     const CheckLocDataExistFunc &check_loc_data_exist,
+                                                     const SubmitDelReqFunc &submit_del_req) override {
+        if (++attempts == 1) {
+            throw std::bad_alloc();
+        }
+        return MetaSearcherManager::CreateMetaSearcher(indexer, check_loc_data_exist, submit_del_req);
     }
 };
 
@@ -227,6 +244,49 @@ TEST_F(MetaSearcherManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
     indexers->initialize = [](const std::string &) { return EC_OK; };
     EXPECT_NE(nullptr, CreateSearcher("test_instance"));
     EXPECT_EQ(2, indexers->init_count.load());
+}
+
+TEST_F(MetaSearcherManagerTest, SearcherConstructionFailureReusesInitializedIndexerOnRetry) {
+    auto indexers = std::make_shared<ControlledSearchIndexerManager>();
+    meta_searcher_manager_ = std::make_unique<FailingSearcherManager>(registry_manager_, indexers);
+    EXPECT_THROW(CreateSearcher("test_instance"), std::bad_alloc);
+    auto indexer = indexers->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    auto searcher = CreateSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+    EXPECT_EQ(indexer, searcher->meta_indexer_);
+    EXPECT_EQ(searcher, CreateSearcher("test_instance"));
+    EXPECT_EQ(1, indexers->init_count.load());
+}
+
+TEST_F(MetaSearcherManagerTest, ExistingIndexerFromAnotherRegistrationCannotBeReused) {
+    auto indexers = std::make_shared<ControlledSearchIndexerManager>();
+    meta_searcher_manager_ = std::make_unique<FailingSearcherManager>(registry_manager_, indexers);
+    EXPECT_THROW(CreateSearcher("test_instance"), std::bad_alloc);
+    auto indexer = indexers->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    // Identical values do not make this new registration the same lifecycle.
+    registry_manager_->instance_infos_["test_instance"] =
+        std::make_shared<InstanceInfo>(*registry_manager_->instance_infos_["test_instance"]);
+    EXPECT_EQ(nullptr, CreateSearcher("test_instance"));
+    EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_EQ(indexer, indexers->GetMetaIndexer("test_instance"));
+    EXPECT_EQ(1, indexers->init_count.load());
+}
+
+TEST_F(MetaSearcherManagerTest, ExistingIndexerWithChangedConfigurationCannotBeReused) {
+    auto indexers = std::make_shared<ControlledSearchIndexerManager>();
+    meta_searcher_manager_ = std::make_unique<FailingSearcherManager>(registry_manager_, indexers);
+    EXPECT_THROW(CreateSearcher("test_instance"), std::bad_alloc);
+    auto config = registry_manager_->instance_group_configs_["test_group"]->cache_config()->meta_indexer_config();
+    const auto batch_size = config->GetBatchKeySize();
+    config->SetBatchKeySize(batch_size + 1);
+    EXPECT_EQ(nullptr, CreateSearcher("test_instance"));
+    EXPECT_EQ(nullptr, meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    config->SetBatchKeySize(batch_size);
+    EXPECT_NE(nullptr, CreateSearcher("test_instance"));
+    EXPECT_EQ(1, indexers->init_count.load());
 }
 
 TEST_F(MetaSearcherManagerTest, RemovedInstancesDoNotAccumulateMutexEntries) {

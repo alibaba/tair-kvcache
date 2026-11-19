@@ -241,11 +241,12 @@ client（MetaClient/gRPC 或 HTTP）→ service（grpc/http 适配 → *ServiceI
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
-QueryExecutor 和指标等 Manager 配置在生产启动阶段完成；这些配置的更新不得与创建并发，QueryExecutor 配置还要求索引表为空。
+QueryExecutor 和指标等 Manager 配置在生产启动阶段完成；IndexerManager 通过内部栅栏串行化配置更新与创建，QueryExecutor 配置还要求索引表为空。
 `MetaSearcherManager` 用同 ID 锁协调 Searcher 创建、提取和归还，不同 Instance 的慢 `Init/Open` 在全局 map 锁外并行，
-成功后才发布。`MetaIndexerManager` 仅用 map 锁保护索引表；
-同 ID 的 Create/Extract/Restore 依赖调用者串行化，正常创建统一经 SearcherManager，删除 pending 状态阻止重建。
-两个 Manager 的 Cleanup 在上层排空后调用。Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+成功后才发布。`MetaIndexerManager` 自身也以同 ID 锁协调 Create/Extract/Restore，并以生命周期栅栏隔离配置、创建和 Cleanup。
+Searcher 构造异常后，下一次尝试可复用同一 Registry 注册对象、配置和有效直方图边界下已初始化的 Indexer，补建 Searcher。
+Registry 增量恢复保留已加载的 active/pending 对象身份，Cleanup 后重载或删除再注册仍会生成新身份。
+两个 Manager 的 Cleanup 在上层排空后调用；IndexerManager 另有内部生命周期栅栏。Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
 删除 Instance 时，Registry 先持久化删除意图并使该 ID 对普通请求不可见；CacheManager 排空 Searcher 持有者，沿原有 TrimCache/Executor 链路删除缓存数据。全量 Trim 后排空 Indexer 持有者并复扫残留，必要时继续 Trim；确认无残留后同步异步写入、删除独立的持久化 metadata 记录（计数、用量），随后释放后端资源并清除删除意图。失败时保留删除意图供重试，同 ID 注册被拒绝；主备切换或重启后的 Recover 只恢复删除中状态并打印告警，不执行 Trim，需后续重试 RemoveInstance 才能完成清理。
 配置 `meta_storage_backend_config.memory_primary=true` 时仅支持 `cached + local + async_redis`：
 Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时不更新 local；全量回填完成并进入 Running 后，
@@ -393,7 +394,8 @@ flowchart LR
 两层 worker 不共用父子等待的线程池；连接任务全部结束后才发布 backend，首轮 Instance 任务全部结束后
 恢复回调才返回。Cleanup 前由 Server 关闭并排空业务请求，CacheManager 停止并 join 恢复重试，再通过
 `recover_run_mutex_` 等待整轮恢复结束，随后调用两个 Manager 的 Cleanup。部分失败沿用原有后台重试，
-Server 的租约校验与业务门禁保持原语义。
+每个 Instance 的异常独立记录且不阻断其他实例；线程准备和 backend Open 的异常会等待已启动线程结束后清理。
+这些异常边界不改变底层既有 `noexcept` 函数的终止行为。Server 的租约校验与业务门禁保持原语义。
 上述变化不新增模块或依赖边；参数和失败处理见 [HA 设计](ha_leader_elector.md#43-有界并行恢复)。
 
 ### 4.10 KVCM 到在线 Optimizer 的事件流

@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -146,6 +147,266 @@ TEST_F(MetaIndexerManagerTest, FailedInitializationDoesNotPublishAndCanRetry) {
     EXPECT_EQ(EC_OK, manager.CreateMetaIndexer("retry", config, {}, nullptr));
     EXPECT_NE(nullptr, manager.GetMetaIndexer("retry"));
     EXPECT_EQ(2, manager.init_count.load());
+}
+
+TEST_F(MetaIndexerManagerTest, SameInstanceInitializesOnce) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto first = std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("same", config, {}, nullptr); });
+    const bool first_entered = gate.WaitForEntered(1);
+    std::promise<void> second_started;
+    auto second = std::async(std::launch::async, [&] {
+        second_started.set_value();
+        return manager.CreateMetaIndexer("same", config, {}, nullptr);
+    });
+    second_started.get_future().wait();
+    const auto second_status = second.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(first_entered);
+    EXPECT_EQ(std::future_status::timeout, second_status);
+    EXPECT_EQ(EC_OK, first.get());
+    EXPECT_EQ(EC_EXIST, second.get());
+    EXPECT_EQ(1u, manager.init_count.load());
+    EXPECT_EQ(1u, manager.GetIndexerSize());
+}
+
+TEST_F(MetaIndexerManagerTest, ExtractionWaitsForSameInstanceCreation) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto creation =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("extract", config, {}, nullptr); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> extraction_started;
+    auto extraction = std::async(std::launch::async, [&] {
+        extraction_started.set_value();
+        return manager.ExtractMetaIndexer("extract");
+    });
+    extraction_started.get_future().wait();
+    const auto extraction_status = extraction.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, extraction_status);
+    EXPECT_EQ(EC_OK, creation.get());
+    EXPECT_NE(nullptr, extraction.get());
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("extract"));
+}
+
+TEST_F(MetaIndexerManagerTest, RestorationWaitsForSameInstanceCreation) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto creation =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("restore", config, {}, nullptr); });
+    const bool entered = gate.WaitForEntered(1);
+    auto replacement = std::make_shared<MetaIndexer>();
+    std::promise<void> restoration_started;
+    auto restoration = std::async(std::launch::async, [&] {
+        restoration_started.set_value();
+        return manager.RestoreMetaIndexer("restore", replacement);
+    });
+    restoration_started.get_future().wait();
+    const auto restoration_status = restoration.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, restoration_status);
+    EXPECT_EQ(EC_OK, creation.get());
+    EXPECT_FALSE(restoration.get());
+    EXPECT_NE(replacement, manager.GetMetaIndexer("restore"));
+}
+
+TEST_F(MetaIndexerManagerTest, QueryExecutorConfigurationWaitsForInflightCreation) {
+    ControlledMetaIndexerManager manager;
+    ASSERT_TRUE(manager.ConfigureQueryExecutor(1, 64, 32));
+    const auto original_executor = manager.query_executor_;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto creation =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("configure", config, {}, nullptr); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> configuration_started;
+    auto configuration = std::async(std::launch::async, [&] {
+        configuration_started.set_value();
+        return manager.ConfigureQueryExecutor(2, 64, 32);
+    });
+    configuration_started.get_future().wait();
+    const auto configuration_status = configuration.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, configuration_status);
+    EXPECT_EQ(EC_OK, creation.get());
+    EXPECT_FALSE(configuration.get());
+    EXPECT_EQ(original_executor, manager.query_executor_);
+    ASSERT_NE(nullptr, manager.GetMetaIndexer("configure"));
+    EXPECT_EQ(original_executor, manager.GetMetaIndexer("configure")->query_executor_);
+}
+
+TEST_F(MetaIndexerManagerTest, HistogramConfigurationWaitsForInflightCreation) {
+    ControlledMetaIndexerManager manager;
+    auto registry = std::make_shared<MetricsRegistry>();
+    const std::vector<double> original_boundaries = {1, 5, 30};
+    const std::vector<double> updated_boundaries = {1, 10, 60};
+    manager.SetRevisitHistogramConfig(registry, original_boundaries);
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto creation =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("old_defaults", config, {}, nullptr); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> configuration_started;
+    auto configuration = std::async(std::launch::async, [&] {
+        configuration_started.set_value();
+        manager.SetRevisitHistogramConfig(registry, updated_boundaries);
+    });
+    configuration_started.get_future().wait();
+    const auto configuration_status = configuration.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, configuration_status);
+    EXPECT_EQ(EC_OK, creation.get());
+    configuration.get();
+    const auto original = manager.GetMetaIndexer("old_defaults");
+    ASSERT_NE(nullptr, original);
+    const auto *original_backend =
+        dynamic_cast<MetaLocalBackend *>(original->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(nullptr, original_backend);
+    ASSERT_NE(nullptr, original_backend->revisit_histogram_);
+    EXPECT_EQ(original_boundaries, original_backend->revisit_histogram_->GetBoundaries());
+
+    ASSERT_EQ(EC_OK, manager.CreateMetaIndexer("new_defaults", config, {}, nullptr));
+    const auto updated = manager.GetMetaIndexer("new_defaults");
+    ASSERT_NE(nullptr, updated);
+    const auto *updated_backend =
+        dynamic_cast<MetaLocalBackend *>(updated->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(nullptr, updated_backend);
+    ASSERT_NE(nullptr, updated_backend->revisit_histogram_);
+    EXPECT_EQ(updated_boundaries, updated_backend->revisit_histogram_->GetBoundaries());
+}
+
+TEST_F(MetaIndexerManagerTest, CleanupWaitsForInflightCreationAndClearsItsResult) {
+    ControlledMetaIndexerManager manager;
+    IndexerInitializationGate gate;
+    manager.initialize = [&](const std::string &) {
+        gate.Enter();
+        return EC_OK;
+    };
+    auto config = std::make_shared<MetaIndexerConfig>();
+    auto creation =
+        std::async(std::launch::async, [&] { return manager.CreateMetaIndexer("cleanup", config, {}, nullptr); });
+    const bool entered = gate.WaitForEntered(1);
+    std::promise<void> cleanup_started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        cleanup_started.set_value();
+        manager.DoCleanup();
+    });
+    cleanup_started.get_future().wait();
+    const auto cleanup_status = cleanup.wait_for(std::chrono::milliseconds(100));
+    gate.Release();
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(std::future_status::timeout, cleanup_status);
+    EXPECT_EQ(EC_OK, creation.get());
+    cleanup.get();
+    EXPECT_EQ(0u, manager.GetIndexerSize());
+    EXPECT_EQ(nullptr, manager.GetMetaIndexer("cleanup"));
+}
+
+TEST_F(MetaIndexerManagerTest, ReusePreservesInitializedIndexerAndRegistrationAcrossExtractRestore) {
+    ControlledMetaIndexerManager manager;
+    const std::vector<double> boundaries = {1, 5, 30};
+    manager.SetRevisitHistogramConfig(std::make_shared<MetricsRegistry>(), boundaries);
+    auto instance = std::make_shared<InstanceInfo>();
+    instance->set_instance_id("reuse");
+    auto config = std::make_shared<MetaIndexerConfig>();
+    ASSERT_EQ(EC_OK, manager.CreateMetaIndexer("reuse", config, {}, instance));
+    const auto original = manager.GetMetaIndexer("reuse");
+    ASSERT_NE(nullptr, original);
+    std::shared_ptr<MetaIndexer> reused;
+    // Equal configuration values and explicitly resolved defaults are compatible.
+    auto equal_config = std::make_shared<MetaIndexerConfig>();
+    EXPECT_EQ(EC_OK, manager.GetMetaIndexerForReuse("reuse", equal_config, boundaries, instance, reused));
+    EXPECT_EQ(original, reused);
+    ASSERT_EQ(original, manager.ExtractMetaIndexer("reuse"));
+    ASSERT_TRUE(manager.RestoreMetaIndexer("reuse", original));
+    EXPECT_EQ(EC_OK, manager.GetMetaIndexerForReuse("reuse", config, {}, instance, reused));
+    EXPECT_EQ(original, reused);
+    EXPECT_EQ(1u, manager.init_count.load());
+}
+
+TEST_F(MetaIndexerManagerTest, ReuseRejectsDifferentRegistrationAndConfigurationWithoutReplacingIndexer) {
+    ControlledMetaIndexerManager manager;
+    const std::vector<double> boundaries = {1, 5, 30};
+    auto registry = std::make_shared<MetricsRegistry>();
+    manager.SetRevisitHistogramConfig(registry, boundaries);
+    auto instance = std::make_shared<InstanceInfo>();
+    instance->set_instance_id("reuse");
+    auto config = std::make_shared<MetaIndexerConfig>();
+    ASSERT_EQ(EC_OK, manager.CreateMetaIndexer("reuse", config, {}, instance));
+    const auto original = manager.GetMetaIndexer("reuse");
+    auto different_registration = std::make_shared<InstanceInfo>(*instance);
+    std::shared_ptr<MetaIndexer> reused = original;
+    EXPECT_EQ(EC_MISMATCH, manager.GetMetaIndexerForReuse("reuse", config, {}, different_registration, reused));
+    EXPECT_EQ(nullptr, reused);
+    // An independently owned pointer to the same address is not a registry registration reference.
+    const std::shared_ptr<const InstanceInfo> different_owner(instance.get(), [](const InstanceInfo *) {});
+    EXPECT_EQ(EC_MISMATCH, manager.GetMetaIndexerForReuse("reuse", config, {}, different_owner, reused));
+    EXPECT_EQ(nullptr, reused);
+
+    auto changed_config = std::make_shared<MetaIndexerConfig>();
+    changed_config->SetBatchKeySize(config->GetBatchKeySize() + 1);
+    EXPECT_EQ(EC_MISMATCH, manager.GetMetaIndexerForReuse("reuse", changed_config, {}, instance, reused));
+    EXPECT_EQ(nullptr, reused);
+    EXPECT_EQ(EC_MISMATCH, manager.GetMetaIndexerForReuse("reuse", config, {1, 10, 60}, instance, reused));
+    EXPECT_EQ(nullptr, reused);
+    manager.SetRevisitHistogramConfig(registry, {1, 10, 60});
+    EXPECT_EQ(EC_MISMATCH, manager.GetMetaIndexerForReuse("reuse", config, {}, instance, reused));
+    EXPECT_EQ(nullptr, reused);
+    // Explicit original boundaries still resolve to the indexer's original configuration.
+    EXPECT_EQ(EC_OK, manager.GetMetaIndexerForReuse("reuse", config, boundaries, instance, reused));
+    EXPECT_EQ(original, reused);
+    // EC_EXIST keeps its previous meaning; only the explicit reuse API checks compatibility.
+    EXPECT_EQ(EC_EXIST, manager.CreateMetaIndexer("reuse", changed_config, {}, different_registration));
+    EXPECT_EQ(original, manager.GetMetaIndexer("reuse"));
+    EXPECT_EQ(1u, manager.init_count.load());
+}
+
+TEST_F(MetaIndexerManagerTest, ReuseRejectsMissingUninitializedAndRetiredIndexers) {
+    auto instance = std::make_shared<InstanceInfo>();
+    instance->set_instance_id("reuse");
+    auto config = std::make_shared<MetaIndexerConfig>();
+    std::shared_ptr<MetaIndexer> reused;
+    EXPECT_EQ(EC_NOENT, manager_->GetMetaIndexerForReuse("reuse", config, {}, instance, reused));
+    EXPECT_EQ(EC_BADARGS, manager_->GetMetaIndexerForReuse("reuse", config, {}, nullptr, reused));
+    ASSERT_TRUE(manager_->RestoreMetaIndexer("reuse", std::make_shared<MetaIndexer>(instance)));
+    EXPECT_EQ(EC_MISMATCH, manager_->GetMetaIndexerForReuse("reuse", config, {}, instance, reused));
+    EXPECT_EQ(nullptr, reused);
+    EXPECT_NE(nullptr, manager_->ExtractMetaIndexer("reuse"));
+    ASSERT_EQ(EC_OK, manager_->CreateMetaIndexer("reuse", config, {}, instance));
+    const auto original = manager_->ExtractMetaIndexer("reuse");
+    ASSERT_NE(nullptr, original);
+    ASSERT_EQ(EC_OK, original->Retire());
+    ASSERT_TRUE(manager_->RestoreMetaIndexer("reuse", original));
+    EXPECT_EQ(EC_MISMATCH, manager_->GetMetaIndexerForReuse("reuse", config, {}, instance, reused));
+    EXPECT_EQ(nullptr, reused);
 }
 
 TEST_F(MetaIndexerManagerTest, TestConfigureQueryExecutorBeforeCreatingIndexers) {
