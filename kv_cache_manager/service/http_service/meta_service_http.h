@@ -75,7 +75,7 @@ public:
                                                                    proto::meta::GetHostCacheStateResponse *response);
 
 protected:
-    HandlerType LimitReportEventBodyBytes(HandlerType handler, size_t budget = 64 * 1024 * 1024);
+    HandlerType LimitReportEventBodyBytes(HandlerType handler, size_t budget = 1024 * 1024 * 1024);
 
 private:
     CachedJsonResponse TryRejectRequest() override;
