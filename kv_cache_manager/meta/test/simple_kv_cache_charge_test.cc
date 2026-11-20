@@ -56,18 +56,18 @@ TEST_F(SimpleKVCacheChargeTest, ChargeIncludesBucketReserveWithoutAllocationMarg
     std::shared_ptr<SimpleKVCacheItem> item;
     Create(Locations(1, 15), item);
     ASSERT_NE(nullptr, item);
-    EXPECT_EQ(112u, item->Size());
+    EXPECT_EQ(127u, item->Size());
 
     const CacheLocationMap single = Locations(1, 60);
     Create(single, item);
     ASSERT_NE(nullptr, item);
-    EXPECT_EQ(173u, item->Size());
+    EXPECT_EQ(172u, item->Size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Put(nullptr, {1}, {single}, PropertyMapVector(1)));
-    EXPECT_EQ(300u, backend_->GetMemUsage());
+    EXPECT_EQ(299u, backend_->GetMemUsage());
 
     Create(Locations(60, 60), item);
     ASSERT_NE(nullptr, item);
-    EXPECT_EQ(8964u, item->Size());
+    EXPECT_EQ(8904u, item->Size());
 }
 
 TEST_F(SimpleKVCacheChargeTest, ReadViewsPinOldVersionsAcrossMutationAndBackendDestruction) {
@@ -183,6 +183,44 @@ TEST_F(SimpleKVCacheChargeTest, PredictedGrowthMatchesPublishedItemAcrossSizes) 
             }
         }
     }
+}
+
+TEST_F(SimpleKVCacheChargeTest, ChecksumOnlyUpdatesConsumeCapacityAndPreservePinnedReadViews) {
+    const CacheLocationMap initial = Locations(1, 90);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Put(nullptr, {1}, {initial}, PropertyMapVector(1)));
+    const size_t initial_charge = backend_->GetMemUsage();
+    const KeyType key = 1;
+    CompactLocationsPerKey before(true);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->GetLocationValuesCompact(nullptr, &key, 1, before));
+
+    auto location = std::make_shared<CacheLocation>(*initial.begin()->second);
+    const std::string checksum("crc\0test", 8);
+    location->mutable_location_specs().front().set_checksum(checksum);
+    location->set_validated_total_size(4096);
+    const CacheLocationMap update{{location->id(), location}};
+    ASSERT_EQ(EC_OK, backend_->CheckWriteCapacity(1, update, {}, false));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->Upsert(nullptr, {1}, {update}, PropertyMapVector(1)));
+    EXPECT_EQ(initial_charge + checksum.size(), backend_->GetMemUsage());
+
+    CompactLocationsPerKey after(true);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->GetLocationValuesCompact(nullptr, &key, 1, after));
+    const CacheLocationReadView old = *before.ReadViews(0).begin();
+    const CacheLocationReadView current = *after.ReadViews(0).begin();
+    EXPECT_TRUE(old.SpecChecksum(0).empty());
+    EXPECT_EQ(old.SpecUri(0), current.SpecUri(0));
+    EXPECT_EQ(checksum, current.SpecChecksum(0));
+
+    auto oversized = std::make_shared<CacheLocation>(*location);
+    oversized->mutable_location_specs().front().set_checksum(std::string(1024 * 1024, 'h'));
+    oversized->set_validated_total_size(4096);
+    const CacheLocationMap rejected{{oversized->id(), oversized}};
+    EXPECT_EQ(EC_NOSPC, backend_->CheckWriteCapacity(1, rejected, {}, false));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOSPC}), backend_->Upsert(nullptr, {1}, {rejected}, PropertyMapVector(1)));
+    EXPECT_EQ(initial_charge + checksum.size(), backend_->GetMemUsage());
+
+    CacheLocationMapVector read;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->GetLocations(nullptr, {1}, read));
+    EXPECT_EQ(checksum, read.front().at(location->id())->location_specs().front().checksum());
 }
 
 TEST_F(SimpleKVCacheChargeTest, LocationRemovalRestoresChargeAndCapacityFailurePreservesValue) {

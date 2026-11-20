@@ -14,6 +14,16 @@ cc_binary(
 )
 
 cc_test(
+    name = "ReportEventBodyBudgetTest",
+    srcs = ["report_event_body_budget_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:report_event_body_budget",
+    ],
+)
+
+cc_test(
     name = "AccessLogWriterTest",
     srcs = ["access_log_writer_test.cc"],
     deps = [

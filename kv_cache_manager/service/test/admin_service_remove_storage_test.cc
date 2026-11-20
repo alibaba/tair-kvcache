@@ -29,8 +29,12 @@ public:
 
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
 
-        admin_service_ =
-            std::make_unique<AdminServiceImpl>(cache_manager_, nullptr, metrics_registry_, registry_manager_, nullptr);
+        admin_service_ = std::make_unique<AdminServiceImpl>(cache_manager_,
+                                                            nullptr,
+                                                            metrics_registry_,
+                                                            registry_manager_,
+                                                            nullptr,
+                                                            /*include_access_log_payload=*/false);
         admin_service_->EnableLeaderOnlyRequests();
     }
 

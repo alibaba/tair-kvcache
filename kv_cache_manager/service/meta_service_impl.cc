@@ -31,7 +31,9 @@
     api_name, is_leader_only, request_debug_expr, response_debug_expr, response_json_kind)                             \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    request_context->set_request_debug_json((request_debug_expr));                                                     \
+    if (include_access_log_payload_) {                                                                                 \
+        request_context->set_request_debug_json((request_debug_expr));                                                 \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -42,11 +44,14 @@
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);                                                                \
         return;                                                                                                        \
     }                                                                                                                  \
-    request_context->set_response_debug_json_generator([response]() { return (response_debug_expr); },                 \
-                                                       response_json_kind);                                            \
-    ServiceCallGuard service_call_guard(cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() {     \
-        DecrementRequestCount(is_leader_only);                                                                         \
-    });
+    if (include_access_log_payload_ || response_json_kind == RequestContext::ResponseJsonKind::kFullMessage) {         \
+        request_context->set_response_debug_json_generator([response]() { return (response_debug_expr); },             \
+                                                           response_json_kind);                                        \
+    }                                                                                                                  \
+    ServiceCallGuard service_call_guard(                                                                               \
+        cache_manager_.get(), request_context, metrics_reporter_.get(), include_access_log_payload_, [this]() {        \
+            DecrementRequestCount(is_leader_only);                                                                     \
+        });
 
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     API_CALL_GUARD_WITH_DEBUG(api_name,                                                                                \
@@ -321,11 +326,13 @@ BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheSt
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                  std::shared_ptr<MetricsReporter> metrics_reporter,
-                                 std::shared_ptr<LeaderElector> leader_elector)
+                                 std::shared_ptr<LeaderElector> leader_elector,
+                                 bool include_access_log_payload)
     : ServiceImplBase()
     , cache_manager_(std::move(cache_manager))
     , metrics_reporter_(std::move(metrics_reporter))
-    , leader_elector_(std::move(leader_elector)) {}
+    , leader_elector_(std::move(leader_elector))
+    , include_access_log_payload_(include_access_log_payload) {}
 
 void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                        const proto::meta::RegisterInstanceRequest *request,

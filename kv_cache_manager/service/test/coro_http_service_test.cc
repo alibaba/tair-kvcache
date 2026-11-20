@@ -4,9 +4,18 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
+#include "kv_cache_manager/service/http_service/meta_service_http.h"
+#include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/service_request_executor.h"
+#include "kv_cache_manager/service/util/proto_message_json_util.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 #include "ylt/coro_http/coro_http_client.hpp"
 
 namespace kv_cache_manager {
@@ -121,6 +130,80 @@ TEST_F(CoroHttpServiceTest, ShrinksLargeBodiesAfterHandlerErrors) {
     EXPECT_EQ(rejected.connection_id, next.connection_id);
     EXPECT_EQ(0u, next.size);
     EXPECT_LT(next.capacity, kThreshold);
+}
+
+class AccessLogPayloadHttpTest : public TESTBASE {
+protected:
+    void SetUp() override {
+        for (const bool include_access_log_payload : {false, true}) {
+            const std::string prefix = include_access_log_payload ? "/full" : "/metadata";
+            auto metrics_registry = std::make_shared<MetricsRegistry>();
+            auto registry_manager = std::make_shared<RegistryManager>("", metrics_registry);
+            auto cache_manager = std::make_shared<CacheManager>(metrics_registry, registry_manager);
+            auto meta_impl =
+                std::make_shared<MetaServiceImpl>(cache_manager, nullptr, nullptr, include_access_log_payload);
+            auto executor = std::make_shared<ServiceRequestExecutor>();
+            ASSERT_TRUE(executor->Init(1, 4));
+            auto budget = std::make_shared<ReportEventBodyBudget>(128);
+            auto service = std::make_unique<MetaServiceHttp>(
+                metrics_registry, meta_impl, registry_manager, executor, nullptr, budget, nullptr);
+            service->Init();
+            service->RegisterHandler();
+            for (const std::string api : {"/api/getInstanceInfo", "/api/reportEvent"}) {
+                const std::string path = prefix + api;
+                server_.set_http_handler<coro_http::POST>(
+                    path, service->WrapWithLogger(path, service->post_handlers_.at(api)));
+            }
+            services_.push_back(std::move(service));
+        }
+        server_task_ = std::make_unique<async_simple::Future<std::error_code>>(server_.async_start());
+        ASSERT_GT(server_.port(), 0);
+    }
+
+    void TearDown() override {
+        server_.stop();
+        if (server_task_) {
+            const std::error_code ec = std::move(*server_task_).get();
+            EXPECT_TRUE(!ec || ec == asio::error::operation_aborted) << ec.message();
+        }
+    }
+
+    template <typename Response>
+    void CheckResponses(const std::string &api) {
+        std::string metadata_response;
+        coro_http::coro_http_client client;
+        for (const std::string prefix : {"/metadata", "/full"}) {
+            SCOPED_TRACE(prefix + api);
+            const std::string url = "http://127.0.0.1:" + std::to_string(server_.port()) + prefix + api;
+            const coro_http::resp_data result =
+                client.post(url, R"({"trace_id":"payload-mode"})", coro_http::req_content_type::none);
+            ASSERT_FALSE(result.net_err) << result.net_err.message();
+            ASSERT_EQ(200, result.status);
+
+            Response response;
+            ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(result.resp_body, &response));
+            ASSERT_TRUE(response.header().has_status());
+            EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+            EXPECT_FALSE(response.header().request_id().empty());
+            response.mutable_header()->clear_request_id();
+
+            if (prefix == "/metadata") {
+                metadata_response = response.SerializeAsString();
+            } else {
+                EXPECT_EQ(metadata_response, response.SerializeAsString());
+            }
+        }
+    }
+
+private:
+    std::vector<std::unique_ptr<MetaServiceHttp>> services_;
+    coro_http::coro_http_server server_{1, 0, std::string("127.0.0.1")};
+    std::unique_ptr<async_simple::Future<std::error_code>> server_task_;
+};
+
+TEST_F(AccessLogPayloadHttpTest, PreservesResponsesForFullJsonAndAccessLogSummaryHandlers) {
+    ASSERT_NO_FATAL_FAILURE(CheckResponses<proto::meta::GetInstanceInfoResponse>("/api/getInstanceInfo"));
+    ASSERT_NO_FATAL_FAILURE(CheckResponses<proto::meta::ReportEventResponse>("/api/reportEvent"));
 }
 
 } // namespace kv_cache_manager

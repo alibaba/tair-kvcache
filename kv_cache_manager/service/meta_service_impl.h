@@ -17,7 +17,8 @@ class MetaServiceImpl : public ServiceImplBase {
 public:
     MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                     std::shared_ptr<MetricsReporter> metrics_reporter,
-                    std::shared_ptr<LeaderElector> leader_elector);
+                    std::shared_ptr<LeaderElector> leader_elector,
+                    bool include_access_log_payload);
     ~MetaServiceImpl() override = default;
 
     // 实现所有MetaService的接口方法
@@ -77,6 +78,7 @@ private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LeaderElector> leader_elector_;
+    const bool include_access_log_payload_;
 };
 
 } // namespace kv_cache_manager

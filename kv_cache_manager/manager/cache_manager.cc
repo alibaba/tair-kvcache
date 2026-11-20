@@ -3933,13 +3933,6 @@ private:
         return;
     }
 
-    ErrorCode ValidateIncomingSpec(const proto::meta::LocationSpec &spec, ValidatedEventLocationSpec &out) const {
-        if (instance_info_->disable_write_session() && !spec.checksum().empty()) {
-            return EC_UNIMPLEMENTED;
-        }
-        return ValidateEventLocationSpec(spec, out) ? EC_OK : EC_BADARGS;
-    }
-
     void PrepareDeltaAdd(int i) {
         const proto::meta::EventItem &item = request_.events(i);
 
@@ -3970,10 +3963,9 @@ private:
                 break;
             }
             ValidatedEventLocationSpec validated_spec;
-            const ErrorCode spec_ec = ValidateIncomingSpec(spec, validated_spec);
-            if (spec_ec != EC_OK ||
+            if (!ValidateEventLocationSpec(spec, validated_spec) ||
                 validated_spec.size > std::numeric_limits<std::uint64_t>::max() - event_total_size) {
-                per_item_ec_[i] = spec_ec != EC_OK ? spec_ec : EC_BADARGS;
+                per_item_ec_[i] = EC_BADARGS;
                 break;
             }
             validated_spec.name = name_it->second;
@@ -4144,10 +4136,9 @@ private:
                     break;
                 }
                 ValidatedEventLocationSpec validated_spec;
-                const ErrorCode spec_ec = ValidateIncomingSpec(spec, validated_spec);
-                if (spec_ec != EC_OK ||
+                if (!ValidateEventLocationSpec(spec, validated_spec) ||
                     validated_spec.size > std::numeric_limits<std::uint64_t>::max() - snapshot_total_size) {
-                    per_item_ec_[i] = spec_ec != EC_OK ? spec_ec : EC_BADARGS;
+                    per_item_ec_[i] = EC_BADARGS;
                     break;
                 }
                 snapshot_total_size += validated_spec.size;

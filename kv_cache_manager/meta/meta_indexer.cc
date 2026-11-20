@@ -191,6 +191,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         return EC_BADARGS;
     }
     std::unique_ptr<MetaCacheBaseBackend> local;
+    SharedLocationSpecName simple_spec_name;
     if (!SupportsWriteSession()) {
         const std::vector<LocationSpecInfo> &specs = instance_info_->location_spec_infos();
         if (specs.size() != 1 || specs.front().name().empty()) {
@@ -222,8 +223,8 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
                 return EC_CONFIG_ERROR;
             }
         }
-        auto spec_name = std::make_shared<const std::string>(specs.front().name());
-        local = std::make_unique<SimpleKVCacheBackend>(std::move(spec_name));
+        simple_spec_name = std::make_shared<const std::string>(specs.front().name());
+        local = std::make_unique<SimpleKVCacheBackend>(simple_spec_name);
     }
     max_key_count_ = config->GetMaxKeyCount();
     const size_t mutex_shard_num = config->GetMutexShardNum();
@@ -247,7 +248,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     storage_backend_config_ = {storage_backend_config->GetStorageType(), storage_backend_config->GetStorageUri()};
 
     backend_manager_ = std::make_unique<MetaStorageBackendManager>();
-    ErrorCode ec = backend_manager_->Init(instance_id_, storage_backend_config, std::move(local));
+    ErrorCode ec = backend_manager_->Init(instance_id_, storage_backend_config, std::move(local), simple_spec_name);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta storage backend manager init failed, ec[%d]", instance_id_.c_str(), ec);
         backend_manager_.reset();
@@ -309,15 +310,14 @@ ErrorCode MetaIndexer::ValidateSimpleLocation(const CacheLocationReadView &locat
         location.SpecName(0) != instance_info_->location_spec_infos().front().name()) {
         return EC_BADARGS;
     }
-    if (!location.SpecChecksum(0).empty()) {
-        return EC_UNIMPLEMENTED;
-    }
-    if (location.SpecUri(0).size() > std::numeric_limits<uint32_t>::max()) {
+    const std::string_view spec_uri = location.SpecUri(0);
+    constexpr size_t kMaxPayloadBytes = std::numeric_limits<uint32_t>::max();
+    if (spec_uri.size() > kMaxPayloadBytes || location.SpecChecksum(0).size() > kMaxPayloadBytes - spec_uri.size()) {
         return EC_OUT_OF_RANGE;
     }
     if (validate_uri && !location.HasValidatedLocationSpecs()) {
         StandardUri uri;
-        if (!uri.Parse(location.SpecUri(0)) || !uri.Valid()) {
+        if (!uri.Parse(spec_uri) || !uri.Valid()) {
             return EC_BADARGS;
         }
     }
@@ -887,8 +887,15 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count,
                                                                  bool fill_missing_cache) noexcept {
-    return ReadModifyWriteLocationImpl(
-        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, fill_missing_cache, false);
+    return ReadModifyWriteLocationImpl(request_context,
+                                       keys,
+                                       location_ids,
+                                       modifier,
+                                       {},
+                                       adjust_reclaimed_key_count,
+                                       false,
+                                       fill_missing_cache,
+                                       false);
 }
 
 MetaIndexer::LocationResult
@@ -898,20 +905,32 @@ MetaIndexer::ReadModifyWriteLocationsForMaintenance(RequestContext *request_cont
                                                     const LocationModifierFunc &modifier,
                                                     bool adjust_reclaimed_key_count) noexcept {
     return ReadModifyWriteLocationImpl(
-        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, false, true);
+        request_context, keys, location_ids, modifier, {}, adjust_reclaimed_key_count, false, false, true);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
                                                                         const KeyVector &keys,
                                                                         const LocationIdsPerKey &location_ids,
                                                                         const LocationModifierFunc &modifier) noexcept {
-    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, {}, false, true, false, false);
+}
+
+MetaIndexer::LocationResult
+MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const LocationIdsPerKey &location_ids,
+                                            const LocationViewModifierFunc &modifier) noexcept {
+    if (SupportsWriteSession()) {
+        return LocationResult(EC_UNIMPLEMENTED);
+    }
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, {}, modifier, false, true, false, false);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
                                                                      const KeyVector &keys,
                                                                      const LocationIdsPerKey &location_ids,
                                                                      const LocationModifierFunc &modifier,
+                                                                     const LocationViewModifierFunc &view_modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
                                                                      bool fill_missing_cache,
@@ -925,8 +944,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     if (keys.empty()) {
         return LocationResult(EC_OK);
     }
-    if (simple_mode && (!modifier || keys.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()))) {
-        return LocationResult(!modifier ? EC_BADARGS : EC_OUT_OF_RANGE);
+    if (simple_mode &&
+        ((!modifier && !view_modifier) || keys.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()))) {
+        return LocationResult(!modifier && !view_modifier ? EC_BADARGS : EC_OUT_OF_RANGE);
     }
     if (keys.size() != location_ids.size()) {
         PREFIX_INDEXER_LOG(ERROR,
@@ -1011,7 +1031,20 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             fill_results = backend_manager_->EnsureCacheForGc(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
-        if (track_created_key_count) {
+        const bool read_views =
+            view_modifier && (!backend_manager_->HasCacheBackend() ||
+                              backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning);
+        CompactLocationsPerKey old_views(read_views);
+        if (read_views) {
+            batch_key_get_ecs = backend_manager_->GetLocationValuesCompact(
+                ephemeral_request_context.get(), batch_keys.data(), batch_keys.size(), old_views);
+            get_ecs_per_key.resize(batch_keys.size());
+            batch_locations_per_key.resize(batch_keys.size());
+            for (size_t i = 0; i < batch_keys.size(); ++i) {
+                get_ecs_per_key[i].assign(batch_location_ids[i].size(), EC_NOENT);
+                batch_locations_per_key[i].resize(batch_location_ids[i].size());
+            }
+        } else if (track_created_key_count) {
             get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
                                                                           batch_keys,
                                                                           batch_location_ids,
@@ -1036,7 +1069,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (fill_cache && fill_results.size() != batch_keys.size())) {
+            (fill_cache && fill_results.size() != batch_keys.size()) ||
+            (read_views && !old_views.IsValid(batch_keys.size()))) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -1139,12 +1173,29 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 key_level_failures[global_idx] = true;
                 continue;
             }
+            std::vector<CacheLocationReadView> previous_views;
+            if (view_modifier) {
+                previous_views.reserve(loc_ids.size());
+            }
             // EC_OK promises a usable value for the requested id. Treat a
             // null or mis-keyed value as corruption and never let a modifier
             // turn it into a write based on fabricated state.
             for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
-                if (get_ecs[loc_index] == EC_OK &&
-                    (!loc_values[loc_index] || loc_values[loc_index]->id() != loc_ids[loc_index])) {
+                CacheLocationReadView previous(loc_values[loc_index]);
+                if (read_views) {
+                    for (const CacheLocationReadView candidate : old_views.ReadViews(i)) {
+                        if (!candidate) {
+                            get_ecs[loc_index] = EC_MISMATCH;
+                            break;
+                        }
+                        if (candidate.id() == loc_ids[loc_index]) {
+                            previous = candidate;
+                            get_ecs[loc_index] = EC_OK;
+                            break;
+                        }
+                    }
+                }
+                if (get_ecs[loc_index] == EC_OK && (!previous || previous.id() != loc_ids[loc_index])) {
                     PREFIX_INDEXER_LOG(ERROR,
                                        "ReadModifyWriteLocation invalid EC_OK value, key[%ld], requested id[%s]",
                                        key,
@@ -1153,13 +1204,16 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                     loc_values[loc_index].reset();
                 }
                 if (simple_mode && get_ecs[loc_index] == EC_OK) {
-                    get_ecs[loc_index] = ValidateSimpleLocation(loc_values[loc_index], false);
+                    get_ecs[loc_index] = ValidateSimpleLocation(previous, false);
                     if (get_ecs[loc_index] != EC_OK) {
                         loc_values[loc_index].reset();
                     }
                 }
                 if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
                     key_level_failures[global_idx] = true;
+                }
+                if (view_modifier) {
+                    previous_views.push_back(get_ecs[loc_index] == EC_OK ? previous : CacheLocationReadView(nullptr));
                 }
             }
             if (track_created_key_count && key_get_ec == EC_NOENT &&
@@ -1172,10 +1226,18 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 key_level_failures[global_idx] = true;
                 continue;
             }
-            const CacheLocationVector previous_locations = convert_deleting ? loc_values : CacheLocationVector{};
+            const CacheLocationVector previous_locations =
+                convert_deleting || (view_modifier && !read_views) ? loc_values : CacheLocationVector{};
             PropertyMap upsert_property_map;
             LocationModifierResult modified =
-                modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
+                view_modifier
+                    ? view_modifier(get_ecs,
+                                    loc_ids,
+                                    static_cast<size_t>(global_idx),
+                                    previous_views,
+                                    loc_values,
+                                    upsert_property_map)
+                    : modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
             ModifierAction action = modified.first;
             std::vector<ErrorCode> &modifier_ecs = modified.second;
             if (modifier_ecs.size() != loc_ids.size() || (simple_mode && loc_values.size() != loc_ids.size())) {

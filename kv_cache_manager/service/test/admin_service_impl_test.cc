@@ -85,8 +85,12 @@ public:
         ASSERT_TRUE(RegisterDummyStorage("hot_01"));
         ASSERT_TRUE(RegisterDummyStorage("cold_01"));
 
-        admin_ = std::make_shared<AdminServiceImpl>(
-            cache_manager_, /*reporter*/ nullptr, metrics_registry_, registry_manager_, /*leader*/ nullptr);
+        admin_ = std::make_shared<AdminServiceImpl>(cache_manager_,
+                                                    /*reporter*/ nullptr,
+                                                    metrics_registry_,
+                                                    registry_manager_,
+                                                    /*leader*/ nullptr,
+                                                    /*include_access_log_payload=*/false);
         admin_->EnableLeaderOnlyRequests();
 
         // MARK/BOTH 要求 group 配置 migration strategy。默认启用，让 MARK/BOTH 用例走正常路径；

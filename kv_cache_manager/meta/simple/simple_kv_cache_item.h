@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_cache_manager/common/cache/advanced_cache.h"
 #include "kv_cache_manager/meta/types.h"
@@ -52,8 +54,15 @@ public:
 
 private:
     struct LocationData {
+        LocationData(const InternedLocationId &location_id, const LocationSpec &spec);
+
+        std::string_view Uri() const noexcept { return {payload.data(), uri_size}; }
+        std::string_view Checksum() const { return std::string_view(payload.data(), payload.size()).substr(uri_size); }
+        bool Matches(const LocationSpec &spec) const { return Uri() == spec.uri() && Checksum() == spec.checksum(); }
+
         InternedLocationId id;
-        std::string uri;
+        std::vector<char> payload;
+        uint32_t uri_size;
     };
     struct LocationRecord {
         std::shared_ptr<const LocationData> data;
@@ -62,7 +71,7 @@ private:
     static_assert(sizeof(LocationRecord) == 24, "Simple location reference must remain 24 bytes");
 
     static size_t EstimateRecordCharge(size_t location_count);
-    static size_t EstimateDataCharge(size_t uri_capacity);
+    static size_t EstimateDataCharge(size_t payload_capacity);
     static ErrorCode Allocate(size_t location_count, Cache::ObjectPtr &out_item);
     const LocationRecord &Record(size_t index) const noexcept;
     bool FindLocationIndex(const LocationId &location_id, size_t &out_index) const noexcept;

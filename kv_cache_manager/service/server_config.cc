@@ -14,6 +14,7 @@
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 
@@ -119,6 +120,16 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_grpc_memory_quota_bytes_ = parsed;
          return true;
      }},
+    {"kvcm.service.http_report_event_body_budget_bytes",
+     [](const std::string &value, ServerConfig *config) {
+         uint32_t bytes = 0;
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos ||
+             !ParseUint32Setting(value, bytes) || bytes > ReportEventBodyBudget::kMaxBytes) {
+             return false;
+         }
+         config->http_report_event_body_budget_bytes_ = bytes;
+         return true;
+     }},
     {"kvcm.service.grpc_cq_thread_num",
      [](const std::string &value, ServerConfig *config) {
          return !value.empty() && value.front() != '-' &&
@@ -169,6 +180,14 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          // 0: auto, 1: fatal, 2: error, 3: warn, 4: info, 5: debug
          config->log_level_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.logger.access_log_payload_mode",
+     [](const std::string &value, ServerConfig *config) {
+         if (value != "metadata" && value != "full") {
+             return false;
+         }
+         config->include_access_log_payload_ = value == "full";
          return true;
      }},
     {"kvcm.startup_config",
@@ -449,10 +468,12 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 void ServerConfig::UpdateDefaultConfig() {
     service_grpc_max_threads_ = 0;
     service_grpc_memory_quota_bytes_ = 0;
+    http_report_event_body_budget_bytes_ = 0;
     service_grpc_cq_thread_num_ = 2;
     service_worker_thread_num_ = 0;
     service_worker_queue_capacity_ = 2048;
     service_worker_shutdown_mode_ = "discard_pending";
+    include_access_log_payload_ = false;
     metrics_reporter_type_ = "local";
     metrics_env_tag_mappings_.clear();
     metrics_common_tags_.clear();

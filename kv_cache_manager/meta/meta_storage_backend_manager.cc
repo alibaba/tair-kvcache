@@ -57,12 +57,13 @@ MetaStorageBackendManager::~MetaStorageBackendManager() {
 
 ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
                                           const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept {
-    return Init(instance_id, config, nullptr);
+    return Init(instance_id, config, nullptr, {});
 }
 
 ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
                                           const std::shared_ptr<MetaStorageBackendConfig> &config,
-                                          std::unique_ptr<MetaCacheBaseBackend> injected_local) noexcept {
+                                          std::unique_ptr<MetaCacheBaseBackend> injected_local,
+                                          const SharedLocationSpecName &simple_spec_name) noexcept {
     try {
         std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
         if (instance_id.empty()) {
@@ -135,7 +136,8 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         auto persistent_config = std::make_shared<MetaStorageBackendConfig>(persistent_type);
         persistent_config->SetStorageUri(storage_uri);
         persistent_config->SetMemoryPrimary(config->GetMemoryPrimary());
-        auto persistent_backend = MetaStorageBackendFactory::CreatePersistentBackend(instance_id, persistent_config);
+        std::unique_ptr<MetaStorageBackend> persistent_backend =
+            MetaStorageBackendFactory::CreatePersistentBackend(instance_id, persistent_config, simple_spec_name);
         if (!persistent_backend) {
             KVCM_LOG_ERROR("fail to create persistent backend uri[%s]", storage_uri.c_str());
             return EC_ERROR;

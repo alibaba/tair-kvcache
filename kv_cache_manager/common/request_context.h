@@ -32,9 +32,8 @@ public:
         bool valid = false;
     };
 
-    // The response generator is request-local and may capture the response
-    // protobuf object. It is evaluated at most once before that object leaves
-    // the synchronous service call.
+    // The request-local generator may borrow the response protobuf.
+    // It is evaluated at most once while the response is alive.
     using ResponseJsonGenerator = std::function<JsonFragment()>;
 
     enum class ResponseJsonKind {
