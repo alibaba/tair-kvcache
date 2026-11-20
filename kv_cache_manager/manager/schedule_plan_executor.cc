@@ -15,7 +15,9 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/tair_reclaim_delete.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -274,7 +276,8 @@ void SchedulePlanExecutor::WorkerRoutine() {
 }
 
 PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
-                                                          const std::shared_ptr<MetaIndexer> &indexer) {
+                                                          const std::shared_ptr<MetaIndexer> &indexer,
+                                                          ReclaimFreeLocations *tair_locations) {
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -320,6 +323,10 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             }
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
+            }
+            if (tair_locations && !task.metadata_only && IsTairMempoolStorageType(iter->second->type())) {
+                tair_locations->emplace_back(block_key, iter->second);
+                continue; // This storage batch owns its physical Free and CAD.
             }
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
@@ -723,7 +730,9 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         &task.location_ids,
                                         expected_location_values,
                                         task.delay,
-                                        task.authoritative_read);
+                                        task.authoritative_read,
+                                        task.free_busy.get());
+    result.actual_task.free_busy = task.free_busy;
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
@@ -735,7 +744,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
                                             std::chrono::microseconds delay,
-                                            bool authoritative_read) {
+                                            bool authoritative_read,
+                                            const FreeBusyTask *free_busy) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -856,6 +866,10 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     if (batch_cas_block_keys.empty()) {
         return admission_result;
     }
+    if (free_busy && !free_busy->Active()) {
+        admission_result.result = MakeErrorResult(EC_ERROR, "Watermark eviction cancelled before metadata admission.");
+        return admission_result;
+    }
 
     std::vector<std::vector<ErrorCode>> batch_results;
     ErrorCode update_ec = meta_searcher.BatchCASLocationStatus(
@@ -911,7 +925,21 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         auto indexer = std::move(admission_result.indexer);
         auto execute_task = [this, completion, actual_task, indexer = std::move(indexer)]() {
             try {
-                completion->Complete(DoLocationDelTask(actual_task, indexer));
+                if (actual_task.free_busy) {
+                    ReclaimFreeLocations locations;
+                    auto result = DoLocationDelTask(actual_task, indexer, &locations);
+                    RunTairReclaimDelete(
+                        *this,
+                        data_storage_manager_,
+                        meta_manager_,
+                        indexer,
+                        actual_task,
+                        locations,
+                        std::move(result),
+                        [completion](PlanExecuteResult done) { completion->Complete(std::move(done)); });
+                } else {
+                    completion->Complete(DoLocationDelTask(actual_task, indexer));
+                }
             } catch (const std::exception &e) {
                 completion->Complete(ErrorCode::EC_ERROR,
                                      StringUtil::FormatString("location delete task threw exception: %s", e.what()));

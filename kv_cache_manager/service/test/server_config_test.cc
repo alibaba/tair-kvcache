@@ -29,6 +29,9 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(128u, config.GetMetaQueryChunkSize());
         ASSERT_EQ(100, config.GetCacheReclaimerKeySamplingSizeTotal());
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
+        EXPECT_TRUE(config.GetFreeBusyEnabled());
+        EXPECT_EQ(50, config.GetFreeBusyInitialBackoffMs());
+        EXPECT_EQ(128ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
         ASSERT_EQ(20000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(1ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
@@ -485,6 +488,22 @@ TEST_F(ServerConfigTest, TestCacheReclaimerAsyncDeleteConfig) {
     environ["kvcm.cache_reclaimer.pending_delete_handler_limit"] = "0";
     ASSERT_TRUE(config.Parse("", environ));
     EXPECT_FALSE(config.Check());
+}
+
+TEST_F(ServerConfigTest, FreeBusyConfig) {
+    ServerConfig config;
+    EXPECT_TRUE(config.Parse("",
+                             {{"kvcm.cache_reclaimer.free_busy_enabled", "false"},
+                              {"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "100"},
+                              {"kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes", "4096"}}));
+    EXPECT_FALSE(config.GetFreeBusyEnabled());
+    EXPECT_EQ(100, config.GetFreeBusyInitialBackoffMs());
+    EXPECT_EQ(4096, config.GetFreeBusyRetryMemoryLimitBytes());
+    for (const auto value : {"0", "-1", "5001", "20ms"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", value}}));
+    }
+    EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes", "0"}}));
+    EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.free_busy_enabled", "yes"}}));
 }
 
 TEST_F(ServerConfigTest, TestCacheGcConfig) {

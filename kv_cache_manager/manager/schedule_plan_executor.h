@@ -36,6 +36,7 @@ private:                                                                        
 #endif
 
 class MetaIndexerManager;
+struct FreeBusyTask;
 class MetaIndexer;
 class DataStorageManager;
 
@@ -81,6 +82,7 @@ struct CacheLocationDelRequest {
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
     // omit Delete for these URIs; remaining specs are deleted normally.
     std::set<std::string> confirmed_missing_uris;
+    std::shared_ptr<FreeBusyTask> free_busy; // Only watermark eviction opts in.
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -234,7 +236,8 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          const FreeBusyTask *free_busy = nullptr);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
@@ -246,8 +249,10 @@ private:
                                                     std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
-    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
-                                        const std::shared_ptr<MetaIndexer> &indexer);
+    PlanExecuteResult
+    DoLocationDelTask(const CacheLocationDelRequest &task,
+                      const std::shared_ptr<MetaIndexer> &indexer,
+                      std::vector<std::pair<int64_t, CacheLocationConstPtr>> *tair_locations = nullptr);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

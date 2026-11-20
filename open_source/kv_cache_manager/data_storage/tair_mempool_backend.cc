@@ -58,6 +58,12 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> TairMempoolBackend::Create(con
     return {};
 }
 
+TairReclaimFreeResult TairMempoolBackend::DeleteForReclaim(const std::vector<uint64_t> &,
+                                                           const std::string &,
+                                                           const std::function<bool()> &) {
+    return {TairReclaimFreeResult::kNotSent};
+}
+
 std::vector<ErrorCode> TairMempoolBackend::Delete(const std::vector<DataStorageUri> &storage_uris,
                                                   const std::string &trace_id,
                                                   std::function<void()> cb) {
