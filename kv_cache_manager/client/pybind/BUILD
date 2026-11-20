@@ -11,6 +11,7 @@ cc_library(
     hdrs = ["py_host_registration.h"],
     deps = [
         "//kv_cache_manager/client:common",
+        "//kv_cache_manager/client/src/internal/util:host_registration",
     ],
 )
 
