@@ -240,10 +240,12 @@ cc_test(
     data = [],
     deps = [
         ":meta_storage_backend_testlib",
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/common/test:redis_client_testlib",
         "//kv_cache_manager/meta:meta_async_redis_backend",
         "//kv_cache_manager/meta:utils",
+        "@cpp_stub",
     ],
 )
 

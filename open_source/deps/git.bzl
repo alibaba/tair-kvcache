@@ -139,6 +139,7 @@ def git_deps():
             "//patches/havenask:havenask.patch",
             "//patches/havenask:anet.patch",
             "//patches/havenask:0001-fix-PrometheusSink-need-header.patch",
+            "//patches/havenask:0002-fix-Thread-create-exception-safety.patch",
         ],
         build_file = clean_dep("//3rdparty/kmonitor:kmonitor.BUILD"),
     )

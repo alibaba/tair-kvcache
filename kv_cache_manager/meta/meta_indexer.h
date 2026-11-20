@@ -283,6 +283,12 @@ private:
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 
 private:
+    friend class MetaIndexerManager;
+
+    // Immutable after successful manager publication.
+    bool manager_initialized_ = false;
+    std::string initial_config_json_;
+    std::vector<double> initial_histogram_boundaries_;
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
     std::shared_ptr<QueryExecutor> query_executor_;

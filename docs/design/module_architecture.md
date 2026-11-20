@@ -196,6 +196,13 @@ client（MetaClient/gRPC）→ service（grpc 适配 → *ServiceImpl）
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
+QueryExecutor 和指标等 Manager 配置在生产启动阶段完成；IndexerManager 通过内部栅栏串行化配置更新与创建，QueryExecutor 配置还要求索引表为空。
+`MetaSearcherManager` 用同 ID 锁协调 Searcher 创建，不同 Instance 的慢 `Init/Open` 在全局 map 锁外并行，成功后才发布。
+`MetaIndexerManager` 自身也以同 ID 锁协调 Create，并以生命周期栅栏隔离配置、创建和 Cleanup。
+Searcher 构造异常后，下一次尝试可复用同一配置和有效直方图边界下已初始化的 Indexer，补建 Searcher。
+Registry 增量恢复保留已加载 Instance 的对象身份，Cleanup 后重载或删除再注册仍会生成新身份。
+两个 Manager 的 Cleanup 在上层排空后调用；IndexerManager 另有内部生命周期栅栏。Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+
 ### 4.3 读取（命中并加载 KVCache）
 
 从完整视角看，读取由推理引擎驱动，client 的两条链路依次参与：
@@ -307,6 +314,17 @@ flowchart LR
 ### 4.8 HA 故障转移
 
 `LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager，并在持锁轮次与租约仍有效时开放 leader-only 请求。失锁时先同步关闭请求入口；选主层暂停本节点竞选，等待已开始的恢复返回并串行清理，同时继续刷新主节点发现信息。降级回调通知 GC/Reclaimer 停止新工作并排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+
+`CacheManager` 使用独立的有界 worker 恢复 Instance，每任务持有自己的 `RequestContext`，执行前在 CacheManager 的
+`metrics_lifecycle` 共享锁内重新读取 Registry；已删除的快照条目直接跳过，不重新注册。
+每个 `MetaAsyncRedisBackend` 使用另一组有界 worker 创建专属 consumer 连接；普通 RedisClient 的首次连接、
+读池懒建和重连共用默认 64 的进程级握手预算，协调 RedisClient 使用独立的固定 4 个许可。
+两层 worker 不共用父子等待的线程池；连接任务全部结束后才发布 backend，首轮 Instance 任务全部结束后
+恢复回调才返回。Cleanup 前由 Server 关闭并排空业务请求，CacheManager 停止并 join 恢复重试，再通过
+`recover_run_mutex_` 等待整轮恢复结束，随后调用两个 Manager 的 Cleanup。部分失败沿用原有后台重试，
+每个 Instance 的异常独立记录且不阻断其他实例；线程准备和 backend Open 的异常会等待已启动线程结束后清理。
+这些异常边界不改变底层既有 `noexcept` 函数的终止行为。Server 的租约校验与业务门禁保持原语义。
+上述变化不新增模块或依赖边；参数和失败处理见 [HA 设计](ha_leader_elector.md#43-有界并行恢复)。
 
 ---
 

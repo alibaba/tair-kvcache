@@ -16,7 +16,7 @@ CoordinationRedisBackend::CoordinationRedisBackend() = default;
 CoordinationRedisBackend::~CoordinationRedisBackend() = default;
 
 std::shared_ptr<RedisClientExt> CoordinationRedisBackend::CreateRedisClient(const StandardUri &storage_uri) const {
-    return std::make_shared<RedisClientExt>(storage_uri);
+    return std::make_shared<RedisClientExt>(storage_uri, RedisClient::ConnectionType::kCoordination);
 }
 
 ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexcept {
