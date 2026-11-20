@@ -653,21 +653,26 @@ int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
 std::vector<ErrorCode> MetaStorageBackendManager::WritePrimary(RequestContext *request_context,
                                                                BatchMetaData &batch,
                                                                const WriteRoute &route,
-                                                               bool replace) noexcept {
+                                                               bool replace,
+                                                               const std::vector<ErrorCode> *admission) noexcept {
     auto write =
         [&](const KeyVector &keys, const CacheLocationMapVector &locations, const PropertyMapVector &properties) {
             return replace ? route.primary.Put(request_context, keys, locations, properties)
                            : route.primary.Upsert(request_context, keys, locations, properties);
         };
-    if (!cache_backend_ || route.local_primary) {
+    if (!cache_backend_ || route.local_primary ||
+        (admission && std::all_of(admission->begin(), admission->end(), [](ErrorCode ec) { return ec == EC_OK; }))) {
         return write(batch.batch_keys, batch.batch_locations, batch.batch_properties);
     }
-    std::vector<ErrorCode> results(batch.batch_keys.size(), EC_OK);
-    bool rejected = false;
-    for (size_t i = 0; i < results.size(); ++i) {
-        results[i] = cache_backend_->CheckWriteCapacity(
-            batch.batch_keys[i], batch.batch_locations[i], batch.batch_properties[i], replace);
-        rejected = rejected || results[i] != EC_OK;
+    // Counted Upsert has already checked admission using its native handles.
+    std::vector<ErrorCode> results = admission ? *admission : std::vector<ErrorCode>(batch.batch_keys.size(), EC_OK);
+    bool rejected = admission != nullptr;
+    if (!admission) {
+        for (size_t i = 0; i < results.size(); ++i) {
+            results[i] = cache_backend_->CheckWriteCapacity(
+                batch.batch_keys[i], batch.batch_locations[i], batch.batch_properties[i], replace);
+            rejected = rejected || results[i] != EC_OK;
+        }
     }
     if (!rejected) {
         return write(batch.batch_keys, batch.batch_locations, batch.batch_properties);
@@ -691,7 +696,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::WritePrimary(RequestContext *r
             KVCM_LOG_ERROR("primary write results[%lu] mismatch keys[%lu]", written.size(), indices.size());
         }
         for (size_t i = 0; i < indices.size(); ++i) {
-            results[indices[i]] = valid ? written[i] : EC_ERROR;
+            results[indices[i]] = valid ? written[i] : (admission ? EC_MISMATCH : EC_ERROR);
         }
     }
     return results;
@@ -813,6 +818,59 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
     return secondary_results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::UpsertWithStats(RequestContext *request_context,
+                                                                  BatchMetaData &batch,
+                                                                  std::vector<UpsertStats> &out_stats,
+                                                                  size_t max_new_keys) noexcept {
+    const auto &keys = batch.batch_keys;
+    batch.EnsureLocationsAndPropertiesResized();
+    out_stats.assign(keys.size(), {});
+    if (!cache_backend_) {
+        return persistent_backend_->UpsertWithStats(
+            request_context, keys, batch.batch_locations, batch.batch_properties, out_stats, max_new_keys);
+    }
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover &&
+        !EnsureKeyInCache(request_context, keys)) {
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    const bool local_primary =
+        memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning;
+    BeforeUpsertWrite before_write;
+    int64_t primary_time_us = 0;
+    if (!local_primary) {
+        const auto route = GetWriteRoute(false);
+        before_write = [&, route](const std::vector<ErrorCode> &admission) {
+            const int64_t primary_begin = TimestampUtil::GetCurrentTimeUs();
+            auto results = WritePrimary(request_context, batch, route, false, &admission);
+            primary_time_us += TimestampUtil::GetCurrentTimeUs() - primary_begin;
+            return results;
+        };
+    }
+    // The complete, non-evicting online view supplies counts for both cached
+    // routes. Recover backfill and the backup write never count as additions.
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->UpsertWithStats(
+        request_context, keys, batch.batch_locations, batch.batch_properties, out_stats, max_new_keys, before_write);
+    if (request_context) {
+        auto *metrics = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(metrics,
+                                           meta_indexer,
+                                           cache_backend_upsert_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin - primary_time_us);
+    }
+    if (results.size() != keys.size() || out_stats.size() != keys.size()) {
+        out_stats.assign(keys.size(), {});
+        return std::vector<ErrorCode>(keys.size(), EC_MISMATCH);
+    }
+    if (local_primary) {
+        // Snapshot publishes SERVING only; retain ordinary best-effort backup
+        // admission without adding a Sync or waiting for Redis flush.
+        (void)persistent_backend_->Upsert(
+            request_context, keys, batch.batch_locations, batch.batch_properties, results);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::UpsertSingleLocations(RequestContext *request_context,

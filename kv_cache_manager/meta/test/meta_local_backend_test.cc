@@ -99,6 +99,80 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, CountedUpsertTracksOnlyPublishedAdditionsAndKeepsExistingKeysWritable) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("counted_upsert", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto location = [](const std::string &id) {
+        return std::make_shared<CacheLocation>(
+            id,
+            CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            1,
+            std::vector<LocationSpec>{{"F0", "event_report://node/mem?s_v=00112233"}});
+    };
+    CacheLocationMap first{{"a", location("a")}};
+    CacheLocationMap expanded = first;
+    expanded.emplace("b", location("b"));
+    std::vector<UpsertStats> stats;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->UpsertWithStats(nullptr, {1}, {first}, {{}}, stats, 1));
+    ASSERT_EQ(1u, stats.size());
+    EXPECT_TRUE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              meta_storage_backend_->UpsertWithStats(nullptr, {1, 2}, {expanded, first}, {{}, {}}, stats, 0));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_FALSE(stats[1].key_created);
+    EXPECT_EQ(0u, stats[1].locations_created);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->UpsertWithStats(nullptr, {1}, {expanded}, {{}}, stats, 0));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(0u, stats[0].locations_created);
+
+    auto reject = [](const std::vector<ErrorCode> &accepted) {
+        return std::vector<ErrorCode>(accepted.size(), EC_ERROR);
+    };
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}),
+              meta_storage_backend_->UpsertWithStats(nullptr, {2}, {first}, {{}}, stats, 1, reject));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(0u, stats[0].locations_created);
+    std::vector<bool> exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Exists(nullptr, {2}, exists));
+    EXPECT_FALSE(exists[0]);
+}
+
+TEST_F(MetaLocalBackendTest, CountedPersistentFirstUpsertRechecksCapacityAfterEachPublish) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("counted_capacity", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto location = [](const std::string &id, size_t uri_size) {
+        return std::make_shared<CacheLocation>(id,
+                                               CLS_SERVING,
+                                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                               1,
+                                               std::vector<LocationSpec>{{"F0", std::string(uri_size, 'u')}});
+    };
+    const CacheLocationMap seed{{"a", location("a", 15)}};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Upsert(nullptr, {1, 2}, {seed, seed}, {{}, {}}));
+    CacheLocationMap grown = seed;
+    grown.emplace("b", location("b", 600000));
+    auto persisted = [](const std::vector<ErrorCode> &admission) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), admission);
+        return admission;
+    };
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              meta_storage_backend_->UpsertWithStats(nullptr, {1, 2}, {grown, grown}, {{}, {}}, stats, 0, persisted));
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_EQ(0u, stats[1].locations_created);
+    EXPECT_LE(meta_storage_backend_->GetMemUsage(), 1024u * 1024u);
+    CacheLocationMapVector stored;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->GetLocations(nullptr, {2}, stored));
+    EXPECT_EQ(1u, stored[0].size());
+}
+
 TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("targeted_status", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());

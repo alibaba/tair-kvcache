@@ -35,6 +35,18 @@ using KeyVector = std::vector<KeyType>;
 // still reference the old `KeyTypeVec` spelling.
 using KeyTypeVec = KeyVector;
 
+// Successful additions made by one native Upsert, not a snapshot of the old value.
+// Failed writes leave both fields zero. Overwriting a location adds nothing.
+struct UpsertStats {
+    bool key_created = false;
+    size_t locations_created = 0;
+};
+
+// Called once after native write admission and before mutating the local view.
+// Cached mode uses this to preserve persistent-first ordering without a separate
+// metadata read. Rejected entries must stay rejected; results remain key-aligned.
+using BeforeUpsertWrite = std::function<std::vector<ErrorCode>(const std::vector<ErrorCode> &)>;
+
 // A key selected for LRU reclamation together with the access timestamp used
 // to rank it. A zero timestamp means that the backend could not provide a
 // usable value; callers preserve the historical best-effort behavior by

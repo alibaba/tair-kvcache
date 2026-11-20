@@ -168,6 +168,20 @@ ErrorCode SimpleKVCacheBackend::PublishItem(KeyType key, const std::shared_ptr<S
     return EC_OK;
 }
 
+ErrorCode SimpleKVCacheBackend::BuildItem(const CacheValue &current,
+                                          const CacheLocationMap &locations,
+                                          const std::unordered_map<LocationId, InternedLocationId> &ids,
+                                          CacheValue &item) {
+    Cache::ObjectPtr value = nullptr;
+    const auto ec = current ? SimpleKVCacheItem::Merge(*current, locations, spec_name_, ids, value)
+                            : SimpleKVCacheItem::Create(locations, spec_name_, ids, value);
+    if (ec == EC_OK) {
+        item = CacheValue(static_cast<SimpleKVCacheItem *>(value),
+                          [](SimpleKVCacheItem *ptr) { SimpleKVCacheItem::Deleter(ptr, nullptr); });
+    }
+    return ec;
+}
+
 std::vector<ErrorCode> SimpleKVCacheBackend::Write(const KeyTypeVec &keys,
                                                    const CacheLocationMapVector &locations,
                                                    const PropertyMapVector &properties,
@@ -225,18 +239,12 @@ std::vector<ErrorCode> SimpleKVCacheBackend::Write(const KeyTypeVec &keys,
                 continue;
             }
         }
-        Cache::ObjectPtr value = nullptr;
-        if (mode == WriteMode::Upsert && current) {
-            results[i] = SimpleKVCacheItem::Merge(*current, locations[i], spec_name_, ids, value);
-        } else {
-            results[i] = SimpleKVCacheItem::Create(locations[i], spec_name_, ids, value);
+        const CacheValue empty;
+        CacheValue item;
+        results[i] = BuildItem(mode == WriteMode::Upsert ? current : empty, locations[i], ids, item);
+        if (results[i] == EC_OK) {
+            results[i] = PublishItem(keys[i], item, static_cast<bool>(current));
         }
-        if (results[i] != EC_OK) {
-            continue;
-        }
-        const CacheValue item(static_cast<SimpleKVCacheItem *>(value),
-                              [](SimpleKVCacheItem *ptr) { SimpleKVCacheItem::Deleter(ptr, nullptr); });
-        results[i] = PublishItem(keys[i], item, static_cast<bool>(current));
     }
     return results;
 }
@@ -734,6 +742,73 @@ std::vector<ErrorCode> SimpleKVCacheBackend::Upsert(RequestContext * /*request_c
         return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
     }
     return Write(keys, locations, properties, previous_error_codes, WriteMode::Upsert);
+}
+
+std::vector<ErrorCode> SimpleKVCacheBackend::UpsertWithStats(RequestContext * /*request_context*/,
+                                                             const KeyTypeVec &keys,
+                                                             const CacheLocationMapVector &locations,
+                                                             const PropertyMapVector &properties,
+                                                             std::vector<UpsertStats> &out_stats,
+                                                             size_t max_new_keys,
+                                                             const BeforeUpsertWrite &before_write) noexcept {
+    out_stats.assign(keys.size(), {});
+    if (locations.size() != keys.size() || properties.size() != keys.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    if (!open_) {
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::vector<UpsertStats> candidates(keys.size());
+    std::vector<CacheValue> prepared(keys.size());
+    std::vector<size_t> growths(keys.size(), 0);
+    std::unordered_map<LocationId, InternedLocationId> ids;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!properties[i].empty()) {
+            results[i] = EC_UNIMPLEMENTED;
+            continue;
+        }
+        for (const auto &entry : locations[i]) {
+            if (ids.find(entry.first) == ids.end()) {
+                ids.emplace(entry.first, location_id_interner_.Intern(entry.first));
+            }
+        }
+        std::lock_guard mutation_lock(mutation_mutex_shards_[ShardIndex(keys[i])]);
+        const CacheValue current = LoadItem(keys[i]);
+        size_t growth = 0;
+        results[i] = SimpleKVCacheItem::EstimateWriteGrowth(current, locations[i], false, growth);
+        if (!current) {
+            growth += EstimateEntryOverhead() + sizeof(LRUHandle) - 1 + sizeof(KeyType);
+        }
+        if (results[i] == EC_OK && growth > cache_->GetAvailableCapacity(KeyToView(keys[i]))) {
+            results[i] = EC_NOSPC;
+        }
+        growths[i] = growth;
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        results[i] = BuildItem(current, locations[i], ids, prepared[i]);
+        if (results[i] == EC_OK) {
+            candidates[i] = {!current, prepared[i]->LocationCount() - (current ? current->LocationCount() : 0)};
+        }
+    }
+    // Build/validate every candidate before admitting anything to Redis.
+    AdmitCountedUpsert(results, candidates, max_new_keys, before_write);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        std::lock_guard mutation_lock(mutation_mutex_shards_[ShardIndex(keys[i])]);
+        if (growths[i] > cache_->GetAvailableCapacity(KeyToView(keys[i]))) {
+            results[i] = EC_NOSPC;
+            continue;
+        }
+        results[i] = PublishItem(keys[i], prepared[i], !candidates[i].key_created);
+        if (results[i] == EC_OK) {
+            out_stats[i] = candidates[i];
+        }
+    }
+    return results;
 }
 
 std::vector<ErrorCode> SimpleKVCacheBackend::Delete(RequestContext * /*request_context*/,

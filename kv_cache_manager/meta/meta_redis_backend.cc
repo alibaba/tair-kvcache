@@ -127,10 +127,33 @@ std::vector<ErrorCode> MetaRedisBackend::Put(RequestContext *request_context,
     return handle->Set(full_keys, field_maps);
 }
 
+std::vector<ErrorCode> MetaRedisBackend::UpsertWithStats(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const CacheLocationMapVector &locations,
+                                                         const PropertyMapVector &properties,
+                                                         std::vector<UpsertStats> &out_stats,
+                                                         size_t max_new_keys,
+                                                         const BeforeUpsertWrite &before_write) noexcept {
+    out_stats.assign(keys.size(), {});
+    if (locations.size() != keys.size() || properties.size() != keys.size() || before_write) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    return UpsertImpl(request_context, keys, locations, properties, &out_stats, max_new_keys);
+}
+
 std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
                                                 const KeyTypeVec &keys,
                                                 const CacheLocationMapVector &locations,
                                                 const PropertyMapVector &properties) noexcept {
+    return UpsertImpl(request_context, keys, locations, properties);
+}
+
+std::vector<ErrorCode> MetaRedisBackend::UpsertImpl(RequestContext *request_context,
+                                                    const KeyTypeVec &keys,
+                                                    const CacheLocationMapVector &locations,
+                                                    const PropertyMapVector &properties,
+                                                    std::vector<UpsertStats> *stats,
+                                                    size_t max_new_keys) {
     const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     FieldMapVec field_maps(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -146,8 +169,21 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
         KVCM_INTERVAL_LOG_WARN(10, "upsert fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->Upsert(full_keys, field_maps);
+    if (!stats) {
+        return handle->Upsert(AppendPrefixToKeys(cache_key_prefix_, keys), field_maps);
+    }
+    std::vector<std::pair<bool, size_t>> counts;
+    auto results = handle->UpsertWithStats(
+        AppendPrefixToKeys(cache_key_prefix_, keys), field_maps, PROPERTY_LOCATION_PREFIX, max_new_keys, counts);
+    if (counts.size() != keys.size() || results.size() != keys.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_MISMATCH);
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] == EC_OK) {
+            (*stats)[i] = {counts[i].first, counts[i].second};
+        }
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {

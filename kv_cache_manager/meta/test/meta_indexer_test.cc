@@ -1562,6 +1562,41 @@ TEST_F(MetaIndexerTest, TestLogicalLocationCountTracksSuccessfulChanges) {
     EXPECT_EQ(0u, meta_indexer_->GetLocationCount());
 }
 
+TEST_F(MetaIndexerTest, SnapshotOverwriteCountsAcrossBatchesReportersAndKeyLimit) {
+    for (const std::string backend : {"local", "dummy"}) {
+        SCOPED_TRACE(backend);
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(EC_OK,
+                  InitIndexer("{\"max_key_count\":3,\"mutex_shard_num\":2,\"batch_key_size\":1,"
+                              "\"meta_storage_backend_config\":{\"storage_type\":\"" +
+                              backend + "\"}}"));
+        const KeyVector keys{1, 2, 3};
+        auto first = [](size_t, CacheLocationMap &locations) { locations["host-a"] = MakeLocation("host-a", "v1"); };
+        auto second = [](size_t, CacheLocationMap &locations) { locations["host-b"] = MakeLocation("host-b", "v2"); };
+        ASSERT_EQ(EC_OK, meta_indexer_->OverwriteLocations(request_context_.get(), keys, first, {}).ec);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
+        ASSERT_EQ(EC_OK, meta_indexer_->OverwriteLocations(request_context_.get(), keys, second, {}).ec);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+        ASSERT_EQ(EC_OK, meta_indexer_->OverwriteLocations(request_context_.get(), keys, second, {}).ec);
+        EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+        const auto limited = meta_indexer_->OverwriteLocations(request_context_.get(), {1, 4}, first, {});
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}), limited.error_codes);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+        CacheLocationMapVector locations;
+        PropertyMapVector properties;
+        ASSERT_EQ(EC_OK, meta_indexer_->Get(request_context_.get(), keys, locations, properties).ec);
+        for (const auto &value : locations) {
+            EXPECT_EQ(2u, value.size());
+        }
+        ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), keys).ec);
+        EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(0u, meta_indexer_->GetLocationCount());
+    }
+}
+
 TEST_F(MetaIndexerTest, TestLegacyMetadataStartsLogicalLocationCountAtZero) {
     ASSERT_EQ(EC_OK, InitIndexer(R"({"max_key_count":100,"mutex_shard_num":8,
                                   "meta_storage_backend_config":{"storage_type":"dummy"}})"));
@@ -1608,7 +1643,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
     // persist
     meta_indexer_->key_count_.store(3);
     meta_indexer_->location_count_.store(5);
-    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900};
+    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 0, 0, 900};
     ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
@@ -1673,7 +1708,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -1820,12 +1855,35 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
     }
 }
 
+TEST_F(MetaIndexerTest, EventReportUsageIsUntrackedIncludingLegacyRecovery) {
+    StorageUsageData usage;
+    usage.Reset();
+    ASSERT_EQ(EC_OK, usage.Deserialize(R"({"pace":100,"event_report_l1p5":700,"event_report_l2":800})"));
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}) {
+        EXPECT_EQ(0u, usage.GetStorageUsageByType(type));
+        usage.SetStorageUsageByType(type, 500);
+        usage.AddStorageUsageByType(type, 20);
+        usage.SubStorageUsageByType(type, 10);
+        EXPECT_EQ(0u, usage.GetStorageUsageByType(type));
+    }
+    EXPECT_EQ(100u, usage.GetStorageUsage());
+    usage.AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 30);
+    usage.SubStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 10);
+    EXPECT_EQ(120u, usage.GetStorageUsage());
+    EXPECT_EQ(120u, usage.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    StorageUsageData recovered;
+    ASSERT_EQ(EC_OK, recovered.Deserialize(usage.Serialize()));
+    EXPECT_EQ(120u, recovered.GetStorageUsage());
+    EXPECT_EQ(0u, recovered.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
     StorageUsageData storage_usage_data;
 
     // Successful round-trip: serialize then deserialize
     {
-        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900};
+        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 0, 0, 900};
 
         storage_usage_data.Reset();
         for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
@@ -1834,7 +1892,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
         std::string serialized = storage_usage_data.Serialize();
         ASSERT_EQ(
-            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"event_report_l1p5":700,"event_report_l2":800,"pace_ssd":900})",
+            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"event_report_l1p5":0,"event_report_l2":0,"pace_ssd":900})",
             serialized);
 
         storage_usage_data.Reset();
@@ -1846,7 +1904,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Legal input: keys in different order
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 0, 0, 10};
         storage_usage_data.Reset();
         ASSERT_EQ(
             EC_OK,
@@ -1882,7 +1940,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Legal input: whitespace-padded JSON
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 0, 0, 10};
         storage_usage_data.Reset();
         ASSERT_EQ(EC_OK,
                   storage_usage_data.Deserialize("  "

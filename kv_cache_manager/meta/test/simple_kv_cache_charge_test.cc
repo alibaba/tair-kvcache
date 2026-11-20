@@ -70,6 +70,60 @@ TEST_F(SimpleKVCacheChargeTest, ChargeIncludesBucketReserveWithoutAllocationMarg
     EXPECT_EQ(8964u, item->Size());
 }
 
+TEST_F(SimpleKVCacheChargeTest, CountedUpsertTracksNewKeysAndLocationsWithoutCountingReplacements) {
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              backend_->UpsertWithStats(nullptr, {1, 2}, {Locations(1, 15), Locations(1, 15)}, {{}, {}}, stats, 1));
+    ASSERT_EQ(2u, stats.size());
+    EXPECT_TRUE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_FALSE(stats[1].key_created);
+    EXPECT_EQ(0u, stats[1].locations_created);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend_->UpsertWithStats(nullptr, {1}, {Locations(2, 15)}, {{}}, stats, 0));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend_->UpsertWithStats(nullptr, {1}, {Locations(2, 30)}, {{}}, stats, 0));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(0u, stats[0].locations_created);
+
+    auto bad = Locations(1, 15);
+    auto location = std::make_shared<CacheLocation>(*bad.begin()->second);
+    location->set_location_specs({LocationSpec("wrong-spec", "event_report://node/mem")});
+    bad.begin()->second = location;
+    size_t persistence_calls = 0;
+    auto before_write = [&](const std::vector<ErrorCode> &admission) {
+        ++persistence_calls;
+        return admission;
+    };
+    const auto errors = backend_->UpsertWithStats(nullptr, {2}, {bad}, {{}}, stats, 1, before_write);
+    ASSERT_EQ(1u, errors.size());
+    EXPECT_NE(EC_OK, errors[0]);
+    EXPECT_EQ(0u, persistence_calls);
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(0u, stats[0].locations_created);
+}
+
+TEST_F(SimpleKVCacheChargeTest, CountedPersistentFirstUpsertRechecksCapacityAfterEachPublish) {
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              backend_->Upsert(nullptr, {1, 2}, {Locations(1, 15), Locations(1, 15)}, {{}, {}}));
+    auto persisted = [](const std::vector<ErrorCode> &admission) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), admission);
+        return admission;
+    };
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              backend_->UpsertWithStats(
+                  nullptr, {1, 2}, {Locations(2, 300000), Locations(2, 300000)}, {{}, {}}, stats, 0, persisted));
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_EQ(0u, stats[1].locations_created);
+    EXPECT_LE(backend_->GetMemUsage(), 1024u * 1024u);
+    CacheLocationMapVector stored;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend_->GetLocations(nullptr, {2}, stored));
+    EXPECT_EQ(1u, stored[0].size());
+}
+
 TEST_F(SimpleKVCacheChargeTest, ReadViewsPinOldVersionsAcrossMutationAndBackendDestruction) {
     CompactLocationsPerKey first(true);
     CompactLocationsPerKey second(true);

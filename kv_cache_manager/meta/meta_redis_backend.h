@@ -36,6 +36,13 @@ public:
                                const KeyTypeVec &keys,
                                const CacheLocationMapVector &locations,
                                const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const CacheLocationMapVector &locations,
+                                           const PropertyMapVector &properties,
+                                           std::vector<UpsertStats> &out_stats,
+                                           size_t max_new_keys,
+                                           const BeforeUpsertWrite &before_write = {}) noexcept override;
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -94,6 +101,12 @@ public:
     ErrorCode DeleteMetaData() noexcept override;
 
 private:
+    std::vector<ErrorCode> UpsertImpl(RequestContext *request_context,
+                                      const KeyTypeVec &keys,
+                                      const CacheLocationMapVector &locations,
+                                      const PropertyMapVector &properties,
+                                      std::vector<UpsertStats> *stats = nullptr,
+                                      size_t max_new_keys = 0);
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
 

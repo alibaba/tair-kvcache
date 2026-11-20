@@ -754,6 +754,77 @@ protected:
     std::shared_ptr<RequestContext> request_context_;
 };
 
+TEST_F(MetaStorageBackendManagerTest, CountedUpsertDoesNotCountRecoveryOrWriteRejectedKeysToPersistence) {
+    MetaStorageBackendManager mgr;
+    InitRecoveringPair(mgr, std::make_unique<MetaLocalBackend>(), false);
+    auto seed = MakeBatch({1});
+    seed.batch_locations[0].emplace("peer", MakeLocation("peer", "peer-uri"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr, seed.batch_keys, seed.batch_locations, seed.batch_properties));
+    auto write = MakeBatch({1, 2});
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}), mgr.UpsertWithStats(request_context_.get(), write, stats, 0));
+    ASSERT_EQ(2u, stats.size());
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_EQ(0u, stats[0].locations_created);
+    EXPECT_FALSE(stats[1].key_created);
+    std::vector<bool> exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Exists(nullptr, {2}, exists));
+    EXPECT_FALSE(exists[0]);
+    CacheLocationMapVector recovered;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->GetLocations(nullptr, {1}, recovered));
+    ASSERT_EQ(1u, recovered.size());
+    EXPECT_EQ(2u, recovered[0].size());
+    EXPECT_EQ("peer-uri", recovered[0].at("peer")->location_specs()[0].uri());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.UpsertWithStats(request_context_.get(), write, stats, 1));
+    EXPECT_FALSE(stats[0].key_created);
+    EXPECT_TRUE(stats[1].key_created);
+    EXPECT_EQ(1u, stats[1].locations_created);
+}
+
+TEST_F(MetaStorageBackendManagerTest, CountedMemoryPrimaryUpsertKeepsCountsWhenBackupAdmissionFails) {
+    MetaStorageBackendManager mgr;
+    auto *backup = InitMemoryPrimary(mgr);
+    EXPECT_CALL(*backup, Upsert(_, _, _, _, _)).WillOnce(Return(std::vector<ErrorCode>{EC_ERROR}));
+    auto write = MakeBatch({1});
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.UpsertWithStats(request_context_.get(), write, stats, 1));
+    ASSERT_EQ(1u, stats.size());
+    EXPECT_TRUE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    CacheLocationMapVector locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->GetLocations(nullptr, {1}, locations));
+    EXPECT_EQ(1u, locations[0].size());
+}
+
+TEST_F(MetaStorageBackendManagerTest, CountedPersistentFirstUpsertPublishesOnlySuccessfulKeys) {
+    MetaStorageBackendManager mgr;
+    auto *backup = InitMemoryPrimary(mgr);
+    mgr.memory_primary_ = false;
+    EXPECT_CALL(*backup, Upsert(_, _, _, _))
+        .WillOnce(Return(std::vector<ErrorCode>{EC_OK, EC_ERROR}))
+        .WillOnce(Return(std::vector<ErrorCode>{EC_OK})); // Malformed result length.
+    auto write = MakeBatch({1, 2});
+    std::vector<UpsertStats> stats;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_ERROR}), mgr.UpsertWithStats(request_context_.get(), write, stats, 2));
+    ASSERT_EQ(2u, stats.size());
+    EXPECT_TRUE(stats[0].key_created);
+    EXPECT_EQ(1u, stats[0].locations_created);
+    EXPECT_FALSE(stats[1].key_created);
+    EXPECT_EQ(0u, stats[1].locations_created);
+    auto next = MakeBatch({3, 4});
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH}),
+              mgr.UpsertWithStats(request_context_.get(), next, stats, 2));
+    for (const auto &count : stats) {
+        EXPECT_FALSE(count.key_created);
+        EXPECT_EQ(0u, count.locations_created);
+    }
+    std::vector<bool> exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_OK}),
+              mgr.cache_backend_->Exists(nullptr, {1, 2, 3, 4}, exists));
+    EXPECT_EQ((std::vector<bool>{true, false, false, false}), exists);
+}
+
 TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
     {
         SCOPED_TRACE("single local backend");

@@ -613,7 +613,8 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
                                                 Cache::Handle *handle,
                                                 const CacheLocationMap &locations,
                                                 const PropertyMap &properties,
-                                                bool check_capacity) {
+                                                bool check_capacity,
+                                                UpsertStats *stats) {
     assert(handle != nullptr);
     MetaMemCacheItem *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     const size_t available = check_capacity ? cache_->GetAvailableCapacity(KeyToView(key)) : 0;
@@ -623,9 +624,13 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(KeyType key,
         if (check_capacity && existing->EstimateMergeGrowth(locations, properties) > available) {
             return EC_NOSPC;
         }
+        const size_t previous_count = stats ? existing->LocationCount() : 0;
         existing->TouchAccessTime();
         charge_delta += existing->MergeLocations(locations);
         charge_delta += existing->MergeProperties(properties);
+        if (stats) {
+            stats->locations_created = existing->LocationCount() - previous_count;
+        }
     }
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
@@ -847,6 +852,66 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
     assert(missing_count == handles.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::UpsertWithStats(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const CacheLocationMapVector &locations,
+                                                         const PropertyMapVector &properties,
+                                                         std::vector<UpsertStats> &out_stats,
+                                                         size_t max_new_keys,
+                                                         const BeforeUpsertWrite &before_write) noexcept {
+    out_stats.assign(keys.size(), {});
+    if (locations.size() != keys.size() || properties.size() != keys.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::vector<UpsertStats> candidates(keys.size());
+    std::vector<std::string_view> key_views(keys.size());
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    cache_->LookupBatch(key_views.data(), keys.size(), handles.data());
+    // Reuse the handles needed by Upsert itself. No old location objects are
+    // materialized and no metadata read API is called for these counters.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        candidates[i].key_created = handles[i] == nullptr;
+        if (!before_write) {
+            continue; // Single-backend admission happens at the mutation below.
+        }
+        size_t growth = 0;
+        if (handles[i]) {
+            const auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handles[i]));
+            std::shared_lock lock(ItemMutex(keys[i]));
+            growth = item->EstimateMergeGrowth(locations[i], properties[i]);
+        } else {
+            growth = sizeof(MetaMemCacheItem) + MetaMemCacheItem().EstimateMergeGrowth(locations[i], properties[i]) +
+                     sizeof(LRUHandle) - 1 + sizeof(KeyType);
+        }
+        if (growth > cache_->GetAvailableCapacity(key_views[i])) {
+            results[i] = EC_NOSPC;
+        }
+    }
+    // Persistent-first cached writes run here, outside all cache/item locks.
+    AdmitCountedUpsert(results, candidates, max_new_keys, before_write);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        if (handles[i]) {
+            results[i] = UpdateHandleInPlace(keys[i], handles[i], locations[i], properties[i], true, &out_stats[i]);
+        } else {
+            results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+            if (results[i] == EC_OK) {
+                out_stats[i] = {true, locations[i].size()};
+            }
+        }
+    }
+    if (std::any_of(handles.begin(), handles.end(), [](auto *handle) { return handle != nullptr; })) {
+        cache_->ReleaseBatch(handles.data(), handles.size());
     }
     return results;
 }

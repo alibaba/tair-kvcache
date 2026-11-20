@@ -37,6 +37,13 @@ public:
                                        const KeyTypeVec &keys,
                                        const CacheLocationMapVector &locations,
                                        const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const CacheLocationMapVector &locations,
+                                           const PropertyMapVector &properties,
+                                           std::vector<UpsertStats> &out_stats,
+                                           size_t max_new_keys,
+                                           const BeforeUpsertWrite &before_write = {}) noexcept override;
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -174,6 +181,10 @@ private:
     // 引用仅在 LRU shard 锁内读写，回调外使用已持有的共享快照。
     using CacheValue = std::shared_ptr<SimpleKVCacheItem>;
 
+    ErrorCode BuildItem(const CacheValue &current,
+                        const CacheLocationMap &locations,
+                        const std::unordered_map<LocationId, InternedLocationId> &ids,
+                        CacheValue &item);
     std::vector<ErrorCode> Write(const KeyTypeVec &keys,
                                  const CacheLocationMapVector &locations,
                                  const PropertyMapVector &properties,

@@ -439,6 +439,90 @@ std::vector<ErrorCode> RedisClient::Update(const std::vector<std::string> &keys,
     return ec_per_key;
 }
 
+std::vector<ErrorCode> RedisClient::UpsertWithStats(const std::vector<std::string> &keys,
+                                                    const std::vector<std::map<std::string, std::string>> &field_maps,
+                                                    const std::string &counted_field_prefix,
+                                                    size_t max_new_keys,
+                                                    std::vector<std::pair<bool, size_t>> &out_stats) {
+    out_stats.assign(keys.size(), {});
+    if (keys.size() != field_maps.size() || counted_field_prefix.empty()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    // A single Redis key per script also works with cluster routing. HSET's
+    // result counts new fields without fetching/deserializing their old values.
+    static const std::string script = R"lua(
+if #ARGV <= 2 then return {0, 0} end
+local existed = redis.call('EXISTS', KEYS[1])
+if existed == 0 and ARGV[2] == '0' then return {-1, 0} end
+local added = 0
+for i = 3, #ARGV, 2 do
+    local inserted = redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+    if string.sub(ARGV[i], 1, string.len(ARGV[1])) == ARGV[1] then
+        added = added + inserted
+    end
+end
+return {1 - existed, added}
+)lua";
+    std::vector<ErrorCode> results(keys.size(), EC_ERROR);
+    auto write = [&](const std::vector<size_t> &positions, bool allow_new) {
+        std::vector<CmdArgs> commands;
+        commands.reserve(positions.size());
+        for (const size_t i : positions) {
+            CmdArgs args{"EVAL", script, "1", keys[i], counted_field_prefix, allow_new ? "1" : "0"};
+            args.reserve(6 + field_maps[i].size() * 2);
+            for (const auto &[field, value] : field_maps[i]) {
+                args.push_back(field);
+                args.push_back(value);
+            }
+            commands.push_back(std::move(args));
+        }
+        if (commands.empty()) {
+            return;
+        }
+        auto replies = CommandPipeline(commands);
+        if (replies.size() != positions.size()) {
+            return;
+        }
+        for (size_t offset = 0; offset < positions.size(); ++offset) {
+            const auto *reply = replies[offset].get();
+            const size_t i = positions[offset];
+            if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2 || !reply->element[0] ||
+                !reply->element[1] || reply->element[0]->type != REDIS_REPLY_INTEGER ||
+                reply->element[1]->type != REDIS_REPLY_INTEGER) {
+                continue;
+            }
+            const auto created = reply->element[0]->integer;
+            const auto added = reply->element[1]->integer;
+            if (created == -1 && added == 0) {
+                results[i] = EC_NOSPC;
+            } else if ((created == 0 || created == 1) && added >= 0 &&
+                       static_cast<size_t>(added) <= field_maps[i].size()) {
+                results[i] = EC_OK;
+                out_stats[i] = {created == 1, static_cast<size_t>(added)};
+            }
+        }
+    };
+    std::vector<size_t> positions(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        positions[i] = i;
+    }
+    // Near the limit, first write all existing keys in one pipeline. Retry only
+    // the admitted missing keys in a second pipeline, never one RTT per key.
+    const bool allow_all_new = max_new_keys >= keys.size();
+    write(positions, allow_all_new);
+    if (!allow_all_new && max_new_keys > 0) {
+        positions.clear();
+        for (size_t i = 0; i < keys.size() && positions.size() < max_new_keys; ++i) {
+            if (results[i] == EC_NOSPC) {
+                positions.push_back(i);
+                results[i] = EC_ERROR;
+            }
+        }
+        write(positions, true);
+    }
+    return results;
+}
+
 std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
                                            const std::vector<std::map<std::string, std::string>> &field_maps) {
     if (keys.size() != field_maps.size()) {

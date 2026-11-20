@@ -480,6 +480,124 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     return result;
 }
 
+MetaIndexer::Result
+MetaIndexer::OverwriteLocations(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const std::function<void(size_t, CacheLocationMap &)> &build_locations,
+                                const std::function<ErrorCode()> &admit_write) noexcept {
+    if (keys.empty()) {
+        return Result(EC_OK);
+    }
+    Result result(keys.size());
+    if (!build_locations || keys.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        result.ec = EC_BADARGS;
+        std::fill(result.error_codes.begin(), result.error_codes.end(), EC_BADARGS);
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    const auto batches = MakeBatches(keys);
+    auto *metrics = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics, meta_indexer, query_key_count, keys.size());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics, meta_indexer, query_batch_num, batches.size());
+    RmwStats stats;
+    int32_t error_count = 0;
+    bool admitted = false;
+    for (const auto &batch : batches) {
+        BatchMetaData write_batch;
+        write_batch.batch_keys.reserve(batch.global_indices.size());
+        write_batch.batch_indexs.reserve(batch.global_indices.size());
+        write_batch.batch_locations.reserve(batch.global_indices.size());
+        for (const auto index : batch.global_indices) {
+            CacheLocationMap locations;
+            build_locations(index, locations);
+            if (locations.empty()) {
+                continue; // A no-op must not create a key with an empty location map.
+            }
+            ErrorCode validation_ec = EC_OK;
+            for (const auto &[id, location] : locations) {
+                if (!location || id.empty() || location->id() != id) {
+                    validation_ec = EC_BADARGS;
+                    break;
+                }
+                if (!SupportsWriteSession()) {
+                    validation_ec = ValidateSimpleLocation(location, true);
+                    if (validation_ec != EC_OK) {
+                        break;
+                    }
+                }
+            }
+            if (validation_ec != EC_OK) {
+                result.error_codes[index] = validation_ec;
+                ++error_count;
+                continue;
+            }
+            write_batch.batch_keys.push_back(keys[index]);
+            write_batch.batch_indexs.push_back(index);
+            write_batch.batch_locations.push_back(std::move(locations));
+        }
+        if (write_batch.batch_keys.empty()) {
+            continue;
+        }
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
+        if (!admitted) {
+            const ErrorCode ec = admit_write ? admit_write() : EC_OK;
+            if (ec != EC_OK) {
+                result.ec = ec;
+                std::fill(result.error_codes.begin(), result.error_codes.end(), ec);
+                return result;
+            }
+            admitted = true;
+        }
+        // Upsert preserves unmentioned locations/properties and retains the
+        // existing recovery, async enqueue and partial-error contracts. In
+        // particular, do not use Put, which can replace the complete key.
+        const size_t current_keys = GetKeyCount();
+        const size_t new_key_budget = max_key_count_ - std::min(current_keys, max_key_count_);
+        std::vector<UpsertStats> additions;
+        const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
+        auto write_errors = backend_manager_->UpsertWithStats(request_context, write_batch, additions, new_key_budget);
+        stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
+        if (write_errors.size() != write_batch.batch_keys.size() || additions.size() != write_batch.batch_keys.size()) {
+            write_errors.assign(write_batch.batch_keys.size(), EC_MISMATCH);
+            additions.assign(write_batch.batch_keys.size(), {});
+        }
+        int32_t created_keys = 0;
+        int64_t created_locations = 0;
+        for (size_t i = 0; i < write_errors.size(); ++i) {
+            if (write_errors[i] != EC_OK) {
+                continue;
+            }
+            if (additions[i].locations_created > write_batch.batch_locations[i].size()) {
+                write_errors[i] = EC_MISMATCH;
+                continue;
+            }
+            created_keys += additions[i].key_created;
+            created_locations += additions[i].locations_created;
+        }
+        error_count +=
+            ProcessErrorCodes(trace_id, write_errors, write_batch.batch_indexs, keys, kRmwUpsertMetaOperation, result);
+        AdjustKeyCountMeta(created_keys);
+        AdjustLocationCountMeta(created_locations);
+        stats.put_key_count += created_keys;
+        stats.update_key_count += write_batch.batch_keys.size() - created_keys;
+        int64_t value = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(metrics, meta_searcher, index_serialize_time_us, value);
+        stats.index_serialize_time_us += value;
+        value = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(metrics, meta_indexer, cache_backend_upsert_time_us, value);
+        stats.cache_backend_upsert_time_us += value;
+        value = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(metrics, meta_indexer, async_enqueue_time_us, value);
+        stats.async_enqueue_time_us += value;
+        value = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(metrics, meta_indexer, async_enqueue_timeout_key_count, value);
+        stats.async_enqueue_timeout_key_count += value;
+    }
+    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    ProcessErrorResult(trace_id, "overwrite_snapshot_locations", error_count, keys.size(), result);
+    return result;
+}
+
 MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const KeyVector &keys) noexcept {
     if (keys.size() == 0) {
         return Result(EC_OK);

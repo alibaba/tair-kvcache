@@ -107,6 +107,48 @@ public:
         return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
     }
 
+    // Count additions in the native mutation, without calling metadata read APIs.
+    // The caller serializes mutations of these unique keys (MetaIndexer shard locks).
+    // max_new_keys is a soft admission budget; existing keys remain writable at zero.
+    virtual std::vector<ErrorCode> UpsertWithStats(RequestContext * /*request_context*/,
+                                                   const KeyTypeVec &keys,
+                                                   const CacheLocationMapVector & /*locations*/,
+                                                   const PropertyMapVector & /*properties*/,
+                                                   std::vector<UpsertStats> &out_stats,
+                                                   size_t /*max_new_keys*/,
+                                                   const BeforeUpsertWrite & /*before_write*/ = {}) noexcept {
+        out_stats.assign(keys.size(), {});
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
+    // Shared admission/error handling for native in-memory counted writers.
+    static void AdmitCountedUpsert(std::vector<ErrorCode> &results,
+                                   const std::vector<UpsertStats> &candidates,
+                                   size_t max_new_keys,
+                                   const BeforeUpsertWrite &before_write) {
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i] == EC_OK && candidates[i].key_created) {
+                if (max_new_keys == 0) {
+                    results[i] = EC_NOSPC;
+                } else {
+                    --max_new_keys;
+                }
+            }
+        }
+        if (before_write && std::find(results.begin(), results.end(), EC_OK) != results.end()) {
+            auto admitted = before_write(results);
+            if (admitted.size() != results.size()) {
+                std::replace(results.begin(), results.end(), EC_OK, EC_MISMATCH);
+                return;
+            }
+            for (size_t i = 0; i < results.size(); ++i) {
+                if (results[i] == EC_OK) {
+                    results[i] = admitted[i];
+                }
+            }
+        }
+    }
+
     // Capacity-unbounded admission for critical async backup writes. Only the
     // async Redis backend supports this operation.
     virtual std::vector<ErrorCode> ForceUpsert(RequestContext * /*request_context*/,

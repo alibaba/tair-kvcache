@@ -254,7 +254,7 @@ Generation 在获得 delta lease 时建立。参数校验、tombstone 等准入�
 5. 最多等待 `snapshot_delta_drain_timeout_ms`（默认 10 秒）让已获得 lease 的 delta 完成；
    超时则 abort candidate、重新打开写门并返回可重试的 `SNAPSHOT_IN_PROGRESS`；
 6. 为本次全部 URI 追加 candidate `s_v`；
-7. 使用稳定 location id 原地替换完整 specs；
+7. 使用稳定 location id 分批直接覆盖完整 specs，不预读旧 location；
 8. 更新内存 committed generation并打开写门；
 9. 返回新的 `committed_snapshot_version`；
 10. 异步扫描并回收该 reporter 的旧 generation。
@@ -264,6 +264,42 @@ Generation 在获得 delta lease 时建立。参数校验、tombstone 等准入�
 consumer flush；成功响应表示本次全部 mutation 已成功 enqueue 且 local cache 已更新，不表示
 Redis 已经执行完成。响应后发生的 pipeline 失败通过异步 Redis 日志和指标暴露，不回溯修改
 已经返回的 ReportEvent 结果。
+
+### Snapshot 直接覆盖与统计边界
+
+ReportEvent snapshot 的 flat 替换路径先完成全部输入校验，再逐批构造新 `CacheLocation`，
+由 `MetaIndexer::OverwriteLocations` 在 metadata shard 锁和 reporter lifecycle write lease
+保护下调用 backend-manager Upsert。它不调用 GetLocations，也不比较或合并旧 specs；
+只覆盖请求指定的稳定 location id，其他 reporter、medium、存储类型的 location 和 key 属性保留。
+新对象使用本次写入的 `create_time`，因此该字段不再代表首次上报时间；引用旧对象的查询仍可安全完成。
+通用 nested replacement、增量 merge/delete 和查询匹配算法沿用原路径。
+
+Upsert 的后端路由、部分失败、异步入队和恢复协议保持原样。恢复期间缺失的 local key
+仍可能从持久层补齐完整内容，以保护未出现在本次 snapshot 中的其他 location；因此
+“无预读”指正常 snapshot 不再执行独立的旧 location 读取，不承诺恢复阶段零读取。
+全部 mutation 成功才提交 generation，失败仍按现有 abort/soft 规则处理，不提供整批事务回滚。
+旧版本失效及后台清理、增量 gate、HOST_DOWN/RemoveInstance fencing 保持原样。
+
+为解除 snapshot 对旧大小的依赖，`event_report_l1p5` / `event_report_l2` 的精确字节用量不再维护：
+Get/Set/Add/Sub 的该类型计数统一为零或 no-op，旧 Redis 统计读取时接受但归零，序列化仍保留原字段。
+这里的零表示 **未统计**，不表示 RTP 没有缓存。普通存储容量统计、URI 中的 size 校验、
+每个 location 的 validated size、本地索引实际内存计量不变。EventReport 原本就不计入
+GetStorageUsage 总量，也不参与常规容量回收。依赖按类型统计的自定义监控/配置需注意此口径变化。
+
+直接覆盖由底层 `UpsertWithStats` 返回每个成功写入实际新增的 key 和 location 数，更新
+`key_count` 与 `location_count`；重复覆盖不重复计数，同一 key 新增其他 reporter 的 location
+只增加 location 数。正常 snapshot 不调用 `Get`、`GetLocations`、`GetLocationIds` 或 `Exists`
+预读旧元数据；本地后端复用写入所需的查找和插入结果，纯 Redis 后端通过单 key Lua 写入及
+`HSET` 返回值统计。接近 key 上限时纯 Redis 最多使用两批 pipeline，先更新已有 key，再按
+剩余额度创建新 key，已有 key 不因额度耗尽而拒绝更新。
+
+双层后端使用完整、不自动逐出的本地视图计数，保留原来的持久层优先或 memory-primary 写入
+顺序。恢复期仍需先补齐缺失的完整 key，避免丢失其他 location/property；补齐和异步备份不计新增。
+单 key 失败不增加计数；异步备份沿用原来的入队/成功语义，不新增同步等待。计数沿用主干的
+逻辑计数口径：旧基线不会全表校准，Redis 写成功但响应丢失等情况不提供 exactly-once 保证。
+snapshot 中遗漏的旧 location 仍在实际 GC 删除时扣减，不在 snapshot 提交时提前扣减。
+容量预检不预留内存，真正发布前仍逐项复检；并发增长或同批增长导致本地容量不足时，保留原有
+持久层已接受而本地失败的部分写入语义，由 snapshot abort 和后续重试收敛。
 
 不同 reporter、不同 storage type 可以并行。第二个并发 snapshot 返回
 `SNAPSHOT_IN_PROGRESS`。
@@ -388,10 +424,13 @@ snapshot replace + commit/abort
 - metadata read-modify-write 在每个 RMW 阶段完成读、准备进入最终写时，只获取一次
   lifecycle generation lease，并持有到该阶段结束；同一阶段不再按 key 重复查 fence 或分配
   shared lock；
-- lease 不能提前到 metadata read 之前获取。这样旧请求阻塞在 metadata I/O 时，HOST_DOWN/
+- merge/delete 的 lease 不能提前到其独立 metadata read 之前获取。这样旧请求阻塞在 metadata I/O 时，HOST_DOWN/
   REGISTER 仍可先取得 lifecycle writer；旧请求恢复后使用非阻塞获取立即失败，不能跨越新
   lifecycle 写入；BatchMerge 的 block-create 与 targeted-location 两个 RMW 阶段之间同样释放并
   重新获取 lease；
+- snapshot 不再有独立旧值读取，在首批 shard 锁内、写入前取得 lease。恢复期 Upsert 对缺失完整 key
+  的补齐属于受 lease 保护的写阶段；HOST_DOWN 必须等待已准入的该阶段结束。尚未取得 lease 的
+  snapshot（例如等待 shard 锁）仍可被 HOST_DOWN 先行 fence，随后拒绝写入；
 - mutation 在已经持有 metadata 锁时只做上述非阻塞的 per-reporter lifecycle lease 获取，
   避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转。lifecycle fence 不存在、reporter
   已注销、generation 不匹配，或 `try_lock` 与 REGISTER、HOST_DOWN、unavailable recovery 等

@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_base.h"
@@ -14,6 +16,14 @@ public:
 public:
     void PrepareMockRedisClient(const std::string &user_info, const std::string &host, int32_t port);
     void CheckReplyType(const redisReply *r, const int expected_type) const;
+    static ReplyUPtr CountReply(int64_t key_created, int64_t locations_created) {
+        auto reply = MakeFakeReply(REDIS_REPLY_ARRAY, "");
+        reply->elements = 2;
+        reply->element = static_cast<redisReply **>(calloc(2, sizeof(redisReply *)));
+        reply->element[0] = MakeFakeReplyInteger(key_created).release();
+        reply->element[1] = MakeFakeReplyInteger(locations_created).release();
+        return reply;
+    }
 
 private:
     std::unique_ptr<MockRedisClient> redis_client_;
@@ -57,6 +67,66 @@ TEST_F(RedisClientTest, TestCommandPipelineSimple) {
     ASSERT_EQ("OK", std::string(replies[0]->str));
     CheckReplyType(replies[1].get(), REDIS_REPLY_STATUS);
     ASSERT_EQ("OK", std::string(replies[1]->str));
+}
+
+TEST_F(RedisClientTest, CountedUpsertPipelinesExistingKeysAndAdmitsOnlyRemainingNewKeys) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_))
+        .WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(3u, commands.size());
+            for (const auto &command : commands) {
+                EXPECT_EQ("EVAL", command[0]);
+                EXPECT_EQ("1", command[2]);
+                EXPECT_EQ("loc:", command[4]);
+                EXPECT_EQ("0", command[5]);
+            }
+            std::vector<ReplyUPtr> replies;
+            replies.push_back(CountReply(0, 1));
+            replies.push_back(CountReply(-1, 0));
+            replies.push_back(CountReply(-1, 0));
+            return replies;
+        }))
+        .WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(1u, commands.size());
+            EXPECT_EQ("new1", commands[0][3]);
+            EXPECT_EQ("1", commands[0][5]);
+            std::vector<ReplyUPtr> replies;
+            replies.push_back(CountReply(1, 1));
+            return replies;
+        }));
+    std::vector<std::pair<bool, size_t>> stats;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOSPC}),
+              redis_client_->UpsertWithStats({"old", "new1", "new2"},
+                                             {{{"loc:a", "value"}}, {{"loc:a", "value"}}, {{"loc:a", "value"}}},
+                                             "loc:",
+                                             1,
+                                             stats));
+    ASSERT_EQ(3u, stats.size());
+    EXPECT_EQ(std::make_pair(false, size_t{1}), stats[0]);
+    EXPECT_EQ(std::make_pair(true, size_t{1}), stats[1]);
+    EXPECT_EQ(std::make_pair(false, size_t{0}), stats[2]);
+}
+
+TEST_F(RedisClientTest, CountedUpsertDoesNotCountErrorsOrMalformedReplies) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+        EXPECT_EQ(3u, commands.size());
+        std::vector<ReplyUPtr> replies;
+        replies.push_back(CountReply(0, 0));
+        replies.push_back(MakeFakeReply(REDIS_REPLY_ERROR, "failed"));
+        replies.push_back(CountReply(1, 99));
+        return replies;
+    }));
+    std::vector<std::pair<bool, size_t>> stats;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_ERROR, EC_ERROR}),
+              redis_client_->UpsertWithStats({"old", "error", "bad-count"},
+                                             {{{"loc:a", "value"}}, {{"loc:a", "value"}}, {{"loc:a", "value"}}},
+                                             "loc:",
+                                             3,
+                                             stats));
+    for (const auto &count : stats) {
+        EXPECT_EQ(std::make_pair(false, size_t{0}), count);
+    }
 }
 
 TEST_F(RedisClientTest, TestCommandPipelineError) {

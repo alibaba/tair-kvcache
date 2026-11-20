@@ -2607,7 +2607,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsFlat(RequestContext *request_co
                                          keys,
                                          LocationSpecsTaskView<ReplaceLocationSpecsTask>(task_offsets, flat_tasks),
                                          out_per_key_ec,
-                                         std::move(acquire_write_lease));
+                                         std::move(acquire_write_lease),
+                                         true);
 }
 
 std::vector<std::vector<int32_t>> MetaSearcher::GetWriteBatches(const KeyVector &keys) const {
@@ -2631,7 +2632,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                                                       const KeyVector &keys,
                                                       LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
                                                       std::vector<ErrorCode> &out_per_key_ec,
-                                                      AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+                                                      AcquireMetadataWriteLeaseFunc acquire_write_lease,
+                                                      bool overwrite_without_read) {
     if (!tasks.Valid(keys.size())) {
         return EC_BADARGS;
     }
@@ -2658,15 +2660,17 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
         return EC_BADARGS;
     }
 
-    LocationIdsPerKey location_ids_per_key(keys.size());
+    LocationIdsPerKey location_ids_per_key(overwrite_without_read ? 0 : keys.size());
     std::vector<size_t> usage_offsets(keys.size() + 1, 0);
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
         usage_offsets[key_index + 1] = usage_offsets[key_index] + tasks.Size(key_index);
     }
-    std::vector<StorageUsageChange> usage_changes(usage_offsets.back());
+    std::vector<StorageUsageChange> usage_changes(overwrite_without_read ? 0 : usage_offsets.back());
+    std::vector<uint64_t> overwrite_sizes(overwrite_without_read ? usage_offsets.back() : 0);
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
-        auto &location_ids = location_ids_per_key[key_index];
-        location_ids.reserve(tasks.Size(key_index));
+        if (!overwrite_without_read) {
+            location_ids_per_key[key_index].reserve(tasks.Size(key_index));
+        }
         std::unordered_set<std::string_view> seen_location_ids;
         if (tasks.Size(key_index) > 1) {
             seen_location_ids.reserve(tasks.Size(key_index));
@@ -2675,17 +2679,68 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             const auto &task = tasks.At(key_index, task_index);
             const auto &location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
-            if ((tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
+            if ((overwrite_without_read && (!IsEventReportStorageType(task.type) || task.status != CLS_SERVING)) ||
+                (tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
                 ValidateReplaceLocationSpecsTask(task, incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
-            location_ids.push_back(location_id);
-            usage_changes[usage_offsets[key_index] + task_index].new_size = incoming_size;
+            if (overwrite_without_read) {
+                overwrite_sizes[usage_offsets[key_index] + task_index] = incoming_size;
+            } else {
+                location_ids_per_key[key_index].push_back(location_id);
+                usage_changes[usage_offsets[key_index] + task_index].new_size = incoming_size;
+            }
         }
     }
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
+    auto make_location =
+        [&](size_t key_index, size_t task_index, uint64_t total_size, const CacheLocation *previous = nullptr) {
+            const auto &task = tasks.At(key_index, task_index);
+            auto location = std::make_shared<CacheLocation>();
+            if (const auto *interned_id = task.ResolvedInternedLocationId()) {
+                location->set_id(*interned_id);
+            } else {
+                location->set_id(previous ? previous->id() : task.location_id);
+            }
+            std::vector<LocationSpec> specs;
+            specs.reserve(task.SpecCount());
+            for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
+                specs.push_back(tasks.CopyOrConsumeSpec(key_index, task_index, spec_index));
+            }
+            location->set_location_specs(std::move(specs));
+            location->set_type(task.type);
+            location->set_status(task.status);
+            location->set_spec_size(location->location_specs().size());
+            location->set_create_time(previous && IsEventReportStorageType(task.type) ? previous->create_time()
+                                                                                      : batch_create_time);
+            location->set_validated_total_size(total_size);
+            return location;
+        };
+    if (overwrite_without_read) {
+        MetadataWriteLease write_lease;
+        auto admit_write = [&]() {
+            if (!acquire_write_lease) {
+                return EC_OK;
+            }
+            ErrorCode ec;
+            std::tie(ec, write_lease) = acquire_write_lease();
+            return ec;
+        };
+        auto build_locations = [&](size_t key_index, CacheLocationMap &locations) {
+            locations.reserve(tasks.Size(key_index));
+            for (size_t task_index = 0; task_index < tasks.Size(key_index); ++task_index) {
+                const auto &task = tasks.At(key_index, task_index);
+                locations.emplace(
+                    task.ResolvedLocationId(),
+                    make_location(key_index, task_index, overwrite_sizes[usage_offsets[key_index] + task_index]));
+            }
+        };
+        auto result = meta_indexer_->OverwriteLocations(request_context, keys, build_locations, admit_write);
+        out_per_key_ec = std::move(result.error_codes);
+        return result.ec;
+    }
     bool write_lease_attempted = false;
     ErrorCode write_lease_ec = EC_OK;
     MetadataWriteLease write_lease;
@@ -2697,11 +2752,11 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                      &write_lease_attempted,
                      &write_lease_ec,
                      &write_lease,
-                     batch_create_time](const std::vector<ErrorCode> &get_ecs,
-                                        const LocationIdVector &location_ids,
-                                        size_t key_index,
-                                        CacheLocationVector &locations,
-                                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+                     &make_location](const std::vector<ErrorCode> &get_ecs,
+                                     const LocationIdVector &location_ids,
+                                     size_t key_index,
+                                     CacheLocationVector &locations,
+                                     PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
         if (acquire_write_lease && !write_lease_attempted) {
             std::tie(write_lease_ec, write_lease) = acquire_write_lease();
             write_lease_attempted = true;
@@ -2730,7 +2785,6 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
 
             const auto &task = tasks.At(key_index, location_index);
             auto &usage = usage_changes[usage_offsets[key_index] + location_index];
-            auto new_location = std::make_shared<CacheLocation>();
             if (get_ec == ErrorCode::EC_OK && locations[location_index]) {
                 if (locations[location_index]->type() != task.type) {
                     modifier_ecs[location_index] = ErrorCode::EC_BADARGS;
@@ -2741,31 +2795,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                 }
                 usage.has_old = true;
             }
-            if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
-                // New locations and legacy owned-id locations converge to the
-                // request's canonical reporter/medium id on the next write.
-                new_location->set_id(*interned_location_id);
-            } else {
-                new_location->set_id(get_ec == ErrorCode::EC_OK && locations[location_index]
-                                         ? locations[location_index]->id()
-                                         : task.location_id);
-            }
-
-            std::vector<LocationSpec> specs;
-            specs.reserve(task.SpecCount());
-            for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
-                specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, spec_index));
-            }
-            new_location->set_location_specs(std::move(specs));
-            new_location->set_type(task.type);
-            new_location->set_status(task.status);
-            new_location->set_spec_size(new_location->location_specs().size());
-            // A snapshot refreshes the same reporter-owned location, not its lifetime.
-            new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old
-                                              ? locations[location_index]->create_time()
-                                              : batch_create_time);
-            new_location->set_validated_total_size(usage.new_size);
-            locations[location_index] = std::move(new_location);
+            locations[location_index] = make_location(
+                key_index, location_index, usage.new_size, usage.has_old ? locations[location_index].get() : nullptr);
             updated = true;
         }
         if (!updated) {

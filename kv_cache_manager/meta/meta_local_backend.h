@@ -228,6 +228,13 @@ public:
                                        const KeyTypeVec &keys,
                                        const CacheLocationMapVector &locations,
                                        const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const CacheLocationMapVector &locations,
+                                           const PropertyMapVector &properties,
+                                           std::vector<UpsertStats> &out_stats,
+                                           size_t max_new_keys,
+                                           const BeforeUpsertWrite &before_write = {}) noexcept override;
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -420,7 +427,8 @@ private:
                                   Cache::Handle *handle,
                                   const CacheLocationMap &locations,
                                   const PropertyMap &properties,
-                                  bool check_capacity);
+                                  bool check_capacity,
+                                  UpsertStats *stats = nullptr);
     ErrorCode UpdateHandleInPlaceSingleLocation(KeyType key,
                                                 Cache::Handle *handle,
                                                 const LocationId &location_id,

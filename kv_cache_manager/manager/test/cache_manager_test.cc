@@ -289,9 +289,16 @@ public:
 
     void BlockNextUpsert() {
         std::lock_guard<std::mutex> lock(control_mutex_);
+        blocked_upsert_key_.reset();
         block_next_upsert_ = true;
         upsert_entered_ = false;
         release_upsert_ = false;
+    }
+
+    void BlockUpsertForKey(int64_t key) {
+        BlockNextUpsert();
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        blocked_upsert_key_ = key;
     }
 
     bool WaitUntilUpsertEntered(std::chrono::milliseconds timeout) {
@@ -334,7 +341,7 @@ public:
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties) noexcept override {
-        MaybeBlockUpsert();
+        MaybeBlockUpsert(keys);
 
         std::optional<int64_t> failed_key;
         {
@@ -361,6 +368,38 @@ public:
             results[i] = one_result.empty() ? EC_ERROR : one_result.front();
         }
         return results;
+    }
+
+    std::vector<ErrorCode> UpsertWithStats(RequestContext *context,
+                                           const KeyTypeVec &keys,
+                                           const CacheLocationMapVector &locations,
+                                           const PropertyMapVector &properties,
+                                           std::vector<UpsertStats> &stats,
+                                           size_t max_new_keys,
+                                           const BeforeUpsertWrite &before_write = {}) noexcept override {
+        MaybeBlockUpsert(keys);
+        std::optional<int64_t> failed_key;
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            if (fail_key_on_next_upsert_ &&
+                std::find(keys.begin(), keys.end(), *fail_key_on_next_upsert_) != keys.end()) {
+                failed_key = fail_key_on_next_upsert_;
+                fail_key_on_next_upsert_.reset();
+            }
+        }
+        BeforeUpsertWrite gate = before_write;
+        if (failed_key) {
+            gate = [&](const std::vector<ErrorCode> &admission) {
+                auto results = admission;
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    if (keys[i] == *failed_key) {
+                        results[i] = EC_ERROR;
+                    }
+                }
+                return before_write ? before_write(results) : results;
+            };
+        }
+        return MetaLocalBackend::UpsertWithStats(context, keys, locations, properties, stats, max_new_keys, gate);
     }
 
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
@@ -448,9 +487,10 @@ private:
         control_cv_.wait(lock, [&] { return release_location_read_; });
     }
 
-    void MaybeBlockUpsert() {
+    void MaybeBlockUpsert(const KeyTypeVec &keys) {
         std::unique_lock<std::mutex> lock(control_mutex_);
-        if (!block_next_upsert_) {
+        if (!block_next_upsert_ ||
+            (blocked_upsert_key_ && std::find(keys.begin(), keys.end(), *blocked_upsert_key_) == keys.end())) {
             return;
         }
         block_next_upsert_ = false;
@@ -462,6 +502,7 @@ private:
     std::mutex control_mutex_;
     std::condition_variable control_cv_;
     bool block_next_upsert_ = false;
+    std::optional<int64_t> blocked_upsert_key_;
     bool upsert_entered_ = false;
     bool release_upsert_ = false;
     bool block_next_location_read_ = false;
@@ -4588,7 +4629,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgres
     EXPECT_NE(std::string::npos, uris.front().find("s_v=" + snapshot_token));
 }
 
-TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
+TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotWaitingForMetadataWrite) {
     const std::string host = "192.168.10.43:8080";
     const int64_t key = 94'420;
     auto event_backend = InstallEventReportBackend();
@@ -4602,13 +4643,27 @@ TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
     const std::string baseline_token = baseline.committed_snapshot_version();
     ASSERT_EQ(1u, QueryEventReportUris({key}).size());
 
-    meta_backend->BlockNextLocationRead();
+    // The write-only snapshot has no metadata read to pause. Hold the shard
+    // before admission instead: HOST_DOWN must invalidate this waiting writer.
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    std::unique_lock<std::mutex> shard_lock(*indexer->mutex_shards_[indexer->GetMutexShardIndex(key)]);
     auto snapshot_future = std::async(std::launch::async, [this, host, key] {
         return CallReportEvent(MakeSnapshotRequest(host, {{key, "must_not_commit"}}), "host_down_snapshot_in_flight");
     });
-    const bool snapshot_entered = meta_backend->WaitUntilLocationReadEntered(std::chrono::seconds(1));
+    std::string committed;
+    std::string candidate;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        event_backend->GetSnapshotVersionTokens({"test_instance", host}, committed, candidate);
+        if (!candidate.empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    const bool snapshot_entered = !candidate.empty();
     if (!snapshot_entered) {
-        meta_backend->ReleaseLocationRead();
+        shard_lock.unlock();
     }
     ASSERT_TRUE(snapshot_entered);
 
@@ -4620,12 +4675,12 @@ TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
     host_down_event->set_event_type(proto::meta::EVENT_HOST_DOWN);
     host_down_event->mutable_host_down();
     const auto [host_down_ec, host_down_response] = CallReportEvent(host_down, "host_down_during_snapshot");
+    shard_lock.unlock();
     ASSERT_EQ(EC_OK, host_down_ec);
     EXPECT_EQ(proto::meta::OK, host_down_response.header().status().code());
     EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", host));
     EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
 
-    meta_backend->ReleaseLocationRead();
     ASSERT_EQ(std::future_status::ready, snapshot_future.wait_for(std::chrono::seconds(2)));
     const auto [snapshot_ec, snapshot_response] = snapshot_future.get();
     EXPECT_EQ(EC_PARTIAL_OK, snapshot_ec);
@@ -5375,8 +5430,16 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
 
     std::shared_ptr<MetaIndexer> meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
     ASSERT_NE(nullptr, meta_indexer);
-    EXPECT_EQ(expected_total_size,
-              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    std::uint64_t actual_total_size = 0;
+    for (const auto &locations : location_maps) {
+        for (const auto &[id, location] : locations) {
+            std::uint64_t size = 0;
+            ASSERT_TRUE(location->GetValidatedTotalSize(size));
+            actual_total_size += size;
+        }
+    }
+    EXPECT_EQ(expected_total_size, actual_total_size);
+    EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesReference) {
@@ -5584,8 +5647,16 @@ TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesRef
         std::shared_ptr<MetaIndexer> meta_indexer =
             cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
         ASSERT_NE(nullptr, meta_indexer);
-        EXPECT_EQ(expected_total_size,
-                  meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2))
+        std::uint64_t actual_total_size = 0;
+        for (const auto &locations : location_maps) {
+            for (const auto &[id, location] : locations) {
+                std::uint64_t size = 0;
+                ASSERT_TRUE(location->GetValidatedTotalSize(size));
+                actual_total_size += size;
+            }
+        }
+        EXPECT_EQ(expected_total_size, actual_total_size);
+        EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2))
             << "round " << round;
     }
 }
@@ -5674,11 +5745,11 @@ TEST_F(CacheManagerTest, TestReportEventRejectsMergeThatOverflowsExistingLocatio
     const auto &stored_specs = location_maps[0].begin()->second->location_specs();
     ASSERT_EQ(1u, stored_specs.size());
     EXPECT_EQ("tp0", stored_specs[0].name());
+    EXPECT_NE(std::string::npos, stored_specs[0].uri().find("size=18446744073709551615"));
 
     std::shared_ptr<MetaIndexer> meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
     ASSERT_NE(nullptr, meta_indexer);
-    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
-              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFoldedDeltaEventsShareFinalWriteFailure) {
@@ -13920,12 +13991,12 @@ TEST_F(SnapshotBatchTest, CommitsOnlyAfterLastBatchAndKeepsAllMediaOfAKeyTogethe
     second_spec->set_uri("event_report://node/mem?size=3");
     const int64_t blocked_key = keys[batches.back().front()];
     const int64_t written_key = keys[batches.front().front()];
-    backend->BlockLocationReadForKey(blocked_key);
+    backend->BlockUpsertForKey(blocked_key);
     std::future<std::pair<ErrorCode, proto::meta::ReportEventResponse>> pending =
         std::async(std::launch::async, [&] { return CallReportEvent(request, "batch_commit_pending"); });
-    const bool blocked = backend->WaitUntilLocationReadEntered(std::chrono::seconds(3));
+    const bool blocked = backend->WaitUntilUpsertEntered(std::chrono::seconds(3));
     if (!blocked) {
-        backend->ReleaseLocationRead();
+        backend->ReleaseUpsert();
         pending.wait();
     }
     ASSERT_TRUE(blocked);
@@ -13933,7 +14004,7 @@ TEST_F(SnapshotBatchTest, CommitsOnlyAfterLastBatchAndKeepsAllMediaOfAKeyTogethe
               event_backend_->GetSnapshotVersion({"test_instance", host_}));
     EXPECT_FALSE(QueryRawEventReportUris(written_key).empty());
     EXPECT_TRUE(QueryEventReportUris({written_key}).empty());
-    backend->ReleaseLocationRead();
+    backend->ReleaseUpsert();
     const std::pair<ErrorCode, proto::meta::ReportEventResponse> result = pending.get();
     ASSERT_EQ(EC_OK, result.first);
     EXPECT_NE(baseline.second.committed_snapshot_version(), result.second.committed_snapshot_version());
@@ -13941,7 +14012,7 @@ TEST_F(SnapshotBatchTest, CommitsOnlyAfterLastBatchAndKeepsAllMediaOfAKeyTogethe
     EXPECT_EQ(3u, indexer_->GetKeyCount());
     EXPECT_EQ(5u, indexer_->GetLocationCount());
     EXPECT_EQ(3u, QueryRawEventReportUris(101).size());
-    EXPECT_EQ(3u, indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(0u, indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     for (const int64_t key : keys) {
         const std::vector<std::string> uris = QueryRawEventReportUris(key);
         ASSERT_FALSE(uris.empty());
@@ -14001,7 +14072,7 @@ TEST_F(SnapshotBatchTest, CompatibilityUrisKeepNormalizationAcrossBatches) {
         const int64_t key = std::stoll(request.events(0).block_snapshot().blocks(index).block_key());
         EXPECT_EQ((std::vector<std::string>{expected}), QueryRawEventReportUris(key));
     }
-    EXPECT_EQ(55u, indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(0u, indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(SnapshotBatchTest, BlockedSnapshotDoesNotFenceOtherShardSnapshotReadOrBatchWrite) {
@@ -14177,7 +14248,7 @@ TEST_F(SnapshotBatchTest, OneSpecEnvUsesBatchedSnapshotWithUnchangedClientReques
     EXPECT_EQ(5u, indexer->GetLocationCount());
 }
 
-TEST_F(SnapshotBatchTest, ConcurrentOneSpecSnapshotsWithReadsAndDeltasPreserveDataAndLifetime) {
+TEST_F(SnapshotBatchTest, ConcurrentOneSpecSnapshotsWithReadsAndDeltasPreserveDataAndRefreshSnapshotTime) {
     ScopedEnv env("kvcm.disable_write_session_for_one_spec", "true");
     registry_manager_->instance_group_configs_.at(registry_manager_->GetInstanceGroupName("test_instance"))
         ->cache_config_->meta_indexer_config_->SetMutexShardNum(64);
@@ -14296,7 +14367,7 @@ TEST_F(SnapshotBatchTest, ConcurrentOneSpecSnapshotsWithReadsAndDeltasPreserveDa
     ASSERT_EQ(3u, final.size());
     ASSERT_EQ(reporter_count, final.front().size());
     for (const CacheLocationConstPtr &location : final.front()) {
-        EXPECT_EQ(create_times.at(location->id()), location->create_time());
+        EXPECT_GE(location->create_time(), create_times.at(location->id()));
         ASSERT_EQ(1u, location->location_specs().size());
         EXPECT_NE(std::string::npos,
                   location->location_specs().front().uri().find("s_v=" + versions.at(location->id())));
