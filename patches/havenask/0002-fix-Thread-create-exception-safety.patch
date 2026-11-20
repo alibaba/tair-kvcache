@@ -1,0 +1,14 @@
+--- aios/autil/autil/Thread.cpp
++++ aios/autil/autil/Thread.cpp
+@@ -46 +46 @@
+-    ThreadFunctionWrapperArg *arg = new ThreadFunctionWrapperArg;
++    unique_ptr<ThreadFunctionWrapperArg> arg(new ThreadFunctionWrapperArg);
+@@ -54 +54 @@
+-    int rtn = pthread_create(&threadPtr->_id, NULL, &Thread::threadWrapperFunction, arg);
++    int rtn = pthread_create(&threadPtr->_id, NULL, &Thread::threadWrapperFunction, arg.get());
+@@ -56,2 +56,3 @@
+-    if (rtn != 0) {
+-        delete arg;
++    if (rtn == 0) {
++        arg.release(); // The new thread owns the argument after pthread_create succeeds.
++    } else {

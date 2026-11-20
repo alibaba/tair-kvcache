@@ -8,11 +8,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <shared_mutex>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
@@ -77,6 +79,91 @@ ErrorCode BatchAddLocationForTest(const std::shared_ptr<MetaSearcher> &meta_sear
     return ec;
 }
 } // namespace
+
+namespace parallel_recover_stub {
+struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t active = 0;
+    size_t max_active = 0;
+    size_t calls = 0;
+    bool released = false;
+    bool fail_first = false;
+    bool throw_first = false;
+    bool shared_context = false;
+    std::set<RequestContext *> active_contexts;
+    std::set<std::string> visited;
+
+    bool WaitForActive(size_t count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(5), [&] { return active >= count; });
+    }
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+};
+State *state = nullptr;
+
+ErrorCode TryCreate(void *, RequestContext *context, const std::string &instance_id) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    const size_t call = ++state->calls;
+    state->visited.insert(instance_id);
+    if (call == 1 && state->throw_first) {
+        throw std::bad_alloc();
+    }
+    if (call == 1 && state->fail_first) {
+        return EC_ERROR;
+    }
+    ++state->active;
+    state->max_active = std::max(state->active, state->max_active);
+    if (!state->active_contexts.insert(context).second) {
+        state->shared_context = true;
+    }
+    state->cv.notify_all();
+    state->cv.wait(lock, [] { return state->released; });
+    state->active_contexts.erase(context);
+    --state->active;
+    return EC_OK;
+}
+
+class BlockingIndexerManager : public MetaIndexerManager {
+public:
+    State gate;
+
+protected:
+    ErrorCode InitMetaIndexer(const std::shared_ptr<MetaIndexer> &indexer,
+                              const std::string &instance_id,
+                              const std::shared_ptr<MetaIndexerConfig> &config) override {
+        {
+            std::unique_lock lock(gate.mutex);
+            ++gate.calls;
+            ++gate.active;
+            gate.cv.notify_all();
+            gate.cv.wait(lock, [this] { return gate.released; });
+            --gate.active;
+        }
+        return MetaIndexerManager::InitMetaIndexer(indexer, instance_id, config);
+    }
+};
+
+class FailingSearcherManager : public MetaSearcherManager {
+public:
+    using MetaSearcherManager::MetaSearcherManager;
+    size_t attempts = 0;
+
+protected:
+    std::shared_ptr<MetaSearcher> CreateMetaSearcher(const std::shared_ptr<MetaIndexer> &indexer,
+                                                     const CheckLocDataExistFunc &check_loc_data_exist,
+                                                     const SubmitDelReqFunc &submit_del_req) override {
+        if (++attempts == 1) {
+            throw std::bad_alloc();
+        }
+        return MetaSearcherManager::CreateMetaSearcher(indexer, check_loc_data_exist, submit_del_req);
+    }
+};
+} // namespace parallel_recover_stub
 
 namespace mark_query_read_error_stub {
 ErrorCode ReadError_stub(void * /*obj*/,
@@ -8570,6 +8657,222 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
     }
 }
 
+TEST_F(CacheManagerTest, TestParallelRecoverIsBoundedAndJoinsAllWorkers) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "3");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (int i = 0; i < 6; ++i) {
+            const auto id = "parallel_instance_" + std::to_string(i);
+            registry_manager_->instance_infos_[id] = std::make_shared<InstanceInfo>(
+                "test_quota_group", "default", id, 64, createLocationSpecInfos(), createModelDeployment());
+        }
+    }
+    parallel_recover_stub::State state;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
+    const bool overlapped = state.WaitForActive(3);
+    EXPECT_EQ(std::future_status::timeout, recovery.wait_for(std::chrono::milliseconds(0)));
+    state.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_TRUE(overlapped);
+    EXPECT_EQ(3, state.max_active);
+    EXPECT_EQ(7, state.calls);
+    EXPECT_EQ(7, state.visited.size());
+    EXPECT_FALSE(state.shared_context);
+}
+
+TEST_F(CacheManagerTest, TestParallelRecoverRetainsPartialFailureAndRetriesEveryInstance) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "2");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        registry_manager_->instance_infos_["another_instance"] = std::make_shared<InstanceInfo>(
+            "test_quota_group", "default", "another_instance", 64, createLocationSpecInfos(), createModelDeployment());
+    }
+    parallel_recover_stub::State state;
+    state.fail_first = true;
+    state.released = true;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecover());
+    EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
+    cache_manager_->StopRecoverRetryLoop();
+    EXPECT_EQ(2, state.calls);
+    EXPECT_EQ(2, state.visited.size());
+
+    state.calls = 0;
+    state.fail_first = false;
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_EQ(2, state.calls);
+}
+
+TEST_F(CacheManagerTest, TestParallelRecoverAttemptsOtherInstancesAfterException) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "2");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    registry_manager_->instance_infos_["another_instance"] = std::make_shared<InstanceInfo>(
+        "test_quota_group", "default", "another_instance", 64, createLocationSpecInfos(), createModelDeployment());
+    parallel_recover_stub::State state;
+    state.throw_first = true;
+    state.released = true;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    EXPECT_EQ(EC_ERROR, cache_manager_->DoRecoverOnce());
+    EXPECT_EQ(2, state.calls);
+    EXPECT_EQ(2, state.visited.size());
+    state.calls = 0;
+    state.throw_first = false;
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_EQ(2, state.calls);
+}
+
+TEST_F(CacheManagerTest, TestRecoveryRetriesSearcherConstructionAcrossRegistryRecovery) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    auto indexers = std::make_shared<parallel_recover_stub::BlockingIndexerManager>();
+    indexers->gate.released = true;
+    CacheManager manager(metrics_registry_, registry_manager_);
+    manager.meta_indexer_manager_ = indexers;
+    manager.meta_searcher_manager_ =
+        std::make_shared<parallel_recover_stub::FailingSearcherManager>(registry_manager_, indexers);
+    const auto registration = registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance");
+    ASSERT_NE(nullptr, registration);
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("instance", "test_instance", "test_instance"));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->storage_->UpsertField("test_instance", "test_instance", registration->ToJsonString()));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("account", "broken", "invalid_json"));
+    registry_manager_->recover_complete_.store(false);
+    EXPECT_EQ(EC_ERROR, manager.DoRecoverOnce());
+    auto indexer = indexers->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    EXPECT_EQ(nullptr, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    // Registry has its own partial-recovery retry loop. It must preserve the
+    // registration identity while filling missing records, or reuse would fail forever.
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("account", "broken"));
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(EC_OK, manager.DoRecoverOnce());
+    auto searcher = manager.meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+    EXPECT_EQ(indexer, searcher->meta_indexer_);
+    EXPECT_EQ(1, indexers->gate.calls);
+}
+
+TEST_F(CacheManagerTest, TestRecoverySnapshotDoesNotRegisterInstancesRemovedBeforeExecution) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (int i = 0; i < 3; ++i) {
+            const auto id = "removed_before_recover_" + std::to_string(i);
+            registry_manager_->instance_infos_[id] = std::make_shared<InstanceInfo>(
+                "test_quota_group", "default", id, 64, createLocationSpecInfos(), createModelDeployment());
+        }
+    }
+    parallel_recover_stub::State state;
+    parallel_recover_stub::state = &state;
+    Stub stub;
+    stub.set(ADDR(CacheManager, TryCreateMetaSearcher), parallel_recover_stub::TryCreate);
+    auto recovery = std::async(std::launch::async, [&] { return cache_manager_->DoRecoverOnce(); });
+    const bool blocked = state.WaitForActive(1);
+    std::string current;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.visited.empty()) {
+            current = *state.visited.begin();
+        }
+    }
+    // Simulate the registry no longer containing queued snapshot entries.
+    {
+        std::unique_lock<std::shared_mutex> lock(registry_manager_->mutex_);
+        for (auto it = registry_manager_->instance_infos_.begin(); it != registry_manager_->instance_infos_.end();) {
+            if (it->first != current) {
+                it = registry_manager_->instance_infos_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    state.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(1, state.calls);
+    EXPECT_EQ(1, registry_manager_->instance_infos_.size());
+}
+
+TEST_F(CacheManagerTest, TestCleanupWaitsForForegroundRecoveryWorkers) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    auto indexers = std::make_shared<parallel_recover_stub::BlockingIndexerManager>();
+    CacheManager manager(metrics_registry_, registry_manager_);
+    manager.meta_indexer_manager_ = indexers;
+    manager.meta_searcher_manager_ = std::make_shared<MetaSearcherManager>(registry_manager_, indexers);
+    auto recovery = std::async(std::launch::async, [&] { return manager.DoRecoverOnce(); });
+    const bool blocked = indexers->gate.WaitForActive(1);
+    std::promise<void> cleanup_started;
+    auto cleanup = std::async(std::launch::async, [&] {
+        cleanup_started.set_value();
+        return manager.DoCleanup();
+    });
+    const auto started_status = cleanup_started.get_future().wait_for(std::chrono::seconds(5));
+    const auto cleanup_status = cleanup.wait_for(std::chrono::milliseconds(30));
+    indexers->gate.Release();
+    EXPECT_EQ(EC_OK, recovery.get());
+    EXPECT_EQ(EC_OK, cleanup.get());
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(std::future_status::ready, started_status);
+    EXPECT_EQ(std::future_status::timeout, cleanup_status);
+    EXPECT_EQ(1, indexers->gate.calls);
+    EXPECT_EQ(nullptr, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_EQ(0, indexers->GetIndexerSize());
+}
+
+TEST_F(CacheManagerTest, TestRecoveryAndRegistrationShareSearcherInitialization) {
+    ScopedEnv concurrency("kvcm.cache_manager.recover_instance_concurrency", "1");
+    auto indexers = std::make_shared<parallel_recover_stub::BlockingIndexerManager>();
+    CacheManager manager(metrics_registry_, registry_manager_);
+    manager.meta_indexer_manager_ = indexers;
+    manager.meta_searcher_manager_ = std::make_shared<MetaSearcherManager>(registry_manager_, indexers);
+    auto recovery = std::async(std::launch::async, [&] {
+        const auto ec = manager.DoRecoverOnce();
+        return std::make_pair(ec, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    });
+    const bool blocked = indexers->gate.WaitForActive(1);
+    std::promise<void> registration_started;
+    auto registration = std::async(std::launch::async, [&] {
+        RequestContext context("register_during_recovery");
+        registration_started.set_value();
+        const auto result = manager.RegisterInstance(&context,
+                                                     "default",
+                                                     "test_instance",
+                                                     64,
+                                                     createLocationSpecInfos(),
+                                                     createModelDeployment(),
+                                                     {},
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     std::nullopt);
+        return std::make_pair(result.first, manager.meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    });
+    const auto started_status = registration_started.get_future().wait_for(std::chrono::seconds(5));
+    const auto registration_status = registration.wait_for(std::chrono::milliseconds(30));
+    indexers->gate.Release();
+    const auto [recovery_ec, recovered_searcher] = recovery.get();
+    const auto [registration_ec, registered_searcher] = registration.get();
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(std::future_status::ready, started_status);
+    EXPECT_EQ(std::future_status::timeout, registration_status);
+    EXPECT_EQ(EC_OK, recovery_ec);
+    EXPECT_EQ(EC_OK, registration_ec);
+    EXPECT_EQ(1, indexers->gate.calls);
+    EXPECT_EQ(1, indexers->GetIndexerSize());
+    ASSERT_NE(nullptr, recovered_searcher);
+    EXPECT_EQ(recovered_searcher, registered_searcher);
+    EXPECT_EQ(indexers->GetMetaIndexer("test_instance"), recovered_searcher->meta_indexer_);
+}
+
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     // Cleanup then recover
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
@@ -8604,6 +8907,34 @@ TEST_F(CacheManagerTest, TestDoRecoverPreservesRegisteredDefaultQueryType) {
         request_context_.get(), "test_instance", CacheManager::QueryType::QT_UNSPECIFIED, keys);
     EXPECT_EQ(EC_OK, ec);
     EXPECT_TRUE(hosts.empty());
+}
+
+TEST_F(CacheManagerTest, TestDoRecoverPreservesDisabledWriteSession) {
+    const std::string instance_id = "sessionless_recover";
+    const auto [registered_ec, storage_config] =
+        cache_manager_->RegisterInstance(request_context_.get(),
+                                         "default",
+                                         instance_id,
+                                         64,
+                                         {LocationSpecInfo("tp0", 4096)},
+                                         {},
+                                         {},
+                                         CacheManager::QueryType::QT_UNSPECIFIED,
+                                         true);
+    ASSERT_EQ(EC_OK, registered_ec);
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context_.get(), instance_id);
+    ASSERT_NE(nullptr, instance_info);
+    ASSERT_TRUE(instance_info->disable_write_session());
+
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    ASSERT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance_id));
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+
+    const auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, searcher);
+    ASSERT_NE(nullptr, searcher->meta_indexer_);
+    EXPECT_EQ(instance_info, searcher->meta_indexer_->instance_info_);
+    EXPECT_FALSE(searcher->meta_indexer_->SupportsWriteSession());
 }
 
 TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
@@ -8663,12 +8994,16 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     // StartRecoverRetryLoop + StopRecoverRetryLoop
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_TRUE(cache_manager_->recover_retry_thread_.joinable());
     cache_manager_->StopRecoverRetryLoop(); // should join within ~100ms
+    EXPECT_FALSE(cache_manager_->recover_retry_thread_.joinable());
 
     // DoCleanup should stop retry thread
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_TRUE(cache_manager_->recover_retry_stop_.load());
+    EXPECT_FALSE(cache_manager_->recover_retry_thread_.joinable());
 }
 
 /* ------------ InvalidateInstanceMetrics tests ------------ */

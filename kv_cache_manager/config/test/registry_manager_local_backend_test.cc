@@ -919,6 +919,105 @@ TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOnceIdempotent) {
     }
 }
 
+TEST_F(RegistryManagerLocalBackendTest, PartialRecoveryRetriesPreserveRegistrationAndUpdatedGroup) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_registration_identity";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("account", "broken", "invalid_json"));
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    const auto registration = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, registration);
+    EXPECT_FALSE(registry_manager_->IsRecoverComplete());
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    // Recovery retries fill missing entries; runtime configuration updates remain authoritative.
+    const auto group = registry_manager_->GetInstanceGroupConfig("group1");
+    ASSERT_NE(nullptr, group);
+    auto updated_group = *group;
+    updated_group.set_version(group->version() + 1);
+    updated_group.set_user_data("updated while recovery is incomplete");
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
+    const auto current_group = registry_manager_->GetInstanceGroupConfig("group1");
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(current_group, registry_manager_->GetInstanceGroupConfig("group1"));
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("account", "broken"));
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_TRUE(registry_manager_->IsRecoverComplete());
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, RecoveryRetryPreservesFailedRemovalIntentWithoutRevivingServingRecord) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_pending_identity";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>("instance1");
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    backend->fail_next_info_upsert = true;
+    registry_manager_->storage_ = std::move(backend);
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    const auto pending = registry_manager_->GetRemovingInstanceInfo("instance1");
+    ASSERT_NE(nullptr, pending);
+    EXPECT_EQ(InstanceInfo::State::kDeleting, pending->state());
+    // The durable record is still serving because persisting the intent failed.
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance1", fields));
+    InstanceInfo durable;
+    ASSERT_TRUE(durable.FromJsonString(fields.at("instance1")));
+    ASSERT_EQ(InstanceInfo::State::kServing, durable.state());
+
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(pending, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    EXPECT_EQ(EC_ERROR,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "group1",
+                                                  "instance1",
+                                                  1024,
+                                                  {LocationSpecInfo{}},
+                                                  ModelDeployment{},
+                                                  {},
+                                                  0,
+                                                  std::nullopt));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, CleanupAndReregistrationCreateNewRegistrationIdentities) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_new_registration_identity";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+    const auto original = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, original);
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    const auto reloaded = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, reloaded);
+    EXPECT_NE(original, reloaded);
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(reloaded, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    RegisterInstance("group1", "instance1");
+    const auto reregistered = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, reregistered);
+    EXPECT_NE(reloaded, reregistered);
+    // Register/remove and recovery serialize on the registry mutex, including background retries.
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(reregistered, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOncePartialFailure) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_partial_fail_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";
