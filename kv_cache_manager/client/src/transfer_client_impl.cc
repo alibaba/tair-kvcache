@@ -196,7 +196,8 @@ ClientErrorCode TransferClientImpl::LoadKvCachesWithDeadline(const UriStrVec &ur
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK();
     auto remote_uris = ParseLocations(uri_str_vec);
-    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers, deadline_ms);
+    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers, deadline_ms,
+                                trace_info ? trace_info->read_execution_id : std::string{});
     if (ec != ER_OK) {
         return ec;
     }
@@ -205,6 +206,15 @@ ClientErrorCode TransferClientImpl::LoadKvCachesWithDeadline(const UriStrVec &ur
 #else
     return ER_OK;
 #endif
+}
+
+bool TransferClientImpl::QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms) {
+    return sdk_wrapper_ && sdk_wrapper_->QueryReadBufferSafety(read_execution_id, deadline_ms);
+}
+
+void TransferClientImpl::DiscardReadRecovery(const std::string &read_execution_id) {
+    if (sdk_wrapper_)
+        sdk_wrapper_->DiscardReadRecovery(read_execution_id);
 }
 
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,

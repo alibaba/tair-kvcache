@@ -256,6 +256,7 @@ struct ForwardContext {
 struct TransferTraceInfo {
     bool need_print = false;
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
+    std::string read_execution_id; // Unique to one LoadKvCaches invocation on this client.
 };
 
 } // namespace kv_cache_manager

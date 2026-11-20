@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -19,6 +20,7 @@ namespace kv_cache_manager {
 // 规范全文见 docs/design/client_sdk_io_contract.md。
 class SdkInterface {
 public:
+    using ReadSafetyQuery = std::function<bool(int64_t)>;
     SdkInterface() {}
     virtual ~SdkInterface() = default;
     virtual ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
@@ -55,6 +57,13 @@ public:
                                             std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
                                             int64_t /*deadline_ms*/) {
         return Put(remote_uris, local_buffers, std::move(actual_remote_uris));
+    }
+    virtual ClientErrorCode GetWithReadSafety(const std::vector<DataStorageUri> &remote_uris,
+                                              const BlockBuffers &local_buffers,
+                                              int64_t deadline_ms,
+                                              ReadSafetyQuery &) {
+        return deadline_ms > 0 ? GetWithDeadline(remote_uris, local_buffers, deadline_ms)
+                               : Get(remote_uris, local_buffers);
     }
 
 protected:

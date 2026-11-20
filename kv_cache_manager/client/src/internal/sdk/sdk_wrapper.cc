@@ -1,5 +1,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <atomic>
+#include <chrono>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
@@ -15,6 +17,22 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+bool IsGroupBufferSafe(ClientErrorCode ec) {
+    return ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+           ec == ER_SDK_ERROR_BUFFER_SAFE;
+}
+
+} // namespace
+
+struct SdkWrapper::ReadRecovery {
+    std::mutex mu;
+    GroupFutures futures;
+    std::shared_ptr<std::vector<SdkInterface::ReadSafetyQuery>> queries;
+    std::atomic<bool> unrecoverable{false};
+};
+
 SdkWrapper::SdkWrapper() : sdk_factory_(SdkFactory::GetInstance()) {}
 
 SdkWrapper::~SdkWrapper() {
@@ -22,6 +40,7 @@ SdkWrapper::~SdkWrapper() {
         wait_task_thread_pool_->stop();
         wait_task_thread_pool_.reset();
     }
+    read_recovery_.clear();
     sdk_map_.clear();
     if (owned_shm_fd_ >= 0) {
         close(owned_shm_fd_);
@@ -157,7 +176,8 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
 
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
-                                int64_t parent_deadline_ms) {
+                                int64_t parent_deadline_ms,
+                                const std::string &read_execution_id) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ER_SDK_ERROR_BUFFER_SAFE;
@@ -171,19 +191,108 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
                                     ? ClampDeadline(wrapper_config_->timeout_config().get_timeout_ms(), parent_deadline_ms)
                                     : 0;
 
+    std::shared_ptr<ReadRecovery> recovery;
+    if (!read_execution_id.empty()) {
+        recovery = std::make_shared<ReadRecovery>();
+        recovery->queries = std::make_shared<std::vector<SdkInterface::ReadSafetyQuery>>(groups.size());
+    }
     // Build task vector for parallel dispatch
     std::vector<std::function<ClientErrorCode()>> tasks;
     tasks.reserve(groups.size());
     for (const auto &group : groups) {
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, deadline_ms]() {
+        tasks.push_back([group, deadline_ms, queries = recovery ? recovery->queries : nullptr,
+                         index = tasks.size()]() {
+            if (queries) {
+                return group.sdk->GetWithReadSafety(group.uris, group.buffers, deadline_ms, (*queries)[index]);
+            }
             return deadline_ms > 0 ? group.sdk->GetWithDeadline(group.uris, group.buffers, deadline_ms)
                                   : group.sdk->Get(group.uris, group.buffers);
         });
     }
 
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms, deadline_ms);
+    ec = RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms, deadline_ms,
+                                recovery ? &recovery->futures : nullptr);
+    if (recovery && !IsGroupBufferSafe(ec)) {
+        try {
+            std::lock_guard<std::mutex> lock(read_recovery_mu_);
+            const auto [entry, inserted] = read_recovery_.try_emplace(read_execution_id, std::move(recovery));
+            if (!inserted) {
+                entry->second->unrecoverable.store(true);
+                KVCM_LOG_WARN("duplicate read safety trace %s", read_execution_id.c_str());
+            }
+        } catch (...) {
+            KVCM_LOG_WARN("failed to retain read safety evidence for trace %s", read_execution_id.c_str());
+        }
+    }
+    return ec;
+}
+
+bool SdkWrapper::QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms) {
+    std::shared_ptr<ReadRecovery> recovery;
+    {
+        std::lock_guard<std::mutex> lock(read_recovery_mu_);
+        const auto it = read_recovery_.find(read_execution_id);
+        if (it == read_recovery_.end()) {
+            return false;
+        }
+        recovery = it->second;
+    }
+    std::unique_lock<std::mutex> lock(recovery->mu, std::try_to_lock);
+    if (!lock.owns_lock() || deadline_ms <= 0) {
+        return false;
+    }
+
+    auto &queries = *recovery->queries;
+    if (!recovery->unrecoverable && !recovery->futures.empty()) {
+        for (const auto &future : recovery->futures) {
+            if (!future.valid()) {
+                recovery->unrecoverable = true;
+                break;
+            }
+            if (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                return false;
+            }
+        }
+        for (size_t index = 0; !recovery->unrecoverable && index < recovery->futures.size(); ++index) {
+            try {
+                if (IsGroupBufferSafe(recovery->futures[index].get())) {
+                    queries[index] = {};
+                } else if (!queries[index]) {
+                    recovery->unrecoverable = true;
+                }
+            } catch (...) {
+                recovery->unrecoverable = true;
+            }
+        }
+        recovery->futures.clear();
+    }
+    if (!recovery->unrecoverable) {
+        for (auto &query : queries) {
+            if (query && !query(deadline_ms)) {
+                return false;
+            }
+            query = {};
+        }
+    }
+    std::lock_guard<std::mutex> map_lock(read_recovery_mu_);
+    const auto it = read_recovery_.find(read_execution_id);
+    if (it == read_recovery_.end() || it->second != recovery) {
+        return false;
+    }
+    const bool safe = !recovery->unrecoverable.load();
+    read_recovery_.erase(it);
+    return safe;
+}
+
+void SdkWrapper::DiscardReadRecovery(const std::string &read_execution_id) {
+    // Release the old context outside the map lock.
+    decltype(read_recovery_)::node_type discarded;
+    {
+        std::lock_guard<std::mutex> lock(read_recovery_mu_);
+        discarded = read_recovery_.extract(read_execution_id);
+    }
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
@@ -292,7 +401,8 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
                                                    int timeout_ms,
-                                                   int64_t deadline_ms) const {
+                                                   int64_t deadline_ms,
+                                                   GroupFutures *pending) const {
     if (tasks.empty()) {
         return ER_OK;
     }
@@ -314,7 +424,8 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     // deadline 之前，若不显式拦截，排在后面的 group 会在 caller 拿到错误返回后
     // 依旧发起 I/O、写 caller buffer（多后端混布时放大暴露面）。
     auto stop = std::make_shared<std::atomic<bool>>(false);
-    std::vector<std::future<ClientErrorCode>> futures;
+    GroupFutures local_futures;
+    auto &futures = pending ? *pending : local_futures;
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
@@ -333,7 +444,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             }
             return task();
         };
-        futures.push_back(wait_task_thread_pool_->async(wrapped));
+        futures.emplace_back(wait_task_thread_pool_->async(wrapped));
     }
 
     // Drain only until the existing deadline. SAFE survives only when every
@@ -349,9 +460,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                 continue;
             }
             const auto ec = futures[j].get();
-            all_buffer_safe = all_buffer_safe &&
-                              (ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
-                               ec == ER_SDK_ERROR_BUFFER_SAFE);
+            all_buffer_safe = all_buffer_safe && IsGroupBufferSafe(ec);
             timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
         }
         return timed_out;
