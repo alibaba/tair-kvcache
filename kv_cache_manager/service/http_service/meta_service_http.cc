@@ -13,6 +13,7 @@
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
 #include "rapidjson/document.h"
 
@@ -43,22 +44,29 @@ CoroHttpService::CachedJsonResponse MetaServiceHttp::TryRejectRequest(bool over_
     return json;
 }
 
-CoroHttpService::HandlerType MetaServiceHttp::LimitReportEventBodyBytes(HandlerType handler, size_t budget) {
-    return [this, handler = std::move(handler), budget](
-               coro_http::coro_http_request &req, coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
-        const auto bytes = req.get_body().size();
-        auto in_use = report_event_body_bytes_.load(std::memory_order_relaxed);
-        do {
-            if (bytes > budget || in_use > budget - bytes) {
-                auto rejection = TryRejectRequest(true);
-                res.add_header("Content-Type", "application/json");
-                res.set_status_and_content(coro_http::status_type::ok, std::move(*rejection));
-                co_return;
+CoroHttpService::HandlerType MetaServiceHttp::LimitReportEventBodyBytes(HandlerType handler) {
+    return [this, handler = std::move(handler)](coro_http::coro_http_request &req,
+                                                coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+        constexpr size_t kMinBudgetedBodyBytes = 8 * 1024 * 1024;
+        const size_t bytes = req.get_body().size();
+        if (bytes < kMinBudgetedBodyBytes) {
+            co_await handler(req, res);
+            co_return;
+        }
+        if (!report_event_body_budget_->TryReserve(bytes)) {
+            if (report_body_budget_rejection_) {
+                report_body_budget_rejection_();
             }
-        } while (!report_event_body_bytes_.compare_exchange_weak(in_use, in_use + bytes, std::memory_order_relaxed));
+            CachedJsonResponse rejection = TryRejectRequest(true);
+            assert(rejection);
+            res.add_header("Content-Type", "application/json");
+            res.set_status_and_content(coro_http::status_type::ok, std::move(*rejection));
+            co_return;
+        }
         // Keep the reservation across parsing, queueing, and response generation.
-        const auto release = [bytes](auto *counter) { counter->fetch_sub(bytes, std::memory_order_relaxed); };
-        const std::unique_ptr<std::atomic<size_t>, decltype(release)> reservation(&report_event_body_bytes_, release);
+        const auto release = [bytes](ReportEventBodyBudget *budget) { budget->Release(bytes); };
+        const std::unique_ptr<ReportEventBodyBudget, decltype(release)> reservation(report_event_body_budget_.get(),
+                                                                                    release);
         co_await handler(req, res);
     };
 }
@@ -123,11 +131,16 @@ MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regist
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
                                  std::shared_ptr<RegistryManager> registry_manager,
                                  std::shared_ptr<ServiceRequestExecutor> executor,
-                                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
+                                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle,
+                                 std::shared_ptr<ReportEventBodyBudget> report_event_body_budget,
+                                 std::function<void()> report_body_budget_rejection)
     : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager, std::move(metrics_lifecycle))
     , meta_service_impl_(std::move(meta_service_impl))
-    , executor_(std::move(executor)) {
+    , executor_(std::move(executor))
+    , report_event_body_budget_(std::move(report_event_body_budget))
+    , report_body_budget_rejection_(std::move(report_body_budget_rejection)) {
     assert(executor_);
+    assert(report_event_body_budget_);
 }
 
 template <typename Request, typename Response, typename Callback>

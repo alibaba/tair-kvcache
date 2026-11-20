@@ -105,6 +105,56 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, AccessLogPayloadModeDefaultsToMetadata) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "full"}}));
+    EXPECT_TRUE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "metadata"}}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+    EXPECT_FALSE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "unknown"}}));
+}
+
+TEST_F(ServerConfigTest, AccessLogPayloadModeEnvironmentOverride) {
+    ServerConfig config;
+    {
+        const ScopedEnv env("kvcm_logger_access_log_payload_mode", "full");
+        ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "metadata"}}));
+        EXPECT_TRUE(config.IncludeAccessLogPayload());
+    }
+
+    const std::string config_file = GetPrivateTestDataPath() + "server_config_simple.conf";
+    ASSERT_TRUE(config.Parse(config_file, {}));
+    EXPECT_TRUE(config.IncludeAccessLogPayload());
+
+    const ScopedEnv env("kvcm_logger_access_log_payload_mode", "metadata");
+    ASSERT_TRUE(config.Parse(config_file, {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+}
+
+TEST_F(ServerConfigTest, LegacyFullAccessLogEnvironmentVariables) {
+    ServerConfig config;
+    {
+        const ScopedEnv env("KVCM_REPORT_EVENT_FULL_ACCESS_LOG", "true");
+        ASSERT_TRUE(config.Parse("", {}));
+        EXPECT_FALSE(config.IncludeAccessLogPayload());
+        EXPECT_TRUE(config.IsReportEventFullAccessLogEnabled());
+        EXPECT_FALSE(config.IsGetHostCacheStateFullAccessLogEnabled());
+    }
+
+    const ScopedEnv env("KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG", "true");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+    EXPECT_FALSE(config.IsReportEventFullAccessLogEnabled());
+    EXPECT_TRUE(config.IsGetHostCacheStateFullAccessLogEnabled());
+}
+
 TEST_F(ServerConfigTest, GrpcMaxThreadsValidation) {
     for (const std::string value : {"-1", "0", "2", "64", "2147483647"}) {
         SCOPED_TRACE(value);
@@ -173,6 +223,24 @@ TEST_F(ServerConfigTest, GrpcMemoryQuotaEnvironmentOverride) {
                              {{"kvcm.service.grpc_memory_quota_bytes", "268435456"}}));
     EXPECT_EQ(67108864u, config.GetServiceGrpcMemoryQuotaBytes());
     EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, HttpReportEventBodyBudgetValidation) {
+    const std::string key = "kvcm.service.http_report_event_body_budget_bytes";
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetHttpReportEventBodyBudgetBytes());
+    ASSERT_TRUE(config.Parse("", {{key, "1073741824"}}));
+    EXPECT_EQ(1073741824u, config.GetHttpReportEventBodyBudgetBytes());
+    for (const char *value : {"", "-1", "+1", "1GiB", "1073741825", "4294967296"}) {
+        SCOPED_TRACE(value);
+        EXPECT_FALSE(config.Parse("", {{key, value}}));
+    }
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetHttpReportEventBodyBudgetBytes());
+    ScopedEnv env("kvcm_service_http_report_event_body_budget_bytes", "268435456");
+    ASSERT_TRUE(config.Parse("", {{key, "134217728"}}));
+    EXPECT_EQ(268435456u, config.GetHttpReportEventBodyBudgetBytes());
 }
 
 TEST_F(ServerConfigTest, GrpcCompletionQueueThreads) {

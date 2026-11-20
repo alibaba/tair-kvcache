@@ -26,6 +26,7 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/simple/simple_kv_cache_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 
 using namespace kv_cache_manager;
@@ -86,7 +87,7 @@ TEST(CacheLocationMoveTest, RedisSpecNameInterningPreservesJson) {
 
     const FieldMap fields{{PROPERTY_LOCATION_PREFIX + std::string("event-id"), json}};
     CacheLocationMap recovered;
-    ASSERT_EQ(EC_OK, DeserializeLocations(fields, recovered, &ids, &names));
+    ASSERT_EQ(EC_OK, RedisLocationCodec{}.DeserializeFieldMap(fields, recovered, nullptr, &ids, &names));
     EXPECT_EQ(&first.location_specs().front().name(), &recovered.at("event-id")->location_specs().front().name());
 
     CacheLocation legacy;
@@ -236,8 +237,8 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
         {PROPERTY_LOCATION_PREFIX + std::string("shared"),
          CacheLocation("shared", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1, {})
              .ToJsonString()}};
-    ASSERT_EQ(EC_OK, DeserializeLocations(fields, first, &interner));
-    ASSERT_EQ(EC_OK, DeserializeFieldMap(fields, second, properties, &interner));
+    ASSERT_EQ(EC_OK, RedisLocationCodec{}.DeserializeFieldMap(fields, first, nullptr, &interner, nullptr));
+    ASSERT_EQ(EC_OK, RedisLocationCodec{}.DeserializeFieldMap(fields, second, &properties, &interner, nullptr));
     ASSERT_EQ(1u, first.size());
     ASSERT_EQ(1u, second.size());
     EXPECT_EQ(&first.at("shared")->id(), &second.at("shared")->id());
@@ -249,8 +250,10 @@ TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
          CacheLocation("random01", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {}).ToJsonString()}};
     CacheLocationMap random_first;
     CacheLocationMap random_second;
-    ASSERT_EQ(EC_OK, DeserializeLocations(random_fields, random_first, &interner));
-    ASSERT_EQ(EC_OK, DeserializeLocations(random_fields, random_second, &interner));
+    ASSERT_EQ(EC_OK,
+              RedisLocationCodec{}.DeserializeFieldMap(random_fields, random_first, nullptr, &interner, nullptr));
+    ASSERT_EQ(EC_OK,
+              RedisLocationCodec{}.DeserializeFieldMap(random_fields, random_second, nullptr, &interner, nullptr));
     EXPECT_NE(&random_first.at("random01")->id(), &random_second.at("random01")->id());
 
     CacheLocation unknown_status;
@@ -1598,6 +1601,271 @@ TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParalle
             EXPECT_EQ(20481, matches[0].local);
             EXPECT_EQ(20481, matches[0].global);
         }
+    }
+}
+
+class SnapshotPersistentBackend : public MetaLocalBackend {
+public:
+    std::vector<ErrorCode> Get(RequestContext *context,
+                               const KeyVector &keys,
+                               CacheLocationMapVector &locations,
+                               PropertyMapVector &properties) noexcept override {
+        std::vector<ErrorCode> errors = MetaLocalBackend::Get(context, keys, locations, properties);
+        // Redis does not synthesize Local's access-time property during Get.
+        for (PropertyMap &property : properties) {
+            property.erase(PROPERTY_LRU_TIME);
+        }
+        return errors;
+    }
+};
+
+class PartialSnapshotUpsertBackend : public SnapshotPersistentBackend {
+public:
+    KeyType failed_key = 2;
+
+    std::vector<ErrorCode> Upsert(RequestContext *context,
+                                  const KeyVector &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        std::vector<ErrorCode> errors = MetaLocalBackend::Upsert(context, keys, locations, properties);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == failed_key) {
+                errors[i] = EC_IO_ERROR;
+            }
+        }
+        return errors;
+    }
+};
+
+class SimpleSnapshotWriteTest : public MetaSearcherTest {
+public:
+    void SetUp() override { request_context_ = std::make_shared<RequestContext>("simple_snapshot"); }
+
+    void Init(int mode) {
+        meta_searcher_.reset();
+        meta_indexer_.reset();
+        const std::string instance_id = "simple_snapshot_" + std::to_string(mode);
+        auto info = std::make_shared<InstanceInfo>("",
+                                                   "group",
+                                                   instance_id,
+                                                   1024,
+                                                   std::vector<LocationSpecInfo>{LocationSpecInfo("tp0", 4096)},
+                                                   ModelDeployment{},
+                                                   std::vector<LocationSpecGroup>{},
+                                                   0);
+        info->set_disable_write_session(true);
+        auto config = std::make_shared<MetaIndexerConfig>();
+        config->SetMaxKeyCount(3);
+        config->SetMutexShardNum(2);
+        config->SetBatchKeySize(2);
+        meta_indexer_ = std::make_shared<MetaIndexer>(info);
+        ASSERT_EQ(EC_OK, meta_indexer_->Init(instance_id, config));
+        if (mode != 0) {
+            MetaStorageBackendManager &manager = *meta_indexer_->backend_manager_;
+            ASSERT_EQ(EC_OK, manager.persistent_backend_->Close());
+            auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+            backend_config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+            manager.persistent_backend_ = std::make_unique<SnapshotPersistentBackend>();
+            manager.cache_backend_ = std::make_unique<SimpleKVCacheBackend>(std::make_shared<const std::string>("tp0"));
+            ASSERT_EQ(EC_OK, manager.persistent_backend_->Init(instance_id, backend_config));
+            ASSERT_EQ(EC_OK, manager.cache_backend_->Init(instance_id, backend_config));
+            ASSERT_EQ(EC_OK, manager.persistent_backend_->Open());
+            ASSERT_EQ(EC_OK, manager.cache_backend_->Open());
+            manager.recover_state_.store(mode == 2 ? MetaStorageBackendManager::RecoverState::kRecover
+                                                   : MetaStorageBackendManager::RecoverState::kRunning);
+        }
+        meta_searcher_ =
+            std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+    }
+
+    std::string Id(int reporter) { return "kvs#event_report_l2#mem#127.0.0.1:" + std::to_string(reporter); }
+
+    MetaSearcher::ReplaceLocationSpecsTask Task(int reporter, uint64_t size) {
+        return {Id(reporter),
+                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                CLS_SERVING,
+                {LocationSpec("tp0",
+                              "event_report://127.0.0.1:" + std::to_string(reporter) +
+                                  "/mem?s_v=11111111&size=" + std::to_string(size))}};
+    }
+
+    void Seed() {
+        const auto seed = [this](const std::vector<ErrorCode> &,
+                                 const LocationIdVector &ids,
+                                 size_t key_index,
+                                 CacheLocationVector &locations,
+                                 PropertyMap &) {
+            locations.clear();
+            for (const std::string &id : ids) {
+                const int reporter = id == Id(1) ? 1 : 2;
+                const MetaSearcher::ReplaceLocationSpecsTask task =
+                    Task(reporter, key_index == 0 ? (reporter == 1 ? 7 : 11) : 5);
+                auto location = std::make_shared<CacheLocation>(id, CLS_SERVING, task.type, 1, task.specs);
+                location->set_create_time(key_index == 0 ? (reporter == 1 ? 123 : 456) : 789);
+                locations.push_back(std::move(location));
+            }
+            return LocationModifierResult{MA_OK, std::vector<ErrorCode>(ids.size(), EC_OK)};
+        };
+        ASSERT_EQ(EC_OK,
+                  meta_indexer_
+                      ->ReadModifyWriteTargetLocations(request_context_.get(), {1, 2}, {{Id(1), Id(2)}, {Id(2)}}, seed)
+                      .ec);
+        EXPECT_EQ(0u, meta_indexer_->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 23));
+    }
+
+    CacheLocationMap Read(KeyType key) {
+        CacheLocationMapVector locations;
+        const MetaIndexer::Result result = meta_indexer_->GetLocations(request_context_.get(), {key}, locations);
+        EXPECT_EQ(EC_OK, result.ec);
+        EXPECT_EQ(1u, locations.size());
+        return locations.empty() ? CacheLocationMap{} : locations.front();
+    }
+};
+
+TEST_F(SimpleSnapshotWriteTest, PreservesCountsTimesPeersAndCapacityAcrossLocalCachedAndRecovery) {
+    for (const int mode : {0, 1, 2}) {
+        SCOPED_TRACE(mode);
+        ASSERT_NO_FATAL_FAILURE(Init(mode));
+        ASSERT_NO_FATAL_FAILURE(Seed());
+        if (mode == 2) {
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+                      meta_indexer_->backend_manager_->cache_backend_->Delete(nullptr, {1, 2}));
+        }
+        const int64_t started = TimestampUtil::GetCurrentTimeUs();
+        std::vector<ErrorCode> errors;
+        for (size_t round = 0; round < 2; ++round) {
+            std::vector<MetaSearcher::ReplaceLocationSpecsTask> tasks{
+                Task(1, 17), Task(3, 19), Task(1, 23), Task(1, 29)};
+            const ErrorCode ec = meta_searcher_->BatchReplaceLocationSpecsFlat(
+                request_context_.get(), {1, 2, 3, 4}, {0, 2, 3, 4, 4}, tasks, errors, nullptr);
+            EXPECT_EQ(EC_OK, ec);
+            ASSERT_EQ((std::vector<ErrorCode>(4, EC_OK)), errors);
+            EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+            EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+            EXPECT_EQ(104u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        }
+        const CacheLocationMap first = Read(1);
+        const CacheLocationMap second = Read(2);
+        const CacheLocationMap third = Read(3);
+        ASSERT_EQ(3u, first.size());
+        ASSERT_EQ(2u, second.size());
+        ASSERT_EQ(1u, third.size());
+        EXPECT_EQ(123, first.at(Id(1))->create_time());
+        EXPECT_EQ(456, first.at(Id(2))->create_time());
+        EXPECT_EQ(789, second.at(Id(2))->create_time());
+        EXPECT_GE(first.at(Id(3))->create_time(), started);
+        EXPECT_GE(second.at(Id(1))->create_time(), started);
+        EXPECT_GE(third.at(Id(1))->create_time(), started);
+
+        std::vector<MetaSearcher::ReplaceLocationSpecsTask> tasks{Task(1, 31), Task(1, 37)};
+        EXPECT_NE(EC_OK,
+                  meta_searcher_->BatchReplaceLocationSpecsFlat(
+                      request_context_.get(), {1, 5}, {0, 1, 2}, tasks, errors, nullptr));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}), errors);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+        EXPECT_EQ(118u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        EXPECT_EQ(123, Read(1).at(Id(1))->create_time());
+        tasks = {Task(1, 99)};
+        const MetaSearcher::AcquireMetadataWriteLeaseFunc deny = [] {
+            return std::pair<ErrorCode, MetaSearcher::MetadataWriteLease>{EC_MISMATCH, {}};
+        };
+        EXPECT_NE(
+            EC_OK,
+            meta_searcher_->BatchReplaceLocationSpecsFlat(request_context_.get(), {1}, {0, 1}, tasks, errors, deny));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), errors);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(6u, meta_indexer_->GetLocationCount());
+        EXPECT_EQ(118u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        EXPECT_EQ(Task(1, 31).specs.front().uri(), Read(1).at(Id(1))->location_specs().front().uri());
+        if (mode != 0) {
+            CacheLocationMapVector persistent;
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      meta_indexer_->backend_manager_->persistent_backend_->GetLocations(nullptr, {1}, persistent));
+            ASSERT_EQ(3u, persistent.front().size());
+            EXPECT_EQ(456, persistent.front().at(Id(2))->create_time());
+        }
+    }
+}
+
+TEST_F(SimpleSnapshotWriteTest, RejectsInvalidSimpleLocationsBeforeWriting) {
+    ASSERT_NO_FATAL_FAILURE(Init(1));
+    ASSERT_NO_FATAL_FAILURE(Seed());
+    std::vector<ErrorCode> errors;
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> tasks{Task(1, 99)};
+    tasks.front().specs.front().set_name("wrong");
+    EXPECT_NE(
+        EC_OK,
+        meta_searcher_->BatchReplaceLocationSpecsFlat(request_context_.get(), {1}, {0, 1}, tasks, errors, nullptr));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), errors);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
+    EXPECT_EQ(23u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(123, Read(1).at(Id(1))->create_time());
+    EXPECT_EQ(Task(1, 7).specs.front().uri(), Read(1).at(Id(1))->location_specs().front().uri());
+}
+
+TEST_F(SimpleSnapshotWriteTest, InvalidRecoveredLocationHasNoPreviousView) {
+    ASSERT_NO_FATAL_FAILURE(Init(2));
+    MetaStorageBackendManager &manager = *meta_indexer_->backend_manager_;
+    const MetaSearcher::ReplaceLocationSpecsTask task = Task(1, 7);
+    const auto invalid =
+        std::make_shared<CacheLocation>(task.location_id, CLS_WRITING, task.type, task.specs.size(), task.specs);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              manager.persistent_backend_->Put(nullptr, {1}, {{{task.location_id, invalid}}}, PropertyMapVector(1)));
+
+    bool modifier_called = false;
+    const MetaIndexer::LocationViewModifierFunc check =
+        [&modifier_called](const std::vector<ErrorCode> &errors,
+                           const LocationIdVector &,
+                           size_t,
+                           const std::vector<CacheLocationReadView> &previous,
+                           CacheLocationVector &locations,
+                           PropertyMap &) {
+            modifier_called = true;
+            EXPECT_EQ(std::vector<ErrorCode>{EC_BADARGS}, errors);
+            EXPECT_FALSE(previous.at(0));
+            EXPECT_EQ(nullptr, locations.at(0));
+            return LocationModifierResult{MA_FAIL, errors};
+        };
+    const MetaIndexer::LocationResult result =
+        meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), {1}, {{task.location_id}}, check);
+    EXPECT_TRUE(modifier_called);
+    EXPECT_EQ(EC_ERROR, result.ec);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_BADARGS}}), result.per_location_error_codes);
+}
+
+TEST_F(SimpleSnapshotWriteTest, CountsOnlyReportedSuccessesAndRetryWithoutDuplicatingCounts) {
+    ASSERT_NO_FATAL_FAILURE(Init(1));
+    MetaStorageBackendManager &manager = *meta_indexer_->backend_manager_;
+    ASSERT_EQ(EC_OK, manager.persistent_backend_->Close());
+    auto backend = std::make_unique<PartialSnapshotUpsertBackend>();
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    ASSERT_EQ(EC_OK, backend->Init("partial_snapshot", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+    manager.persistent_backend_ = std::move(backend);
+    std::vector<ErrorCode> errors;
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> tasks{Task(1, 7), Task(1, 11), Task(1, 13)};
+    EXPECT_NE(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), {1, 2, 3}, {0, 1, 2, 3}, tasks, errors, nullptr));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_IO_ERROR, EC_OK}), errors);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(2u, meta_indexer_->GetLocationCount());
+    EXPECT_EQ(20u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    const int64_t original_time = Read(1).at(Id(1))->create_time();
+    static_cast<PartialSnapshotUpsertBackend &>(*manager.persistent_backend_).failed_key = -1;
+    for (size_t attempt = 0; attempt < 2; ++attempt) {
+        tasks = {Task(1, 7), Task(1, 11), Task(1, 13)};
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchReplaceLocationSpecsFlat(
+                      request_context_.get(), {1, 2, 3}, {0, 1, 2, 3}, tasks, errors, nullptr));
+        EXPECT_EQ((std::vector<ErrorCode>(3, EC_OK)), errors);
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
+        EXPECT_EQ(31u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        EXPECT_EQ(original_time, Read(1).at(Id(1))->create_time());
     }
 }
 

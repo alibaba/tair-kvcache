@@ -169,7 +169,7 @@ bool RedisClient::GetReplyStrOrNil(const redisReply *reply, std::string &out_str
         KVCM_REDIS_LOG_ERROR("redis get reply str or nil fail, unexpected reply type[%d]", reply->type);
         return false;
     }
-    out_str = (reply->type == REDIS_REPLY_STRING ? std::string(reply->str) : std::string());
+    out_str = (reply->type == REDIS_REPLY_STRING ? std::string(reply->str, reply->len) : std::string());
     return true;
 }
 

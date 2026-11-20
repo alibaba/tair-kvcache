@@ -34,13 +34,15 @@ MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instan
 
 std::unique_ptr<MetaStorageBackend>
 MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_id,
-                                                   const std::shared_ptr<MetaStorageBackendConfig> &config) {
+                                                   const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                                   const SharedLocationSpecName &simple_spec_name) {
     const std::string &storage_type = config->GetStorageType();
+    RedisLocationCodec codec(simple_spec_name);
     std::unique_ptr<MetaStorageBackend> backend;
     if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
-        backend = std::make_unique<MetaRedisBackend>();
+        backend = std::make_unique<MetaRedisBackend>(std::move(codec));
     } else if (storage_type == META_ASYNC_REDIS_BACKEND_TYPE_STR) {
-        backend = std::make_unique<MetaAsyncRedisBackend>();
+        backend = std::make_unique<MetaAsyncRedisBackend>(std::move(codec));
     } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaDummyBackend>();
     } else {

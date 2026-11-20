@@ -177,7 +177,8 @@ void GrpcStubTest::StartService(int port) {
     loader.Load("");
     metrics_reporter_ = std::make_shared<DummyMetricsReporter>();
     metrics_reporter_->Init(cache_manager_, metrics_registry_, "");
-    meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, nullptr);
+    meta_service_impl_ = std::make_shared<MetaServiceImpl>(
+        cache_manager_, metrics_reporter_, nullptr, MetaServiceImpl::AccessLogOptions{});
     meta_service_ =
         std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_, executor_);
     meta_service_->Init();
@@ -1010,7 +1011,8 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     ASSERT_EQ(EC_OK, leader_elector->SetSelfNodeInfo(node_info));
 
     // Recreate MetaServiceImpl with the leader elector.
-    meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector);
+    meta_service_impl_ = std::make_shared<MetaServiceImpl>(
+        cache_manager_, metrics_reporter_, leader_elector, MetaServiceImpl::AccessLogOptions{});
     meta_service_ =
         std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_, executor_);
     meta_service_->Init();

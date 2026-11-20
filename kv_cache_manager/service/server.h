@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -37,6 +38,7 @@ class RedisHealthMetrics;
 class CoordinationRedisHealthMetrics;
 struct MetricsLifecycle;
 class LoopThread;
+class ReportEventBodyBudget;
 
 class Server {
 public:
@@ -66,6 +68,8 @@ private:
     bool is_startup_loaded_ = false;
     ServerConfig config_;
     std::shared_ptr<ServiceRequestExecutor> request_executor_;
+    std::shared_ptr<ReportEventBodyBudget> report_event_body_budget_;
+    std::shared_ptr<LoopThread> report_event_body_budget_thread_;
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
     std::shared_ptr<DebugServiceImpl> debug_impl_;
@@ -99,6 +103,7 @@ private:
     std::shared_ptr<CoordinationRedisHealthMetrics> coordination_redis_health_metrics_;
     std::shared_ptr<LoopThread> coordination_redis_health_thread_;
     // Accessed by the report thread, then by Stop after that thread is joined.
+    std::chrono::steady_clock::time_point last_body_budget_report_;
     uint64_t last_request_rejected_ = 0;
     uint64_t last_request_discarded_ = 0;
     ServiceRequestExecutor::QueueWaitStats last_queue_wait_;

@@ -8,7 +8,6 @@
 #include <vector>
 
 #include "google/protobuf/message.h"
-#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -28,10 +27,15 @@
 
 // TODO(rui): move into common.h
 #define API_CALL_GUARD_WITH_DEBUG(                                                                                     \
-    api_name, is_leader_only, request_debug_expr, response_debug_expr, response_json_kind)                             \
+    api_name, is_leader_only, request_debug_expr, response_debug_expr, response_json_kind, full_access_log_override)   \
+    const bool force_full_access_log = (full_access_log_override);                                                     \
+    const bool include_access_log_payload = access_log_options_.include_payload || force_full_access_log;              \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    request_context->set_request_debug_json((request_debug_expr));                                                     \
+    if (include_access_log_payload) {                                                                                  \
+        request_context->set_request_debug_json(force_full_access_log ? BuildProtoMessageDebugJson(request)            \
+                                                                      : (request_debug_expr));                         \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -42,18 +46,27 @@
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);                                                                \
         return;                                                                                                        \
     }                                                                                                                  \
-    request_context->set_response_debug_json_generator([response]() { return (response_debug_expr); },                 \
-                                                       response_json_kind);                                            \
-    ServiceCallGuard service_call_guard(cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() {     \
-        DecrementRequestCount(is_leader_only);                                                                         \
-    });
+    const RequestContext::ResponseJsonKind access_log_response_kind =                                                  \
+        force_full_access_log ? RequestContext::ResponseJsonKind::kFullMessage : (response_json_kind);                 \
+    if (include_access_log_payload || access_log_response_kind == RequestContext::ResponseJsonKind::kFullMessage) {    \
+        request_context->set_response_debug_json_generator(                                                            \
+            [response, full = force_full_access_log]() {                                                               \
+                return full ? BuildProtoMessageDebugJson(response) : (response_debug_expr);                            \
+            },                                                                                                         \
+            access_log_response_kind);                                                                                 \
+    }                                                                                                                  \
+    ServiceCallGuard service_call_guard(                                                                               \
+        cache_manager_.get(), request_context, metrics_reporter_.get(), include_access_log_payload, [this]() {         \
+            DecrementRequestCount(is_leader_only);                                                                     \
+        });
 
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     API_CALL_GUARD_WITH_DEBUG(api_name,                                                                                \
                               is_leader_only,                                                                          \
                               BuildProtoMessageDebugJson(request),                                                     \
                               BuildProtoMessageDebugJson(response),                                                    \
-                              RequestContext::ResponseJsonKind::kFullMessage)
+                              RequestContext::ResponseJsonKind::kFullMessage,                                          \
+                              false)
 
 #define SET_SPAN_TRACER_STR_IN_HEADER(request_context_pointer)                                                         \
     if (request_context_pointer->need_span_tracer()) {                                                                 \
@@ -112,18 +125,11 @@ namespace kv_cache_manager {
 
 namespace {
 
-constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
-constexpr const char *kGetHostCacheStateFullAccessLogEnv = "KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG";
-
 RequestContext::JsonFragment BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
     RequestContext::JsonFragment fragment;
     fragment.valid = ProtoMessageJsonUtil::ToJson(message, fragment.json);
     return fragment;
 }
-
-bool IsReportEventFullAccessLogEnabled() { return EnvUtil::GetEnv(kReportEventFullAccessLogEnv, false); }
-
-bool IsGetHostCacheStateFullAccessLogEnabled() { return EnvUtil::GetEnv(kGetHostCacheStateFullAccessLogEnv, false); }
 
 const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
     if (event.has_block_add()) {
@@ -139,10 +145,6 @@ const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
 }
 
 RequestContext::JsonFragment BuildReportEventRequestAccessLogSummary(const proto::meta::ReportEventRequest *request) {
-    if (IsReportEventFullAccessLogEnabled()) {
-        return BuildProtoMessageDebugJson(request);
-    }
-
     int node_register_count = 0;
     int heartbeat_count = 0;
     int host_down_count = 0;
@@ -225,10 +227,6 @@ RequestContext::JsonFragment BuildReportEventRequestAccessLogSummary(const proto
 
 RequestContext::JsonFragment
 BuildReportEventResponseAccessLogSummary(const proto::meta::ReportEventResponse *response) {
-    if (IsReportEventFullAccessLogEnabled()) {
-        return BuildProtoMessageDebugJson(response);
-    }
-
     int failed_item_count = 0;
     for (const auto item_result : response->item_results()) {
         if (item_result != proto::meta::OK) {
@@ -256,10 +254,6 @@ BuildReportEventResponseAccessLogSummary(const proto::meta::ReportEventResponse 
 
 RequestContext::JsonFragment
 BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheStateRequest *request) {
-    if (IsGetHostCacheStateFullAccessLogEnabled()) {
-        return BuildProtoMessageDebugJson(request);
-    }
-
     rapidjson::StringBuffer sb;
     rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
     writer.StartObject();
@@ -293,10 +287,6 @@ BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheSta
 
 RequestContext::JsonFragment
 BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheStateResponse *response) {
-    if (IsGetHostCacheStateFullAccessLogEnabled()) {
-        return BuildProtoMessageDebugJson(response);
-    }
-
     int64_t max_prefix_match_blocks = 0;
     for (const auto &host : response->hosts()) {
         max_prefix_match_blocks = std::max(max_prefix_match_blocks, host.local());
@@ -321,11 +311,13 @@ BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheSt
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                  std::shared_ptr<MetricsReporter> metrics_reporter,
-                                 std::shared_ptr<LeaderElector> leader_elector)
+                                 std::shared_ptr<LeaderElector> leader_elector,
+                                 AccessLogOptions access_log_options)
     : ServiceImplBase()
     , cache_manager_(std::move(cache_manager))
     , metrics_reporter_(std::move(metrics_reporter))
-    , leader_elector_(std::move(leader_elector)) {}
+    , leader_elector_(std::move(leader_elector))
+    , access_log_options_(access_log_options) {}
 
 void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                        const proto::meta::RegisterInstanceRequest *request,
@@ -984,7 +976,8 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                               true,
                               BuildReportEventRequestAccessLogSummary(request),
                               BuildReportEventResponseAccessLogSummary(response),
-                              RequestContext::ResponseJsonKind::kAccessLogSummary);
+                              RequestContext::ResponseJsonKind::kAccessLogSummary,
+                              access_log_options_.full_report_event);
     auto *header = response->mutable_header();
 
     KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
@@ -1018,7 +1011,8 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                               true,
                               BuildGetHostCacheStateRequestAccessLogSummary(request),
                               BuildGetHostCacheStateResponseAccessLogSummary(response),
-                              RequestContext::ResponseJsonKind::kAccessLogSummary);
+                              RequestContext::ResponseJsonKind::kAccessLogSummary,
+                              access_log_options_.full_get_host_cache_state);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
     std::string invalid_fields = "missing or invalid fields: ";

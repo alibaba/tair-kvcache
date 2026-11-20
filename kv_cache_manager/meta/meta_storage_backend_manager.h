@@ -44,7 +44,8 @@ public:
     // Injected local serves as the sole backend for local, or the hot layer for cached.
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config,
-                   std::unique_ptr<MetaCacheBaseBackend> injected_local) noexcept;
+                   std::unique_ptr<MetaCacheBaseBackend> injected_local,
+                   const SharedLocationSpecName &simple_spec_name) noexcept;
 
     ErrorCode Open() noexcept;
     ErrorCode Close() noexcept;

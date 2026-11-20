@@ -32,11 +32,10 @@ void WriteTrustedObject(JsonWriter &writer, const kv_cache_manager::RequestConte
 
 } // namespace
 
-std::string AccessLogWriter::Build(const RequestContext &request_context) {
-    // Materialize lazy fragments before taking the end timestamp so access-log
-    // request cost retains the existing inclusion of JSON serialization time.
-    const RequestContext::JsonFragment &request_json = request_context.request_debug_json();
-    const RequestContext::JsonFragment &response_json = request_context.response_debug_json();
+std::string AccessLogWriter::Build(const RequestContext &request_context, bool include_payload) {
+    // Include response serialization in the logged cost when writing the payload.
+    const RequestContext::JsonFragment *response_json =
+        include_payload ? &request_context.response_debug_json() : nullptr;
     const int64_t cost_us = TimestampUtil::GetCurrentTimeUs() - request_context.request_begin_time_us();
 
     rapidjson::StringBuffer buffer;
@@ -58,10 +57,12 @@ std::string AccessLogWriter::Build(const RequestContext &request_context) {
     writer.Key("request_cost_time_us");
     writer.Int64(cost_us);
 
-    writer.Key("request");
-    WriteTrustedObject(writer, request_json);
-    writer.Key("response");
-    WriteTrustedObject(writer, response_json);
+    if (response_json) {
+        writer.Key("request");
+        WriteTrustedObject(writer, request_context.request_debug_json());
+        writer.Key("response");
+        WriteTrustedObject(writer, *response_json);
+    }
 
     writer.EndObject();
     return std::string(buffer.GetString(), buffer.GetSize());

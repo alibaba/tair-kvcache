@@ -54,13 +54,18 @@ TEST_F(RequestContextTest, ResponseJsonIsMaterializedOnce) {
 
 TEST_F(RequestContextTest, AccessLogSummaryIsNotReusable) {
     RequestContext request_context("fake_trace_id");
+    int response_serializations = 0;
     request_context.set_response_debug_json_generator(
-        []() { return RequestContext::JsonFragment{R"({"summary":true})", true}; },
+        [&response_serializations]() {
+            ++response_serializations;
+            return RequestContext::JsonFragment{R"({"summary":true})", true};
+        },
         RequestContext::ResponseJsonKind::kAccessLogSummary);
 
-    EXPECT_EQ(R"({"summary":true})", request_context.response_debug_json().json);
     EXPECT_FALSE(request_context.TakeReusableResponseJson().has_value());
+    EXPECT_EQ(0, response_serializations);
     EXPECT_EQ(R"({"summary":true})", request_context.response_debug_json().json);
+    EXPECT_EQ(1, response_serializations);
 }
 
 TEST_F(RequestContextTest, FailedResponseJsonIsNotReusable) {

@@ -204,6 +204,7 @@ cc_test(
         "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service",
         "//kv_cache_manager/service:service_request_executor",
+        "//kv_cache_manager/service/util:report_event_body_budget",
     ],
 )
 
@@ -331,7 +332,14 @@ cc_test(
     ],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:meta_service_impl",
+        "//kv_cache_manager/service:service_request_executor",
         "//kv_cache_manager/service/http_service",
+        "//kv_cache_manager/service/util:proto_message_json_util",
+        "//kv_cache_manager/service/util:report_event_body_budget",
         "@yalantinglibs//:ylt",
     ],
 )

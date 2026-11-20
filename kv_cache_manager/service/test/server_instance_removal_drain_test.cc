@@ -126,9 +126,15 @@ public:
         ASSERT_TRUE(server_.cache_manager_->Init());
         SeedInstance(kInstance);
         SeedInstance(kSentinel);
-        server_.meta_impl_ = std::make_shared<MetaServiceImpl>(server_.cache_manager_, nullptr, nullptr);
-        server_.admin_impl_ = std::make_shared<AdminServiceImpl>(
-            server_.cache_manager_, nullptr, server_.metrics_registry_, server_.registry_manager_, nullptr);
+        const bool include_access_log_payload = true;
+        server_.meta_impl_ = std::make_shared<MetaServiceImpl>(
+            server_.cache_manager_, nullptr, nullptr, MetaServiceImpl::AccessLogOptions{include_access_log_payload});
+        server_.admin_impl_ = std::make_shared<AdminServiceImpl>(server_.cache_manager_,
+                                                                 nullptr,
+                                                                 server_.metrics_registry_,
+                                                                 server_.registry_manager_,
+                                                                 nullptr,
+                                                                 include_access_log_payload);
         server_.meta_impl_->EnableLeaderOnlyRequests();
         server_.admin_impl_->EnableLeaderOnlyRequests();
     }
