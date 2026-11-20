@@ -2,6 +2,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +21,9 @@ class ServiceProcessController {
     using PortsArray = std::array<int, 4>;
 
 public:
+    // 优雅关闭的等待上限；超过就认为关闭卡住。
+    static constexpr int64_t kStopServiceTimeoutMs = 60 * 1000;
+
     bool StartServiceInSubProcess(const std::filesystem::path &workspace_path) {
         if (!GenFreePorts()) {
             return false;
@@ -61,17 +65,32 @@ public:
         return true;
     }
 
-    void StopService() {
+    // 优雅关闭卡住时不能无限轮询把 CI 挂死：超时后强制结束并返回失败。
+    bool StopService(int64_t timeout_ms = kStopServiceTimeoutMs) {
         fprintf(stdout, "stop service\n");
         fflush(stdout);
         kill(service_pid_, SIGTERM);
-        while (true) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto result = GetServiceProcessPid(service_ports_);
+            if (result.has_value() && !result.value().second) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        fprintf(stderr, "stop service timeout after %ld ms, force kill pid[%d]\n", timeout_ms, service_pid_);
+        fflush(stderr);
+        kill(service_pid_, SIGKILL);
+        auto kill_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < kill_deadline) {
             auto result = GetServiceProcessPid(service_ports_);
             if (result.has_value() && !result.value().second) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        return false;
     }
 
     inline int rpc_port() const { return service_ports_[0]; }

@@ -233,6 +233,20 @@ cc_library(
         "loop_thread.h",
     ],
     deps = [
+        ":logger",
+    ],
+)
+
+cc_library(
+    name = "shutdown_controller",
+    srcs = [
+        "shutdown_controller.cc",
+    ],
+    hdrs = [
+        "shutdown_controller.h",
+    ],
+    deps = [
+        ":logger",
     ],
 )
 

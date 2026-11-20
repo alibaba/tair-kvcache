@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -58,11 +59,12 @@ private:
 
     void OnBecomeLeader();
     void OnNoLongerLeader();
+    void DoStop();
 
 private:
     const std::string kLeaderLockKey = "_TAIR_KVCM_LEADER_KEY";
 
-    std::atomic<bool> stop_{false};
+    std::once_flag stop_once_;
     bool is_startup_loaded_ = false;
     ServerConfig config_;
     std::shared_ptr<ServiceRequestExecutor> request_executor_;

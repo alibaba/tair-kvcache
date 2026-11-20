@@ -51,7 +51,7 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
-| **common** | `common/` | 基础设施层：日志、JSON、错误码、Redis 客户端、`RequestContext`（逐请求追踪上下文）、`concurrent_hash_map`、`lru_cache`、`loop_thread`、SDK 与存储后端共用的 `LockFreeThreadPool`、服务发现、崩溃处理等。几乎所有 C++ 模块都依赖它。 |
+| **common** | `common/` | 基础设施层：日志、JSON、错误码、Redis 客户端、`RequestContext`（逐请求追踪上下文）、`concurrent_hash_map`、`lru_cache`、`loop_thread`、SDK 与存储后端共用的 `LockFreeThreadPool`、服务发现、崩溃处理、退出信号消费与优雅关闭通知（`shutdown_controller`，见 [退出信号处理与优雅关闭设计](graceful_shutdown_signal_handling.md)）等。几乎所有 C++ 模块都依赖它。 |
 | **metrics** | `metrics/` | 可观测性。`MetricsRegistry`/`MetricsCollector` 收集指标，多种 reporter（kmonitor/local/logging/dummy）上报，`PrometheusExporter` 通过 HTTP 暴露。 |
 | **event** | `event/` | 轻量事件总线。`EventManager` 将领域事件分发给注册的 `EventPublisher`；除默认日志发布器外，`OptimizerEventPublisher` 会将缓存读取事件转换为 protocol 中的 `TraceQueryRequest`，再经 `SubscriptionEventSink` 交给 service 层的 gRPC 流。 |
 | **protocol** | `protocol/protobuf/` | gRPC/proto 契约。定义 meta/admin/debug/kv_meta 以及 optimizer 事件流服务，生成 C++ 与 Python 桩。 |
