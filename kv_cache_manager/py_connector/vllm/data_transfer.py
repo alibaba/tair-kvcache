@@ -194,7 +194,6 @@ class DataTransferManager:
         coordinator_client: TpCoordinatorClient,
         extra_config: TairKvCacheConnectorExtraConfig,
     ) -> None:
-        self._info = kvcache_info
         self._manager_block_size = manager_block_size
         self._transfer_client = transfer_client
         self._coordinator_client = coordinator_client
@@ -267,6 +266,18 @@ class DataTransferManager:
     ) -> Future:
         return self._io_executor.submit(func, *args, **kwargs)
 
+    def _attn_staging_view(
+        self, cpu_buffer: torch.Tensor, group: AttentionTransferGroup, batch: int
+    ) -> torch.Tensor:
+        """Pinned host staging view for one attention bucket: the *bucket's*
+        element type (instances may mix element sizes, e.g. a V3.2 bf16 main
+        spec next to a uint8 indexer) and one row per token slots
+        (compress_ratio == 1 => manager block rows).
+        """
+        return cpu_buffer.view(group.dtype).view(
+            batch, group.num_kv_ptrs, self._manager_block_size, group.per_token_dim
+        )
+
     # ------------------------------------------------------------------ #
     # BlockBuffer helper
     # ------------------------------------------------------------------ #
@@ -305,7 +316,7 @@ class DataTransferManager:
         block_ids:           state     -> list[int] block id per manager block.
         remote_uris:         positionally aligned with the manager blocks; None
                              where the manager allocated no location for this
-                             group's spec (see ``_spec_groups``).
+                             group's spec (see ``vllm_common.build_spec_groups``).
 
         A block is reported successful only when its data was actually written.
         Where a state group has no state (vLLM's null block in mamba "align"
@@ -478,12 +489,7 @@ class DataTransferManager:
                 # (attention) and copy_ (state) write host pinned memory
                 # directly over PCIe; no device-side staging copy exists.
                 if isinstance(group, AttentionTransferGroup):
-                    view = cpu_buffer.view(self._info.dtype).view(
-                        len(valid),
-                        group.num_kv_ptrs,
-                        self._manager_block_size,
-                        group.per_token_dim,
-                    )
+                    view = self._attn_staging_view(cpu_buffer, group, len(valid))
                     batch_gather_scatter_helper.batch_gather_kv_caches(
                         group.kvcache_ptr_tensor_gpu,
                         view,
@@ -651,12 +657,7 @@ class DataTransferManager:
                     # kernel (attention) and copy_ (state) read host pinned
                     # memory directly over PCIe; no device-side staging copy.
                     if isinstance(group, AttentionTransferGroup):
-                        view = cpu_buffer.view(self._info.dtype).view(
-                            len(valid),
-                            group.num_kv_ptrs,
-                            self._manager_block_size,
-                            group.per_token_dim,
-                        )
+                        view = self._attn_staging_view(cpu_buffer, group, len(valid))
                         batch_gather_scatter_helper.batch_scatter_kv_caches(
                             group.kvcache_ptr_tensor_gpu,
                             view,
