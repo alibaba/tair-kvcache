@@ -80,7 +80,8 @@ protected:
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         reporter_ = std::make_shared<LocalMetricsReporter>();
         ASSERT_TRUE(reporter_->Init(cache_manager_, metrics_registry_, ""));
-        service_ = std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr);
+        service_ =
+            std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr, MetaServiceImpl::AccessLogOptions{});
         service_->DisableLeaderOnlyRequests();
     }
 
@@ -123,6 +124,53 @@ protected:
     std::shared_ptr<CacheManager> cache_manager_;
     std::unique_ptr<MetaServiceImpl> service_;
 };
+
+TEST_F(MetaServiceImplTest, OnlyFullModeMaterializesPayloadBeforeTransport) {
+    for (const bool include_access_log_payload : {false, true}) {
+        MetaServiceImpl service(
+            cache_manager_, reporter_, nullptr, MetaServiceImpl::AccessLogOptions{include_access_log_payload});
+        RequestContext context("payload-mode");
+        proto::meta::GetInstanceInfoRequest request;
+        request.set_trace_id(context.trace_id());
+        proto::meta::GetInstanceInfoResponse response;
+        service.GetInstanceInfo(&context, &request, &response);
+
+        ASSERT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        EXPECT_EQ(include_access_log_payload, context.request_debug_json().valid);
+        EXPECT_EQ(include_access_log_payload, context.response_debug_json_.materialized_);
+    }
+}
+
+TEST_F(MetaServiceImplTest, FullAccessLogOverridesApplyToTheirApi) {
+    const MetaServiceImpl::AccessLogOptions modes[] = {
+        {},
+        {true, false, false},
+        {false, true, false},
+        {false, false, true},
+    };
+    for (const MetaServiceImpl::AccessLogOptions &options : modes) {
+        MetaServiceImpl service(cache_manager_, reporter_, nullptr, options);
+        const bool log_report_event = options.include_payload || options.full_report_event;
+        RequestContext report_context("report-event-log");
+        proto::meta::ReportEventRequest report_request;
+        report_request.set_trace_id(report_context.trace_id());
+        proto::meta::ReportEventResponse report_response;
+        service.ReportEvent(&report_context, &report_request, &report_response);
+        EXPECT_EQ(log_report_event, report_context.request_debug_json().valid);
+        EXPECT_EQ(log_report_event, report_context.response_debug_json().valid);
+        EXPECT_EQ(options.full_report_event, report_context.TakeReusableResponseJson().has_value());
+
+        const bool log_cache_state = options.include_payload || options.full_get_host_cache_state;
+        RequestContext state_context("cache-state-log");
+        proto::meta::GetHostCacheStateRequest state_request;
+        state_request.set_trace_id(state_context.trace_id());
+        proto::meta::GetHostCacheStateResponse state_response;
+        service.GetHostCacheState(&state_context, &state_request, &state_response);
+        EXPECT_EQ(log_cache_state, state_context.request_debug_json().valid);
+        EXPECT_EQ(log_cache_state, state_context.response_debug_json().valid);
+        EXPECT_EQ(options.full_get_host_cache_state, state_context.TakeReusableResponseJson().has_value());
+    }
+}
 
 TEST_F(MetaServiceImplTest, FollowerRejectsReportEventQueryAndWrite) {
     RequestContext query_context("follower-query");

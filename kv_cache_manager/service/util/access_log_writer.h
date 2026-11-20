@@ -10,7 +10,7 @@ class RequestContext;
 // produced exclusively by KVCM serializers and are embedded without reparsing.
 class AccessLogWriter {
 public:
-    static std::string Build(const RequestContext &request_context);
+    static std::string Build(const RequestContext &request_context, bool include_payload);
 };
 
 } // namespace kv_cache_manager

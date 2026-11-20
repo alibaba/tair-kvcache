@@ -277,7 +277,8 @@ protected:
         metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
         registry_ = std::make_shared<RegistryManager>("", metrics_);
         cache_manager_ = std::make_shared<CacheManager>(metrics_, registry_, metrics_lifecycle_);
-        impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, nullptr, std::move(elector));
+        impl_ = std::make_shared<MetaServiceImpl>(
+            cache_manager_, nullptr, std::move(elector), MetaServiceImpl::AccessLogOptions{});
         service_ = std::make_shared<MetaServiceGRpc>(metrics_, impl_, registry_, executor_, metrics_lifecycle_);
         service_->Init();
         grpc_reporter_ = std::make_shared<LocalMetricsReporter>();

@@ -14,19 +14,13 @@ namespace kv_cache_manager {
 
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
                                    RequestContext *request_context,
-                                   MetricsReporter *metrics_reporter)
-    : cache_manager_(cache_manager), request_context_(request_context), metrics_reporter_(metrics_reporter) {
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ServiceQuery);
-}
-
-ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
-                                   RequestContext *request_context,
                                    MetricsReporter *metrics_reporter,
+                                   bool include_access_log_payload,
                                    std::function<void()> completion_callback)
     : cache_manager_(cache_manager)
     , request_context_(request_context)
     , metrics_reporter_(metrics_reporter)
+    , include_access_log_payload_(include_access_log_payload)
     , completion_callback_(std::move(completion_callback)) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ServiceQuery);
@@ -48,9 +42,10 @@ ServiceCallGuard::~ServiceCallGuard() {
     // the wire enum value (where a successful request is non-zero).
     const bool request_failed = request_context_->status_code() != RequestContext::kOkStatusCode;
     const double error_code = request_failed ? 1.0 : 0.0;
-    // The response must be finalized before materialization. Doing this once
-    // here lets the access log and the HTTP transport share the same bytes.
-    request_context_->MaterializeResponseJson();
+    if (include_access_log_payload_) {
+        // Full logs and HTTP can share these bytes after the response is finalized.
+        request_context_->MaterializeResponseJson();
+    }
     if (completion_callback_) {
         completion_callback_();
     }
@@ -82,7 +77,7 @@ ServiceCallGuard::~ServiceCallGuard() {
 }
 
 void ServiceCallGuard::PrintAccessLog(RequestContext *request_context) {
-    std::string access_log = AccessLogWriter::Build(*request_context);
+    std::string access_log = AccessLogWriter::Build(*request_context, include_access_log_payload_);
     KVCM_ACCESS_LOG(access_log);
 }
 

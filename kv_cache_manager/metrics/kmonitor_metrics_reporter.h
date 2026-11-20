@@ -15,6 +15,7 @@ public:
               const std::string &config,
               const MetricsTags &common_tags = {}) override;
     void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) override;
+    void ReportEventBodyBudgetRejections(uint64_t rejected) override;
     void ReportInterval() override;
 
 private:

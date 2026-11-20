@@ -322,7 +322,8 @@ void SimpleKVCacheItem::AppendReadViews(const SharedLocationSpecName &spec_name,
         const DataStorageType type = data.id->compare(0, kL1p5Prefix.size(), kL1p5Prefix) == 0
                                          ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5
                                          : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
-        out_locations.AppendReadView(CacheLocationReadView(*data.id, *spec_name, data.uri, type));
+        out_locations.AppendReadView(
+            CacheLocationReadView(*data.id, *spec_name, data.uri, type, Record(i).create_time));
     }
 }
 

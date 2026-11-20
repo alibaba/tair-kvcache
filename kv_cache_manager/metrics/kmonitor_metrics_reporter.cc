@@ -109,6 +109,9 @@ struct KmonitorMetricsReporter::Context {
     /* ==================== intervallic metrics ===================== */
 
     // Meta request executor metrics
+    DECLARE_METRICS(service, report_event_body_budget_bytes);
+    DECLARE_METRICS(service, report_event_body_in_flight_bytes);
+    DECLARE_METRICS(service, report_event_body_budget_rejected);
     DECLARE_METRICS(service, request_queue_length);
     DECLARE_METRICS(service, request_queue_length_max);
     DECLARE_METRICS(service, request_queue_length_avg);
@@ -439,7 +442,10 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     /* ==================== intervallic metrics ===================== */
 
+    REGISTER_QPS_METRIC(service, report_event_body_budget_rejected);
     // KMonitor represents cumulative counters as GAUGE, not QPS increments.
+    REGISTER_GAUGE_METRIC(service, report_event_body_budget_bytes);
+    REGISTER_GAUGE_METRIC(service, report_event_body_in_flight_bytes);
     REGISTER_GAUGE_METRIC(service, request_queue_length);
     REGISTER_GAUGE_METRIC(service, request_queue_length_max);
     REGISTER_GAUGE_METRIC(service, request_queue_length_avg);
@@ -719,6 +725,12 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
         REPORT_METRICS(data_storage, create_qps, 1.0);
         REPORT_COLLECTED_METRICS(data_storage, create_keys_qps);
         REPORT_COLLECTED_METRICS(data_storage, create_time_us);
+    }
+}
+
+void KmonitorMetricsReporter::ReportEventBodyBudgetRejections(uint64_t rejected) {
+    if (ctx_->service_report_event_body_budget_rejected_metrics) {
+        ctx_->service_report_event_body_budget_rejected_metrics->Report(nullptr, static_cast<double>(rejected));
     }
 }
 
@@ -1121,6 +1133,10 @@ void KmonitorMetricsReporter::ReportInterval() {
             }
         };
 
+        report_registry_metric(ctx_->service_report_event_body_budget_bytes_metrics.get(),
+                               "service.report_event_body_budget_bytes");
+        report_registry_metric(ctx_->service_report_event_body_in_flight_bytes_metrics.get(),
+                               "service.report_event_body_in_flight_bytes");
         report_registry_metric(ctx_->service_request_queue_length_metrics.get(), "service.request_queue_length");
         report_registry_metric(ctx_->service_request_queue_length_max_metrics.get(),
                                "service.request_queue_length_max");

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -22,6 +23,7 @@ public:
                       const std::string &config,
                       const MetricsTags &common_tags = {}) = 0;
     virtual void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) = 0;
+    virtual void ReportEventBodyBudgetRejections(uint64_t) {}
     virtual void ReportInterval() = 0;
     virtual std::shared_ptr<MetricsRegistry> GetMetricsRegistry() = 0;
     const MetricsTags &GetCommonTags() const { return common_tags_; }

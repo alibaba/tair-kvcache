@@ -5,18 +5,21 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/mpsc_write_queue.h"
+#include "kv_cache_manager/meta/utils.h"
 
 namespace kv_cache_manager {
 
 class MetaAsyncRedisBackend : public MetaStorageBackend {
 public:
     MetaAsyncRedisBackend() = default;
+    explicit MetaAsyncRedisBackend(RedisLocationCodec codec) : codec_(std::move(codec)) {}
     ~MetaAsyncRedisBackend() override;
 
     std::string GetStorageType() noexcept override;
@@ -152,6 +155,7 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 2000;
+    const RedisLocationCodec codec_;
     LocationIdInterner id_interner_;
     LocationSpecNameInterner name_interner_;
 

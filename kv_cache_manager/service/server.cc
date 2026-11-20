@@ -40,6 +40,7 @@
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/service_request_executor.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 
@@ -122,9 +123,20 @@ bool Server::Init(const ServerConfig &config) {
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
 
-    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_);
-    admin_impl_ = std::make_shared<AdminServiceImpl>(
-        cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
+    const bool include_access_log_payload = config_.IncludeAccessLogPayload();
+    const MetaServiceImpl::AccessLogOptions access_log_options{
+        include_access_log_payload,
+        config_.IsReportEventFullAccessLogEnabled(),
+        config_.IsGetHostCacheStateFullAccessLogEnabled(),
+    };
+    meta_impl_ =
+        std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_, access_log_options);
+    admin_impl_ = std::make_shared<AdminServiceImpl>(cache_manager_,
+                                                     metrics_reporter_,
+                                                     metrics_registry_,
+                                                     registry_manager_,
+                                                     leader_elector_,
+                                                     include_access_log_payload);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -219,6 +231,30 @@ bool Server::Start() {
                   worker_count,
                   config_.GetServiceWorkerQueueCapacity(),
                   config_.GetServiceWorkerShutdownMode().c_str());
+    const size_t configured_body_budget = config_.GetHttpReportEventBodyBudgetBytes();
+    report_event_body_budget_ = std::make_shared<ReportEventBodyBudget>(configured_body_budget);
+    last_body_budget_report_ = std::chrono::steady_clock::now();
+    KVCM_LOG_INFO("HTTP ReportEvent body budget mode=%s, initial_bytes=%zu",
+                  configured_body_budget == 0 ? "auto" : "fixed",
+                  report_event_body_budget_->Limit());
+    const bool report_kmonitor_qps = config_.metrics_reporter_type() == "kmonitor";
+    if (configured_body_budget == 0 || report_kmonitor_qps) {
+        report_event_body_budget_thread_ = LoopThread::CreateLoopThread(
+            [budget = report_event_body_budget_, reporter = report_kmonitor_qps ? metrics_reporter_ : nullptr]() {
+                budget->Refresh();
+                // A zero update keeps the QPS series visible while there are no rejections.
+                if (reporter) {
+                    reporter->ReportEventBodyBudgetRejections(0);
+                }
+            },
+            ReportEventBodyBudget::kSampleIntervalUs,
+            "report-event-body-budget",
+            true);
+        if (!report_event_body_budget_thread_) {
+            KVCM_LOG_ERROR("init HTTP ReportEvent body budget sampler failed");
+            return false;
+        }
+    }
     if (!StartMetricsReportThread()) {
         KVCM_LOG_ERROR("init metrics reporter failed");
         return false;
@@ -379,7 +415,13 @@ bool Server::StartHttpServer() {
     KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
 
     meta_http_service_ = std::make_shared<MetaServiceHttp>(
-        metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
+        metrics_registry_,
+        meta_impl_,
+        registry_manager_,
+        request_executor_,
+        metrics_lifecycle_,
+        report_event_body_budget_,
+        [reporter = metrics_reporter_]() { reporter->ReportEventBodyBudgetRejections(1); });
     admin_http_service_ = std::make_shared<AdminServiceHttp>(metrics_registry_,
                                                              admin_impl_,
                                                              config_.enable_prometheus(),
@@ -615,6 +657,17 @@ bool Server::StartMetricsReportThread() {
 }
 
 void Server::ReportMetrics(bool final_snapshot) {
+    if (metrics_registry_ && report_event_body_budget_) {
+        metrics_registry_->GetGauge("service.report_event_body_budget_bytes") = report_event_body_budget_->Limit();
+        metrics_registry_->GetGauge("service.report_event_body_in_flight_bytes") = report_event_body_budget_->InUse();
+        const uint64_t rejected = report_event_body_budget_->TakeRejected();
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        const std::chrono::steady_clock::duration elapsed =
+            std::max(now - last_body_budget_report_, std::chrono::steady_clock::duration{1});
+        last_body_budget_report_ = now;
+        metrics_registry_->GetGauge("service.report_event_body_budget_rejected") =
+            static_cast<double>(rejected) / std::chrono::duration<double>(elapsed).count();
+    }
     if (request_executor_) {
         const auto state = request_executor_->TakeMetricsSnapshot();
         // Aggregate at most once per reporting interval, outside admission's
@@ -693,6 +746,9 @@ void Server::Stop() {
         request_executor_->CloseAdmission(config_.GetServiceWorkerShutdownMode() == "drain"
                                               ? ServiceRequestExecutor::ShutdownMode::kDrain
                                               : ServiceRequestExecutor::ShutdownMode::kDiscardPending);
+    }
+    if (report_event_body_budget_thread_) {
+        report_event_body_budget_thread_->Stop();
     }
     if (meta_service_) {
         meta_service_->StopAccepting();

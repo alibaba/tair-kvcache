@@ -11,8 +11,10 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "kv_cache_manager/common/common.h"
@@ -191,6 +193,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         return EC_BADARGS;
     }
     std::unique_ptr<MetaCacheBaseBackend> local;
+    SharedLocationSpecName simple_spec_name;
     if (!SupportsWriteSession()) {
         const std::vector<LocationSpecInfo> &specs = instance_info_->location_spec_infos();
         if (specs.size() != 1 || specs.front().name().empty()) {
@@ -222,8 +225,8 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
                 return EC_CONFIG_ERROR;
             }
         }
-        auto spec_name = std::make_shared<const std::string>(specs.front().name());
-        local = std::make_unique<SimpleKVCacheBackend>(std::move(spec_name));
+        simple_spec_name = std::make_shared<const std::string>(specs.front().name());
+        local = std::make_unique<SimpleKVCacheBackend>(simple_spec_name);
     }
     max_key_count_ = config->GetMaxKeyCount();
     const size_t mutex_shard_num = config->GetMutexShardNum();
@@ -247,7 +250,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     storage_backend_config_ = {storage_backend_config->GetStorageType(), storage_backend_config->GetStorageUri()};
 
     backend_manager_ = std::make_unique<MetaStorageBackendManager>();
-    ErrorCode ec = backend_manager_->Init(instance_id_, storage_backend_config, std::move(local));
+    ErrorCode ec = backend_manager_->Init(instance_id_, storage_backend_config, std::move(local), simple_spec_name);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta storage backend manager init failed, ec[%d]", instance_id_.c_str(), ec);
         backend_manager_.reset();
@@ -887,8 +890,14 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count,
                                                                  bool fill_missing_cache) noexcept {
-    return ReadModifyWriteLocationImpl(
-        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, fill_missing_cache, false);
+    return ReadModifyWriteLocationImpl(request_context,
+                                       keys,
+                                       location_ids,
+                                       modifier,
+                                       adjust_reclaimed_key_count,
+                                       false,
+                                       fill_missing_cache,
+                                       false);
 }
 
 MetaIndexer::LocationResult
@@ -908,16 +917,29 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestC
     return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
 }
 
+MetaIndexer::LocationResult
+MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const LocationIdsPerKey &location_ids,
+                                            const LocationViewModifierFunc &modifier) noexcept {
+    if (SupportsWriteSession()) {
+        return LocationResult(EC_UNIMPLEMENTED);
+    }
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
+}
+
+template <typename Modifier>
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
                                                                      const KeyVector &keys,
                                                                      const LocationIdsPerKey &location_ids,
-                                                                     const LocationModifierFunc &modifier,
+                                                                     const Modifier &modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
                                                                      bool fill_missing_cache,
                                                                      bool maintenance_no_touch) noexcept {
     const std::string &trace_id = request_context->trace_id();
     const bool simple_mode = !SupportsWriteSession();
+    constexpr bool kViewModifier = std::is_same_v<Modifier, LocationViewModifierFunc>;
     const bool convert_deleting = simple_mode && !track_created_key_count && !maintenance_no_touch;
     // Ordinary simple writes fill a missing Recover key before validation.
     // Maintenance retains its explicit hot-only read policy.
@@ -1011,19 +1033,38 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             fill_results = backend_manager_->EnsureCacheForGc(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
-        if (track_created_key_count) {
-            get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
-                                                                          batch_keys,
-                                                                          batch_location_ids,
-                                                                          batch_locations_per_key,
-                                                                          batch_key_get_ecs);
-        } else {
-            get_ecs_per_key =
-                (maintenance_no_touch || (fill_cache && backend_manager_->HasCacheBackend()))
-                    ? backend_manager_->GetLocationsForMaintenance(
-                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
-                    : backend_manager_->GetLocations(
-                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
+        const bool read_views =
+            kViewModifier && (!backend_manager_->HasCacheBackend() ||
+                              backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning);
+        std::conditional_t<kViewModifier, std::optional<CompactLocationsPerKey>, std::monostate> old_views;
+        if constexpr (kViewModifier) {
+            if (read_views) {
+                CompactLocationsPerKey &views = old_views.emplace(true);
+                batch_key_get_ecs = backend_manager_->GetLocationValuesCompact(
+                    ephemeral_request_context.get(), batch_keys.data(), batch_keys.size(), views);
+                get_ecs_per_key.resize(batch_keys.size());
+                batch_locations_per_key.resize(batch_keys.size());
+                for (size_t i = 0; i < batch_keys.size(); ++i) {
+                    get_ecs_per_key[i].assign(batch_location_ids[i].size(), EC_NOENT);
+                    batch_locations_per_key[i].resize(batch_location_ids[i].size());
+                }
+            }
+        }
+        if (!read_views) {
+            if (track_created_key_count) {
+                get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
+                                                                              batch_keys,
+                                                                              batch_location_ids,
+                                                                              batch_locations_per_key,
+                                                                              batch_key_get_ecs);
+            } else {
+                get_ecs_per_key =
+                    (maintenance_no_touch || (fill_cache && backend_manager_->HasCacheBackend()))
+                        ? backend_manager_->GetLocationsForMaintenance(
+                              ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
+                        : backend_manager_->GetLocations(
+                              ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
+            }
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -1034,9 +1075,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         stats.index_deserialize_time_us += v;
         stats.has_index_deserialize = true;
 
+        bool invalid_views = false;
+        if constexpr (kViewModifier) {
+            invalid_views = read_views && !old_views->IsValid(batch_keys.size());
+        }
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (fill_cache && fill_results.size() != batch_keys.size())) {
+            (fill_cache && fill_results.size() != batch_keys.size()) || invalid_views) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -1139,27 +1184,59 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 key_level_failures[global_idx] = true;
                 continue;
             }
+            std::conditional_t<kViewModifier, std::vector<CacheLocationReadView>, std::monostate> previous_views;
+            if constexpr (kViewModifier) {
+                previous_views.reserve(loc_ids.size());
+            }
+            using PreviousLocation =
+                std::conditional_t<kViewModifier, CacheLocationReadView, const CacheLocationConstPtr &>;
             // EC_OK promises a usable value for the requested id. Treat a
             // null or mis-keyed value as corruption and never let a modifier
             // turn it into a write based on fabricated state.
             for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
-                if (get_ecs[loc_index] == EC_OK &&
-                    (!loc_values[loc_index] || loc_values[loc_index]->id() != loc_ids[loc_index])) {
-                    PREFIX_INDEXER_LOG(ERROR,
-                                       "ReadModifyWriteLocation invalid EC_OK value, key[%ld], requested id[%s]",
-                                       key,
-                                       loc_ids[loc_index].c_str());
-                    get_ecs[loc_index] = EC_MISMATCH;
-                    loc_values[loc_index].reset();
+                PreviousLocation previous(loc_values[loc_index]);
+                if constexpr (kViewModifier) {
+                    if (read_views) {
+                        for (const CacheLocationReadView candidate : old_views->ReadViews(i)) {
+                            if (!candidate) {
+                                get_ecs[loc_index] = EC_MISMATCH;
+                                break;
+                            }
+                            if (candidate.id() == loc_ids[loc_index]) {
+                                previous = candidate;
+                                get_ecs[loc_index] = EC_OK;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (get_ecs[loc_index] == EC_OK) {
+                    bool id_matches;
+                    if constexpr (kViewModifier) {
+                        id_matches = previous && previous.id() == loc_ids[loc_index];
+                    } else {
+                        id_matches = previous && previous->id() == loc_ids[loc_index];
+                    }
+                    if (!id_matches) {
+                        PREFIX_INDEXER_LOG(ERROR,
+                                           "ReadModifyWriteLocation invalid EC_OK value, key[%ld], requested id[%s]",
+                                           key,
+                                           loc_ids[loc_index].c_str());
+                        get_ecs[loc_index] = EC_MISMATCH;
+                        loc_values[loc_index].reset();
+                    }
                 }
                 if (simple_mode && get_ecs[loc_index] == EC_OK) {
-                    get_ecs[loc_index] = ValidateSimpleLocation(loc_values[loc_index], false);
+                    get_ecs[loc_index] = ValidateSimpleLocation(previous, false);
                     if (get_ecs[loc_index] != EC_OK) {
                         loc_values[loc_index].reset();
                     }
                 }
                 if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
                     key_level_failures[global_idx] = true;
+                }
+                if constexpr (kViewModifier) {
+                    previous_views.push_back(get_ecs[loc_index] == EC_OK ? previous : CacheLocationReadView(nullptr));
                 }
             }
             if (track_created_key_count && key_get_ec == EC_NOENT &&
@@ -1172,10 +1249,21 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 key_level_failures[global_idx] = true;
                 continue;
             }
-            const CacheLocationVector previous_locations = convert_deleting ? loc_values : CacheLocationVector{};
+            const CacheLocationVector previous_locations =
+                convert_deleting || (kViewModifier && !read_views) ? loc_values : CacheLocationVector{};
             PropertyMap upsert_property_map;
-            LocationModifierResult modified =
-                modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
+            LocationModifierResult modified = [&]() {
+                if constexpr (kViewModifier) {
+                    return modifier(get_ecs,
+                                    loc_ids,
+                                    static_cast<size_t>(global_idx),
+                                    previous_views,
+                                    loc_values,
+                                    upsert_property_map);
+                } else {
+                    return modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
+                }
+            }();
             ModifierAction action = modified.first;
             std::vector<ErrorCode> &modifier_ecs = modified.second;
             if (modifier_ecs.size() != loc_ids.size() || (simple_mode && loc_values.size() != loc_ids.size())) {

@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -9,6 +10,7 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/service_request_executor.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -211,6 +213,27 @@ TEST_F(ServerMetricsTest, WindowMetricsArePublishedBeforeReporterAndResetWhileId
     EXPECT_EQ(0, registry->GetGauge("service.request_wait_time_us_avg").Get());
     EXPECT_EQ(0, registry->GetGauge("service.request_execution_time_us_max").Get());
     EXPECT_EQ(0, registry->GetGauge("service.request_execution_time_us_avg").Get());
+}
+
+TEST_F(ServerMetricsTest, BodyBudgetRejectionQpsResetsWhileIdle) {
+    server_.report_event_body_budget_ = std::make_shared<ReportEventBodyBudget>(8);
+    const std::string metric_name = "service.report_event_body_budget_rejected";
+    const Gauge qps = server_.metrics_registry_->GetGauge(metric_name);
+    const std::string zero_sample = "kvcm_service_report_event_body_budget_rejected 0\n";
+
+    server_.ReportMetrics();
+    EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*server_.metrics_registry_, "kvcm", {}).find(zero_sample));
+
+    EXPECT_FALSE(server_.report_event_body_budget_->TryReserve(9));
+    EXPECT_FALSE(server_.report_event_body_budget_->TryReserve(9));
+    const std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now() - 2s;
+    server_.last_body_budget_report_ = window_start;
+    server_.ReportMetrics();
+    const double elapsed = std::chrono::duration<double>(server_.last_body_budget_report_ - window_start).count();
+    EXPECT_DOUBLE_EQ(2.0 / elapsed, qps.Get());
+
+    server_.ReportMetrics();
+    EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*server_.metrics_registry_, "kvcm", {}).find(zero_sample));
 }
 
 TEST_F(ServerMetricsTest, RepeatedSamplesAccumulateOnlyNewCounts) {

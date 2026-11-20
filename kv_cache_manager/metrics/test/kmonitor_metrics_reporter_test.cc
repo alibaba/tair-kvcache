@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "kmonitor/client/MetricType.h"
 #include "kmonitor/client/core/MetricsTags.h"
 #include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -48,11 +49,19 @@ void CaptureInstanceMetadataMetrics(kmonitor::MutableMetric *metric, const kmoni
 }
 
 thread_local std::map<std::string, double> reported_executor_metrics;
+thread_local std::vector<double> reported_body_budget_rejections;
 
 void CaptureExecutorMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
     const auto offset = metric->metric_name_.find("service.request_");
     if (offset != std::string::npos) {
         reported_executor_metrics[metric->metric_name_.substr(offset)] = value;
+    }
+}
+
+void CaptureBodyBudgetRejections(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    if (metric->metric_name_.find("service.report_event_body_budget_rejected") != std::string::npos) {
+        EXPECT_EQ(kmonitor::QPS, metric->GetMetricType());
+        reported_body_budget_rejections.push_back(value);
     }
 }
 
@@ -319,6 +328,22 @@ TEST_F(KmonitorMetricsReporterTest, ExecutorWindowMetricsAndCumulativeCountersRe
         EXPECT_DOUBLE_EQ(1.5, reported_executor_metrics.at("service.request_queue_wait_seconds_sum"));
         EXPECT_DOUBLE_EQ(23, reported_executor_metrics.at("service.request_queue_wait_seconds_count"));
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, BodyBudgetRejectionsUseNativeQpsUpdates) {
+    Stub stub;
+    stub.set(static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+                 &kmonitor::MutableMetric::Report),
+             CaptureBodyBudgetRejections);
+    reported_body_budget_rejections.clear();
+
+    reporter_->ReportEventBodyBudgetRejections(0);
+    reporter_->ReportEventBodyBudgetRejections(1);
+    metrics_registry_->GetGauge("service.report_event_body_budget_rejected") = 2.5;
+    reporter_->ReportInterval();
+    reporter_->ReportEventBodyBudgetRejections(0);
+
+    EXPECT_EQ((std::vector<double>{0.0, 1.0, 0.0}), reported_body_budget_rejections);
 }
 
 TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {

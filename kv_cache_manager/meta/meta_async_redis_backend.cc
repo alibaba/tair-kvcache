@@ -461,8 +461,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec =
-            DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i], &id_interner_, &name_interner_);
+        ErrorCode ec = codec_.DeserializeFieldMap(
+            field_maps[i], out_locations[i], &out_properties[i], &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("async redis get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -494,7 +494,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *reque
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i], &id_interner_, &name_interner_);
+        ErrorCode ec =
+            codec_.DeserializeFieldMap(field_maps[i], out_locations[i], nullptr, &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR(
                 "async redis get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
@@ -552,7 +553,8 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
                 continue;
             }
             auto location = std::make_shared<CacheLocation>();
-            if (!location->FromJsonStringInterned(it->second, id_interner_, &name_interner_)) {
+            if (!codec_.DeserializeLocation(
+                    location_ids[i][j], it->second, &id_interner_, &name_interner_, *location)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }
@@ -999,7 +1001,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
 
     if (!op.field_maps.empty()) {
         for (size_t i = 0; i < op.keys.size(); ++i) {
-            op.field_maps[i] = SerializeToFieldMap(op.locations[i], std::move(op.field_maps[i]));
+            op.field_maps[i] = codec_.SerializeToFieldMap(op.locations[i], std::move(op.field_maps[i]));
         }
     }
 

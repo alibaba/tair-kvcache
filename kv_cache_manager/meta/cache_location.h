@@ -387,14 +387,24 @@ public:
             source_ = std::cref(*location);
         }
     }
-    CacheLocationReadView(const std::string &id, const std::string &name, const std::string &uri, DataStorageType type)
-        : source_(SimpleFields{std::cref(id), std::cref(name), std::cref(uri), type}) {}
+    CacheLocationReadView(const std::string &id,
+                          const std::string &name,
+                          const std::string &uri,
+                          DataStorageType type,
+                          int64_t create_time)
+        : source_(SimpleFields{std::cref(id), std::cref(name), std::cref(uri), type, create_time}) {}
 
     explicit operator bool() const { return source_.index() != 0; }
     const CacheLocation &OriginalLocation() const { return std::get<1>(source_).get(); }
     const std::string &id() const { return IsSimple() ? std::get<2>(source_).id.get() : OriginalLocation().id(); }
     DataStorageType type() const { return IsSimple() ? std::get<2>(source_).type : OriginalLocation().type(); }
     CacheLocationStatus status() const { return IsSimple() ? CLS_SERVING : OriginalLocation().status(); }
+    int64_t create_time() const {
+        return IsSimple() ? std::get<2>(source_).create_time : OriginalLocation().create_time();
+    }
+    bool GetValidatedTotalSize(uint64_t &size) const {
+        return !IsSimple() && OriginalLocation().GetValidatedTotalSize(size);
+    }
     size_t SpecSize() const { return IsSimple() ? 1 : OriginalLocation().spec_size(); }
     size_t SpecCount() const { return IsSimple() ? 1 : OriginalLocation().location_specs().size(); }
     bool HasSpecName(size_t index) const {
@@ -417,6 +427,7 @@ private:
         std::reference_wrapper<const std::string> name;
         std::reference_wrapper<const std::string> uri;
         DataStorageType type;
+        int64_t create_time;
     };
     bool IsSimple() const { return source_.index() == 2; }
     std::variant<std::monostate, std::reference_wrapper<const CacheLocation>, SimpleFields> source_;

@@ -12,10 +12,10 @@ class MetricsReporter;
 
 class ServiceCallGuard {
 public:
-    ServiceCallGuard(CacheManager *cache_manager, RequestContext *request_context, MetricsReporter *metrics_reporter);
     ServiceCallGuard(CacheManager *cache_manager,
                      RequestContext *request_context,
                      MetricsReporter *metrics_reporter,
+                     bool include_access_log_payload,
                      std::function<void()> completion_callback);
 
     ~ServiceCallGuard();
@@ -25,6 +25,7 @@ private:
     CacheManager *cache_manager_;
     RequestContext *request_context_;
     MetricsReporter *metrics_reporter_;
+    const bool include_access_log_payload_;
     std::function<void()> completion_callback_;
     // Records per-request begin timestamp; writes (now - begin) to
     // service.query_rt_us when the scope ends.  Explicitly reset in

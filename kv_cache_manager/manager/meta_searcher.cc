@@ -43,14 +43,18 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
-bool TryGetLocationSpecSize(const LocationSpec &spec, std::uint64_t &size) {
+bool TryGetLocationSpecSize(std::string_view uri_string, std::uint64_t &size) {
     size = 0;
-    DataStorageUri uri(spec.uri());
+    DataStorageUri uri(uri_string);
     if (!uri.Valid()) {
         return false;
     }
     uri.GetParamAs<std::uint64_t>("size", size);
     return true;
+}
+
+bool TryGetLocationSpecSize(const LocationSpec &spec, std::uint64_t &size) {
+    return TryGetLocationSpecSize(spec.uri(), size);
 }
 
 std::uint64_t GetLocationSpecSize(const LocationSpec &spec) {
@@ -65,6 +69,17 @@ std::uint64_t GetLocationSpecsSize(const std::vector<LocationSpec> &specs) {
         total_size += GetLocationSpecSize(loc_spec);
     }
     return total_size;
+}
+
+std::uint64_t GetLocationSpecsSize(const CacheLocationReadView &location) {
+    std::uint64_t total = 0;
+    for (size_t i = 0; i < location.SpecCount(); ++i) {
+        std::uint64_t size = 0;
+        if (TryGetLocationSpecSize(location.SpecUri(i), size)) {
+            total += size;
+        }
+    }
+    return total;
 }
 
 void ApplyStorageUsageChange(MetaIndexer *meta_indexer,
@@ -2700,6 +2715,7 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                      batch_create_time](const std::vector<ErrorCode> &get_ecs,
                                         const LocationIdVector &location_ids,
                                         size_t key_index,
+                                        const auto &previous_locations,
                                         CacheLocationVector &locations,
                                         PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
         if (acquire_write_lease && !write_lease_attempted) {
@@ -2731,13 +2747,14 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             const auto &task = tasks.At(key_index, location_index);
             auto &usage = usage_changes[usage_offsets[key_index] + location_index];
             auto new_location = std::make_shared<CacheLocation>();
-            if (get_ec == ErrorCode::EC_OK && locations[location_index]) {
-                if (locations[location_index]->type() != task.type) {
+            const CacheLocationReadView previous(previous_locations[location_index]);
+            if (get_ec == ErrorCode::EC_OK && previous) {
+                if (previous.type() != task.type) {
                     modifier_ecs[location_index] = ErrorCode::EC_BADARGS;
                     continue;
                 }
-                if (!locations[location_index]->GetValidatedTotalSize(usage.old_size)) {
-                    usage.old_size = GetLocationSpecsSize(locations[location_index]->location_specs());
+                if (!previous.GetValidatedTotalSize(usage.old_size)) {
+                    usage.old_size = GetLocationSpecsSize(previous);
                 }
                 usage.has_old = true;
             }
@@ -2746,9 +2763,7 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                 // request's canonical reporter/medium id on the next write.
                 new_location->set_id(*interned_location_id);
             } else {
-                new_location->set_id(get_ec == ErrorCode::EC_OK && locations[location_index]
-                                         ? locations[location_index]->id()
-                                         : task.location_id);
+                new_location->set_id(get_ec == ErrorCode::EC_OK && previous ? previous.id() : task.location_id);
             }
 
             std::vector<LocationSpec> specs;
@@ -2761,9 +2776,8 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
             new_location->set_status(task.status);
             new_location->set_spec_size(new_location->location_specs().size());
             // A snapshot refreshes the same reporter-owned location, not its lifetime.
-            new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old
-                                              ? locations[location_index]->create_time()
-                                              : batch_create_time);
+            new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old ? previous.create_time()
+                                                                                               : batch_create_time);
             new_location->set_validated_total_size(usage.new_size);
             locations[location_index] = std::move(new_location);
             updated = true;
@@ -2776,8 +2790,22 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    MetaIndexer::LocationResult result =
-        meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, modifier);
+    MetaIndexer::LocationResult result(EC_OK);
+    if (meta_indexer_->SupportsWriteSession()) {
+        const LocationModifierFunc object_modifier = [&modifier](const std::vector<ErrorCode> &errors,
+                                                                 const LocationIdVector &ids,
+                                                                 size_t key_index,
+                                                                 CacheLocationVector &locations,
+                                                                 PropertyMap &properties) {
+            return modifier(errors, ids, key_index, locations, locations, properties);
+        };
+        result =
+            meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, object_modifier);
+    } else {
+        const MetaIndexer::LocationViewModifierFunc view_modifier = modifier;
+        result =
+            meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, view_modifier);
+    }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
     bool malformed_result = result.per_location_error_codes.size() != keys.size();
