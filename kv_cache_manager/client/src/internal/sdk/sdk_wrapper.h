@@ -32,7 +32,7 @@ public:
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         int64_t parent_deadline_ms = 0,
-                        const std::string &read_execution_id = {});
+                        const TransferTraceInfo *trace_info = nullptr);
     bool QueryReadBufferSafety(const std::string &read_execution_id, int64_t deadline_ms);
     void DiscardReadRecovery(const std::string &read_execution_id);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,

@@ -196,10 +196,12 @@ ClientErrorCode TransferClientImpl::LoadKvCachesWithDeadline(const UriStrVec &ur
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK();
     auto remote_uris = ParseLocations(uri_str_vec);
-    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers, deadline_ms,
-                                trace_info ? trace_info->read_execution_id : std::string{});
+    auto ec = sdk_wrapper_->Get(remote_uris, block_buffers, deadline_ms, trace_info.get());
     if (ec != ER_OK) {
         return ec;
+    }
+    if (trace_info && trace_info->read_recovery_cancelled && trace_info->read_recovery_cancelled->load()) {
+        return ER_SDK_TIMEOUT_BUFFER_SAFE;
     }
 #if defined(USING_CUDA) || defined(USING_MUSA)
     return PrintBlockHashAndUri("get_", uri_str_vec, block_buffers, trace_info);

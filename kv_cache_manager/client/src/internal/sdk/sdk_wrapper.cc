@@ -177,7 +177,11 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
                                 int64_t parent_deadline_ms,
-                                const std::string &read_execution_id) {
+                                const TransferTraceInfo *trace_info) {
+    const auto read_recovery_cancelled = trace_info ? trace_info->read_recovery_cancelled : nullptr;
+    if (read_recovery_cancelled && read_recovery_cancelled->load()) {
+        return ER_SDK_TIMEOUT_BUFFER_SAFE;
+    }
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ER_SDK_ERROR_BUFFER_SAFE;
@@ -192,7 +196,7 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
                                     : 0;
 
     std::shared_ptr<ReadRecovery> recovery;
-    if (!read_execution_id.empty()) {
+    if (trace_info && !trace_info->read_execution_id.empty()) {
         recovery = std::make_shared<ReadRecovery>();
         recovery->queries = std::make_shared<std::vector<SdkInterface::ReadSafetyQuery>>(groups.size());
     }
@@ -201,8 +205,11 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
     tasks.reserve(groups.size());
     for (const auto &group : groups) {
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, deadline_ms, queries = recovery ? recovery->queries : nullptr,
+        tasks.push_back([group, deadline_ms, read_recovery_cancelled, queries = recovery ? recovery->queries : nullptr,
                          index = tasks.size()]() {
+            if (read_recovery_cancelled && read_recovery_cancelled->load()) {
+                return ER_TASK_CANCELLED;
+            }
             if (queries) {
                 return group.sdk->GetWithReadSafety(group.uris, group.buffers, deadline_ms, (*queries)[index]);
             }
@@ -215,8 +222,14 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
     ec = RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms, deadline_ms,
                                 recovery ? &recovery->futures : nullptr);
     if (recovery && !IsGroupBufferSafe(ec)) {
+        const auto &read_execution_id = trace_info->read_execution_id;
         try {
             std::lock_guard<std::mutex> lock(read_recovery_mu_);
+            // Check under the same lock that removes the entry. Discard either
+            // erases this publication or makes it skip insertion.
+            if (read_recovery_cancelled && read_recovery_cancelled->load()) {
+                return ec;
+            }
             const auto [entry, inserted] = read_recovery_.try_emplace(read_execution_id, std::move(recovery));
             if (!inserted) {
                 entry->second->unrecoverable.store(true);

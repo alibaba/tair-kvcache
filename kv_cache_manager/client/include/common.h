@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -257,6 +258,8 @@ struct TransferTraceInfo {
     bool need_print = false;
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
     std::string read_execution_id; // Unique to one LoadKvCaches invocation on this client.
+    // Set by the caller before discarding recovery for a released READ.
+    std::shared_ptr<const std::atomic<bool>> read_recovery_cancelled;
 };
 
 } // namespace kv_cache_manager

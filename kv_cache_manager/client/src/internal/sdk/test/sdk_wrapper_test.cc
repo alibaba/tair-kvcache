@@ -513,6 +513,7 @@ struct FakeSdkControl {
     std::atomic<int> get_delay_ms{0}; // Get 内的睡眠时长（模拟慢 I/O）
     std::atomic<int> get_result{static_cast<int>(ER_OK)};
     std::atomic<bool> return_put_uris{false};
+    std::shared_future<void> allow_get_return;
     // Init 时观测到的注入预算（TestStaticBudgetInjection 用）：wrapper 应把自身
     // timeout_config 注入 SdkBackendConfig，后端据此自律。
     std::atomic<int> observed_get_budget_ms{0};
@@ -536,6 +537,9 @@ public:
     SdkType Type() override { return SdkType::LOCAL_FILE; }
     ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override {
         ctrl_->get_call_count.fetch_add(1);
+        if (ctrl_->allow_get_return.valid()) {
+            ctrl_->allow_get_return.wait_for(std::chrono::seconds(10));
+        }
         int delay_ms = ctrl_->get_delay_ms.load();
         if (delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -640,6 +644,34 @@ bool WaitForTrue(const std::function<bool()> &cond, int max_retry = 300) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
+}
+
+TEST_F(SdkWrapperTest, DiscardedReadCannotPublishRecoveryAfterGetReturns) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    std::promise<void> allow_get_return;
+    ctrl->allow_get_return = allow_get_return.get_future().share();
+    ctrl->get_result.store(ER_SDKREAD_ERROR);
+    auto client_config = MakeClientConfigWithTimeouts(2000, 10000);
+    SdkWrapper wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    const std::vector<DataStorageUri> uris{DataStorageUri("file://nfs_test/test?blkid=0&size=1024")};
+    const BlockBuffers buffers{BlockBuffer()};
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    TransferTraceInfo trace;
+    trace.read_execution_id = "read";
+    trace.read_recovery_cancelled = cancelled;
+    auto result = std::async(std::launch::async, [&] { return wrapper.Get(uris, buffers, 0, &trace); });
+    EXPECT_TRUE(WaitForTrue([&] { return ctrl->get_call_count.load() == 1; }));
+
+    cancelled->store(true);
+    wrapper.DiscardReadRecovery(trace.read_execution_id);
+    allow_get_return.set_value();
+
+    EXPECT_EQ(result.get(), ER_SDKREAD_ERROR);
+    EXPECT_TRUE(wrapper.read_recovery_.empty());
 }
 
 TEST_F(SdkWrapperTest, TransferFailuresAreSafeBeforeDispatchAndAfterCompletedPut) {
