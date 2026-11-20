@@ -177,6 +177,23 @@ py_test(
     deps = [":e2e_lib"],
 )
 
+py_test(
+    name = "test_save_after_prefill",
+    timeout = "eternal",
+    srcs = ["test_save_after_prefill.py"],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    imports = ["."],
+    tags = [
+        "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
+    ],
+    deps = [":e2e_lib"],
+)
+
 # Wildcards skip "manual" targets; run the whole suite explicitly with
 #   bazelisk test //integration_test/vllm_e2e:e2e_tests
 test_suite(
@@ -191,6 +208,7 @@ test_suite(
         ":test_multi_turn",
         ":test_mutation",
         ":test_partial_hit",
+        ":test_save_after_prefill",
         ":test_tp",
     ],
 )

@@ -51,6 +51,14 @@ Capture points
   ``wait_for_save`` once the token ids have arrived. The loaded KV persists in
   the paged cache (its blocks are allocated to the request).
 
+Deferred reference (``$KVCM_E2E_DEFER_REF=1``): the save-time capture above
+synchronizes the device first, which changes the timing it is meant to check
+and reads the cache at the same moment the save path does. In deferred mode
+``wait_for_save`` only records the saved blocks' tables (no synchronization)
+and the reference is captured in ``get_finished`` once the request has finished:
+its blocks are still held for the pending saves, and they hold the KV the forward
+pass wrote, i.e. what the local prefix cache would serve.
+
 Captures are written to ``$KVCM_E2E_CAPTURE_DIR`` as ``.pt`` files named
 ``{ref|loaded}_tp{rank}_{token_hash}.pt`` so the out-of-process driver can match
 reference vs loaded by content (the captured token ids).
@@ -71,6 +79,7 @@ from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker
 from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 
 CAPTURE_DIR_ENV = "KVCM_E2E_CAPTURE_DIR"
+DEFER_REF_ENV = "KVCM_E2E_DEFER_REF"
 
 
 def _worker_attr(name):
@@ -136,6 +145,12 @@ class VerifyingConnector(TairKvCacheConnector):
         # tables here and emit the capture once the token ids arrive.
         # req_id -> (manager_block_idxes, block_ids_per_group)
         self._pending_loaded: dict[str, tuple[list, list]] = {}
+
+        # Deferred reference captures: req_id -> [(token_ids, block_ids_per_group,
+        # manager_block_idxes)] recorded at save time, captured once the request
+        # has finished (see the module docstring).
+        self._defer_ref = os.environ.get(DEFER_REF_ENV, "") == "1"
+        self._deferred_refs: dict[str, list] = {}
 
         orig_factory = self._data_transfer.create_load_done_callback
 
@@ -216,6 +231,16 @@ class VerifyingConnector(TairKvCacheConnector):
     def _capture_refs(self, meta: TairKvCacheConnectorMetadata):
         if not meta.to_save_requests:
             return
+        if getattr(self, "_defer_ref", False):
+            tokens = getattr(meta, "token_snapshots", {})
+            for save_req in meta.to_save_requests:
+                token_ids = tokens.get(save_req.req_id)
+                if token_ids is None or not save_req.all_block_ids:
+                    continue
+                self._deferred_refs.setdefault(save_req.req_id, []).append(
+                    (list(token_ids), [list(b) for b in save_req.all_block_ids],
+                     list(save_req.manager_block_idxes)))
+            return
         # Make all forward-pass KV writes visible before reading the paged cache.
         self._device_mod.synchronize()
         tokens = getattr(meta, "token_snapshots", {})
@@ -229,6 +254,25 @@ class VerifyingConnector(TairKvCacheConnector):
                 block_ids_per_group=save_req.all_block_ids,
                 manager_block_idxes=save_req.manager_block_idxes,
             )
+
+    def get_finished(self, finished_req_ids):
+        deferred = getattr(self, "_deferred_refs", None)
+        if deferred and finished_req_ids:
+            done = [r for r in finished_req_ids if r in deferred]
+            if done:
+                try:
+                    # The request is finished and its blocks are still held for
+                    # its pending saves; nothing writes them any more.
+                    self._device_mod.synchronize()
+                    for req_id in done:
+                        for token_ids, bpg, mbis in deferred.pop(req_id):
+                            self._capture_range(kind="ref", token_ids=token_ids,
+                                                block_ids_per_group=bpg,
+                                                manager_block_idxes=mbis)
+                except Exception as e:  # never break inference for a capture error
+                    logger.warning("VerifyingConnector deferred capture failed: %s", e,
+                                   exc_info=True)
+        return super().get_finished(finished_req_ids)
 
     def _capture_pending_loaded(self, meta):
         if not self._pending_loaded:
