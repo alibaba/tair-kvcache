@@ -30,6 +30,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -828,6 +829,10 @@ void CacheReclaimer::SetSleepIntervalMs(const RequestContext *request_context,
     LOG_WITH_TRACE(DEBUG, "set sleep interval to [%u] ms", sleep_interval_ms);
 }
 
+InstanceGroupQuota CacheReclaimer::GetReclaimQuota(const InstanceGroup &group) const {
+    return ResolveEffectiveQuota(group, registry_manager_->data_storage_manager().get()).ForReclaim();
+}
+
 std::shared_ptr<CacheReclaimer::WaterLevelExceed>
 CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
                                     const std::string &ins_gr,
@@ -919,7 +924,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     // must not suppress the other dimension's water-level check.
 
     // 2.2.1. trigger_strategy:used_percent for instance group quota capacity
-    if (effective_group_bytes > 0) {
+    if (effective_group_bytes > 0 && instance_group_quota.capacity() != -1) {
         if (instance_group_quota.capacity() <= 0) {
             // proceed as group quota capacity is 0
             LOG_WITH_GR(DEBUG,
@@ -1868,7 +1873,7 @@ void CacheReclaimer::TryMigrateOnGroup(
         return;
     }
 
-    const auto &quota = instance_group->quota();
+    const auto quota = GetReclaimQuota(*instance_group);
     struct CachedMigrationBatch {
         bool built = false;
         bool ok = false;
@@ -2806,7 +2811,7 @@ CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
         }
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
         const auto water_level_exceed = GetWaterLevelExceed(
-            request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);
+            request_context.get(), ins_gr, GetReclaimQuota(*instance_group), reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         if (!IsTriggerReclaiming(water_level_exceed)) {
@@ -2857,7 +2862,7 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
     const auto read_water_level = [&]() {
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
         auto water_level = GetWaterLevelExceed(
-            request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);
+            request_context.get(), ins_gr, GetReclaimQuota(*instance_group), reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         return water_level;

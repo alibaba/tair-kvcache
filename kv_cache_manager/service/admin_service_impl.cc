@@ -16,6 +16,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
@@ -111,6 +112,24 @@ bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::Re
 } // anonymous namespace
 
 namespace kv_cache_manager {
+
+namespace {
+void FillRuntimeQuota(const EffectiveGroupQuota &quota, proto::admin::InstanceGroup *group) {
+    auto *runtime = group->mutable_runtime_quota();
+    runtime->set_total_bytes_limit_enabled(quota.configured_capacity != -1);
+    runtime->set_reference_capacity(quota.reference_capacity);
+    for (const auto &[type, value] : quota.types) {
+        auto *status = runtime->add_storage_types();
+        status->set_storage_type(static_cast<proto::admin::StorageType>(type));
+        status->set_mode(value.config.mode());
+        status->set_ratio(value.config.ratio());
+        status->set_effective_capacity(value.capacity);
+        status->set_backend_capacity(value.backend_capacity);
+        status->set_refresh_success(value.refresh_success);
+        status->set_last_success_time_s(value.last_success_time_s);
+    }
+}
+} // namespace
 
 AdminServiceImpl::AdminServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                    std::shared_ptr<MetricsReporter> metrics_reporter,
@@ -318,7 +337,11 @@ void AdminServiceImpl::CreateInstanceGroup(RequestContext *request_context,
     if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
     }
-    ErrorCode ec_info = registry_manager_->CreateInstanceGroup(request_context, instance_group_req);
+    const auto ec_info =
+        registry_manager_->CreateInstanceGroup(request_context, instance_group_req, &invalid_fields);
+    if (ec_info == EC_BADARGS) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
+    }
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
         request_context->set_status_code(status->code());
@@ -352,8 +375,11 @@ void AdminServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
     if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
     }
-    ErrorCode ec_info =
-        registry_manager_->UpdateInstanceGroup(request_context, instance_group_req, request->current_version());
+    const auto ec_info = registry_manager_->UpdateInstanceGroup(
+        request_context, instance_group_req, request->current_version(), &invalid_fields);
+    if (ec_info == EC_BADARGS) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
+    }
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
         request_context->set_status_code(status->code());
@@ -440,6 +466,8 @@ void AdminServiceImpl::GetInstanceGroup(RequestContext *request_context,
     } else {
         auto *instance_group_config = response->mutable_instance_group();
         ProtoConvert::InstanceGroupToProto(*instance_group_res, instance_group_config);
+        const auto storage_manager = registry_manager_->data_storage_manager();
+        FillRuntimeQuota(ResolveEffectiveQuota(*instance_group_res, storage_manager.get()), instance_group_config);
         status->set_code(proto::admin::OK);
         request_context->set_status_code(status->code());
         status->set_message("Instance group retrieved successfully");
@@ -465,9 +493,11 @@ void AdminServiceImpl::ListInstanceGroup(RequestContext *request_context,
         return;
     }
 
+    const auto storage_manager = registry_manager_->data_storage_manager();
     for (const auto &instance_group : instance_groups) {
         auto *instance_group_config = response->add_instance_group();
         ProtoConvert::InstanceGroupToProto(*instance_group, instance_group_config);
+        FillRuntimeQuota(ResolveEffectiveQuota(*instance_group, storage_manager.get()), instance_group_config);
     }
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());

@@ -3,6 +3,8 @@
 KVCacheManager 在 Admin HTTP 服务端口（默认 6492）上提供了兼容 Prometheus
 的指标抓取端点 `GET /metrics`。
 
+每个存储后端通过 `data_storage.total_capacity_bytes` 上报总字节数，首次取得有效容量前为 -1。按 Group 和存储类型查看 `cache_manager_group_storage.usage_bytes`、`effective_quota` 和 `usage_ratio`，分别为用量、当前有效额度和两者之比。自动额度还提供 `refresh_success` 和 `last_success_time_s`。Group 总额度不限时，总水位用各类型有效额度之和作分母。
+
 ## 快速开始
 
 默认配置下该端点自动启用。将 Prometheus 实例指向 Admin HTTP 端口即可：

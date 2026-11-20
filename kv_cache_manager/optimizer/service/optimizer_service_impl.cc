@@ -319,10 +319,15 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
     for (const auto &source : configuration.instance_groups()) {
         OptimizerInstanceGroup group;
         group.set_name(source.name());
-        if (!config.mock_cache_layout()) {
-            group.set_capacity_gb({static_cast<double>(source.capacity_bytes()) / (1024.0 * 1024 * 1024)});
-        } else {
+        auto existing_group = registry->GetInstanceGroup(source.name());
+        if (config.mock_cache_layout()) {
             group.set_capacity_gb(config.capacity_gb());
+        } else if (source.capacity_bytes() != -1) {
+            group.set_capacity_gb({static_cast<double>(source.capacity_bytes()) / (1024.0 * 1024 * 1024)});
+        } else if (existing_group) {
+            // An unlimited source supplies no finite replay tier. Keep tiers
+            // already in use by registered instances to preserve replay state.
+            group.set_capacity_gb(existing_group->capacity_gb());
         }
         group.set_ttl_seconds_list(config.ttl_seconds_list());
         group.set_eviction_policy("lru");
@@ -332,7 +337,6 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (!group.ValidateRequiredFields(invalid)) {
             return EC_BADARGS;
         }
-        auto existing_group = registry->GetInstanceGroup(source.name());
         if (!existing_group) {
             const auto ec = manager_->CreateInstanceGroup(group);
             if (ec != EC_OK && ec != EC_DUPLICATE_ENTITY) {

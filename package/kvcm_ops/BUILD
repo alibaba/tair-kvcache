@@ -3,6 +3,12 @@ load("@rules_python//python:packaging.bzl", "py_wheel")
 
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "dynamic_quota_test",
+    srcs = ["test/dynamic_quota_test.py"],
+    deps = [":kvcm_ops_lib"],
+)
+
 py_library(
     name = "kvcm_ops_lib",
     srcs = glob([

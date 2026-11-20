@@ -557,6 +557,8 @@ private:
 
     std::map<std::string, GroupLruRotationState> group_lru_rotation_by_group_;
 
+    InstanceGroupQuota GetReclaimQuota(const InstanceGroup &group) const;
+
     /**
      * @brief Calculate the group's WaterLevelExceed data
      *
