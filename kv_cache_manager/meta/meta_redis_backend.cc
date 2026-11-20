@@ -111,7 +111,7 @@ std::vector<ErrorCode> MetaRedisBackend::Put(RequestContext *request_context,
     const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     FieldMapVec field_maps(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+        field_maps[i] = codec_.SerializeToFieldMap(locations[i], properties[i]);
     }
     const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
     auto *service_metrics_collector =
@@ -134,7 +134,7 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
     const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     FieldMapVec field_maps(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+        field_maps[i] = codec_.SerializeToFieldMap(locations[i], properties[i]);
     }
     const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
     auto *service_metrics_collector =
@@ -206,8 +206,8 @@ std::vector<ErrorCode> MetaRedisBackend::Get(RequestContext *request_context,
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec =
-            DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i], &id_interner_, &name_interner_);
+        ErrorCode ec = codec_.DeserializeFieldMap(
+            field_maps[i], out_locations[i], &out_properties[i], &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -239,7 +239,8 @@ std::vector<ErrorCode> MetaRedisBackend::GetLocations(RequestContext *request_co
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i], &id_interner_, &name_interner_);
+        ErrorCode ec =
+            codec_.DeserializeFieldMap(field_maps[i], out_locations[i], nullptr, &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -298,7 +299,8 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
                 continue;
             }
             auto location = std::make_shared<CacheLocation>();
-            if (!location->FromJsonStringInterned(it->second, id_interner_, &name_interner_)) {
+            if (!codec_.DeserializeLocation(
+                    location_ids[i][j], it->second, &id_interner_, &name_interner_, *location)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }

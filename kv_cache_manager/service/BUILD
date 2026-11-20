@@ -49,6 +49,7 @@ cc_library(
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
         "//kv_cache_manager/service/http_service",
         "//kv_cache_manager/service/util:manager_message_proto_util",
+        "//kv_cache_manager/service/util:report_event_body_budget",
         "//kv_cache_manager/service/util:service_call_guard",
     ],
 )

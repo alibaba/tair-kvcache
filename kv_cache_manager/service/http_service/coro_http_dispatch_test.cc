@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -13,6 +14,7 @@
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -380,34 +382,52 @@ TEST(CoroHttpDispatchTest, ShutdownHandlesAcceptedSocketWritesAndDisconnects) {
 }
 
 TEST(CoroHttpDispatchTest, ReportEventBudgetRejectsBeforeQueueAndReleasesAfterReply) {
+    constexpr size_t kBudgetBytes = 8 * 1024 * 1024;
     auto executor = std::make_shared<ServiceRequestExecutor>();
     ASSERT_TRUE(executor->Init(1, 4));
     auto metrics = std::make_shared<MetricsRegistry>();
-    MetaDispatchService service(metrics, nullptr, std::make_shared<RegistryManager>("", metrics), executor);
+    auto budget = std::make_shared<ReportEventBodyBudget>(kBudgetBytes);
+    std::atomic<size_t> reported_rejections{0};
+    MetaDispatchService service(metrics,
+                                nullptr,
+                                std::make_shared<RegistryManager>("", metrics),
+                                executor,
+                                nullptr,
+                                budget,
+                                [&reported_rejections]() { ++reported_rejections; });
     IoLoop io;
     async_simple::Promise<bool> release;
     std::promise<void> started;
     auto entered = started.get_future();
     auto limited = service.LimitReportEventBodyBytes(
         [&](coro_http::coro_http_request &req, coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
-            if (req.get_body() == "hold") {
+            if (req.get_body().substr(0, 1) == "H") {
                 started.set_value();
                 co_await release.getFuture();
             }
             res.set_status_and_content(coro_http::status_type::ok, "done");
-        },
-        4);
-    auto held = io.Start(limited, "hold");
+        });
+    std::future<Reply> held = io.Start(limited, std::string(kBudgetBytes, 'H'));
     const auto ready = entered.wait_for(5s);
     EXPECT_EQ(std::future_status::ready, ready);
     if (ready == std::future_status::ready) {
-        EXPECT_NE(std::string::npos, io.Start(limited, "x").get().body.find("SERVICE_BUSY"));
+        EXPECT_EQ("done", io.Start(limited, "heartbeat").get().body);
+        EXPECT_EQ("done", io.Start(limited, std::string(kBudgetBytes - 1, 'x')).get().body);
+        const Reply rejected = io.Start(limited, std::string(kBudgetBytes, 'x')).get();
+        EXPECT_NE(std::string::npos, rejected.body.find("SERVICE_BUSY"));
         EXPECT_EQ(0u, executor->GetSnapshot().queued);
         EXPECT_EQ(1u, executor->GetSnapshot().rejected);
+        EXPECT_EQ(1u, budget->TakeRejected());
+        EXPECT_EQ(1u, reported_rejections.load());
+        EXPECT_EQ(kBudgetBytes, budget->InUse());
     }
     release.setValue(true);
     EXPECT_EQ("done", held.get().body);
-    EXPECT_EQ("done", io.Start(limited, "test").get().body);
+    EXPECT_EQ("done", io.Start(limited, std::string(kBudgetBytes, 'x')).get().body);
+    EXPECT_EQ(0u, budget->InUse());
+    executor->CloseAdmission(ServiceRequestExecutor::ShutdownMode::kDrain);
+    const Reply closed = io.Start(limited, std::string(kBudgetBytes + 1, 'x')).get();
+    EXPECT_NE(std::string::npos, closed.body.find("SERVER_NOT_LEADER"));
 }
 
 class MetaSubmitRaceService : public MetaDispatchService {
@@ -429,9 +449,12 @@ TEST(CoroHttpDispatchTest, OverloadedMetaRejectsBeforeParsingJson) {
                          [](ServiceRequestExecutor::CompletionToken) {}});
     ASSERT_EQ(std::future_status::ready, ready.wait_for(5s));
     auto metrics = std::make_shared<MetricsRegistry>();
-    MetaDispatchService service(metrics, nullptr, std::make_shared<RegistryManager>("", metrics), executor);
+    auto budget = std::make_shared<ReportEventBodyBudget>(64 * 1024 * 1024);
+    MetaDispatchService service(
+        metrics, nullptr, std::make_shared<RegistryManager>("", metrics), executor, nullptr, budget, nullptr);
     service.Init();
-    MetaSubmitRaceService race_service(metrics, nullptr, std::make_shared<RegistryManager>("", metrics), executor);
+    MetaSubmitRaceService race_service(
+        metrics, nullptr, std::make_shared<RegistryManager>("", metrics), executor, nullptr, budget, nullptr);
     race_service.Init();
     IoLoop io;
     auto pending = io.Start(service.MissingInstanceHandler(), "{}");
@@ -463,7 +486,8 @@ TEST(CoroHttpDispatchTest, MetaCollectorLookupWaitsOnWorkerWithoutBlockingSingle
     auto lifecycle = std::make_shared<MetricsLifecycle>();
     auto registry = std::make_shared<RegistryManager>("", metrics);
     // The unknown-instance preparation returns before dereferencing impl.
-    MetaDispatchService service(metrics, nullptr, registry, executor, lifecycle);
+    auto budget = std::make_shared<ReportEventBodyBudget>(64 * 1024 * 1024);
+    MetaDispatchService service(metrics, nullptr, registry, executor, lifecycle, budget, nullptr);
     service.Init();
     IoLoop io;
     std::unique_lock<std::shared_mutex> hold_lifecycle(lifecycle->mut_);

@@ -13,6 +13,11 @@
 namespace kv_cache_manager {
 namespace {
 
+bool FitsLocationPayload(const LocationSpec &spec) {
+    constexpr size_t kMaxBytes = std::numeric_limits<uint32_t>::max();
+    return spec.uri().size() <= kMaxBytes && spec.checksum().size() <= kMaxBytes - spec.uri().size();
+}
+
 ErrorCode ValidateLocations(const CacheLocationMap &locations,
                             const SharedLocationSpecName &spec_name,
                             const std::unordered_map<LocationId, InternedLocationId> &interned_ids) {
@@ -45,10 +50,7 @@ ErrorCode ValidateLocations(const CacheLocationMap &locations,
         if (!spec.name_handle() || spec.name() != *spec_name) {
             return EC_BADARGS;
         }
-        if (!spec.checksum().empty()) {
-            return EC_UNIMPLEMENTED;
-        }
-        if (spec.uri().size() > std::numeric_limits<uint32_t>::max()) {
+        if (!FitsLocationPayload(spec)) {
             return EC_OUT_OF_RANGE;
         }
         if (!location->HasValidatedLocationSpecs()) {
@@ -62,6 +64,17 @@ ErrorCode ValidateLocations(const CacheLocationMap &locations,
 }
 
 } // namespace
+
+SimpleKVCacheItem::LocationData::LocationData(const InternedLocationId &location_id, const LocationSpec &spec)
+    : id(location_id), uri_size(static_cast<uint32_t>(spec.uri().size())) {
+    const std::string &uri = spec.uri();
+    const std::string_view checksum = spec.checksum();
+    payload.reserve(uri.size() + checksum.size());
+    payload.insert(payload.end(), uri.begin(), uri.end());
+    if (!checksum.empty()) {
+        payload.insert(payload.end(), checksum.begin(), checksum.end());
+    }
+}
 
 SimpleKVCacheItem::SimpleKVCacheItem() noexcept = default;
 
@@ -108,8 +121,8 @@ ErrorCode SimpleKVCacheItem::Create(const CacheLocationMap &locations,
     const auto destroy = [](SimpleKVCacheItem *item) { Deleter(item, nullptr); };
     std::unique_ptr<SimpleKVCacheItem, decltype(destroy)> item(static_cast<SimpleKVCacheItem *>(value), destroy);
     for (const CacheLocationMap::value_type &entry : locations) {
-        auto data = std::make_shared<const LocationData>(
-            LocationData{interned_ids.find(entry.first)->second, entry.second->location_specs().front().uri()});
+        auto data = std::make_shared<const LocationData>(interned_ids.find(entry.first)->second,
+                                                         entry.second->location_specs().front());
         const ErrorCode ec = item->AppendLocation(data, entry.second->create_time());
         if (ec != EC_OK) {
             return ec;
@@ -160,13 +173,13 @@ ErrorCode SimpleKVCacheItem::Merge(const SimpleKVCacheItem &current,
         }
     }
     for (const CacheLocationMap::value_type &entry : updates) {
-        const std::string &uri = entry.second->location_specs().front().uri();
+        const LocationSpec &spec = entry.second->location_specs().front();
         std::shared_ptr<const LocationData> data;
         size_t index = 0;
-        if (current.FindLocationIndex(entry.first, index) && current.Record(index).data->uri == uri) {
+        if (current.FindLocationIndex(entry.first, index) && current.Record(index).data->Matches(spec)) {
             data = current.Record(index).data;
         } else {
-            data = std::make_shared<const LocationData>(LocationData{interned_ids.find(entry.first)->second, uri});
+            data = std::make_shared<const LocationData>(interned_ids.find(entry.first)->second, spec);
         }
         const ErrorCode ec = item->AppendLocation(data, entry.second->create_time());
         if (ec != EC_OK) {
@@ -242,9 +255,8 @@ size_t SimpleKVCacheItem::EstimateRecordCharge(size_t location_count) {
     return sizeof(SimpleKVCacheItem) + location_count * sizeof(LocationRecord) + kHashBucketMargin;
 }
 
-size_t SimpleKVCacheItem::EstimateDataCharge(size_t uri_capacity) {
-    static const size_t kInlineStringCapacity = std::string().capacity();
-    return sizeof(LocationData) + sizeof(void *) * 2 + (uri_capacity > kInlineStringCapacity ? uri_capacity + 1 : 0);
+size_t SimpleKVCacheItem::EstimateDataCharge(size_t payload_capacity) {
+    return sizeof(LocationData) + sizeof(void *) * 2 + payload_capacity;
 }
 
 ErrorCode SimpleKVCacheItem::EstimateWriteGrowth(const std::shared_ptr<SimpleKVCacheItem> &current,
@@ -260,21 +272,21 @@ ErrorCode SimpleKVCacheItem::EstimateWriteGrowth(const std::shared_ptr<SimpleKVC
         if (!entry.second || entry.second->location_specs().size() != 1) {
             return EC_BADARGS;
         }
-        if (!entry.second->location_specs().front().checksum().empty()) {
-            return EC_UNIMPLEMENTED;
+        const LocationSpec &spec = entry.second->location_specs().front();
+        if (!FitsLocationPayload(spec)) {
+            return EC_OUT_OF_RANGE;
         }
-        const std::string &uri = entry.second->location_specs().front().uri();
         size_t index = 0;
         if (current && !replace && current->FindLocationIndex(entry.first, index)) {
-            const std::string &previous = current->Record(index).data->uri;
-            if (previous == uri) {
+            const LocationData &previous = *current->Record(index).data;
+            if (previous.Matches(spec)) {
                 continue;
             }
-            after -= EstimateDataCharge(previous.capacity());
+            after -= EstimateDataCharge(previous.payload.capacity());
         } else {
             ++next_count;
         }
-        after += EstimateDataCharge(uri.size());
+        after += EstimateDataCharge(spec.uri().size() + spec.checksum().size());
     }
     after += EstimateRecordCharge(next_count);
     const size_t before = current ? current->Size() : 0;
@@ -286,7 +298,7 @@ ErrorCode SimpleKVCacheItem::AppendLocation(const std::shared_ptr<const Location
                                             int64_t create_time) noexcept {
     constexpr size_t kMaxBytes = std::numeric_limits<uint32_t>::max();
     // 共享数据及控制块按每条引用保守计费，避免外置 URI 后 LRU charge 漏掉大部分内存。
-    const size_t data_charge = EstimateDataCharge(data->uri.capacity());
+    const size_t data_charge = EstimateDataCharge(data->payload.capacity());
     if (data_charge > kMaxBytes - charge_bytes_) {
         return EC_OUT_OF_RANGE;
     }
@@ -310,7 +322,9 @@ CacheLocationConstPtr SimpleKVCacheItem::ProjectLocation(const LocationRecord &r
     location->set_status(CLS_SERVING);
     location->set_spec_size(1);
     location->set_create_time(record.create_time);
-    location->push_location_spec(LocationSpec(spec_name, record.data->uri));
+    LocationSpec spec(spec_name, std::string(record.data->Uri()));
+    spec.set_checksum(record.data->Checksum());
+    location->push_location_spec(std::move(spec));
     return location;
 }
 
@@ -322,7 +336,8 @@ void SimpleKVCacheItem::AppendReadViews(const SharedLocationSpecName &spec_name,
         const DataStorageType type = data.id->compare(0, kL1p5Prefix.size(), kL1p5Prefix) == 0
                                          ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5
                                          : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
-        out_locations.AppendReadView(CacheLocationReadView(*data.id, *spec_name, data.uri, type));
+        out_locations.AppendReadView(
+            CacheLocationReadView(*data.id, *spec_name, data.payload, data.uri_size, type, Record(i).create_time));
     }
 }
 

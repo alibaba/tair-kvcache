@@ -1,6 +1,6 @@
 #pragma once
 
-#include <atomic>
+#include <functional>
 #include <memory>
 #include <string_view>
 
@@ -13,6 +13,7 @@ namespace kv_cache_manager {
 
 class MetaServiceImpl;
 class MetricsRegistry;
+class ReportEventBodyBudget;
 class RequestContext;
 struct MetricsLifecycle;
 
@@ -22,7 +23,9 @@ public:
                     std::shared_ptr<MetaServiceImpl> meta_service_impl,
                     std::shared_ptr<RegistryManager> registry_manager,
                     std::shared_ptr<ServiceRequestExecutor> executor,
-                    std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
+                    std::shared_ptr<MetricsLifecycle> metrics_lifecycle,
+                    std::shared_ptr<ReportEventBodyBudget> report_event_body_budget,
+                    std::function<void()> report_body_budget_rejection);
 
     void Init() override;
     void RegisterHandler() override;
@@ -75,7 +78,7 @@ public:
                                                                    proto::meta::GetHostCacheStateResponse *response);
 
 protected:
-    HandlerType LimitReportEventBodyBytes(HandlerType handler, size_t budget = 64 * 1024 * 1024);
+    HandlerType LimitReportEventBodyBytes(HandlerType handler);
 
 private:
     CachedJsonResponse TryRejectRequest() override;
@@ -89,7 +92,8 @@ private:
 
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
     std::shared_ptr<ServiceRequestExecutor> executor_;
-    std::atomic<size_t> report_event_body_bytes_{0};
+    std::shared_ptr<ReportEventBodyBudget> report_event_body_budget_;
+    std::function<void()> report_body_budget_rejection_;
 };
 
 } // namespace kv_cache_manager

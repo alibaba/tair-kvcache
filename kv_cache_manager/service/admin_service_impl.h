@@ -20,7 +20,8 @@ public:
                      std::shared_ptr<MetricsReporter> metrics_reporter,
                      std::shared_ptr<MetricsRegistry> metrics_registry,
                      std::shared_ptr<RegistryManager> registry_manager,
-                     std::shared_ptr<LeaderElector> leader_elector);
+                     std::shared_ptr<LeaderElector> leader_elector,
+                     bool include_access_log_payload);
     ~AdminServiceImpl() override = default;
 
     // 实现所有ConfigService的接口方法
@@ -130,6 +131,7 @@ private:
     std::shared_ptr<MetricsRegistry> metrics_registry_; // for the GetMetrics API
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<LeaderElector> leader_elector_;
+    const bool include_access_log_payload_;
 };
 
 } // namespace kv_cache_manager

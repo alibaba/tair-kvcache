@@ -70,7 +70,8 @@ void LoggingMetricsReporter::ReportInterval() {
     executor << "[Report_Request_Executor_Metrics_By_Print]|";
     bool has_executor_metrics = false;
     for (const auto &[name, tags, val] : all_metrics) {
-        if (name.rfind("service.request_", 0) == 0 && name.rfind("service.request_queue_wait_seconds_", 0) != 0) {
+        if (name.rfind("service.report_event_body_", 0) == 0 ||
+            (name.rfind("service.request_", 0) == 0 && name.rfind("service.request_queue_wait_seconds_", 0) != 0)) {
             has_executor_metrics = true;
             executor << "[" << name << "]:";
             if (std::holds_alternative<CounterValue>(val->value)) {

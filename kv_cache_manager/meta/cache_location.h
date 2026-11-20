@@ -387,14 +387,25 @@ public:
             source_ = std::cref(*location);
         }
     }
-    CacheLocationReadView(const std::string &id, const std::string &name, const std::string &uri, DataStorageType type)
-        : source_(SimpleFields{std::cref(id), std::cref(name), std::cref(uri), type}) {}
+    CacheLocationReadView(const std::string &id,
+                          const std::string &name,
+                          const std::vector<char> &payload,
+                          uint32_t uri_size,
+                          DataStorageType type,
+                          int64_t create_time)
+        : source_(SimpleFields{std::cref(id), std::cref(name), std::cref(payload), type, uri_size, create_time}) {}
 
     explicit operator bool() const { return source_.index() != 0; }
     const CacheLocation &OriginalLocation() const { return std::get<1>(source_).get(); }
     const std::string &id() const { return IsSimple() ? std::get<2>(source_).id.get() : OriginalLocation().id(); }
     DataStorageType type() const { return IsSimple() ? std::get<2>(source_).type : OriginalLocation().type(); }
     CacheLocationStatus status() const { return IsSimple() ? CLS_SERVING : OriginalLocation().status(); }
+    int64_t create_time() const {
+        return IsSimple() ? std::get<2>(source_).create_time : OriginalLocation().create_time();
+    }
+    bool GetValidatedTotalSize(uint64_t &size) const {
+        return !IsSimple() && OriginalLocation().GetValidatedTotalSize(size);
+    }
     size_t SpecSize() const { return IsSimple() ? 1 : OriginalLocation().spec_size(); }
     size_t SpecCount() const { return IsSimple() ? 1 : OriginalLocation().location_specs().size(); }
     bool HasSpecName(size_t index) const {
@@ -403,11 +414,20 @@ public:
     const std::string &SpecName(size_t index) const {
         return IsSimple() ? std::get<2>(source_).name.get() : OriginalLocation().location_specs()[index].name();
     }
-    const std::string &SpecUri(size_t index) const {
-        return IsSimple() ? std::get<2>(source_).uri.get() : OriginalLocation().location_specs()[index].uri();
+    std::string_view SpecUri(size_t index) const {
+        if (!IsSimple()) {
+            return OriginalLocation().location_specs()[index].uri();
+        }
+        const SimpleFields &fields = std::get<2>(source_);
+        return {fields.payload.get().data(), fields.uri_size};
     }
     std::string_view SpecChecksum(size_t index) const {
-        return IsSimple() ? std::string_view{} : OriginalLocation().location_specs()[index].checksum();
+        if (!IsSimple()) {
+            return OriginalLocation().location_specs()[index].checksum();
+        }
+        const SimpleFields &fields = std::get<2>(source_);
+        const std::vector<char> &payload = fields.payload.get();
+        return std::string_view(payload.data(), payload.size()).substr(fields.uri_size);
     }
     bool HasValidatedLocationSpecs() const { return !IsSimple() && OriginalLocation().HasValidatedLocationSpecs(); }
 
@@ -415,8 +435,10 @@ private:
     struct SimpleFields {
         std::reference_wrapper<const std::string> id;
         std::reference_wrapper<const std::string> name;
-        std::reference_wrapper<const std::string> uri;
+        std::reference_wrapper<const std::vector<char>> payload;
         DataStorageType type;
+        uint32_t uri_size;
+        int64_t create_time;
     };
     bool IsSimple() const { return source_.index() == 2; }
     std::variant<std::monostate, std::reference_wrapper<const CacheLocation>, SimpleFields> source_;

@@ -129,6 +129,17 @@ public:
                                                   const KeyVector &keys,
                                                   const LocationIdsPerKey &location_ids,
                                                   const LocationModifierFunc &modifier) noexcept;
+    using LocationViewModifierFunc = std::function<LocationModifierResult(const std::vector<ErrorCode> &,
+                                                                          const LocationIdVector &,
+                                                                          size_t,
+                                                                          const std::vector<CacheLocationReadView> &,
+                                                                          CacheLocationVector &,
+                                                                          PropertyMap &)>;
+    // Simple snapshots borrow old fields; recovery retains the targeted object read.
+    LocationResult ReadModifyWriteTargetLocations(RequestContext *request_context,
+                                                  const KeyVector &keys,
+                                                  const LocationIdsPerKey &location_ids,
+                                                  const LocationViewModifierFunc &modifier) noexcept;
     // Pure-local fast path for one target location per unique key. It keeps
     // ids and results flat, avoids per-key temporary maps/vectors, and retains
     // the same metadata shard locking and key-count semantics as the generic
@@ -241,6 +252,7 @@ private:
                                                const KeyVector &keys,
                                                const LocationIdsPerKey &location_ids,
                                                const LocationModifierFunc &modifier,
+                                               const LocationViewModifierFunc &view_modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
                                                bool fill_missing_cache,

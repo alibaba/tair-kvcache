@@ -10,10 +10,10 @@ namespace kv_cache_manager {
 class StandardUri {
 public:
     StandardUri() = default;
-    explicit StandardUri(const std::string &Uri);
+    explicit StandardUri(std::string_view uri);
 
 public:
-    bool Parse(const std::string &Uri);
+    bool Parse(std::string_view uri);
     std::string ToUriString() const;
     // Serialize the URI as if one new query parameter had been inserted,
     // without cloning/mutating the parameter map. The output keeps the same

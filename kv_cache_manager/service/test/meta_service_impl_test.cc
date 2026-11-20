@@ -80,7 +80,8 @@ protected:
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         reporter_ = std::make_shared<LocalMetricsReporter>();
         ASSERT_TRUE(reporter_->Init(cache_manager_, metrics_registry_, ""));
-        service_ = std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr);
+        service_ =
+            std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr, /*include_access_log_payload=*/false);
         service_->DisableLeaderOnlyRequests();
     }
 
@@ -123,6 +124,21 @@ protected:
     std::shared_ptr<CacheManager> cache_manager_;
     std::unique_ptr<MetaServiceImpl> service_;
 };
+
+TEST_F(MetaServiceImplTest, OnlyFullModeMaterializesPayloadBeforeTransport) {
+    for (const bool include_access_log_payload : {false, true}) {
+        MetaServiceImpl service(cache_manager_, reporter_, nullptr, include_access_log_payload);
+        RequestContext context("payload-mode");
+        proto::meta::GetInstanceInfoRequest request;
+        request.set_trace_id(context.trace_id());
+        proto::meta::GetInstanceInfoResponse response;
+        service.GetInstanceInfo(&context, &request, &response);
+
+        ASSERT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        EXPECT_EQ(include_access_log_payload, context.request_debug_json().valid);
+        EXPECT_EQ(include_access_log_payload, context.response_debug_json_.materialized_);
+    }
+}
 
 TEST_F(MetaServiceImplTest, FollowerRejectsReportEventQueryAndWrite) {
     RequestContext query_context("follower-query");

@@ -131,6 +131,7 @@ cc_library(
         ":types",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common/hash",
+        "//kv_cache_manager/data_storage:snapshot_uri_utils",
     ],
 )
 

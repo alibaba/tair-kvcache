@@ -276,10 +276,12 @@ cc_test(
         "redis",
     ],
     deps = [
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:common",
+        "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/meta:meta_storage_backend",
         "//kv_cache_manager/meta:meta_storage_backend_manager",
         "//kv_cache_manager/meta:types",

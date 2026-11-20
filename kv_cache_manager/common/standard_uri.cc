@@ -4,7 +4,7 @@
 
 namespace kv_cache_manager {
 
-StandardUri::StandardUri(const std::string &uri) { Parse(uri); }
+StandardUri::StandardUri(std::string_view uri) { Parse(uri); }
 std::string StandardUri::GetParam(const std::string &key) const {
     auto it = params_.find(key);
     return it == params_.end() ? "" : it->second;
@@ -12,7 +12,7 @@ std::string StandardUri::GetParam(const std::string &key) const {
 
 void StandardUri::SetParam(const std::string &key, const std::string &value) { params_[key] = value; }
 
-bool StandardUri::Parse(const std::string &uri) {
+bool StandardUri::Parse(std::string_view uri) {
     protocol_.clear();
     user_info_.clear();
     hostname_.clear();
@@ -74,12 +74,12 @@ bool StandardUri::Parse(const std::string &uri) {
         (pos_query_start == std::string::npos || pos_path_start < pos_query_start)) {
         if (pos_query_start != std::string::npos && pos_path_start < pos_query_start) {
             path_ = uri.substr(pos_path_start, pos_query_start - pos_path_start);
-            ParseParams(std::string_view(uri).substr(pos_query_start + 1));
+            ParseParams(uri.substr(pos_query_start + 1));
         } else {
             path_ = uri.substr(pos_path_start);
         }
     } else if (pos_query_start != std::string::npos && pos_query_start < uri.size()) {
-        ParseParams(std::string_view(uri).substr(pos_query_start + 1));
+        ParseParams(uri.substr(pos_query_start + 1));
     }
     return true;
 }

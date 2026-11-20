@@ -262,7 +262,7 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardReportsSuccessFailureAndRecover
     for (int status : {RequestContext::kOkStatusCode, 10, RequestContext::kOkStatusCode}) {
         RequestContext context("request-outcome", collector);
         context.set_status_code(status);
-        { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get()); }
+        { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get(), false, {}); }
         EXPECT_DOUBLE_EQ(status == RequestContext::kOkStatusCode ? 0. : 1.,
                          collector->get_service_error_code_metrics());
     }
@@ -288,7 +288,7 @@ TEST_F(LocalMetricsReporterTest, ConcurrentServiceCallsCountTheirOwnFailures) {
             for (int j = 0; j < kRequests; ++j) {
                 RequestContext context("concurrent-outcome", collector);
                 context.set_status_code(i % 2 == 0 ? RequestContext::kOkStatusCode : 10);
-                ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get());
+                ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get(), false, {});
             }
         });
     }
@@ -335,7 +335,7 @@ TEST_F(LocalMetricsReporterTest, LifetimeSamplesReachPrometheusAtRequestCompleti
     RequestContext context("lifetime_sample", service_collector);
     context.set_status_code(RequestContext::kOkStatusCode);
     context.GetMetricsCollectorsVehicle().AddMetricsCollector(request_collector);
-    { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get()); }
+    { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get(), false, {}); }
 
     const auto output = PrometheusExporter::Expose(*metrics_registry_);
     for (const auto *suffix : {"min", "max", "avg"}) {
@@ -378,7 +378,7 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
     request_context.set_status_code(10);
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(snapshot_collector);
     {
-        ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get());
+        ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get(), false, {});
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
@@ -401,7 +401,7 @@ TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadO
     RequestContext request_context("event-report-success", service_collector);
     request_context.set_status_code(RequestContext::kOkStatusCode);
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(heartbeat_collector);
-    { ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get()); }
+    { ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get(), false, {}); }
 
     EXPECT_DOUBLE_EQ(0., heartbeat_collector->get_service_error_code_metrics());
     EXPECT_EQ(1, heartbeat_collector->get_service_query_counter_metrics());
@@ -1121,9 +1121,9 @@ TEST_F(LocalMetricsReporterTest, HeartbeatPublishesZeroAfterSnapshotWithoutChang
     RequestContext heartbeat_context("heartbeat-key-count", heartbeat);
     heartbeat_context.set_status_code(RequestContext::kOkStatusCode);
     SET_METRICS_(snapshot, meta_indexer, query_key_count, 3600000.);
-    { ServiceCallGuard guard(cache_manager_.get(), &snapshot_context, reporter_.get()); }
+    { ServiceCallGuard guard(cache_manager_.get(), &snapshot_context, reporter_.get(), false, {}); }
     EXPECT_DOUBLE_EQ(3600000., shared->get_meta_indexer_query_key_count_metrics());
-    { ServiceCallGuard guard(cache_manager_.get(), &heartbeat_context, reporter_.get()); }
+    { ServiceCallGuard guard(cache_manager_.get(), &heartbeat_context, reporter_.get(), false, {}); }
     EXPECT_DOUBLE_EQ(0., shared->get_meta_indexer_query_key_count_metrics());
     EXPECT_DOUBLE_EQ(3600000., snapshot->get_meta_indexer_query_key_count_metrics());
     EXPECT_EQ(2u, shared->get_service_query_counter_metrics());

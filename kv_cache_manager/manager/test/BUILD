@@ -106,6 +106,7 @@ cc_test(
         "//kv_cache_manager/meta",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta/simple:simple_kv_cache_backend",
     ],
 )
 

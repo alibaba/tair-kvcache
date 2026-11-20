@@ -1,5 +1,6 @@
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -34,13 +35,17 @@ MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instan
 
 std::unique_ptr<MetaStorageBackend>
 MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_id,
-                                                   const std::shared_ptr<MetaStorageBackendConfig> &config) {
+                                                   const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                                   const SharedLocationSpecName &simple_spec_name) {
     const std::string &storage_type = config->GetStorageType();
+    const bool compact_write =
+        simple_spec_name && EnvUtil::GetEnv<bool>("kvcm.enable_simple_redis_compact_write", false);
+    RedisLocationCodec codec(simple_spec_name, compact_write);
     std::unique_ptr<MetaStorageBackend> backend;
     if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
-        backend = std::make_unique<MetaRedisBackend>();
+        backend = std::make_unique<MetaRedisBackend>(std::move(codec));
     } else if (storage_type == META_ASYNC_REDIS_BACKEND_TYPE_STR) {
-        backend = std::make_unique<MetaAsyncRedisBackend>();
+        backend = std::make_unique<MetaAsyncRedisBackend>(std::move(codec));
     } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaDummyBackend>();
     } else {

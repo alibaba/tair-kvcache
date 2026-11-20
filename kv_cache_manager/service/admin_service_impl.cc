@@ -46,7 +46,9 @@ kv_cache_manager::RequestContext::JsonFragment BuildProtoMessageDebugJson(const 
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    request_context->set_request_debug_json(BuildProtoMessageDebugJson(request));                                      \
+    if (include_access_log_payload_) {                                                                                 \
+        request_context->set_request_debug_json(BuildProtoMessageDebugJson(request));                                  \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -58,9 +60,10 @@ kv_cache_manager::RequestContext::JsonFragment BuildProtoMessageDebugJson(const 
     }                                                                                                                  \
     request_context->set_response_debug_json_generator([response]() { return BuildProtoMessageDebugJson(response); },  \
                                                        RequestContext::ResponseJsonKind::kFullMessage);                \
-    ServiceCallGuard service_call_guard(cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() {     \
-        DecrementRequestCount(is_leader_only);                                                                         \
-    });
+    ServiceCallGuard service_call_guard(                                                                               \
+        cache_manager_.get(), request_context, metrics_reporter_.get(), include_access_log_payload_, [this]() {        \
+            DecrementRequestCount(is_leader_only);                                                                     \
+        });
 
 // 这里的字段检测不包含任何基本数据类型，例如int32、int64、bool等
 #define CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN(api_name, manager_req, single_field)                               \
@@ -116,12 +119,14 @@ AdminServiceImpl::AdminServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                    std::shared_ptr<MetricsReporter> metrics_reporter,
                                    std::shared_ptr<MetricsRegistry> metrics_registry,
                                    std::shared_ptr<RegistryManager> registry_manager,
-                                   std::shared_ptr<LeaderElector> leader_elector)
+                                   std::shared_ptr<LeaderElector> leader_elector,
+                                   bool include_access_log_payload)
     : cache_manager_(std::move(cache_manager))
     , metrics_reporter_(std::move(metrics_reporter))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
-    , leader_elector_(std::move(leader_elector)) {}
+    , leader_elector_(std::move(leader_elector))
+    , include_access_log_payload_(include_access_log_payload) {}
 
 // Storage相关接口实现
 void AdminServiceImpl::AddStorage(RequestContext *request_context,

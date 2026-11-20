@@ -485,6 +485,7 @@ TEST_F(MetaIndexerTest, TestSimpleReadViewsPreserveResultsAndVisitorErrors) {
                                    CacheLocationVector &locations,
                                    PropertyMap &) {
         auto per_key = std::make_shared<CacheLocation>(*location);
+        per_key->set_create_time(100 + key_index);
         per_key->mutable_location_specs().front().set_uri(location->location_specs().front().uri() +
                                                           "&key=" + std::to_string(key_index + 1));
         locations.assign(ids.size(), per_key);
@@ -517,6 +518,7 @@ TEST_F(MetaIndexerTest, TestSimpleReadViewsPreserveResultsAndVisitorErrors) {
                     const CacheLocationReadView view = *batch.ReadViews(i).begin();
                     EXPECT_EQ(legacy[i][0]->id(), view.id());
                     EXPECT_EQ(legacy[i][0]->status(), view.status());
+                    EXPECT_EQ(legacy[i][0]->create_time(), view.create_time());
                     EXPECT_EQ(legacy[i][0]->type(), view.type());
                     EXPECT_EQ(legacy[i][0]->location_specs().front().name(), view.SpecName(0));
                     EXPECT_EQ(legacy[i][0]->location_specs().front().uri(), view.SpecUri(0));
@@ -554,6 +556,32 @@ TEST_F(MetaIndexerTest, TestSimpleReadViewsPreserveResultsAndVisitorErrors) {
             EXPECT_FALSE(result.stopped_by_visitor);
         }
     }
+    CompactLocationsPerKey borrowed(true);
+    ASSERT_EQ(EC_OK, meta_indexer_->GetLocationValues(request_context_.get(), {1}, borrowed).ec);
+    ASSERT_TRUE(borrowed.IsValid(1));
+    const CacheLocationReadView pinned = *borrowed.ReadViews(0).begin();
+    const MetaIndexer::LocationViewModifierFunc overwrite = [&](const std::vector<ErrorCode> &errors,
+                                                                const LocationIdVector &ids,
+                                                                size_t,
+                                                                const std::vector<CacheLocationReadView> &previous,
+                                                                CacheLocationVector &locations,
+                                                                PropertyMap &) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), errors);
+        EXPECT_EQ(1u, previous.size());
+        EXPECT_FALSE(locations.front());
+        EXPECT_EQ(pinned.SpecUri(0).data(), previous.front().SpecUri(0).data());
+        EXPECT_EQ(100, previous.front().create_time());
+        auto updated = std::make_shared<CacheLocation>(*location);
+        updated->set_create_time(previous.front().create_time());
+        locations.front() = std::move(updated);
+        EXPECT_EQ(pinned.SpecUri(0), previous.front().SpecUri(0));
+        return LocationModifierResult{MA_OK, std::vector<ErrorCode>(ids.size(), EC_OK)};
+    };
+    EXPECT_EQ(
+        EC_OK,
+        meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), {1}, {{location_id}}, overwrite).ec);
+    EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(3u, meta_indexer_->GetLocationCount());
 }
 
 TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesStopsAtFirstMissingChunk) {

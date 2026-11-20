@@ -105,6 +105,14 @@ kvcm.service.grpc_max_threads=0
 # 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
 kvcm.service.grpc_memory_quota_bytes=0
 
+# HTTP ReportEvent 在途原始请求体总预算（字节），仅计入请求体达到 8 MiB 的请求。
+# 0 每 200 ms 读取 /proc/meminfo 计算预算，范围为 64 MiB 至 1 GiB。正数使用固定值，上限为 1 GiB。
+# 自动模式从 MemAvailable 扣除 max(512 MiB, MemTotal 的 1%) 后按 8 倍处理开销折算。
+# 无法读取有效样本或超过 1 秒未更新时，自动预算使用 64 MiB。
+# 在 HTTP 收完请求体后、JSON 解析前检查预算。超额返回 SERVICE_BUSY，小于 8 MiB 直接进入正常处理。修改后需要重启。
+# 环境变量形式：kvcm_service_http_report_event_body_budget_bytes。
+kvcm.service.http_report_event_body_budget_bytes=0
+
 # Meta gRPC 默认 2 个轮询线程；必须是正整数。所有轮询线程共享一个 CQ。
 # 承担网络推进、protobuf 请求解析和完成事件处理；不执行业务，不计入 grpc_max_threads。
 # 独立 Admin Server 保留同步框架，不创建这些轮询线程。修改后需要重启。
@@ -487,6 +495,11 @@ Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
 
 ## Logger Config
 
+默认 `kvcm.logger.access_log_payload_mode=metadata`，访问日志只记录时间、客户端 IP、trace ID、request ID、接口、状态码和耗时。
+需要原有请求和响应正文或接口摘要时，设置 `kvcm.logger.access_log_payload_mode=full`。
+该配置启动时生效，也可通过环境变量 `kvcm_logger_access_log_payload_mode` 设置。
+HTTP 回包仍使用完整的 protobuf JSON。
+
 ```TEXT
 alog.rootLogger=INFO, rootAppender
 alog.max_msg_len=20480
@@ -495,8 +508,8 @@ alog.appender.rootAppender=FileAppender
 alog.appender.rootAppender.fileName=logs/kv_cache_manager.log
 alog.appender.rootAppender.layout=PatternLayout
 alog.appender.rootAppender.layout.LogPattern=[%%d] [%%l] [%%p:%%t] %%m
-alog.appender.rootAppender.async_flush=false
-alog.appender.rootAppender.flush=true
+alog.appender.rootAppender.async_flush=true
+alog.appender.rootAppender.flush=false
 alog.appender.rootAppender.compress=false
 
 alog.logger.access=INFO, accessAppender

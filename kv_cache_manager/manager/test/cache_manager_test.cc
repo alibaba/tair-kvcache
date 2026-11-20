@@ -14099,8 +14099,9 @@ TEST_F(SnapshotBatchTest, BlockedSnapshotDoesNotFenceOtherShardSnapshotReadOrBat
     }
 }
 
-TEST_F(SnapshotBatchTest, SimpleRejectsChecksumBeforeMutationAndSnapshotAdmission) {
-    const std::string instance = "simple_checksum_reject";
+TEST_F(SnapshotBatchTest, SimpleStoresChecksumThroughAddsAndSnapshots) {
+    const std::string instance = "simple_checksum";
+    const int64_t key = 101;
     const std::pair<ErrorCode, std::string> registered =
         cache_manager_->RegisterInstance(request_context_.get(),
                                          "default",
@@ -14114,37 +14115,62 @@ TEST_F(SnapshotBatchTest, SimpleRejectsChecksumBeforeMutationAndSnapshotAdmissio
     ASSERT_EQ(EC_OK, registered.first);
     const std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance);
     ASSERT_NE(nullptr, indexer);
-    proto::meta::ReportEventRequest add = MakeAddRequest(host_, 101, "rejected_checksum");
+    const std::shared_ptr<MetaSearcher> searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance);
+    ASSERT_NE(nullptr, searcher);
+    const auto read_location = [&]() -> CacheLocationConstPtr {
+        BlockMask mask;
+        CacheLocationMapVector locations;
+        if (searcher->BatchGetLocation(request_context_.get(), {key}, mask, locations) != EC_OK ||
+            locations.size() != 1 || locations.front().size() != 1) {
+            return nullptr;
+        }
+        return locations.front().begin()->second;
+    };
+
+    proto::meta::ReportEventRequest add = MakeAddRequest(host_, key, "checksum");
     add.set_instance_id(instance);
-    add.mutable_events(0)->mutable_block_add()->mutable_specs(0)->set_checksum("checksum");
-    const std::pair<ErrorCode, proto::meta::ReportEventResponse> add_result =
-        CallReportEvent(add, "checksum_add_reject");
-    EXPECT_EQ(EC_PARTIAL_OK, add_result.first);
-    EXPECT_EQ(proto::meta::UNSUPPORTED, add_result.second.header().status().code());
-    EXPECT_FALSE(event_backend_->IsNodeRegistered(instance, host_));
-    EXPECT_EQ(0u, indexer->GetKeyCount());
+    proto::meta::LocationSpec *add_spec = add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
+    const std::string checksum("first\0checksum", 14);
+    add_spec->set_checksum(checksum);
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "simple_checksum_add").first);
+    const CacheLocationConstPtr initial = read_location();
+    ASSERT_NE(nullptr, initial);
+    ASSERT_EQ(1u, initial->location_specs().size());
+    EXPECT_EQ(checksum, initial->location_specs().front().checksum());
 
-    proto::meta::ReportEventRequest baseline = MakeSnapshotRequest(host_, {{101, "baseline"}});
-    baseline.set_instance_id(instance);
-    baseline.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0)->set_checksum("");
-    const std::pair<ErrorCode, proto::meta::ReportEventResponse> baseline_result =
-        CallReportEvent(baseline, "checksum_empty_allowed");
-    ASSERT_EQ(EC_OK, baseline_result.first);
-    ASSERT_EQ(1u, indexer->GetKeyCount());
-    const uint64_t attempt = event_backend_->GetSnapshotAttemptEpoch({instance, host_});
+    add_spec->set_checksum("0");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "simple_checksum_update").first);
+    const CacheLocationConstPtr updated = read_location();
+    ASSERT_NE(nullptr, updated);
+    EXPECT_EQ(initial->location_specs().front().uri(), updated->location_specs().front().uri());
+    EXPECT_EQ(initial->create_time(), updated->create_time());
+    EXPECT_EQ("0", updated->location_specs().front().checksum());
 
-    proto::meta::ReportEventRequest snapshot =
-        MakeSnapshotRequest(host_, {{201, "a"}, {202, "b"}, {203, "c"}, {204, "d"}, {205, "e"}});
+    add_spec->clear_checksum();
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "simple_checksum_omitted_add").first);
+    const CacheLocationConstPtr patched = read_location();
+    ASSERT_NE(nullptr, patched);
+    EXPECT_EQ("0", patched->location_specs().front().checksum());
+
+    proto::meta::ReportEventRequest snapshot = MakeSnapshotRequest(host_, {{key, "checksum_snapshot"}});
     snapshot.set_instance_id(instance);
-    snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(4)->mutable_specs(0)->set_checksum(
-        "tail_checksum");
-    const std::pair<ErrorCode, proto::meta::ReportEventResponse> snapshot_result =
-        CallReportEvent(snapshot, "checksum_snapshot_tail_reject");
-    EXPECT_EQ(EC_PARTIAL_OK, snapshot_result.first);
-    EXPECT_EQ(proto::meta::UNSUPPORTED, snapshot_result.second.header().status().code());
-    EXPECT_EQ(baseline_result.second.committed_snapshot_version(), snapshot_result.second.committed_snapshot_version());
-    EXPECT_EQ(attempt, event_backend_->GetSnapshotAttemptEpoch({instance, host_}));
+    proto::meta::LocationSpec *snapshot_spec =
+        snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
+    snapshot_spec->set_checksum("snapshot-checksum");
+    ASSERT_EQ(EC_OK, CallReportEvent(snapshot, "simple_checksum_snapshot").first);
+    const CacheLocationConstPtr replaced = read_location();
+    ASSERT_NE(nullptr, replaced);
+    EXPECT_EQ("snapshot-checksum", replaced->location_specs().front().checksum());
+    EXPECT_EQ(initial->create_time(), replaced->create_time());
+
+    snapshot_spec->clear_checksum();
+    ASSERT_EQ(EC_OK, CallReportEvent(snapshot, "simple_checksum_omitted_snapshot").first);
+    const CacheLocationConstPtr cleared = read_location();
+    ASSERT_NE(nullptr, cleared);
+    EXPECT_FALSE(cleared->location_specs().front().has_checksum());
+    EXPECT_EQ(initial->create_time(), cleared->create_time());
     EXPECT_EQ(1u, indexer->GetKeyCount());
+    EXPECT_EQ(1u, indexer->GetLocationCount());
 }
 
 TEST_F(SnapshotBatchTest, OneSpecEnvUsesBatchedSnapshotWithUnchangedClientRequest) {

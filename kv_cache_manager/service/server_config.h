@@ -29,6 +29,7 @@ public:
     int32_t GetServiceIoThreadNum() const { return service_io_thread_num_; }
     int32_t GetServiceGrpcMaxThreads() const { return service_grpc_max_threads_; }
     uint64_t GetServiceGrpcMemoryQuotaBytes() const { return service_grpc_memory_quota_bytes_; }
+    uint32_t GetHttpReportEventBodyBudgetBytes() const { return http_report_event_body_budget_bytes_; }
     uint32_t GetServiceGrpcCqThreadNum() const { return service_grpc_cq_thread_num_; }
     uint32_t GetServiceWorkerThreadNum() const { return service_worker_thread_num_; }
     uint32_t ResolveServiceWorkerThreadNum(unsigned int hardware_threads) const;
@@ -40,6 +41,7 @@ public:
     int32_t GetServiceAdminHttpPort() const { return service_admin_http_port_; }
     bool IsEnableDebugService() const { return enable_debug_service_; }
     uint32_t GetLogLevel() const { return log_level_; }
+    bool IncludeAccessLogPayload() const { return include_access_log_payload_; }
     const std::string &startup_config() { return startup_config_; }
     int32_t GetSchedulePlanExecutorThreadCount() { return schedule_plan_executor_thread_count_; }
     uint32_t GetSchedulePlanMigrationWorkerBudget() const { return schedule_plan_migration_worker_budget_; }
@@ -116,6 +118,7 @@ private:
     int32_t service_io_thread_num_ = 0;
     int32_t service_grpc_max_threads_ = 0;
     uint64_t service_grpc_memory_quota_bytes_ = 0;
+    uint32_t http_report_event_body_budget_bytes_ = 0;
     uint32_t service_grpc_cq_thread_num_ = 2;
     uint32_t service_worker_thread_num_ = 0;
     uint32_t service_worker_queue_capacity_ = 2048;
@@ -126,6 +129,7 @@ private:
     int32_t service_admin_http_port_ = 0;
     bool enable_debug_service_ = false;
     uint32_t log_level_ = 0;
+    bool include_access_log_payload_ = false;
     std::string startup_config_;
     int32_t schedule_plan_executor_thread_count_ = 0;
     uint32_t schedule_plan_migration_worker_budget_ = 0;
