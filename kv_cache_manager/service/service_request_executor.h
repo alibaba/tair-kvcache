@@ -122,6 +122,8 @@ public:
     Snapshot TakeMetricsSnapshot();
 
 private:
+    using ThreadFactory = std::function<std::thread(std::function<void()>)>;
+    bool InitWithThreadFactory(std::size_t worker_count, std::size_t queue_capacity, const ThreadFactory &start_worker);
     static void WorkerLoop(const std::shared_ptr<State> &state);
 
     std::shared_ptr<State> state_;
