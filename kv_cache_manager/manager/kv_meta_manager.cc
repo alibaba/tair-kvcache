@@ -132,6 +132,7 @@ bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation
     out = {};
     out.type = location.type();
     out.value_size = size;
+    out.user_data = location.object_user_data();
     out.specs.reserve(location.location_specs().size());
     for (const auto &spec : location.location_specs()) {
         out.specs.emplace_back(spec.name(), spec.uri());
@@ -201,6 +202,7 @@ struct KvMetaManager::SessionItem {
     std::string location_id;
     CacheLocationConstPtr location;
     std::uint64_t value_size = 0;
+    std::shared_ptr<const KvMetaObjectUserData> user_data{};
 };
 
 struct KvMetaManager::ExactLocation {
@@ -1778,7 +1780,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                           const std::string &instance_id,
                           const std::vector<std::string> &keys,
                           const std::vector<std::uint64_t> &value_sizes,
-                          std::int64_t write_timeout_seconds) {
+                          std::int64_t write_timeout_seconds,
+                          const std::vector<KvMetaObjectUserData> &user_data) {
     StartWriteResult response;
     if (const ErrorCode ec = CheckReady(request_context); ec != EC_OK) {
         return {ec, {}};
@@ -1787,7 +1790,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {ec, {}};
     }
     if (value_sizes.size() != keys.size() || write_timeout_seconds <= 0 ||
-        write_timeout_seconds > limits_.max_write_timeout_seconds) {
+        write_timeout_seconds > limits_.max_write_timeout_seconds ||
+        (!user_data.empty() && user_data.size() != keys.size()) ||
+        std::any_of(user_data.begin(), user_data.end(), [](const auto &value) { return !value.bounded(); })) {
         return {EC_BADARGS, {}};
     }
     std::uint64_t batch_bytes = 0;
@@ -2002,6 +2007,10 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             location->set_id(existing[request_index].location_id);
             unpublished[request_index] = {
                 existing[request_index].internal_key, existing[request_index].location_id, location, size};
+            if (!user_data.empty() && !user_data[request_index].empty()) {
+                unpublished[request_index].user_data =
+                    std::make_shared<const KvMetaObjectUserData>(user_data[request_index]);
+            }
             std::uint64_t actual_size = 0;
             if (ValidateLocation(request_context,
                                  existing[request_index].internal_key,
@@ -2194,6 +2203,7 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
             auto serving = std::make_shared<CacheLocation>(*locations[0]);
             serving->set_status(CLS_SERVING);
             const auto item_index = layer[key_index];
+            serving->set_object_user_data(session.items[item_index].user_data);
             // Charge before publication; GC must never see a SERVING value
             // whose bytes have not been added. Keep cleanup ownership until
             // the metadata acknowledgement is known.

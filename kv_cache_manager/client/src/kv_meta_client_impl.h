@@ -26,6 +26,12 @@ public:
                                                                   const std::vector<std::string> &keys,
                                                                   const std::vector<std::uint64_t> &value_sizes,
                                                                   std::int32_t write_timeout_seconds) override;
+    std::pair<ClientErrorCode, KvMetaStartWriteResult>
+    StartWriteWithUserData(const std::string &trace_id,
+                           const std::vector<std::string> &keys,
+                           const std::vector<std::uint64_t> &value_sizes,
+                           std::int32_t write_timeout_seconds,
+                           const std::vector<KvMetaObjectUserData> &user_data) override;
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override;

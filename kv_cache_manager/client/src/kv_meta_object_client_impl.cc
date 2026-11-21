@@ -243,8 +243,17 @@ KvMetaObjectResult KvMetaObjectClientImpl::SaveObjectsWithTransferState(const st
                                                                         const std::vector<std::string> &keys,
                                                                         const std::vector<std::uint64_t> &value_sizes,
                                                                         const BlockBuffers &object_buffers) {
+    return SaveObjectsWithUserData(trace_id, keys, value_sizes, object_buffers, {});
+}
+
+KvMetaObjectResult KvMetaObjectClientImpl::SaveObjectsWithUserData(
+    const std::string &trace_id,
+    const std::vector<std::string> &keys,
+    const std::vector<std::uint64_t> &value_sizes,
+    const BlockBuffers &object_buffers,
+    const std::vector<KvMetaObjectUserData> &user_data) {
     bool may_be_inflight = false;
-    const auto ec = SaveObjectsImpl(trace_id, keys, value_sizes, object_buffers, may_be_inflight);
+    const auto ec = SaveObjectsImpl(trace_id, keys, value_sizes, object_buffers, may_be_inflight, user_data);
     return {ec, may_be_inflight};
 }
 
@@ -252,7 +261,8 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjectsImpl(const std::string &trace
                                                         const std::vector<std::string> &keys,
                                                         const std::vector<std::uint64_t> &value_sizes,
                                                         const BlockBuffers &object_buffers,
-                                                        bool &data_transfer_may_be_inflight) {
+                                                        bool &data_transfer_may_be_inflight,
+                                                        const std::vector<KvMetaObjectUserData> &user_data) {
     const auto validation_ec = ValidateRequest(keys, value_sizes, object_buffers, max_object_bytes_);
     if (validation_ec != ER_OK) {
         return validation_ec;
@@ -265,7 +275,8 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjectsImpl(const std::string &trace
     ClientErrorCode start_ec = ER_INVALID_GRPCSTATUS;
     KvMetaStartWriteResult start_result;
     try {
-        auto result = metadata_client_->StartWrite(trace_id, keys, value_sizes, write_timeout_seconds_);
+        auto result = metadata_client_->StartWriteWithUserData(
+            trace_id, keys, value_sizes, write_timeout_seconds_, user_data);
         start_ec = result.first;
         start_result = std::move(result.second);
     } catch (...) {

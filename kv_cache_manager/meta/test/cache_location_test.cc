@@ -53,6 +53,25 @@ TEST_F(CacheLocationTest, LegacyJsonWithoutChecksumKeepsPresenceFalse) {
     EXPECT_EQ(parsed.status(), CacheLocationStatus::CLS_SERVING);
 }
 
+TEST_F(CacheLocationTest, UserDataRoundTripsAndOldRecordsClearPresence) {
+    CacheLocation old;
+    auto user_data = std::make_shared<KvMetaObjectUserData>();
+    user_data->userdata1 = 0;
+    user_data->userdata2 = std::string("a\0b", 3);
+    CacheLocation current(old);
+    current.set_object_user_data(user_data);
+    ASSERT_TRUE(current.object_user_data());
+    EXPECT_GT(current.EstimateMemUsage(), old.EstimateMemUsage());
+
+    CacheLocation parsed;
+    ASSERT_TRUE(parsed.FromJsonString(current.ToJsonString()));
+    ASSERT_TRUE(parsed.object_user_data());
+    EXPECT_EQ(user_data->userdata1, parsed.object_user_data()->userdata1);
+    EXPECT_EQ(user_data->userdata2, parsed.object_user_data()->userdata2);
+    ASSERT_TRUE(parsed.FromJsonString(old.ToJsonString()));
+    EXPECT_FALSE(parsed.object_user_data());
+}
+
 TEST_F(CacheLocationTest, OpaqueChecksumIsPreserved) {
     LocationSpec spec("tp0", "file://x");
     std::string checksum = "校验:00FF/+=\"\\\n";

@@ -41,6 +41,11 @@ public:
                                                     const std::vector<std::string> &keys,
                                                     const std::vector<std::uint64_t> &value_sizes,
                                                     const BlockBuffers &object_buffers) override;
+    KvMetaObjectResult SaveObjectsWithUserData(const std::string &trace_id,
+                                                const std::vector<std::string> &keys,
+                                                const std::vector<std::uint64_t> &sizes,
+                                                const BlockBuffers &buffers,
+                                                const std::vector<KvMetaObjectUserData> &user_data) override;
     KvMetaObjectResult LoadObjectsWithTransferState(const std::string &trace_id,
                                                     const std::vector<std::string> &keys,
                                                     const std::vector<std::uint64_t> &expected_value_sizes,
@@ -51,7 +56,8 @@ private:
                                     const std::vector<std::string> &keys,
                                     const std::vector<std::uint64_t> &value_sizes,
                                     const BlockBuffers &object_buffers,
-                                    bool &data_transfer_may_be_inflight);
+                                    bool &data_transfer_may_be_inflight,
+                                    const std::vector<KvMetaObjectUserData> &user_data);
     ClientErrorCode LoadObjectsImpl(const std::string &trace_id,
                                     const std::vector<std::string> &keys,
                                     const std::vector<std::uint64_t> &expected_value_sizes,

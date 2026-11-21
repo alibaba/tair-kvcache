@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common.h"
+#include "kv_cache_manager/common/kv_meta_constants.h"
 
 namespace kv_cache_manager {
 
@@ -26,6 +27,7 @@ struct KvMetaValueLocation {
     // TransferClient is not compatible. Values in one batch may differ.
     std::uint64_t value_size{0};
     Location location_specs;
+    KvMetaObjectUserData user_data{};
 };
 
 struct KvMetaGetResult {
@@ -107,6 +109,18 @@ public:
     virtual std::pair<ClientErrorCode, KvMetaGetResult>
     GetWithDeadline(const std::string &, const std::vector<std::string> &, std::chrono::steady_clock::time_point) {
         return {ER_SERVICE_UNSUPPORTED, {}};
+    }
+
+    virtual std::pair<ClientErrorCode, KvMetaStartWriteResult>
+    StartWriteWithUserData(const std::string &trace_id,
+                           const std::vector<std::string> &keys,
+                           const std::vector<std::uint64_t> &value_sizes,
+                           std::int32_t timeout,
+                           const std::vector<KvMetaObjectUserData> &user_data) {
+        if (!user_data.empty()) {
+            return {ER_SERVICE_UNSUPPORTED, {}};
+        }
+        return StartWrite(trace_id, keys, value_sizes, timeout);
     }
 };
 

@@ -18,6 +18,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/jsonizable.h"
+#include "kv_cache_manager/common/kv_meta_constants.h"
 #include "kv_cache_manager/data_storage/common_define.h"
 
 namespace kv_cache_manager {
@@ -203,6 +204,12 @@ public:
         Put(writer, "spec_size", spec_size());
         Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
+        if (object_user_data_ && object_user_data_->userdata1) {
+            Put(writer, "userdata1", *object_user_data_->userdata1);
+        }
+        if (object_user_data_ && object_user_data_->userdata2) {
+            Put(writer, "userdata2", *object_user_data_->userdata2);
+        }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
@@ -267,6 +274,12 @@ public:
         return true;
     }
 
+    void set_object_user_data(std::shared_ptr<const KvMetaObjectUserData> value) {
+        object_user_data_ = std::move(value);
+    }
+    [[nodiscard]] const std::shared_ptr<const KvMetaObjectUserData> &object_user_data() const noexcept {
+        return object_user_data_;
+    }
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
         ClearValidatedTotalSize();
@@ -298,6 +311,12 @@ public:
             usage += spec.name().size() + EstimateStringPayloadCharge(spec.uri());
             if (spec.has_checksum()) {
                 usage += spec.checksum().size() + 1;
+            }
+        }
+        if (object_user_data_) {
+            usage += sizeof(KvMetaObjectUserData) + 2 * sizeof(void *);
+            if (object_user_data_->userdata2) {
+                usage += EstimateStringPayloadCharge(*object_user_data_->userdata2);
             }
         }
         return usage;
@@ -347,6 +366,22 @@ private:
             return false;
         }
         set_spec_size(spec_size);
+        KvMetaObjectUserData user_data;
+        const auto first = rapid_value.FindMember("userdata1");
+        if (first != rapid_value.MemberEnd()) {
+            if (!first->value.IsInt()) {
+                return false;
+            }
+            user_data.userdata1 = first->value.GetInt();
+        }
+        const auto second = rapid_value.FindMember("userdata2");
+        if (second != rapid_value.MemberEnd()) {
+            if (!second->value.IsString() || second->value.GetStringLength() > kKvMetaMaxObjectUserData2Bytes) {
+                return false;
+            }
+            user_data.userdata2.emplace(second->value.GetString(), second->value.GetStringLength());
+        }
+        object_user_data_ = user_data.empty() ? nullptr : std::make_shared<const KvMetaObjectUserData>(std::move(user_data));
         return true;
     }
 
@@ -357,6 +392,7 @@ private:
     void ClearValidatedTotalSize() { packed_sizes_ |= kValidatedTotalSizeMask; }
 
     InternedLocationId id_;
+    std::shared_ptr<const KvMetaObjectUserData> object_user_data_;
     int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
     // Pure-local ReportEvent has already validated every URI and summed its

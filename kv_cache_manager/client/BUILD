@@ -66,6 +66,7 @@ cc_library(
     strip_include_prefix = "include",
     deps = [
         ":common",
+        "//kv_cache_manager/common:kv_meta_constants",
     ],
     alwayslink = True,
 )

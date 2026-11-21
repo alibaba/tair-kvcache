@@ -77,6 +77,15 @@ bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::Va
     target->set_type(ToKvMetaStorageType(source.type));
     target->set_spec_size(static_cast<std::int32_t>(source.specs.size()));
     target->set_value_size(source.value_size);
+    if (source.user_data) {
+        auto *user_data = target->mutable_user_data();
+        if (source.user_data->userdata1) {
+            user_data->set_userdata1(*source.user_data->userdata1);
+        }
+        if (source.user_data->userdata2) {
+            user_data->set_userdata2(*source.user_data->userdata2);
+        }
+    }
     for (const auto &[name, uri] : source.specs) {
         auto *spec = target->add_location_specs();
         spec->set_name(name);
@@ -284,17 +293,33 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
         return;
     }
     if (!HasBoundedKvMetaKeys(request->keys(), kv_meta_manager_->limits()) ||
-        request->value_sizes_size() != request->keys_size()) {
+        request->value_sizes_size() != request->keys_size() ||
+        (request->user_data_size() != 0 && request->user_data_size() != request->keys_size())) {
         SetDirectError(request_context,
                        status,
                        proto::kv_meta::INVALID_ARGUMENT,
-                       "KVMeta PutStart keys or value_sizes exceed the configured request limits");
+                       "KVMeta PutStart keys, value_sizes or user_data do not match request limits");
         return;
     }
     const std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     const std::vector<std::uint64_t> sizes(request->value_sizes().begin(), request->value_sizes().end());
+    std::vector<KvMetaObjectUserData> user_data;
+    user_data.reserve(request->user_data_size());
+    for (const auto &source : request->user_data()) {
+        if (source.userdata2().size() > kKvMetaMaxObjectUserData2Bytes) {
+            SetDirectError(request_context, status, proto::kv_meta::INVALID_ARGUMENT, "KVMeta userdata2 exceeds 256 bytes");
+            return;
+        }
+        auto &value = user_data.emplace_back();
+        if (source.userdata1_field_case() == proto::kv_meta::ObjectUserData::kUserdata1) {
+            value.userdata1 = source.userdata1();
+        }
+        if (source.userdata2_field_case() == proto::kv_meta::ObjectUserData::kUserdata2) {
+            value.userdata2 = source.userdata2();
+        }
+    }
     auto [ec, result] = kv_meta_manager_->StartWrite(
-        request_context, request->instance_id(), keys, sizes, request->write_timeout_seconds());
+        request_context, request->instance_id(), keys, sizes, request->write_timeout_seconds(), user_data);
     if (ec == EC_EXIST) {
         SetDirectError(
             request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("PutStart", ec, request_context));

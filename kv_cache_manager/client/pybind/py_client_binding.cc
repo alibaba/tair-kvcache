@@ -273,7 +273,13 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::call_guard<py::gil_scoped_release>());
 
     py::class_<kvcm::ObjectMeta>(module, "ObjectMeta")
-        .def_property_readonly("size_bytes", &kvcm::ObjectMeta::SizeBytes);
+        .def_property_readonly("size_bytes", &kvcm::ObjectMeta::SizeBytes)
+        .def_property_readonly("userdata1", [](const kvcm::ObjectMeta &meta) { return meta.UserData().userdata1; })
+        .def_property_readonly("userdata2", [](const kvcm::ObjectMeta &meta) { return meta.UserData().userdata2; });
+    py::class_<kvcm::KvMetaObjectUserData>(module, "KvMetaObjectUserData")
+        .def(py::init<>())
+        .def_readwrite("userdata1", &kvcm::KvMetaObjectUserData::userdata1)
+        .def_readwrite("userdata2", &kvcm::KvMetaObjectUserData::userdata2);
     py::class_<kvcm::KvMetaObjectClient, py::smart_holder>(module, "KvMetaObjectClient", py::dynamic_attr())
         .def_static(
             "Create",
@@ -385,6 +391,23 @@ PYBIND11_MODULE(kvcm_py_client, module) {
             py::arg("keys"),
             py::arg("value_sizes"),
             py::arg("object_buffers"),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "SaveObjectsWithUserData",
+            [](kvcm::KvMetaObjectClient &client,
+               const std::string &trace_id,
+               const std::vector<std::string> &keys,
+               const std::vector<std::uint64_t> &sizes,
+               const kvcm::BlockBuffers &buffers,
+               const std::vector<kvcm::KvMetaObjectUserData> &user_data) {
+                const auto result = client.SaveObjectsWithUserData(trace_id, keys, sizes, buffers, user_data);
+                return std::make_pair(result.ec, result.data_transfer_may_be_inflight);
+            },
+            py::arg("trace_id"),
+            py::arg("keys"),
+            py::arg("value_sizes"),
+            py::arg("object_buffers"),
+            py::arg("user_data"),
             py::call_guard<py::gil_scoped_release>())
         .def(
             "LoadObjectsWithTransferState",

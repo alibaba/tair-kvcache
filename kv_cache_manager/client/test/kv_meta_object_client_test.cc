@@ -20,7 +20,7 @@
 namespace kv_cache_manager {
 namespace {
 
-static_assert(kKvMetaObjectClientApiVersion == 2);
+static_assert(kKvMetaObjectClientApiVersion == 3);
 
 TEST(KvMetaObjectClientVersionTest, SharedLibraryExportsHeaderCapabilityVersion) {
     EXPECT_EQ(GetKvMetaObjectClientApiVersion(), kKvMetaObjectClientApiVersion);

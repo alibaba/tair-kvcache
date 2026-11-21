@@ -11,6 +11,11 @@ config_setting(
     values = {"define": "CLIENT_ONLY_HEADER=true"},
 )
 
+cc_library(
+    name = "kv_meta_constants",
+    hdrs = ["kv_meta_constants.h"],
+)
+
 # TODO(qisa.cb) 目标太杂了，需要归类一下
 cc_library(
     name = "common",
@@ -19,10 +24,10 @@ cc_library(
     hdrs = [
         "common.h",
         "error_code.h",
-        "kv_meta_constants.h",
     ],
     deps = [
         ":jsonizable",
+        ":kv_meta_constants",
         ":logger",
         ":request_context",
         ":string_util",

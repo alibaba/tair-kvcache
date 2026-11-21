@@ -50,6 +50,7 @@ public:
         DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         std::uint64_t value_size = 0;
         std::vector<std::pair<std::string, std::string>> specs;
+        std::shared_ptr<const KvMetaObjectUserData> user_data;
     };
 
     struct GetResult {
@@ -96,7 +97,8 @@ public:
                                                       const std::string &instance_id,
                                                       const std::vector<std::string> &keys,
                                                       const std::vector<std::uint64_t> &value_sizes,
-                                                      std::int64_t write_timeout_seconds);
+                                                      std::int64_t write_timeout_seconds,
+                                                      const std::vector<KvMetaObjectUserData> &user_data = {});
 
     ErrorCode FinishWrite(RequestContext *request_context,
                           const std::string &instance_id,

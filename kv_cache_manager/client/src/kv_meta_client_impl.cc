@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/kv_meta_client_impl.h"
 
+#include <algorithm>
 #include <chrono>
 #include <grpcpp/grpcpp.h>
 #include <sstream>
@@ -92,6 +93,16 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
     target.value_size = source.value_size();
     target.location_specs.clear();
     target.location_specs.push_back({source_spec.name(), source_spec.uri()});
+    if (source.has_user_data()) {
+        const auto &value = source.user_data();
+        if (value.userdata1_field_case() == proto::kv_meta::ObjectUserData::kUserdata1) {
+            target.user_data.userdata1 = value.userdata1();
+        }
+        if (value.userdata2_field_case() == proto::kv_meta::ObjectUserData::kUserdata2 &&
+            value.userdata2().size() <= kKvMetaMaxObjectUserData2Bytes) {
+            target.user_data.userdata2 = value.userdata2();
+        }
+    }
     return true;
 }
 
@@ -369,8 +380,19 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
                              const std::vector<std::string> &keys,
                              const std::vector<std::uint64_t> &value_sizes,
                              std::int32_t write_timeout_seconds) {
+    return StartWriteWithUserData(trace_id, keys, value_sizes, write_timeout_seconds, {});
+}
+
+std::pair<ClientErrorCode, KvMetaStartWriteResult>
+KvMetaClientImpl::StartWriteWithUserData(const std::string &trace_id,
+                                         const std::vector<std::string> &keys,
+                                         const std::vector<std::uint64_t> &value_sizes,
+                                         std::int32_t write_timeout_seconds,
+                                         const std::vector<KvMetaObjectUserData> &user_data) {
     if (!ValidateKeys(keys) || value_sizes.size() != keys.size() || write_timeout_seconds <= 0 ||
-        write_timeout_seconds > kKvMetaMaxWriteTimeoutSeconds) {
+        write_timeout_seconds > kKvMetaMaxWriteTimeoutSeconds ||
+        (!user_data.empty() && user_data.size() != keys.size()) ||
+        std::any_of(user_data.begin(), user_data.end(), [](const auto &value) { return !value.bounded(); })) {
         return {ER_INVALID_PARAMS, {}};
     }
     std::uint64_t batch_bytes = 0;
@@ -388,6 +410,16 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
     for (std::size_t i = 0; i < keys.size(); ++i) {
         request.add_keys(keys[i]);
         request.add_value_sizes(value_sizes[i]);
+        if (!user_data.empty()) {
+            const auto &value = user_data[i];
+            auto *target = request.add_user_data();
+            if (value.userdata1) {
+                target->set_userdata1(*value.userdata1);
+            }
+            if (value.userdata2) {
+                target->set_userdata2(*value.userdata2);
+            }
+        }
     }
     proto::kv_meta::PutStartResponse response;
     const ClientErrorCode ec =

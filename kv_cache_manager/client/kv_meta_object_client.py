@@ -22,7 +22,8 @@ KV_META_MAX_OBJECT_BYTES = 1024 * 1024 * 1024
 KV_META_MAX_BATCH_BYTES = 4 * 1024 * 1024 * 1024
 KV_META_MAX_CALL_TIMEOUT_MS = 600_000
 KV_META_MAX_WRITE_TIMEOUT_SECONDS = 1800
-KV_META_OBJECT_API_VERSION = 2
+KV_META_OBJECT_API_VERSION = 3
+KV_META_MAX_OBJECT_USERDATA2_BYTES = 256
 
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_INT32 = (1 << 31) - 1
@@ -564,10 +565,16 @@ class KvMetaObjectClient:
         return block
 
     def _invoke_buffers(
-        self, operation: str, objects: Any, trace_id: Optional[str]
+        self, operation: str, objects: Any, trace_id: Optional[str], user_data=()
     ) -> None:
         materialized = self._validate_buffers(objects)
         batches = self._partition(materialized)
+        native_user_data = ()
+        if user_data:
+            entries = _snapshot_sequence(user_data, "KVMeta user data")
+            if len(entries) != len(materialized):
+                raise ValueError("KVMeta user data must align with keys")
+            native_user_data = tuple(self._native_user_data(entry) for entry in entries)
         keys = tuple(obj.key for obj in materialized)
         sizes = tuple(obj.nbytes for obj in materialized)
         native_buffers = tuple(
@@ -590,6 +597,9 @@ class KvMetaObjectClient:
                         else "LoadObjectsWithTransferState"
                     ),
                 )
+            if native_user_data:
+                method = client.SaveObjectsWithUserData
+                with_transfer_state = True
         except Exception as error:
             raise KvMetaObjectClientError(
                 operation,
@@ -602,12 +612,15 @@ class KvMetaObjectClient:
         for batch_index, (begin, end) in enumerate(batches):
             may_be_inflight = True
             try:
-                result = method(
+                args = (
                     self._batch_trace_id(base_trace, batch_index, len(batches)),
                     list(keys[begin:end]),
                     list(sizes[begin:end]),
                     list(native_buffers[begin:end]),
                 )
+                if native_user_data:
+                    args += (list(native_user_data[begin:end]),)
+                result = method(*args)
                 if with_transfer_state:
                     if (
                         not isinstance(result, tuple)
@@ -649,6 +662,21 @@ class KvMetaObjectClient:
                     data_transfer_may_be_inflight=may_be_inflight,
                 )
 
+    def _native_user_data(self, entry):
+        value = self._pybind.KvMetaObjectUserData()
+        if entry is None:
+            return value
+        userdata1, userdata2 = entry
+        if userdata1 is not None:
+            if type(userdata1) is not int or not -(1 << 31) <= userdata1 <= _MAX_INT32:
+                raise ValueError("KVMeta userdata1 must be a signed 32-bit integer")
+            value.userdata1 = userdata1
+        if userdata2 is not None:
+            if not isinstance(userdata2, str) or _utf8_size(userdata2, "KVMeta userdata2") > KV_META_MAX_OBJECT_USERDATA2_BYTES:
+                raise ValueError("KVMeta userdata2 must be a string of at most 256 UTF-8 bytes")
+            value.userdata2 = userdata2
+        return value
+
     @staticmethod
     def _buffers_from_tensors(
         keys: Any, tensors: Any
@@ -670,6 +698,9 @@ class KvMetaObjectClient:
         trace_id: Optional[str] = None,
     ) -> None:
         self.save_buffers(self._buffers_from_tensors(keys, tensors), trace_id=trace_id)
+
+    def save_with_user_data(self, keys, tensors, user_data, *, trace_id=None) -> None:
+        self._invoke_buffers("save", self._buffers_from_tensors(keys, tensors), trace_id, user_data)
 
     def load(
         self,

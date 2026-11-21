@@ -223,6 +223,92 @@ TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) 
     EXPECT_TRUE(wrong_size_response.locations().empty());
 }
 
+TEST_F(KvMetaServiceImplTest, UserDataPublishesOnlyWithItsSuccessfulObjectGeneration) {
+    constexpr auto OK = proto::kv_meta::OK;
+    constexpr auto INVALID_ARGUMENT = proto::kv_meta::INVALID_ARGUMENT;
+    const auto put = [&](const proto::kv_meta::PutStartRequest &request) {
+        proto::kv_meta::PutStartResponse response;
+        RequestContext context("put-userdata");
+        service_->PutStart(&context, &request, &response);
+        return response;
+    };
+    const auto finish = [&](const std::string &session, bool success) {
+        proto::kv_meta::PutFinishRequest request;
+        request.set_instance_id(kInstanceId);
+        request.set_write_session_id(session);
+        request.mutable_success_keys()->add_values(success);
+        proto::kv_meta::CommonResponse response;
+        RequestContext context("finish-userdata");
+        service_->PutFinish(&context, &request, &response);
+        return response.header().status().code();
+    };
+    const auto get = [&] {
+        proto::kv_meta::GetRequest request;
+        request.set_instance_id(kInstanceId);
+        request.add_keys("first");
+        request.add_keys("old");
+        request.add_keys("failed");
+        proto::kv_meta::GetResponse response;
+        RequestContext context("get-userdata");
+        service_->Get(&context, &request, &response);
+        return response;
+    };
+
+    proto::kv_meta::PutStartRequest first;
+    first.set_instance_id(kInstanceId);
+    first.set_write_timeout_seconds(30);
+    first.add_keys("first");
+    first.add_value_sizes(4096);
+    auto *data = first.add_user_data();
+    data->set_userdata1(0);
+    data->set_userdata2(std::string(257, 'a'));
+    EXPECT_EQ(INVALID_ARGUMENT, put(first).header().status().code());
+    first.mutable_user_data(0)->set_userdata2("");
+    const auto pending = put(first);
+    ASSERT_EQ(OK, pending.header().status().code());
+    ASSERT_EQ(1, pending.locations_size());
+    EXPECT_FALSE(pending.locations(0).has_user_data());
+    EXPECT_FALSE(get().hit_mask().values(0));
+    ASSERT_EQ(OK, finish(pending.write_session_id(), true));
+
+    proto::kv_meta::PutStartRequest legacy = first;
+    legacy.set_keys(0, "old");
+    legacy.clear_user_data();
+    const auto old = put(legacy);
+    ASSERT_EQ(OK, old.header().status().code());
+    ASSERT_EQ(OK, finish(old.write_session_id(), true));
+
+    proto::kv_meta::PutStartRequest mixed = first;
+    mixed.mutable_user_data(0)->set_userdata1(1009);
+    mixed.add_keys("failed");
+    mixed.add_value_sizes(4096);
+    EXPECT_EQ(INVALID_ARGUMENT, put(mixed).header().status().code());
+    mixed.add_user_data()->set_userdata1(2000);
+    const auto mixed_pending = put(mixed);
+    ASSERT_EQ(OK, mixed_pending.header().status().code());
+    ASSERT_EQ(2, mixed_pending.key_mask().values_size());
+    EXPECT_TRUE(mixed_pending.key_mask().values(0));
+    EXPECT_FALSE(mixed_pending.key_mask().values(1));
+    ASSERT_EQ(1, mixed_pending.locations_size());
+    ASSERT_EQ(OK, finish(mixed_pending.write_session_id(), false));
+
+    const auto readback = get();
+    ASSERT_EQ(OK, readback.header().status().code());
+    ASSERT_EQ(3, readback.locations_size());
+    const auto &committed = readback.locations(0);
+    EXPECT_EQ(4096, committed.value_size());
+    ASSERT_TRUE(committed.has_user_data());
+    EXPECT_EQ(proto::kv_meta::ObjectUserData::kUserdata1, committed.user_data().userdata1_field_case());
+    EXPECT_EQ(0, committed.user_data().userdata1());
+    EXPECT_EQ(proto::kv_meta::ObjectUserData::kUserdata2, committed.user_data().userdata2_field_case());
+    EXPECT_EQ("", committed.user_data().userdata2());
+    EXPECT_EQ(pending.locations(0).location_specs(0).uri(), committed.location_specs(0).uri());
+    EXPECT_TRUE(readback.hit_mask().values(1));
+    EXPECT_FALSE(readback.locations(1).has_user_data());
+    EXPECT_FALSE(readback.hit_mask().values(2));
+    EXPECT_FALSE(readback.locations(2).has_user_data());
+}
+
 TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {
     service_->DisableLeaderOnlyRequests();
 

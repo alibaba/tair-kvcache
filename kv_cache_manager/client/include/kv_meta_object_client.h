@@ -15,7 +15,7 @@ namespace kv_cache_manager {
 // Increment when the Python-visible object API changes incompatibly.  The
 // packaged Python wrapper checks this value before constructing native state so
 // a stale extension cannot silently reinterpret exact-size object requests.
-inline constexpr std::uint32_t kKvMetaObjectClientApiVersion = 2;
+inline constexpr std::uint32_t kKvMetaObjectClientApiVersion = 3;
 
 // Returns the capability version compiled into kv_cache_manager_client.so.
 // Consumers should compare this with kKvMetaObjectClientApiVersion before
@@ -35,6 +35,7 @@ std::uint32_t GetKvMetaObjectMetadataVersion() noexcept;
 class ObjectMeta {
 public:
     [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return location_.value_size; }
+    [[nodiscard]] const KvMetaObjectUserData &UserData() const noexcept { return location_.user_data; }
 
 private:
     friend class KvMetaObjectClientImpl;
@@ -151,6 +152,17 @@ public:
     // can fail; callers must still validate their object payload as usual.
     virtual KvMetaObjectResult LoadFromMeta(const ObjectMeta &, const BlockBuffer &, const std::string & = "") {
         return {ER_SERVICE_UNSUPPORTED, false};
+    }
+
+    virtual KvMetaObjectResult SaveObjectsWithUserData(const std::string &trace_id,
+                                                        const std::vector<std::string> &keys,
+                                                        const std::vector<std::uint64_t> &sizes,
+                                                        const BlockBuffers &buffers,
+                                                        const std::vector<KvMetaObjectUserData> &user_data) {
+        if (!user_data.empty()) {
+            return {ER_SERVICE_UNSUPPORTED, false};
+        }
+        return SaveObjectsWithTransferState(trace_id, keys, sizes, buffers);
     }
 
 protected:

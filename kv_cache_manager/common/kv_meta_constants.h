@@ -2,8 +2,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 
 namespace kv_cache_manager {
+
+inline constexpr std::size_t kKvMetaMaxObjectUserData2Bytes = 256;
+
+struct KvMetaObjectUserData {
+    std::optional<std::int32_t> userdata1;
+    std::optional<std::string> userdata2;
+
+    [[nodiscard]] bool empty() const noexcept { return !userdata1 && !userdata2; }
+    [[nodiscard]] bool bounded() const noexcept {
+        return !userdata2 || userdata2->size() <= kKvMetaMaxObjectUserData2Bytes;
+    }
+};
 
 inline constexpr std::size_t kKvMetaMaxBatchItems = 64;
 inline constexpr std::size_t kKvMetaMaxKeyBytes = 512;

@@ -64,12 +64,25 @@ message LocationSpec {
     string uri = 2;
 }
 
+// Opaque application fields. Oneof preserves presence with the supported
+// proto3 compiler, including a supplied zero or empty string.
+message ObjectUserData {
+    oneof userdata1_field {
+        int32 userdata1 = 1;
+    }
+    oneof userdata2_field {
+        string userdata2 = 2;  // Up to 256 UTF-8 bytes.
+    }
+}
+
 message ValueLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
     // 业务 value 的有效字节数；V1 要求与 PACE URI 中的 size 严格相等。
     uint64 value_size = 4;
+    // Present on Get for a committed object with user data.
+    ObjectUserData user_data = 5;
 }
 
 message InstanceInfo {
@@ -205,6 +218,8 @@ message PutStartRequest {
     int32 write_timeout_seconds = 4; // seconds, 要在指定timeout内调用PutFinish，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 与 keys 严格一一对应，每个 value 的有效字节数。不同 key 可以不同。
     repeated uint64 value_sizes = 5;
+    // Omit this list or supply one entry per key. An empty entry is allowed.
+    repeated ObjectUserData user_data = 6;
 }
 
 message PutStartResponse {
