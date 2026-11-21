@@ -775,6 +775,10 @@ class KvMetaObjectClient:
                 )
             completed += end - begin
 
+    def native_object_api(self):
+        """Own a native exact-object save handle to this registered client."""
+        return self._client_snapshot().native_object_api()
+
     def get_object_meta(
         self, key: str, timeout_ms: int, *, trace_id: Optional[str] = None
     ):
