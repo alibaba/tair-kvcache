@@ -72,6 +72,60 @@ py::capsule ExportObjectNativeApi(std::shared_ptr<kvcm::KvMetaObjectClient> clie
     return capsule;
 }
 
+struct ObjectNativeLoadOwner {
+    std::shared_ptr<kvcm::KvMetaObjectClient> client;
+    std::shared_ptr<const kvcm::ObjectMeta> meta;
+    KvcmObjectNativeLoadApiV1 api;
+};
+
+extern "C" KvcmObjectNativeResultV2 LoadNativeObject(void *context,
+                                                     const KvcmObjectNativeLoadRequestV1 *request) noexcept {
+    if (context == nullptr || request == nullptr || request->trace_id == nullptr ||
+        request->trace_id_size == 0 || request->buffer == nullptr || request->buffer_size == 0 ||
+        request->buffer_size > std::numeric_limits<size_t>::max() || request->memory_type > 1) {
+        return {kvcm::ER_INVALID_PARAMS, false};
+    }
+    const auto &owner = *static_cast<ObjectNativeLoadOwner *>(context);
+    if (request->buffer_size != owner.meta->SizeBytes()) {
+        return {kvcm::ER_INVALID_LOCAL_BUFFERS, false};
+    }
+    try {
+        const std::string trace(request->trace_id, request->trace_id_size);
+        const auto memory = request->memory_type == 0 ? kvcm::MemoryType::CPU : kvcm::MemoryType::GPU;
+        const kvcm::BlockBuffer buffer{{{memory, request->buffer, static_cast<size_t>(request->buffer_size)}}};
+        try {
+            const auto result = owner.client->LoadFromMeta(*owner.meta, buffer, trace);
+            return {result.ec, result.data_transfer_may_be_inflight};
+        } catch (...) { return {kvcm::ER_SDKREAD_ERROR, true}; }
+    } catch (...) { return {kvcm::ER_SDKREAD_ERROR, false}; }
+}
+
+py::capsule ExportObjectNativeLoad(std::shared_ptr<kvcm::KvMetaObjectClient> client,
+                                  std::shared_ptr<const kvcm::ObjectMeta> meta) {
+    auto owner = std::make_unique<ObjectNativeLoadOwner>();
+    owner->client = std::move(client);
+    owner->meta = std::move(meta);
+    const auto hint = owner->meta->UserData().userdata1;
+    owner->api = {KVCM_OBJECT_NATIVE_LOAD_VERSION_1,
+                  sizeof(KvcmObjectNativeLoadApiV1),
+                  owner.get(),
+                  owner->client.get(),
+                  LoadNativeObject,
+                  owner->meta->SizeBytes(),
+                  static_cast<uint8_t>(hint.has_value()),
+                  hint.value_or(0)};
+    py::capsule capsule(&owner->api, KVCM_OBJECT_NATIVE_LOAD_CAPSULE_V1,
+                        static_cast<PyCapsule_Destructor>(nullptr));
+    if (PyCapsule_SetContext(capsule.ptr(), owner.get()) != 0 ||
+        PyCapsule_SetDestructor(capsule.ptr(), [](PyObject *object) {
+            delete static_cast<ObjectNativeLoadOwner *>(PyCapsule_GetContext(object));
+        }) != 0) {
+        throw py::error_already_set();
+    }
+    owner.release();
+    return capsule;
+}
+
 struct OSException {
     int errcode;
 };
@@ -161,6 +215,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     module.attr("KV_META_OBJECT_TRANSFER_STATE_VERSION") = kvcm::GetKvMetaObjectTransferStateVersion();
     module.attr("KV_META_OBJECT_ADDRESS_UPDATE_VERSION") = kvcm::GetKvMetaObjectAddressUpdateVersion();
     module.attr("KV_META_OBJECT_METADATA_VERSION") = kvcm::GetKvMetaObjectMetadataVersion();
+    module.attr("KV_META_OBJECT_NATIVE_LOAD_VERSION") = KVCM_OBJECT_NATIVE_LOAD_VERSION_1;
 
     // 绑定枚举
     py::native_enum<kvcm::ClientErrorCode>(module, "ClientErrorCode", "enum.Enum")
@@ -332,7 +387,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
 
-    py::class_<kvcm::ObjectMeta>(module, "ObjectMeta")
+    py::class_<kvcm::ObjectMeta, std::shared_ptr<kvcm::ObjectMeta>>(module, "ObjectMeta")
         .def_property_readonly("size_bytes", &kvcm::ObjectMeta::SizeBytes)
         .def_property_readonly("userdata1", [](const kvcm::ObjectMeta &meta) { return meta.UserData().userdata1; })
         .def_property_readonly("userdata2", [](const kvcm::ObjectMeta &meta) { return meta.UserData().userdata2; });
@@ -406,6 +461,28 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::kw_only(),
              py::arg("trace_id") = "",
              py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_object_meta_with_native_load",
+            [](std::shared_ptr<kvcm::KvMetaObjectClient> client,
+               const std::string &key,
+               uint32_t timeout_ms,
+               const std::string &trace_id) {
+                std::pair<kvcm::ClientErrorCode, std::optional<kvcm::ObjectMeta>> result;
+                {
+                    py::gil_scoped_release release;
+                    result = client->GetObjectMeta(key, timeout_ms, trace_id);
+                }
+                if (!result.second) {
+                    return py::make_tuple(result.first, py::object(py::none()), py::object(py::none()));
+                }
+                auto meta = std::make_shared<kvcm::ObjectMeta>(std::move(*result.second));
+                auto capsule = ExportObjectNativeLoad(std::move(client), meta);
+                return py::make_tuple(result.first, py::cast(std::move(meta)), py::object(std::move(capsule)));
+            },
+            py::arg("key"),
+            py::arg("timeout_ms"),
+            py::kw_only(),
+            py::arg("trace_id") = "")
         .def(
             "load_from_meta",
             [](kvcm::KvMetaObjectClient &client,

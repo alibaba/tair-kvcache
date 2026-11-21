@@ -783,21 +783,37 @@ class KvMetaObjectClient:
         self, key: str, timeout_ms: int, *, trace_id: Optional[str] = None
     ):
         """Return ObjectMeta or None using the existing native metadata client."""
+        return self._get_object_meta(key, timeout_ms, trace_id, native_load=False)
+
+    @property
+    def supports_native_object_load(self) -> bool:
+        return getattr(self._pybind, "KV_META_OBJECT_NATIVE_LOAD_VERSION", None) == 1
+
+    def get_object_meta_with_native_load(
+        self, key: str, timeout_ms: int, *, trace_id: Optional[str] = None
+    ):
+        """Return (ObjectMeta, load capability) from one metadata lookup."""
+        return self._get_object_meta(key, timeout_ms, trace_id, native_load=True)
+
+    def _get_object_meta(self, key, timeout_ms, trace_id, *, native_load):
         _bounded_text(key, "KVMeta object key", KV_META_MAX_KEY_BYTES)
         _positive_int(timeout_ms, "KVMeta lookup timeout_ms", KV_META_MAX_CALL_TIMEOUT_MS)
         trace_id = self._resolve_trace_id("get_object_meta", trace_id)
         client = self._client_snapshot()
-        lookup = getattr(client, "get_object_meta", None)
+        method = "get_object_meta_with_native_load" if native_load else "get_object_meta"
+        lookup = getattr(client, method, None)
         if getattr(self._pybind, "KV_META_OBJECT_METADATA_VERSION", None) != 1 or not callable(lookup):
             raise ImportError("installed kvcm_py_client lacks native object metadata lookup")
         try:
-            code, meta = lookup(key, timeout_ms, trace_id=trace_id)
+            code, meta, *handle = lookup(key, timeout_ms, trace_id=trace_id)
         except Exception as error:
             raise KvMetaObjectClientError(
                 "get_object_meta", type(error).__name__, data_transfer_may_be_inflight=False
             ) from error
         if not _is_ok_code(self._pybind, code):
             raise KvMetaObjectClientError("get_object_meta", code, data_transfer_may_be_inflight=False)
+        if native_load:
+            return meta, handle[0]
         return meta
 
     def load_from_meta(self, meta, buffer: Any, *, trace_id: Optional[str] = None) -> None:
