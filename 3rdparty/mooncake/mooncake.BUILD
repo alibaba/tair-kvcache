@@ -25,6 +25,11 @@ config_setting(
 )
 
 config_setting(
+    name = "enable_efa",
+    values = {"define": "MOONCAKE_USE_EFA=true"},
+)
+
+config_setting(
     name = "enable_ascend",
     values = {"define": "MOONCAKE_USE_ASCEND=true"},
 )
@@ -153,18 +158,43 @@ inline const std::string& GetMooncakeStoreVersion() {
     static const std::string version(MOONCAKE_STORE_VERSION);
     return version;
 }
+constexpr const char* MOONCAKE_DISPLAY_VERSION = "0.3.13.post1";
 }  // namespace mooncake
 EOF
 """,
+)
+
+# asio stays header-only (no asio_impl.cpp / ASIO_SEPARATE_COMPILATION) so it
+# matches the other yalantinglibs users linked into the same binaries.
+cc_library(
+    name = "mooncake_common",
+    srcs = glob(
+        ["mooncake-common/src/*.cpp"],
+        exclude = ["mooncake-common/src/asio_impl.cpp"],
+    ),
+    hdrs = glob(["mooncake-common/include/**/*.h"]),
+    includes = ["mooncake-common/include"],
+    deps = [
+        "@glog//:glog",
+        "@jsoncpp_git//:jsoncpp",
+        "@yalantinglibs//:ylt",
+        "@yaml-cpp//:yaml_cpp",
+    ],
+    copts = mooncake_copts,
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "mooncake_transfer_engine",
     srcs = glob([
         "mooncake-transfer-engine/src/*.cpp",
+        "mooncake-transfer-engine/src/shared_segment/*.cpp",
+        "mooncake-transfer-engine/src/shared_segment/*.h",
         "mooncake-transfer-engine/src/common/**/*.cpp",
         "mooncake-transfer-engine/src/transport/*.cpp",
         "mooncake-transfer-engine/src/transport/rdma_transport/**/*.cpp",
+        "mooncake-transfer-engine/src/transport/rdma_twosided/**/*.cpp",
+        # rpc_communicator is the pybind11-only Python RPC helper; not needed here.
     ]) + select({
         ":enable_ascend": glob(["mooncake-transfer-engine/src/transport/ascend_transport/**/*.cpp"]),
         "//conditions:default": [],
@@ -178,20 +208,31 @@ cc_library(
         ]),
         "//conditions:default": [],
     }) + select({
-        ":enable_tcp": glob(["mooncake-transfer-engine/src/transport/tcp_transport/**/*.cpp"]),
+        ":enable_tcp": glob([
+            "mooncake-transfer-engine/src/transport/tcp_transport/**/*.cpp",
+            "mooncake-transfer-engine/src/transport/tcp_transport/**/*.h",
+        ]),
         "//conditions:default": [],
     }) + select({
         ":enable_nvmeof": glob(["mooncake-transfer-engine/src/transport/nvmeof_transport/**/*.cpp"]),
         "//conditions:default": [],
+    }) + select({
+        ":enable_efa": glob(["mooncake-transfer-engine/src/transport/efa_transport/**/*.cpp"]),
+        "//conditions:default": [],
     }),
     hdrs = glob(["mooncake-transfer-engine/include/**/*.h"]),
-    defines = ["YLT_ENABLE_IBV"],
+    # USE_EFA changes TransferMetadata::HandShakeDesc layout, so it must reach
+    # every dependent (defines), not just the files compiled here (copts).
+    defines = ["YLT_ENABLE_IBV"] + select({
+        ":enable_efa": ["USE_EFA"],
+        "//conditions:default": [],
+    }),
     includes = [
         "mooncake-transfer-engine/include",
-        # "/usr/include",
-        # "/usr/include/curl"
+        "mooncake-transfer-engine/src/shared_segment",
     ],
     deps = [
+        ":mooncake_common",
         "@com_github_gflags_gflags//:gflags",
         "@jsoncpp_git//:jsoncpp",
         "@yalantinglibs//:ylt",
@@ -202,6 +243,9 @@ cc_library(
         "//conditions:default": [],
     }) + select({
         ":enable_http": ["@curl//:curl"],
+        "//conditions:default": [],
+    }) + select({
+        ":enable_efa": ["@libfabric//:libfabric"],
         "//conditions:default": [],
     }),
     linkopts = [
@@ -220,30 +264,36 @@ cc_library(
 cc_library(
     name = "mooncake_store",
     srcs = glob(
-        [
-            "mooncake-store/src/**/*.cpp",
-            "mooncake-common/src/default_config.cpp",
-        ],
+        ["mooncake-store/src/**/*.cpp"],
         exclude = [
-            "mooncake-store/src/hf3fs/*.cpp",       
-            "mooncake-store/src/utils/s3_helper.cpp", 
-            "mooncake-store/src/master.cpp",          
+            # executables
+            "mooncake-store/src/master.cpp",
             "mooncake-store/src/real_client_main.cpp",
+            # optional backends not built here (USE_3FS / USE_NOF / AWS SDK /
+            # ENABLE_KV_EVENTS / STORE_USE_K8S_LEASE / liburing)
+            "mooncake-store/src/hf3fs/**",
+            "mooncake-store/src/storage/distributed/hf3fs_adapter.cpp",
+            "mooncake-store/src/spdk/**",
+            "mooncake-store/src/utils/s3_helper.cpp",
+            "mooncake-store/src/kv_event/**",
+            "mooncake-store/src/ha/leadership/backends/k8s/**",
+            "mooncake-store/src/uring_file.cpp",
+            # unit-test stub and the separately linked libmooncake_store_c.so
+            "mooncake-store/src/nvme_kv_executor_stub.cpp",
+            "mooncake-store/src/store_c_shared.cpp",
         ],
-    ) + [":mooncake_version_h"],  
+    ) + glob(["mooncake-store/src/**/*.h"]) + [":mooncake_version_h"],
     hdrs = glob(
         [
             "mooncake-store/include/**/*.h",
             "mooncake-store/include/**/*.hpp",
-            "mooncake-common/include/default_config.h",
         ],
         exclude = [
-            "mooncake-store/src/hf3fs/*.h",
-            "mooncake-store/include/utils/s3_helper.h", 
+            "mooncake-store/include/hf3fs/**",
+            "mooncake-store/include/utils/s3_helper.h",
         ],
     ),
     includes = [
-        "mooncake-common/include",
         "mooncake-store/include",
         "mooncake-store/include/cachelib_memory_allocator",
         "mooncake-store/include/utils",
@@ -253,6 +303,7 @@ cc_library(
         "mooncake-store/include/serialize",
     ],
     deps = [
+        ":mooncake_common",
         ":mooncake_transfer_engine",
         "@boost//:headers-base",
         "@boost//:headers-all",

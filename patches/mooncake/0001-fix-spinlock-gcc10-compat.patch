@@ -1,8 +1,6 @@
 --- a/mooncake-store/include/mutex.h
 +++ b/mooncake-store/include/mutex.h
-@@ -118,29 +118,29 @@
- 
- // Simple spin lock implementation using std::atomic_flag for exclusive locking
+@@ -120,33 +120,33 @@
  // only.
  class CAPABILITY("mutex") SpinLock {
     private:
@@ -12,6 +10,11 @@
     public:
      // Acquire/lock the spinlock.
      void lock() ACQUIRE() {
+         // Fast path: try to acquire directly
+-        if (!flag.test_and_set(std::memory_order_acquire)) return;
++        if (!flag.exchange(true, std::memory_order_acquire)) return;
+ 
+         // Slow path: spin wait with relaxed loads, acquire on success
          do {
 -            while (flag.test(std::memory_order_relaxed)) {
 +            while (flag.load(std::memory_order_relaxed)) {
@@ -36,3 +39,5 @@
 -    bool is_locked() const { return flag.test(std::memory_order_relaxed); }
 +    bool is_locked() const { return flag.load(std::memory_order_relaxed); }
  };
+ 
+ // MutexLocker is an RAII class that acquires a mutex in its constructor, and

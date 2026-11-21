@@ -382,8 +382,11 @@ client_t mooncake_client_create(const char *local_hostname,
             ? master_server_entry
             : kDefaultMasterAddress.c_str();
 
+    // EFA must get explicit devices: Mooncake's auto-discovery path installs
+    // the "rdma" (ibverbs RC) transport, which EFA devices do not support.
     std::optional<std::string> device_names =
-        (protocol != nullptr && strcmp(protocol, "rdma") == 0)
+        (protocol != nullptr &&
+         (strcmp(protocol, "rdma") == 0 || strcmp(protocol, "efa") == 0))
             ? std::optional<std::string>(rdma_devices)
             : std::nullopt;
 
