@@ -1,3 +1,4 @@
+#include <limits>
 #include <pybind11/gil.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/pybind11.h>
@@ -6,12 +7,58 @@
 
 #include "kv_cache_manager/client/include/kv_meta_object_client.h"
 #include "kv_cache_manager/client/include/transfer_client.h"
+#include "kv_cache_manager/client/pybind/kv_meta_object_native_api.h"
 #include "kv_cache_manager/client/pybind/python_client_owner.h"
 
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
 
 namespace {
+struct ObjectNativeApiOwner {
+    std::shared_ptr<kvcm::KvMetaObjectClient> client;
+    KvcmObjectNativeApiV1 api;
+};
+
+extern "C" KvcmObjectNativeResultV1 SaveNativeObject(void *context,
+                                                     const KvcmObjectNativeSaveRequestV1 *request) noexcept {
+    if (context == nullptr || request == nullptr || request->key == nullptr || request->key_size == 0 ||
+        request->key_size > 512 || request->trace_id == nullptr || request->trace_id_size == 0 ||
+        request->buffer == nullptr || request->buffer_size == 0 ||
+        request->buffer_size > std::numeric_limits<size_t>::max() || request->memory_type > 1) {
+        return {kvcm::ER_INVALID_PARAMS, false};
+    }
+    auto &client = *static_cast<kvcm::KvMetaObjectClient *>(context);
+    try {
+        const std::string trace_id(request->trace_id, request->trace_id_size);
+        const std::vector<std::string> keys{std::string(request->key, request->key_size)};
+        const std::vector<uint64_t> sizes{request->buffer_size};
+        const kvcm::MemoryType memory = request->memory_type == 0 ? kvcm::MemoryType::CPU : kvcm::MemoryType::GPU;
+        const kvcm::BlockBuffers buffers{{{{memory, request->buffer, static_cast<size_t>(request->buffer_size)}}}};
+        try {
+            const auto result = client.SaveObjectsWithTransferState(trace_id, keys, sizes, buffers);
+            return {result.ec, result.data_transfer_may_be_inflight};
+        } catch (...) { return {kvcm::ER_SDKWRITE_ERROR, true}; }
+    } catch (...) { return {kvcm::ER_SDKWRITE_ERROR, false}; }
+}
+
+py::capsule ExportObjectNativeApi(std::shared_ptr<kvcm::KvMetaObjectClient> client) {
+    auto owner = std::make_unique<ObjectNativeApiOwner>();
+    owner->client = std::move(client);
+    owner->api = {
+        KVCM_OBJECT_NATIVE_API_VERSION_1, sizeof(KvcmObjectNativeApiV1), owner->client.get(), SaveNativeObject};
+    // Expose the public table as the pointer and use capsule context for ownership.
+    // The capsule is returned to the caller, never attached back to the client.
+    py::capsule capsule(&owner->api, KVCM_OBJECT_NATIVE_API_CAPSULE_V1, static_cast<PyCapsule_Destructor>(nullptr));
+    if (PyCapsule_SetContext(capsule.ptr(), owner.get()) != 0 ||
+        PyCapsule_SetDestructor(capsule.ptr(), [](PyObject *capsule_object) {
+            delete static_cast<ObjectNativeApiOwner *>(PyCapsule_GetContext(capsule_object));
+        }) != 0) {
+        throw py::error_already_set();
+    }
+    owner.release();
+    return capsule;
+}
+
 struct OSException {
     int errcode;
 };
@@ -338,6 +385,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
             },
             py::arg("trace_id"),
             py::arg("config"))
+        .def("native_object_api", &ExportObjectNativeApi)
         .def("get_object_meta",
              &kvcm::KvMetaObjectClient::GetObjectMeta,
              py::arg("key"),

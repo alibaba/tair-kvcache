@@ -8,7 +8,11 @@ load("@python_platform//:platform.bzl", "python_platform")
 
 pybind_extension(
     name = "kvcm_py_client",
-    srcs = ["py_client_binding.cc", "python_client_owner.h"],
+    srcs = [
+        "kv_meta_object_native_api.h",
+        "py_client_binding.cc",
+        "python_client_owner.h",
+    ],
     deps = [
         "//kv_cache_manager/client:client",
     ],
