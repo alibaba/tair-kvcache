@@ -79,8 +79,8 @@ void TraceNativeGet(const std::string &trace_id,
     using namespace std::chrono;
     const auto wall = resumed - started;
     const bool slow = wall >= milliseconds(100) && TraceSlowNativeGetEnabled();
-    const bool mid_tail =
-        wall >= milliseconds(10) && wall < milliseconds(30) && TraceNativeGetMidTailEnabled();
+    const bool mid_tail = wall >= milliseconds(10) && wall < milliseconds(100) && TraceNativeGetMidTailEnabled();
+    const bool p99_tail = mid_tail && wall >= milliseconds(30);
     if ((!slow && !mid_tail) || trace_id.size() != 32 || trace_id[12] != '4' ||
         std::string_view("89ab").find(trace_id[16]) == std::string_view::npos ||
         !std::all_of(trace_id.begin(), trace_id.end(), [](char ch) {
@@ -88,11 +88,12 @@ void TraceNativeGet(const std::string &trace_id,
         })) {
         return;
     }
-    // Independent log budgets preserve the established >=100 ms sampling
-    // while a brief diagnostic run observes the P99 band.
+    // Keep separate log budgets so spikes in one band cannot hide the others.
     static std::atomic<int64_t> next_slow_sample_ms{std::numeric_limits<int64_t>::min()};
     static std::atomic<int64_t> next_mid_tail_sample_ms{std::numeric_limits<int64_t>::min()};
-    auto &budget = slow ? next_slow_sample_ms : next_mid_tail_sample_ms;
+    static std::atomic<int64_t> next_p99_tail_sample_ms{std::numeric_limits<int64_t>::min()};
+    auto &budget = slow ? next_slow_sample_ms : (p99_tail ? next_p99_tail_sample_ms : next_mid_tail_sample_ms);
+    const char *band = slow ? "ge_100ms" : (p99_tail ? "30_to_lt_100ms" : "10_to_lt_30ms");
     if (!TakeTraceSample(budget, duration_cast<milliseconds>(resumed.time_since_epoch()).count())) {
         return;
     }
@@ -102,7 +103,7 @@ void TraceNativeGet(const std::string &trace_id,
                   static_cast<long long>(duration_cast<microseconds>(returned - started).count()),
                   static_cast<long long>(duration_cast<microseconds>(resumed - returned).count()),
                   static_cast<int>(code),
-                  slow ? "ge_100ms" : "10_to_lt_30ms");
+                  band);
 }
 
 struct ObjectNativeApiOwner {
