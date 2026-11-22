@@ -15,6 +15,7 @@ pybind_extension(
     ],
     deps = [
         "//kv_cache_manager/client:client",
+        "//kv_cache_manager/common:logger",
     ],
     visibility = ["//visibility:public"],
 )

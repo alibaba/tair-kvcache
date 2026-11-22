@@ -1,19 +1,63 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <pybind11/gil.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
+#include <string_view>
 
 #include "kv_cache_manager/client/include/kv_meta_object_client.h"
 #include "kv_cache_manager/client/include/transfer_client.h"
 #include "kv_cache_manager/client/pybind/kv_meta_object_native_api.h"
 #include "kv_cache_manager/client/pybind/python_client_owner.h"
+#include "kv_cache_manager/common/logger.h"
 
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
 
 namespace {
+using SteadyClock = std::chrono::steady_clock;
+
+bool TraceSlowNativeGetEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("KVCM_TRACE_SLOW_NATIVE_GET");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+void TraceSlowNativeGet(const std::string &trace_id,
+                        SteadyClock::time_point started,
+                        SteadyClock::time_point returned,
+                        SteadyClock::time_point resumed,
+                        kvcm::ClientErrorCode code) {
+    using namespace std::chrono;
+    if (resumed - started < milliseconds(100) || trace_id.size() != 32 || trace_id[12] != '4' ||
+        std::string_view("89ab").find(trace_id[16]) == std::string_view::npos ||
+        !std::all_of(trace_id.begin(), trace_id.end(), [](char ch) {
+            return ('0' <= ch && ch <= '9') || ('a' <= ch && ch <= 'f');
+        })) {
+        return;
+    }
+    static std::atomic<int64_t> next_sample_ms{std::numeric_limits<int64_t>::min()};
+    const auto now_ms = duration_cast<milliseconds>(resumed.time_since_epoch()).count();
+    auto next_ms = next_sample_ms.load(std::memory_order_relaxed);
+    if (now_ms < next_ms ||
+        !next_sample_ms.compare_exchange_strong(next_ms, now_ms + 1000, std::memory_order_relaxed)) {
+        return;
+    }
+    py::gil_scoped_release release;
+    KVCM_LOG_WARN("KVMeta native Get phases trace_id[%s] native_us[%lld] python_resume_us[%lld] code[%d]",
+                  trace_id.c_str(),
+                  static_cast<long long>(duration_cast<microseconds>(returned - started).count()),
+                  static_cast<long long>(duration_cast<microseconds>(resumed - returned).count()),
+                  static_cast<int>(code));
+}
+
 struct ObjectNativeApiOwner {
     std::shared_ptr<kvcm::KvMetaObjectClient> client;
     KvcmObjectNativeApiV2 api;
@@ -468,9 +512,20 @@ PYBIND11_MODULE(kvcm_py_client, module) {
                uint32_t timeout_ms,
                const std::string &trace_id) {
                 std::pair<kvcm::ClientErrorCode, std::optional<kvcm::ObjectMeta>> result;
+                const bool trace_slow_get = TraceSlowNativeGetEnabled();
+                SteadyClock::time_point started, returned;
                 {
                     py::gil_scoped_release release;
+                    if (trace_slow_get) {
+                        started = SteadyClock::now();
+                    }
                     result = client->GetObjectMeta(key, timeout_ms, trace_id);
+                    if (trace_slow_get) {
+                        returned = SteadyClock::now();
+                    }
+                }
+                if (trace_slow_get) {
+                    TraceSlowNativeGet(trace_id, started, returned, SteadyClock::now(), result.first);
                 }
                 if (!result.second) {
                     return py::make_tuple(result.first, py::object(py::none()), py::object(py::none()));
