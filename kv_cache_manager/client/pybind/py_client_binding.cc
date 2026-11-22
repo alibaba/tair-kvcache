@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -22,40 +24,85 @@ namespace kvcm = kv_cache_manager;
 namespace {
 using SteadyClock = std::chrono::steady_clock;
 
+bool TraceFlag(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
 bool TraceSlowNativeGetEnabled() {
-    static const bool enabled = [] {
-        const char *value = std::getenv("KVCM_TRACE_SLOW_NATIVE_GET");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
+    static const bool enabled = TraceFlag("KVCM_TRACE_SLOW_NATIVE_GET");
     return enabled;
 }
 
-void TraceSlowNativeGet(const std::string &trace_id,
-                        SteadyClock::time_point started,
-                        SteadyClock::time_point returned,
-                        SteadyClock::time_point resumed,
-                        kvcm::ClientErrorCode code) {
+bool MidTailTraceHostSelected() {
+    const char *configured = std::getenv("KVCM_TRACE_NATIVE_GET_MID_TAIL_HOSTS");
+    if (configured == nullptr) {
+        return true;
+    }
+    char hostname[256] = {};
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0) {
+        return false;
+    }
+    std::string_view hosts(configured);
+    while (!hosts.empty()) {
+        const auto separator = hosts.find(',');
+        const auto host = hosts.substr(0, separator);
+        const auto start = host.find_first_not_of(" \t\r\n");
+        const auto end = host.find_last_not_of(" \t\r\n");
+        if (start != std::string_view::npos && host.substr(start, end - start + 1) == hostname) {
+            return true;
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        hosts.remove_prefix(separator + 1);
+    }
+    return false;
+}
+
+bool TraceNativeGetMidTailEnabled() {
+    static const bool enabled = TraceFlag("KVCM_TRACE_NATIVE_GET_MID_TAIL") && MidTailTraceHostSelected();
+    return enabled;
+}
+
+bool TakeTraceSample(std::atomic<int64_t> &next_sample_ms, int64_t now_ms) {
+    auto next_ms = next_sample_ms.load(std::memory_order_relaxed);
+    return now_ms >= next_ms
+           && next_sample_ms.compare_exchange_strong(next_ms, now_ms + 1000, std::memory_order_relaxed);
+}
+
+void TraceNativeGet(const std::string &trace_id,
+                    SteadyClock::time_point started,
+                    SteadyClock::time_point returned,
+                    SteadyClock::time_point resumed,
+                    kvcm::ClientErrorCode code) {
     using namespace std::chrono;
-    if (resumed - started < milliseconds(100) || trace_id.size() != 32 || trace_id[12] != '4' ||
+    const auto wall = resumed - started;
+    const bool slow = wall >= milliseconds(100) && TraceSlowNativeGetEnabled();
+    const bool mid_tail =
+        wall >= milliseconds(10) && wall < milliseconds(30) && TraceNativeGetMidTailEnabled();
+    if ((!slow && !mid_tail) || trace_id.size() != 32 || trace_id[12] != '4' ||
         std::string_view("89ab").find(trace_id[16]) == std::string_view::npos ||
         !std::all_of(trace_id.begin(), trace_id.end(), [](char ch) {
             return ('0' <= ch && ch <= '9') || ('a' <= ch && ch <= 'f');
         })) {
         return;
     }
-    static std::atomic<int64_t> next_sample_ms{std::numeric_limits<int64_t>::min()};
-    const auto now_ms = duration_cast<milliseconds>(resumed.time_since_epoch()).count();
-    auto next_ms = next_sample_ms.load(std::memory_order_relaxed);
-    if (now_ms < next_ms ||
-        !next_sample_ms.compare_exchange_strong(next_ms, now_ms + 1000, std::memory_order_relaxed)) {
+    // Independent log budgets preserve the established >=100 ms sampling
+    // while a brief diagnostic run observes the P99 band.
+    static std::atomic<int64_t> next_slow_sample_ms{std::numeric_limits<int64_t>::min()};
+    static std::atomic<int64_t> next_mid_tail_sample_ms{std::numeric_limits<int64_t>::min()};
+    auto &budget = slow ? next_slow_sample_ms : next_mid_tail_sample_ms;
+    if (!TakeTraceSample(budget, duration_cast<milliseconds>(resumed.time_since_epoch()).count())) {
         return;
     }
     py::gil_scoped_release release;
-    KVCM_LOG_WARN("KVMeta native Get phases trace_id[%s] native_us[%lld] python_resume_us[%lld] code[%d]",
+    KVCM_LOG_WARN("KVMeta native Get phases trace_id[%s] native_us[%lld] python_resume_us[%lld] code[%d] band[%s]",
                   trace_id.c_str(),
                   static_cast<long long>(duration_cast<microseconds>(returned - started).count()),
                   static_cast<long long>(duration_cast<microseconds>(resumed - returned).count()),
-                  static_cast<int>(code));
+                  static_cast<int>(code),
+                  slow ? "ge_100ms" : "10_to_lt_30ms");
 }
 
 struct ObjectNativeApiOwner {
@@ -512,20 +559,20 @@ PYBIND11_MODULE(kvcm_py_client, module) {
                uint32_t timeout_ms,
                const std::string &trace_id) {
                 std::pair<kvcm::ClientErrorCode, std::optional<kvcm::ObjectMeta>> result;
-                const bool trace_slow_get = TraceSlowNativeGetEnabled();
+                const bool trace_get = TraceSlowNativeGetEnabled() || TraceNativeGetMidTailEnabled();
                 SteadyClock::time_point started, returned;
                 {
                     py::gil_scoped_release release;
-                    if (trace_slow_get) {
+                    if (trace_get) {
                         started = SteadyClock::now();
                     }
                     result = client->GetObjectMeta(key, timeout_ms, trace_id);
-                    if (trace_slow_get) {
+                    if (trace_get) {
                         returned = SteadyClock::now();
                     }
                 }
-                if (trace_slow_get) {
-                    TraceSlowNativeGet(trace_id, started, returned, SteadyClock::now(), result.first);
+                if (trace_get) {
+                    TraceNativeGet(trace_id, started, returned, SteadyClock::now(), result.first);
                 }
                 if (!result.second) {
                     return py::make_tuple(result.first, py::object(py::none()), py::object(py::none()));
