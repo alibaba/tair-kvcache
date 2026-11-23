@@ -9,7 +9,12 @@ reference implementation, token by token.
 import unittest
 from typing import Any, Dict
 
+# vllm_stubs must be imported before torch: in the open-source CI (no torch
+# installed) it registers the MagicMock stand-in that the bare `import torch`
+# below then resolves to.
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
+
+import torch
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVLayout,
@@ -35,6 +40,7 @@ def _make_group(group_bs, kernel_bs=0, is_attention=True):
             per_token_dim=8,
             kernel_block_size=kernel_bs,
             block_stride=0,
+            dtype=torch.bfloat16,
             **common,
         )
     return StateTransferGroup(block_view_tensors=[], page_size_bytes=0, **common)
@@ -112,6 +118,71 @@ class TestAttnTokenIndices(unittest.TestCase):
         group = _make_group(group_bs=16, kernel_bs=16)
         with self.assertRaises(AssertionError):
             conn._attn_token_indices(group, [1], [0])  # table too short
+
+
+class TestSlotInvariants(unittest.TestCase):
+    """C10: the invariants every c == 1 slot mapping must satisfy.
+
+    The gather/scatter kernel copies a whole manager block as one batch, so
+    the mapping must give exactly one slot per token, never a duplicate, and
+    within one physical page a single contiguous run (no holes, no page
+    revisited) -- that is what makes the row-wise copy exact."""
+
+    #: (manager_bs, group_bs, kernel_bs): the V3.2 MLA geometry, a manager
+    #: block spanning two group blocks, the V4 indexer page shape, plain MLA,
+    #: the hybrid geometry and small hand values.
+    CASES = [
+        (64, 64, 64),
+        (128, 64, 64),
+        (256, 256, 64),
+        (16, 16, 16),
+        (528, 528, 64),
+        (4, 4, 2),
+    ]
+
+    def test_slot_invariants(self):
+        for manager_bs, group_bs, kernel_bs in self.CASES:
+            with self.subTest(
+                manager_bs=manager_bs, group_bs=group_bs, kernel_bs=kernel_bs
+            ):
+                conn = make_connector(manager_block_size=manager_bs)
+                group = _make_group(group_bs, kernel_bs)
+                needed = 3 * manager_bs // group_bs + 1
+                block_table = [(i * 7 + 1) % 61 for i in range(needed)]
+                rows = conn._attn_token_indices(group, [0, 1, 2], block_table)
+                ratio = group_bs // kernel_bs
+                flat_limit = (max(block_table) + 1) * ratio * kernel_bs
+                for row in rows:
+                    self.assertEqual(len(row), manager_bs)
+                    self.assertEqual(len(set(row)), len(row))
+                    # Flat slot indexes stay inside the paged tensor.
+                    self.assertTrue(all(slot < flat_limit for slot in row))
+                    seen = set()
+                    prev_page = None
+                    run = 0
+                    for slot in row:
+                        page, offset = divmod(slot, kernel_bs)
+                        if page != prev_page:
+                            self.assertNotIn(page, seen)  # page not revisited
+                            seen.add(page)
+                            run = 0
+                        # A page's slots are one contiguous run: the kernel
+                        # copies rows, not holes.
+                        self.assertEqual(offset, run)
+                        run += 1
+                        prev_page = page
+
+    def test_hand_golden_permuted_table(self):
+        # manager_bs=4, group_bs=4, kernel_bs=2 with a permuted table
+        # (0->5, 1->2, ...): manager block 0 lands on pages 10, 11 (10,11,12,
+        # 13) and block 1 on pages 4, 5 (8,9,10,11).
+        conn = make_connector(manager_block_size=4)
+        group = _make_group(group_bs=4, kernel_bs=2)
+        table = [5, 2, 9, 0]
+        self.assertEqual(
+            conn._attn_token_indices(group, [0], table), [[20, 21, 22, 23]]
+        )
+        self.assertEqual(conn._attn_token_indices(group, [1], table), [[8, 9, 10, 11]])
 
 
 class TestStateBlockIds(unittest.TestCase):
