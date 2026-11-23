@@ -1,0 +1,22 @@
+--- a/mooncake-store/src/client_service.cpp
++++ b/mooncake-store/src/client_service.cpp
+@@ -571,7 +571,8 @@
+ 
+     LOG(INFO) << "whitelist filters: " << raw_filters;
+     std::vector<std::string> filters;
+-    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
++    const std::string raw_filters_str(raw_filters);
++    boost::split(filters, raw_filters_str, boost::is_any_of(","),
+                  boost::token_compress_off);
+     for (auto& filter : filters) {
+         filter = std::string(TrimAsciiWhitespace(filter));
+@@ -581,7 +582,8 @@
+ 
+ static std::vector<std::string> ParseDeviceNames(std::string_view value) {
+     std::vector<std::string> devices;
+-    boost::split(devices, std::string(value), boost::is_any_of(","),
++    const std::string value_str(value);
++    boost::split(devices, value_str, boost::is_any_of(","),
+                  boost::token_compress_on);
+     for (auto& device : devices) {
+         device = std::string(TrimAsciiWhitespace(device));
