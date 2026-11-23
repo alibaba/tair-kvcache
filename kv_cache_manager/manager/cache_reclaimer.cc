@@ -2172,7 +2172,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                 "cache location count: [%" PRIu64 "], bytes: [%" PRIu64 "]",
                 blk_count,
                 loc_count,
-                request_bytes);
+                req.demand.size.bytes);
     return true;
 }
 

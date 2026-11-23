@@ -554,6 +554,37 @@ TEST_F(FreeBusyDeleteTest, TrimSplitsOversizedPageByLocationAndRetriesOnlyTheRef
     EXPECT_EQ(1u, executor->Deletes().RemainingRequests(DeleteSource::Trim));
 }
 
+TEST_F(FreeBusyDeleteTest, TrimSkipsChangedLocationsAndDeletesTheRestOfThePage) {
+    DeleteLimits limits;
+    limits.cluster.locations = 2;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto backend = Backend("t", {{TairReclaimFreeResult::kSuccess}, {TairReclaimFreeResult::kSuccess}});
+    CacheMetaDelRequest page{kTestInstanceName, {1, 2, 3, 4, 5}};
+    for (auto key : page.block_keys) {
+        SetLocation(key, "target", type, {"pace://t/" + std::to_string(key)});
+    }
+
+    size_t batches = 0;
+    auto on_submit = [&](std::future<PlanExecuteResult> future) {
+        EXPECT_EQ(EC_OK, future.get().status);
+        if (++batches == 1) {
+            // The page was read before the first batch. Another delete takes key 3,
+            // and key 5 gets a new GA before their batches try to mark them.
+            SetLocation(3, "target", type, {"pace://t/3"}, CLS_DELETING);
+            SetLocation(5, "target", type, {"pace://t/50"});
+        }
+        return true;
+    };
+    EXPECT_EQ(EC_OK, executor->SubmitTrimPage(&context, page, indexer, executor->Deletes().Generation(), on_submit));
+    EXPECT_EQ(3u, batches);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1, 2}, {4}}), backend->calls);
+    EXPECT_EQ(CLS_DELETING, Locations(3).at("target")->status());
+    EXPECT_TRUE(Locations(4).empty());
+    EXPECT_EQ("pace://t/50", Locations(5).at("target")->location_specs().front().uri());
+    EXPECT_EQ(0u, executor->Deletes().resources->reserved.load());
+}
+
 TEST_F(FreeBusyDeleteTest, OrdinaryMetaDeleteBypassesFullClusterAdmission) {
     DeleteLimits limits;
     limits.cluster = {1, 10};

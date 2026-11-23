@@ -904,19 +904,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             ErrorCode::EC_ERROR, StringUtil::FormatString("FillActualTask error: %s", error_message.c_str()));
         return admission_result;
     }
-    if (trim) {
-        // Other paths may have removed a target while Trim waited. A changed
-        // target or failed CAS must prevent the final instance-wide residue trim.
-        for (const auto &row : batch_results) {
-            if (std::any_of(row.begin(), row.end(), [](auto ec) { return ec != EC_OK && ec != EC_NOENT; })) {
-                admission_result.result =
-                    MakeErrorResult(EC_PARTIAL_OK, "Trim could not mark every selected Location.");
-                break;
-            }
-        }
-    }
     if (admission_result.actual_task.block_keys.empty()) {
-        if (update_ec != EC_OK && !(trim && (update_ec == EC_NOENT || update_ec == EC_PARTIAL_OK))) {
+        if (update_ec != ErrorCode::EC_OK) {
             admission_result.result = MakeErrorResult(
                 update_ec,
                 StringUtil::FormatString("Failed to admit location delete metadata update, instance[%s]",
@@ -944,7 +933,7 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
                                               ScheduleTaskClass task_class) {
     try {
         auto admission_result = prepare();
-        if (!admission_result.needs_physical_delete) {
+        if (admission_result.result.status != ErrorCode::EC_OK || !admission_result.needs_physical_delete) {
             completion->Complete(std::move(admission_result.result));
             return;
         }
@@ -953,28 +942,22 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
                        static_cast<long long>(delay.count()));
         auto actual_task = std::move(admission_result.actual_task);
         auto indexer = std::move(admission_result.indexer);
-        auto execute_task = [this,
-                             completion,
-                             actual_task = std::move(actual_task),
-                             indexer = std::move(indexer),
-                             admission = std::move(admission_result.result)]() {
-            auto finish = [completion, admission](PlanExecuteResult result) {
-                completion->Complete(result.status == EC_OK ? admission : std::move(result));
-            };
+        auto execute_task = [this, completion, actual_task = std::move(actual_task), indexer = std::move(indexer)]() {
             try {
                 if (actual_task.free_busy) {
                     ReclaimFreeLocations locations;
                     auto result = DoLocationDelTask(actual_task, indexer, &locations);
-                    RunTairReclaimDelete(*this,
-                                         data_storage_manager_,
-                                         meta_manager_,
-                                         indexer,
-                                         actual_task,
-                                         locations,
-                                         std::move(result),
-                                         std::move(finish));
+                    RunTairReclaimDelete(
+                        *this,
+                        data_storage_manager_,
+                        meta_manager_,
+                        indexer,
+                        actual_task,
+                        locations,
+                        std::move(result),
+                        [completion](PlanExecuteResult done) { completion->Complete(std::move(done)); });
                 } else {
-                    finish(DoLocationDelTask(actual_task, indexer));
+                    completion->Complete(DoLocationDelTask(actual_task, indexer));
                 }
             } catch (const std::exception &e) {
                 completion->Complete(ErrorCode::EC_ERROR,
