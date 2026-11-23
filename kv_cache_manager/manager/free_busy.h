@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <map>
+#include <functional>
 #include <memory>
-#include <mutex>
+#include <string>
 #include <utility>
 
 #include "kv_cache_manager/meta/cache_location.h"
@@ -14,7 +14,7 @@ namespace kv_cache_manager {
 
 class MetricsRegistry;
 
-// Shared by watermark tasks from this Reclaimer, including delayed callbacks.
+// Shared by managed Free tasks in this executor, including delayed callbacks.
 struct FreeBusyResources {
     explicit FreeBusyResources(uint64_t limit, std::shared_ptr<MetricsRegistry> metrics = {})
         : memory_limit(limit), metrics(std::move(metrics)) {}
@@ -46,14 +46,8 @@ struct FreeBusyResources {
     }
 };
 
-struct FreeBusyFeedback {
-    uint64_t busy_ms{0};
-    bool success{false};
-};
-
 struct FreeBusyTask {
     using Clock = std::chrono::steady_clock;
-    using Feedback = std::map<DataStorageType, FreeBusyFeedback>;
     FreeBusyTask(std::shared_ptr<FreeBusyResources> resources, uint64_t initial_ms)
         : resources(std::move(resources)), generation(this->resources->generation.load()), initial_ms(initial_ms) {}
     ~FreeBusyTask() { ReleaseUnused(); }
@@ -85,17 +79,12 @@ struct FreeBusyTask {
         }
         return bytes;
     }
-    void Record(DataStorageType type, uint64_t busy_ms) {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto &feedback = feedback_by_type[type];
-        feedback.busy_ms = std::max(feedback.busy_ms, busy_ms);
-        feedback.success |= busy_ms == 0;
-    }
-    Feedback Drain() {
-        std::lock_guard<std::mutex> lock(mutex);
-        Feedback result;
-        result.swap(feedback_by_type);
-        return result;
+    // Installed before submission. Feedback is applied to the original admission.
+    std::function<void(const std::string &, uint64_t)> on_feedback;
+    void Record(const std::string &storage, uint64_t busy_ms) const {
+        if (on_feedback) {
+            on_feedback(storage, busy_ms);
+        }
     }
 
     const std::shared_ptr<FreeBusyResources> resources;
@@ -103,9 +92,6 @@ struct FreeBusyTask {
     const uint64_t initial_ms;
     uint64_t unassigned{0};
 
-private:
-    std::mutex mutex;
-    Feedback feedback_by_type;
 };
 
 } // namespace kv_cache_manager

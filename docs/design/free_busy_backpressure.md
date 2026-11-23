@@ -1,43 +1,25 @@
-# KVCM 水位驱逐的 Free Busy 退避设计
+# KVCM 删除流控与 Free Busy 退避设计
 
-设计评审稿，2026-11-18。水位驱逐按固定 pending 额度提交，额度过小会拖慢回收，过大则可能让繁忙后端的 Free 积压、超时。首版让 Meta 在接不下整批 Free 时立即告知 KVCM。Reclaimer 据此少接新任务，Executor 延后重试被拒的批次，压力解除后逐步恢复准入。
+## 1. 目标与范围
 
-## 1. 本次 PR 的范围
+水位驱逐、主动 GC 和运维 `TrimCache` 可以同时向同一个 Tair mempool 发送 Free。每个来源单独限制并发时，后端承担的是三路之和。额度配少会拖慢回收，配多则可能让繁忙的 Meta 或 Provider 超时。
 
-只接入 **CacheReclaimer 水位驱逐发往 Tair mempool 的 Free**。KVCM 的新协议默认开启，由 `kvcm.cache_reclaimer.free_busy_enabled` 统一控制。默认发送协议头并预留重试内存，收到 Meta 明确的整批拒收后才收紧额度、延后重试。显式设为 `false` 时走原 Delete 和原 pending 准入。GC、RemoveCache、Trim、RemoveInstance 和分配/迁移回滚沿用各自的入口。其他入口占满后端时，首版只能减少水位驱逐贡献的负载。
+每个 KVCM 进程在 `SchedulePlanExecutor` 中统一管理这三路删除。它按目标 mempool 共享在途 Location 数和待删字节数，也允许给每个来源单独封顶。任一路收到 Meta 明确拒收后，三路的后续批次都遵守该集群收紧后的额度。不同 mempool 各自调额。外部 `RemoveCache`、注销实例时的清理和写入/迁移回滚沿用普通删除入口。[额度与来源配置](#6-三路删除统一流控)
 
-Meta 的 busy 针对一次 HTTP 请求。每个 KVCM 进程按现有的**实例组 × 基础存储类型**记账，起始额度直接取已有 pending 配置。同组同类型的删除共用一份额度，即使目标属于不同 Provider 或不同 Tair 集群也会一起降速。访问同一 Meta 的不同组、DRAM 和 SSD 则分别调整。
+## 2. 额度如何收紧和恢复
 
-pending 从 Executor 接纳任务算到任务收尾，包括读者宽限期、执行 Free 和删除元数据。收紧额度只影响新任务，已经接纳的任务继续执行。一次 Free 可合并多个 Location，因此实际 HTTP 并发和每秒删除量还取决于批大小、宽限时间和回包耗时。
+候选筛选读取 Executor 当前额度，提交时在同一把锁内复核并占用来源、集群和重试记录预算。每个已接纳的逻辑任务占一个来源请求名额，包括宽限等待、实际 Free 和元数据收尾。Tair 协议批按 storage 完成时归还对应的 Location 和字节，任务 Future 收尾时归还请求名额及剩余额度。一次 Free 可以包含多个 Location 和更多 GA，配置值计量的是在途工作量。[准入与归还](../../kv_cache_manager/manager/delete_admission.cc)
 
-## 2. 把反馈接入两处已有检查
-
-| 现有配置 | 计量内容 | 默认硬上限 |
-|---|---|---|
-| `kvcm.cache_reclaimer.pending_location_limit_per_group_type` | 该实例组、该基础存储类型未收尾的 Location 数 | 20,000 个 |
-| `kvcm.cache_reclaimer.pending_bytes_limit_per_group_type` | 这些 Location 对应的待回收数据量 | 1 TiB |
-
-两项配置继续作为硬上限。首次收到明确 busy 时，Reclaimer 才为对应的实例组和 Tair 基础存储类型记录**当前有效额度**（Location 数、bytes）和冷却截止时间。实际占用直接读现有的 `pending_quota_by_group_type_`。
-
-- **筛选候选。** `FilterLocIDImpl` 发现 LRU 候选时沿用已有的 `eligibility_only` 扫描。实际选取时先走原有硬上限检查，再对受退避影响的类型比较“当前 pending + 本轮已选 + 候选”和两项有效额度。冷却中或超额就跳过该候选。[候选筛选](../../kv_cache_manager/manager/cache_reclaimer.cc)
-- **提交与记账。** `SubmitDelReq` 先复核原有组级、进程级硬上限，再用同一规则复核实际批量。软额度拒绝单独处理，`pending_limit_reject_count` 仍只统计原有硬上限。Executor 接纳后照常记账，原任务的 Future 结束时释放一次。重试沿用这份 pending 和原有回收量预测的到期时间（`credit_deadline`）。[现有 pending 记账](cache_reclaimer_async_delete.md)
-
-### 额度怎样收紧和恢复
-
-以下增减幅度是联调起点。直接复用原 DeleteHandler 的单调时钟准入时间 `submitted_at_`。每个受压的组和类型只多记最近一次调额时间，用它区分在新额度下接纳的任务与已经排队的旧任务。[原任务的准入时间](../../kv_cache_manager/manager/cache_reclaimer.h)
-
-| 反馈 | Reclaimer 的处理 |
+| 集群收到的反馈 | 对新准入的影响 |
 |---|---|
-| 尚未收到 busy | 两项 pending 额度取原配置值。重试内存预算有余量时，按现有流程提交 |
-| 本轮准入的任务首次收到明确 busy | 暂停该组、该类型的新准入。两项有效额度分别取“当前有效额度”和“实际 pending 占用”的较小值，再减半，向下取整，最低保留 1 个 Location 和 1 字节。本轮冷却取触发这次收紧的批次的退避间隔，从处理反馈时开始计时。旧任务的回包只影响它自己的重试 |
-| 冷却结束 | 当前占用降到有效额度以内后再接新任务。已经接纳的批次沿用原 pending，退避到期后按第 4 节的重试并发上限执行 |
-| 冷却后收到实际 Free 成功 | 用同一冷却时长作为恢复观察间隔。观察期内，本轮准入的任务有实际 Free 成功、没有本轮 busy，两项额度最多翻倍一次，最高回到配置值。每次调额更新轮次边界，旧成功不能在后续轮询中重复使用 |
+| 尚未收到 busy | 使用配置的共享硬上限 |
+| 当前轮次的任务首次收到明确 busy | 两项有效额度分别取当前额度和实际占用的较小值，再减半，向下取整，最低为 1。暂停该集群的新准入一个实际退避间隔 |
+| 冷却到期 | 新任务能放进有效额度就接纳。此前已接纳的任务继续处理，被拒的批次沿用原额度重试 |
+| 新轮次的任务收到 Provider 确认成功 | 冷却后再观察一个等长间隔。期满有成功反馈，后续准入检查可将有效额度翻倍一次，最高回到硬上限。期间收到本轮 busy 会清掉该成功反馈并再次收紧 |
 
-例如首次 busy 时实际 pending 是 80 个 Location、4 GiB，有效额度收至 40 个、2 GiB。原已接纳的 80 个继续处理。即使其中有任务到宽限期结束才首次发 Free，也属于旧轮次。两项额度恢复、旧轮次任务也已收尾时，可清理这份组级状态。
+例如集群实际在途 80 个 Location、4 GiB，首次 busy 可使额度降至 40 个、2 GiB。每次调额用单调时钟记录轮次边界。此前接纳的任务即使在宽限期后才发出 Free，它的回包也只决定本批重试和收尾。冷却结束且该集群已经排空时，允许一个超过临时字节额度的 Location 单独推进，前提是满足共享、来源和内存的硬上限。
 
-为避免一个大 Location 永远超过临时的待删数据字节额度，冷却结束、该组类型的 pending 和本轮已选都为空时，可单独放行一个满足各项硬上限的 Location。筛选和提交复核共用这条规则，重试记录也要能放进第 4 节的进程内存预算。当前占用归零只清理记账，仍在生效的退避状态保留。
-
-## 3. 只让水位驱逐识别 busy
+## 3. Tair Free 如何识别 busy
 
 **灰度顺序。** KVCM 的协议和自动重试共用一个默认开启的开关。Meta 混部期间，或双方尚未确认第 4 节的 GA 身份和重发窗口时，部署须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。旧 follower 转发时可能把新 leader 的 429 写为 501 并保留原正文。启用前，所有可能服务、转发或接任 leader 的 Meta 都要完成升级，并按实际路由核对额度和完整回包。
 
@@ -60,25 +42,25 @@ Meta 可按下列格式返回 HTTP 429，其中 `retry_after_ms` 是 Meta 可选
 }
 ```
 
-**入口与接口。** 由 `CacheReclaimer::SubmitDelReq` 给启用协议的任务加标记，随 `PrepareDeleteTask` 生成的实际任务传下去。GC 也用 `SubmitAsync` 和 `kReclaim`，任务类别不能识别来源。复用 `DataStorageManager` 已有的具体 Tair backend 依赖，只加水位驱逐专用的调用。开源 Tair 桩和内源实现对齐这个入口，内源为该次 HTTP 请求带上 `X-TairMempool-Free-Protocol: 1`，在错误归并前识别约定的 429、协议版本、业务码和整批未接纳保证。返回原删除结果、明确 busy 及可选等待时间，或单批过大及本机 GA 上限。公共 `DataStorageBackend::Delete`、共享错误码和其他后端继续按原接口工作。[现有 Tair 装配](../../kv_cache_manager/data_storage/data_storage_manager.cc) · [公共 Delete 接口](../../kv_cache_manager/data_storage/data_storage_backend.h)
+**入口与接口。** 三个来源在申请额度时标明来源，Executor 将本次准入记录传给实际任务。开启协议且任务包含 Tair 目标时，沿用 Tair backend 的专用 Free 入口，HTTP 请求带 `X-TairMempool-Free-Protocol: 1`。后端在错误归并前识别约定的状态码、协议版本和整批未接纳保证。只清元数据的 EventReport GC 也占 GC 请求名额，物理层不会发送 Free。[Executor 入口](../../kv_cache_manager/manager/schedule_plan_executor.cc) · [Tair 存储访问](../../kv_cache_manager/data_storage/data_storage_manager.cc)
 
 **存储访问。** 首发和重试都在 `DataStorageManager` 现有删除读锁内查找并调用后端。退避等待期间释放锁，重试时在锁内核对仍是原后端实例，避免注销存储时的 `Close` 和 Delete 同时执行。[存储的删除与注销](../../kv_cache_manager/data_storage/data_storage_manager.cc)
 
 **反馈时机。** v1 的 HTTP 200 成功响应带布尔字段 `provider_free_acknowledged`。只要本批至少一个 Provider 对 Free RPC 返回业务成功，该值就是 `true`，包括同批另有 GA 缺路由的情况。整批因缺路由或节点断连被跳过时，该值为 `false`。KVCM 对成功回包照常执行 CAD，只有明确的布尔值 `true` 才计入额度恢复。旧 Meta 缺字段或字段类型异常时，成功收尾并保持当前额度。
 
-Executor 在任务共享的线程安全状态中记录明确 busy、建议等待时间和 Provider 确认的成功。Reclaimer 的 `HandleDelRes` 在已有轮询中取走反馈，Future 就绪时，在移除 DeleteHandler 前取完最后的回包反馈。同一轮询按实例组和基础存储类型合并本轮准入任务的反馈，有 busy 优先收紧。[Reclaimer 轮询与收尾](../../kv_cache_manager/manager/cache_reclaimer.cc)
+Executor 收到回包时，按本次准入记录中的 storage 找到对应集群，在共享锁内立即处理反馈。明确 busy 清除尚未使用的成功反馈，三路的下一次准入都能看到新额度。[调额逻辑](../../kv_cache_manager/manager/delete_admission.cc)
 
 ## 4. 被拒的原批次如何重试
 
 **重试的安全假设。** Meta 返回 `FREE_BUSY_NOT_ACCEPTED` 时，整批尚未向任何 Provider 下发。KVCM 的重试假定 GA 仍对应原分配。重读元数据后，主动删除仍可能抢先释放同一个 GA。并发删除、Provider 重启或地址复用时的重试安全性，以及允许重发的时长，由双方另行确认。
 
-**保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查水位驱逐任务的代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个 storage 整批被拒时，只保存该批原始 URI 文本和对应的 `(block_key, location_id)`。其他 storage 继续执行，已完成的 Location 及时 CAD（按条件删除元数据）。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。原任务的 pending 在所有批次结束、Future 完成后释放一次。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
+**保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查任务的准入代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个 storage 整批被拒时，保存该批原始 URI 文本和对应的 `(block_key, location_id)`。GC 同时保留各 spec 是否按后端策略跳过删除的标记，重试继续跳过已确认缺失的对象。其他 storage 继续执行，已完成的 Location 及时 CAD（按条件删除元数据）。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。每个 storage 批次独立收尾，原任务在最后一个批次结束时释放来源请求名额。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
 
 **何时重发。** KVCM 从可选配置 `kvcm.cache_reclaimer.free_busy_initial_backoff_ms` 读取首次本地退避时间，默认 50 ms，有效范围为 1 至 5000 毫秒。同一批连续 busy 时，本地等待从配置值起逐次翻倍，加入抖动后最多 5 s。Meta 提供 `retry_after_ms` 时，实际等待取它与本地等待的较大值。触发调额的这次实际等待，同时决定第 2 节的冷却期和随后等长的观察期。
 
 允许启动重试的总时限为 30 秒，从原批次首次准备 Free 开始计时。延迟投递和回调使用同一截止时间。取得存储读锁后先检查代次和时限，取到 PACE 客户端并准备启动 HTTP 时再检查一次，覆盖等待连接池的时间。已经启动的请求按实际回包收尾。
 
-**重试删除的并发上限。** 每个 KVCM 进程的所有实例组和 Tair 存储共享一组名额，只限制水位驱逐收到明确 busy 后同时执行的重试批数。按 `SchedulePlanExecutor::GetWorkerCount()` 返回的实际 worker 数 N 计算，联调起点取 `max(1, floor(N / 2))`。2 个 worker 最多同时重试 1 批，8 个最多 4 批。首次 Free 和其他任务共用原线程池，无需申请重试名额，也无需按部署规模另配参数。[Executor 的实际 worker 数](../../kv_cache_manager/manager/schedule_plan_executor.h)
+**重试删除的并发上限。** 每个 KVCM 进程的所有实例组和 Tair 存储共享一组名额，限制三路收到明确 busy 后同时执行的重试批数。按 `SchedulePlanExecutor::GetWorkerCount()` 返回的实际 worker 数 N 计算，联调起点取 `max(1, floor(N / 2))`。2 个 worker 最多同时重试 1 批，8 个最多 4 批。首次 Free 和其他任务共用原线程池，无需申请重试名额，也无需按部署规模另配参数。[Executor 的实际 worker 数](../../kv_cache_manager/manager/schedule_plan_executor.h)
 
 延迟回调到期后先检查取消和总截止时间，再尝试取一个名额。取到才开始核对元数据，Free 返回就归还。若整批无需重发，或因读取失败、取消而提前结束，退出时也归还名额。名额用满时，回调用原批次记录错开时间再投递，立即让出 worker。排队和退避期间不占重试名额，原 pending、内存预留和总截止时间继续沿用。等待本地名额不计作 Meta busy，不触发降额或下一档退避。
 
@@ -98,11 +80,11 @@ Executor 在任务共享的线程安全状态中记录明确 busy、建议等待
 
 ### 重试记录的进程级内存上限
 
-可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes`，以字节为单位，限制单个 KVCM 进程为 Tair 水位驱逐重试记录预留的内存总量。该进程内的所有实例组和 Tair 存储共用这份预算。常规部署使用默认值，内存余量较小的部署可显式调低。
+可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes`，以字节为单位，限制单个 KVCM 进程为三路 Tair 删除重试记录预留的内存总量。该进程内的所有实例组和 Tair 存储共用这份预算。常规部署使用默认值，内存余量较小的部署可显式调低。
 
 退避期间保存**完整 URI 文本和受影响的 Location 关联**，重发时再解析当批 URI。预算覆盖这些文本、关联、容器容量和每批的固定开销。
 
-- **准入时预留。** 开关启用时，在把目标标记为 `DELETING` 前按整批都可能被拒的情况原子预留额度。即使尚未发生 busy，进程预算不足也会缩小本轮批次，其余候选保留原状态，留待下轮扫描。单个 Location 自身就超过总预算时，记录所需字节并继续扫描其他候选。
+- **准入时预留。** 开关启用时，在把目标标记为 `DELETING` 前按整批都可能被拒的情况原子预留额度。Reclaimer 和 GC 跳过本轮放不下的候选，后续扫描可再选。Trim 在调用线程等待可用预算，整页超过预算时按 Location 拆批。单个 Location 放不进总预算时，Trim 返回失败。
 - **发送和重试。** 首次 Free 使用执行时核实的完整 URI。如果实际批次变大，先补足额度再发。补额失败时，该 storage 批次立即按未发出收尾，归还预留并保留元数据。只有 Meta 明确拒收后才保存该批 URI，供每次重发时核对。重试剔除已变更的 Location 后立即归还其预算，剩余目标继续退避。
 - **收尾时归还。** 跳过的目标及时退还对应预留。每批结束时，释放这批的重试记录并归还剩余额度一次。原任务的 pending 在 Future 完成时统一释放。
 
@@ -113,21 +95,21 @@ Executor 在任务共享的线程安全状态中记录明确 busy、建议等待
 | 完整 URI 文本 | 约 12–14 MiB | 约 20–22 MiB |
 | 已解析的 `DataStorageUri` 对象 | 约 43–51 MiB | 约 51–59 MiB |
 
-以上只计这批记录持有的堆内存。进程峰值还包含已有 pending、发送时的临时对象和分配器碎片。现有 `pending_bytes_limit_per_group_type` 按 URI 的 `size` 累加后端待删数据量，一个 Location 也可以关联多个 GA。这些配额只能间接约束重试记录。[pending 字节计量](../../kv_cache_manager/manager/cache_reclaimer.cc)
+以上只计这批记录持有的堆内存。进程峰值还包含已有 pending、发送时的临时对象和分配器碎片。在途字节按 URI 的 `size` 累加后端待删数据量，一个 Location 也可以关联多个 GA。这些配额只能间接约束重试记录。[pending 字节计量](../../kv_cache_manager/manager/delete_admission.cc)
 
-默认预算取 **128 MiB**，按需预留。Linux/libstdc++ 容器中的校准使用 8 字符 Location ID、30 字符实例名，每批 100 个 Location。用 90 字节 URI 时，2 万个单 spec Location 预留 29.1 MiB，20 spec 时预留 **117.5 MiB**。20 spec 的记录实际堆增量约 57.4 MiB。用分层存储集成测试中的 72–77 字节 URI 长度代入同一 20 spec 场景，预留为 103.1–107.1 MiB。128 MiB 可以覆盖上述场景的一个满额组。多个组共用预算，更长的 URI 或更多 spec 仍可能在 Meta 空闲时先触及进程上限。[Location ID 的生成](../../kv_cache_manager/manager/meta_searcher.cc) · [预留公式](../../kv_cache_manager/manager/free_busy.h)
+默认预算取 **128 MiB**，按需预留。Linux/libstdc++ 容器中的校准使用 8 字符 Location ID、30 字符实例名，每批 100 个 Location。用 90 字节 URI 时，2 万个单 spec Location 预留 29.1 MiB，20 spec 时预留 **117.5 MiB**。20 spec 的记录实际堆增量约 57.4 MiB。用分层存储集成测试中的 72–77 字节 URI 长度代入同一 20 spec 场景，预留为 103.1–107.1 MiB。128 MiB 可以覆盖上述 2 万个 Location 样本。三路共用预算。在上述 20 spec、90 字节 URI 的场景中，24,576 个 Location 的预留约为 144 MiB，因此即使 Meta 空闲也可能先触及 128 MiB 的进程预算。[Location ID 的生成](../../kv_cache_manager/manager/meta_searcher.cc) · [预留公式](../../kv_cache_manager/manager/free_busy.h)
 
-在同一 Linux 环境，使用真实删除执行器、本地元数据和始终成功的测试后端做了三轮对照。每轮删除 2 万个 Location、40 万个 GA，使用 8 个 worker 和 1 秒读者宽限期。从开始提交到所有 Future 完成，64 MiB 预算约需 2.17 秒，128 MiB 和关闭协议均约需 1.19 秒。128 MiB 在三轮中都没有等待预算。该对照衡量 KVCM 在此工作负载下的排空时间，线上端到端耗时还取决于 Meta 和 Provider。
+早期仅水位驱逐的版本在同一 Linux 环境，使用真实删除执行器、本地元数据和始终成功的测试后端做了三轮对照。每轮删除 2 万个 Location、40 万个 GA，使用 8 个 worker 和 1 秒读者宽限期。从开始提交到所有 Future 完成，64 MiB 预算约需 2.17 秒，128 MiB 和关闭协议均约需 1.19 秒。128 MiB 在三轮中都没有等待预算。该对照衡量 KVCM 在此工作负载下的排空时间，线上端到端耗时还取决于 Meta 和 Provider。
 
 ## 5. 验收
 
 | 场景 | 应看到的结果 |
 |---|---|
-| 未配置协议开关，或显式设为 `false` | 默认仅 Tair 水位驱逐携带协议头并预留重试预算。预算充足且无明确 busy 时按原 pending 额度提交，旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走原 Delete，跳过协议头和重试预算预留 |
+| 未配置协议开关，或显式设为 `false` | 默认三路 Tair 删除携带协议头并预留重试预算。预算充足且无明确 busy 时按共享硬上限和来源上限提交，旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，继续执行静态准入上限 |
 | 初始退避使用默认值或改为 100 ms | 首次本地等待分别从 50 ms、100 ms 起步并加抖动。如果 Meta 建议等待 200 ms 且长于本地等待，实际重试等待为 200 ms。若本批触发调额，本轮冷却和随后的观察期各为 200 ms |
 | 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
 | 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
-| 同组多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
+| 同一集群多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
 | 同一任务的 Location A、B 分属两个 storage，A 成功，B 明确 busy | A 及时 CAD。只重发 B 的原批次，原 pending 最后释放一次。若重发返回普通错误，按既有规则收尾并记录可能未释放的对象 |
 | 首发或重发收到 200 success | 照常 CAD。只有 `provider_free_acknowledged=true` 产生成功反馈。全批缺路由、全批断连和旧 Meta 缺字段均保持当前额度 |
 | 分别用 2、8 个 worker，让多组重试同时到期，并安排一批已就绪的首次 Free | 同时执行的重试最多分别为 1、4 批。重试名额占满时，空闲 worker 仍可执行首发。等待名额的批次只挂一次，Meta busy 计数和总截止时间不变，名额归还后可继续重试 |
@@ -136,9 +118,80 @@ Executor 在任务共享的线程安全状态中记录明确 busy、建议等待
 | 单个 storage 的首发预算补足失败，或同批两个 Location 中一个在退避期间换了 URI | 补额失败的批次零下发，保留元数据。重试批次在剔除已变更目标后只持有剩余记录的预算 |
 | 排队任务在首次 CAS 前被撤销，或重试在连接池等待期间被撤销或到期 | 前者的 Location 保持可读，后者保留 `DELETING`，两者均无新增 HTTP 请求 |
 | Meta 的建议等待时间超过剩余总时限，或延迟任务排队至截止、取消、停机切主、后端替换 | 停止重发，未发出且仍在的原目标可定位。截止前已发出的请求按实际结果收尾，重试内存预留和原任务 pending 各释放一次 |
-| 分别使用默认内存预算和显式调低的字节上限，覆盖尚无 busy 和多组同时 busy | 各组预留总和始终在本进程的生效上限内。放不下的新候选保留原状态，已被拒批次复用原预留。归还后恢复准入，组级及进程级 pending 硬上限始终有效 |
+| 分别使用默认内存预算和显式调低的字节上限，覆盖尚无 busy 和多组同时 busy | 各组预留总和始终在本进程的生效上限内。放不下的新候选保留原状态，已被拒批次复用原预留。归还后恢复准入，集群和来源硬上限始终有效 |
 
-联调用同一份水位驱逐负载对比开关前后的正常回收速度和过载超时数，再混入主动删除观察水位驱逐的让步。评估重试并发上限时，同时看首次 Free 从就绪到 worker 开始执行的排队时间，以及压力解除后积压批次的排空时间。只剩重试时也按同一上限执行，此时排空可能变慢。复用现有的 `pending_location_count`、`pending_delete_bytes` 和回收耗时。`free_busy_reject_count`、`free_busy_retry_attempt_count` 和 `free_busy_reserved_bytes` 分别观测 Meta 的明确拒收、重试尝试次数和进程预留字节数。
+三路联调还应覆盖以下场景。
 
-- `free_busy_budget_skip_location_count` 统计筛选或提交时因内存预留不足被挡住的 Tair 候选次数。同一 Location 下轮再次被挡会再计一次，这些候选保留原状态。
+- 同一进程的两个 Trim 和 GC 同时访问同一接入地址的 DRAM、SSD。观察三路合计占用、Trim 共用的请求名额以及一个集群 busy 时另一个集群的进展。
+- 一页 Trim 包含 100 个 Location。把有效额度压到 40，确认页内所有部分都收尾后接口才返回。只临时占用了部分额度时，确认能放进完整窗口的批次保持完整。单项超过硬上限时，确认 Trim 报错并跳过最终的残留清理。
+- 让 Trim 在调用线程等额度后降主，确认等待被唤醒、已接纳任务按取消规则收尾。用普通 `RemoveCache` 对照三路满额时的提交行为。
+
+原有协议联调用同一份水位驱逐负载对比开关前后的正常回收速度和过载超时数，再混入主动删除观察水位驱逐的让步。评估重试并发上限时，同时看首次 Free 从就绪到 worker 开始执行的排队时间，以及压力解除后积压批次的排空时间。只剩重试时也按同一上限执行，此时排空可能变慢。复用现有的 `pending_location_count`、`pending_delete_bytes` 和回收耗时。`free_busy_reject_count`、`free_busy_retry_attempt_count` 和 `free_busy_reserved_bytes` 分别观测 Meta 的明确拒收、重试尝试次数和进程预留字节数。
+
+- `free_busy_budget_skip_location_count` 统计 Reclaimer 筛选或提交时因内存预留不足被挡住的 Tair 候选次数。同一 Location 下轮再次被挡会再计一次，这些候选保留原状态。
 - `free_busy_retained_location_count{reason}` 统计专用删除路径停止处理、交由日志核对的目标个数。等本地名额到期记 `slot_deadline`，等 Meta busy 退避到期记 `busy_deadline`，准备发送时到期记 `dispatch_deadline`，主存储读失败记 `primary_read`，撤销记 `cancelled`。其余原因包括预算、URI、批次大小、实例或后端变化及本地执行失败。累计值按 Location 计算，当前仍在 `DELETING` 的数量可能随后变化。具体目标查终止日志。
+
+## 6. 三路删除统一流控
+
+Reclaimer、GC 和 `TrimCache` 各自按批提交并标明来源，由 **`SchedulePlanExecutor` 统一准入和调额**。三路竞争目标 mempool 的空闲额度。Executor 同时检查本批能否放进集群共享额度和该来源的剩余额度，接纳后记账一次。来源上限只限定这一路最多能同时占用多少。
+
+| 适用范围 | 计量内容 | 默认策略 |
+|---|---|---|
+| 单个目标 mempool，三路合计 | 在途 Location 数、待删数据字节数 | 24,576 个 Location、1,280 GiB |
+| 单个删除来源 | 在途删除请求数、在途 Location 数、待删数据字节数 | 各项可独立封顶，数值 0 表示该项不限 |
+
+来源的在途请求数按 Executor 已接纳、尚未收尾的逻辑删除任务计量。同一任务按 storage 拆批或因 busy 多次重试，在适用的来源请求数上限中只占一个名额，原任务收尾时归还。各批次收尾时归还对应的 Location 和字节额度。
+
+共享默认值在原每组、每类型 20,000 个 Location 和 1 TiB 的数值上留了余量，作为 202 混合负载压测的起点。每个 KVCM 进程独立记账；多个进程访问同一集群时，通过同一 Meta 的 busy 信号各自调整。
+
+Reclaimer 和 GC 筛选候选时查询 Executor，可留给后续扫描重新选择。Reclaimer 继续维护去重、用量预测和观测计数。GC 继续维护扫描游标和已提交目标。实际准入只在 Executor 记账一次。三路的来源请求数、可选 Location 数和 bytes 上限按本进程各自的逻辑任务统计，混合存储任务也占来源名额；只有 Tair 目标占 mempool 集群额度。同一来源跨集群提交时仍共用该来源的进程上限。
+
+每个 KVCM 进程用存储配置中的 mempool 接入地址标识目标集群。取 `service_discovery_url` 的配置值，为空时取 `domain`。配置相同接入地址的 DRAM 和 SSD 共用额度和 busy 状态。同一物理集群若配置了不同的地址别名，各别名分别记账。无法取得接入地址时按 storage 唯一名记账。[Tair 存储配置](../../kv_cache_manager/data_storage/storage_config.h)
+
+任一路收到 Meta 的明确 busy 后，Executor 从下一次准入起收紧该集群的额度。此前已接纳、尚未发 Free 的批次按原计划执行。被 Meta 明确拒收的原批次沿用已占额度，按退避时间重试。
+
+### Executor 怎样取下一项任务
+
+三个来源共用同一组 worker。每个空闲 worker 一次取一个已到执行时间的任务，一项物理删除任务可以处理多个 Location。每次取任务时，worker 都按以下顺序检查队列。
+
+1. 先看 Reclaimer 和 GC 共用的 `kReclaim` 队列，队里有就绪任务就取一项。
+2. 当 `kReclaim` 没有就绪任务时，再看 Trim 所在的 `kSystem` 队列。
+
+同一队列按可执行时间排序，时间相同则先取先入队的任务。已接纳的批次因 busy 重试时沿用原任务类别，退避到期后参与同样的排序。[任务类别与队内排序](../../kv_cache_manager/manager/schedule_plan_executor.h) · [worker 取任务顺序](../../kv_cache_manager/manager/schedule_plan_executor.cc)
+
+例如，只有一个 worker，GC 的两批物理删除和 Trim 的一批物理删除都已就绪，期间也没有新任务加入。worker 会连续取 GC 的两批，再取 Trim 的一批。多个 worker 可以并行执行已经取出的任务。
+
+### TrimCache 的运维额度
+
+`TrimCache` 用于运维清理，后端有余量时应允许单次 Trim 更快推进。其在途 Location 数和待删字节数默认只受目标集群的共享有效额度约束，部署方仍可按需设置 Trim 来源上限。集群满额或因 busy 收紧时，三路继续竞争可用额度。
+
+原先每次 Trim 调用最多有 `2 × Executor worker 数` 批在途。现在每个 KVCM 进程的所有 Trim 调用**合计最多 32 个已接纳、尚未收尾的批次**。单个 Trim 可以用足这 32 个名额，各批仍须满足目标集群的 Location 数和字节额度。在 Linux 集成环境分别运行单个大 Trim、多个并行 Trim，并与后台回收混跑，用 Trim 完成耗时、Meta busy 次数和超时次数验证 32 批的默认值。[Trim 提交与等待](../../kv_cache_manager/manager/cache_manager.cc)
+
+对于整批能放进当前有效上限、只是部分额度正被占用的情况，Trim 提交方保留当前批，等可用额度足够时再提交。等待期间 Executor 的 worker 继续处理在途任务。整次 Trim 在所有批次完成且元数据收尾成功后返回成功。
+
+**整页超过有效上限时按 Location 拆批。** Trim 每次扫描以 256 个 key 为一页的提示值。假设下一页有 100 个 Location，当前额度是 40 个，字节和其他上限均有余量。若额度稳定，Trim 依次提交 40、40、20 个；若额度恢复，剩余部分按新的额度计算。未提交的目标由本次调用暂存在当前页，保持原元数据状态。每个子批提交前核对数量、字节和重试内存预算，按页内读到的原值执行条件 CAS。目标已被删除时可跳过，目标值变化或 CAS 失败时 Trim 记录错误并跳过最终的实例残留清理。单个 Location 超过临时字节额度时适用第 2 节的单独放行规则，超过硬上限时明确报错。已收到 Meta busy 的批次仍按原批重试。
+
+### 旧配置迁移
+
+配置加载时生成一份生效规则。显式的新配置优先。缺少新值时，只自动转换计量单位和作用范围都等价的旧值。对于明确设置却无法等价转换的旧项，输出迁移提示及新配置的生效值，部署方可以按新口径重新配置。缺省项取新模型默认值。无论配置来自哪种写法，运行时均执行上述 Executor 准入逻辑。
+
+新配置使用前缀 `kvcm.delete_admission.`。下表是没有显式配置时的值，bytes 的配置单位为字节。
+
+| 作用范围 | 请求数 | Location 数 | bytes |
+|---|---:|---:|---:|
+| 单个 mempool 接入地址 | — | `cluster_locations=24576` | `cluster_bytes=1374389534720`（1,280 GiB） |
+| Reclaimer | `reclaimer_requests=1024` | `reclaimer_locations=0` | `reclaimer_bytes=4398046511104`（4 TiB） |
+| GC | `gc_requests=64` | `gc_locations=0` | `gc_bytes=0` |
+| Trim | `trim_requests=32` | `trim_locations=0` | `trim_bytes=0` |
+
+Reclaimer 的旧 `pending_delete_handler_limit`、`pending_bytes_limit` 分别映射到 `reclaimer_requests`、`reclaimer_bytes`。GC 的旧 `max_inflight_delete_requests` 映射到 `gc_requests`。显式的新来源值优先，包括 0。协议开关沿用 `kvcm.cache_reclaimer.free_busy_enabled`，同时控制三路是否发送协议头、预留重试内存和自动重发。关闭时仍执行静态共享额度与来源上限。
+
+例如，旧的 `kvcm.cache_reclaimer.pending_location_limit_per_group_type=8000` 约束一个实例组、一种基础存储类型的水位驱逐。这个数无法推导出一个 mempool 能承受的三路总量。升级时若希望三路合计最多 8,000 个 Location，就显式把新共享上限设为 8,000。只提供这个旧值的部署会看到迁移提示，Tair 共享上限取新默认值。非 Tair 的水位驱逐继续用原组、类型上限，通过同一套准入逻辑执行。[旧配置的计量范围](cache_reclaimer_async_delete.md)
+
+### RemoveCache 走普通 Free
+
+`RemoveCache` 通过原有入口向 Executor 提交删除任务，提交后接口即可返回，后台 worker 调用普通 Free。该来源跳过 KVCM 的共享额度、来源上限和 busy 重试，即使三路已经用完目标集群的额度，`RemoveCache` 仍可提交。[接口文档](../api/meta_service.md#remove-cache) · [删除任务提交与跟踪](../../kv_cache_manager/manager/reclaimer_task_supervisor.cc)
+
+`RemoveInstance` 使用已经摘除的 MetaIndexer 完成实例清理，保留每次调用 `2 × worker 数` 的窗口以及普通 Delete。
+
+Meta 会把 `RemoveCache` 发来的显式 GA 列表计入 Free 负载。大量普通 Free 占用后端时，Meta 可以向上述三路返回 busy，由 Executor 收紧这三路的共享额度。

@@ -558,6 +558,32 @@ TEST_F(ServerConfigTest, TestCacheReclaimerAsyncDeleteConfig) {
     EXPECT_FALSE(config.Check());
 }
 
+TEST_F(ServerConfigTest, DeleteAdmissionUsesEquivalentLegacyLimitsAndExplicitSourceOverrides) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("",
+                             {{"kvcm.cache_reclaimer.pending_location_limit_per_group_type", "11"},
+                              {"kvcm.cache_reclaimer.pending_bytes_limit", "44"},
+                              {"kvcm.cache_gc.max_inflight_delete_requests", "5"},
+                              {"kvcm.delete_admission.reclaimer_requests", "0"},
+                              {"kvcm.delete_admission.trim_bytes", "99"}}));
+    auto limits = config.GetDeleteLimits();
+    EXPECT_EQ(24576u, limits.cluster.locations);
+    EXPECT_EQ(11u, limits.non_tair_reclaim.locations);
+    EXPECT_EQ(44u, limits.sources[0].size.bytes);
+    EXPECT_EQ(0u, limits.sources[0].requests);
+    EXPECT_EQ(5u, limits.sources[1].requests);
+    EXPECT_EQ(32u, limits.sources[2].requests);
+    EXPECT_EQ(99u, limits.sources[2].size.bytes);
+    ASSERT_TRUE(config.Parse("",
+                             {{"kvcm.delete_admission.cluster_locations", "8"},
+                              {"kvcm.delete_admission.gc_requests", "7"},
+                              {"kvcm.cache_gc.max_inflight_delete_requests", "2"}}));
+    EXPECT_EQ(8u, config.GetDeleteLimits().cluster.locations);
+    EXPECT_EQ(7u, config.GetDeleteLimits().sources[1].requests);
+    EXPECT_FALSE(config.Parse("", {{"kvcm.delete_admission.cluster_bytes", "0"}}));
+    EXPECT_FALSE(config.Parse("", {{"kvcm.delete_admission.trim_locations", "-1"}}));
+}
+
 TEST_F(ServerConfigTest, FreeBusyConfig) {
     ServerConfig config;
     EXPECT_TRUE(config.Parse("",

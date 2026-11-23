@@ -8,6 +8,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -135,6 +136,7 @@ const char *MaintenanceUnknownReasonName(EventReportBackend::MaintenanceProbeUnk
 }
 
 struct DeleteCandidate {
+    CacheLocationConstPtr location;
     std::string expected_location_value;
     CandidateReason reason{CandidateReason::kOrphanWriting};
     std::set<std::string> confirmed_missing_uris;
@@ -307,9 +309,8 @@ void CacheGarbageCollector::Join() noexcept {
         worker_->Stop();
         worker_.reset();
     }
-    // Match CacheReclaimer's demotion policy: accepted actions continue best effort in the Executor, while GC never
-    // waits for their end-to-end Futures. Clearing these observer handles does not cancel physical deletes or
-    // EventReport metadata actions. Both paths revalidate their mutation preconditions in the Executor worker.
+    // The Executor owns admitted actions and their reservations. Clearing GC's
+    // observer handles never releases capacity held by an executing action.
     for (auto &entry : instances_) {
         entry.buffered_scan = {};
         entry.buffered_key_index = 0;
@@ -374,7 +375,7 @@ ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
     std::set<KeyType> event_report_keys;
     // RunOneTick already checked the inflight limit. With only one free slot,
     // don't consume a slice that could need both kinds of delete action.
-    const bool single_action = config_.max_inflight_delete_requests - inflight_deletes_.size() == 1;
+    const bool single_action = schedule_plan_executor_->Deletes().RemainingRequests(DeleteSource::GC) == 1;
     std::optional<bool> event_report_action;
     while (entry.buffered_key_index < buffer.keys.size() && out.keys.size() < config_.scan_batch_size &&
            location_count < config_.scan_batch_size) {
@@ -432,7 +433,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             return;
         }
         PollInflightDeletes();
-        if (inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
+        if (!schedule_plan_executor_->Deletes().RemainingRequests(DeleteSource::GC)) {
             if (round_active_ && instance_index_ < instances_.size()) {
                 ++instances_[instance_index_].inflight_throttled_tick_count;
             }
@@ -516,7 +517,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                                     std::vector<PendingLocationKey> request_targets,
                                     const char *action_name,
                                     const std::map<std::string, size_t> &reason_counts) {
-            if (request_targets.empty() || inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
+            if (request_targets.empty()) {
                 return false;
             }
             InflightDelete tracked_action;
@@ -533,6 +534,15 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             }
             AsyncDeleteSubmitResult submit_result;
             try {
+                request.reservation = schedule_plan_executor_->Deletes().TryReserve(DeleteSource::GC, request.demand);
+                if (!request.reservation) {
+                    return false;
+                }
+                request.demand = {};
+                tracked_action.reservation = request.reservation;
+                if constexpr (std::is_same_v<std::decay_t<decltype(request)>, CacheLocationDelRequest>) {
+                    request.free_busy = request.reservation->protocol;
+                }
                 submit_result = schedule_plan_executor_->SubmitAsync(request);
             } catch (const std::exception &e) {
                 RecordOperationError("submit_exception");
@@ -549,6 +559,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                 return false;
             }
             if (!submit_result.accepted) {
+                request.reservation->Finish();
                 if (submit_result.future.valid()) {
                     RecordOperationError("submit_contract");
                     KVCM_LOG_ERROR("cache gc %s SubmitAsync rejected with a valid Future, instance[%s]",
@@ -616,7 +627,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                     {instance_id, actions.event_report_request.block_keys[i], target.location_id});
             }
         }
-        if (!event_report_targets.empty() && inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
+        if (!event_report_targets.empty() && !schedule_plan_executor_->Deletes().RemainingRequests(DeleteSource::GC)) {
             for (const auto &targets : actions.event_report_request.targets) {
                 for (const auto &target : targets) {
                     RecordCandidateDropped(CandidateReasonName(EventReportTokenReason(target.cleanup_token)),
@@ -759,6 +770,9 @@ void CacheGarbageCollector::UpdateInflightDeleteMetrics() noexcept {
 }
 
 void CacheGarbageCollector::ReleasePendingLocations(const InflightDelete &inflight) noexcept {
+    if (inflight.reservation) {
+        inflight.reservation->Finish();
+    }
     for (const auto &pending_location : inflight.pending_locations) {
         pending_locations_.erase(pending_location);
     }
@@ -938,6 +952,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                 }
                 candidates.emplace(candidate_key,
                                    DeleteCandidate{
+                                       .location = location,
                                        .expected_location_value = location->ToJsonString(),
                                        .reason = CandidateReason::kOrphanWriting,
                                    });
@@ -1151,6 +1166,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                     }
                     candidates.emplace(entry.key,
                                        DeleteCandidate{
+                                           .location = entry.location,
                                            .expected_location_value = entry.location->ToJsonString(),
                                            .reason = reason,
                                            .event_report_backend = probe_batch.backend,
@@ -1179,6 +1195,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
         if (!probe.confirmed_missing_uris.empty()) {
             candidates.emplace(std::move(probe.key),
                                DeleteCandidate{
+                                   .location = probe.location,
                                    .expected_location_value = probe.location->ToJsonString(),
                                    .reason = CandidateReason::kStorageMissing,
                                    .confirmed_missing_uris = std::move(probe.confirmed_missing_uris),
@@ -1225,6 +1242,15 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             RecordCandidateDropped(CandidateReasonName(candidate.reason), "total_budget", 1);
             continue;
         }
+        auto &admission = schedule_plan_executor_->Deletes();
+        auto add_candidate = [&](DeleteDemand &demand) {
+            const auto cost = admission.Describe(*candidate.location, instance_id.size(), DeleteSource::GC, {}, demand);
+            if (!admission.TryAppend(DeleteSource::GC, demand, cost)) {
+                RecordCandidateDropped(CandidateReasonName(candidate.reason), "inflight_limit", 1);
+                return false;
+            }
+            return true;
+        };
         if (IsEventReportReason(candidate.reason)) {
             const bool new_key = event_report_selected_keys.find(block_key) == event_report_selected_keys.end();
             if (new_key && event_report_selected_keys.size() >= config_.event_report_action_batch_size) {
@@ -1233,6 +1259,9 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             }
             if (!candidate.event_report_backend || !candidate.event_report_cleanup_token.has_value()) {
                 RecordOperationError("event_report_candidate_contract");
+                continue;
+            }
+            if (!add_candidate(actions.event_report_request.demand)) {
                 continue;
             }
             event_report_targets[block_key].push_back(EventReportMetadataDeleteTarget{
@@ -1246,6 +1275,9 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             event_report_selected_keys.insert(block_key);
             ++actions.event_report_reason_counts[CandidateReasonName(candidate.reason)];
         } else {
+            if (!add_candidate(actions.executor_request.demand)) {
+                continue;
+            }
             auto &block_targets = executor_targets[block_key];
             block_targets.location_ids.push_back(location_id);
             block_targets.expected_location_values.push_back(candidate.expected_location_value);

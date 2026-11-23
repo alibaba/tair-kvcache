@@ -442,6 +442,12 @@ public:
     }
 
     std::unique_ptr<CacheGarbageCollector> MakeGc(const CacheGarbageCollector::Config &config) {
+        if (executor_->Deletes().limits.sources[1].requests != config.max_inflight_delete_requests) {
+            DeleteLimits limits;
+            limits.sources[1].requests = config.max_inflight_delete_requests;
+            executor_ = std::make_shared<SchedulePlanExecutor>(
+                1, meta_indexer_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+        }
         return std::make_unique<CacheGarbageCollector>(config,
                                                        registry_manager_,
                                                        meta_indexer_manager_,

@@ -37,11 +37,17 @@ uint64_t Jitter(uint64_t base) {
 
 // Keep every spec of a Location together. A malformed sibling keeps the
 // Location in DELETING, while other Locations on the same storage can proceed.
-bool AppendGAs(
-    const std::string &instance, int64_t key, const CacheLocation &loc, std::string &name, std::vector<uint64_t> &gas) {
+template <typename ShouldSkip>
+bool AppendGAs(const std::string &instance,
+               int64_t key,
+               const CacheLocation &loc,
+               std::string &name,
+               std::vector<uint64_t> &gas,
+               ShouldSkip should_skip) {
     const size_t start = gas.size();
     bool valid = !loc.location_specs().empty();
-    for (const auto &spec : loc.location_specs()) {
+    for (size_t i = 0; i < loc.location_specs().size(); ++i) {
+        const auto &spec = loc.location_specs()[i];
         DataStorageUri uri(spec.uri());
         if (name.empty()) {
             name = uri.GetHostName();
@@ -55,7 +61,7 @@ bool AppendGAs(
                           key,
                           loc.id().c_str(),
                           spec.uri().c_str());
-        } else {
+        } else if (!should_skip(i, spec.uri())) {
             gas.push_back(ga);
         }
     }
@@ -99,6 +105,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         , meta(std::move(meta))
         , indexer(indexer)
         , task(request.free_busy)
+        , reservation(request.reservation)
         , instance(request.instance_id)
         , name(std::move(name))
         , completion(std::move(completion))
@@ -109,10 +116,15 @@ struct Batch : std::enable_shared_from_this<Batch> {
     const std::shared_ptr<MetaIndexerManager> meta;
     const std::weak_ptr<MetaIndexer> indexer;
     const std::shared_ptr<FreeBusyTask> task;
+    const std::shared_ptr<DeleteReservation> reservation;
     const std::string instance, name;
     const std::shared_ptr<TaskCompletion> completion;
     std::weak_ptr<DataStorageBackend> backend;
-    std::map<std::pair<int64_t, std::string>, std::vector<std::string>> records;
+    struct SavedSpec {
+        std::string uri;
+        bool confirmed_missing;
+    };
+    std::map<std::pair<int64_t, std::string>, std::vector<SavedSpec>> records;
     uint64_t reserved = 0;
     uint64_t next_delay;
     Clock::time_point deadline;
@@ -134,6 +146,9 @@ struct Batch : std::enable_shared_from_this<Batch> {
         records.clear();
         task->resources->reserved.fetch_sub(reserved);
         reserved = 0;
+        if (reservation) {
+            reservation->ReleaseStorage(name);
+        }
         completion->FinishBatch(ok && !has_invalid_target);
     }
 
@@ -170,11 +185,14 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         auto self = shared_from_this();
         if (!executor.SubmitTask(
-                ScheduleTaskClass::kReclaim,
+                reservation && reservation->source == DeleteSource::Trim ? ScheduleTaskClass::kSystem
+                                                                         : ScheduleTaskClass::kReclaim,
                 [self, deadline_reason]() {
                     try {
                         self->Retry(deadline_reason);
-                    } catch (const std::exception &e) { self->Stop("local_error", e.what()); } catch (...) {
+                    } catch (const std::exception &e) {
+                        self->Stop("local_error", e.what());
+                    } catch (...) {
                         self->Stop("local_error", "retry exception");
                     }
                 },
@@ -229,11 +247,13 @@ struct Batch : std::enable_shared_from_this<Batch> {
                                 it->second.end(),
                                 loc->location_specs().begin(),
                                 loc->location_specs().end(),
-                                [](const auto &uri, const auto &spec) { return uri == spec.uri(); })) {
+                                [](const auto &saved, const auto &spec) { return saved.uri == spec.uri(); })) {
                     it = records.erase(it);
                     continue;
                 }
-                if (!AppendGAs(instance, keys[i], *loc, expected_storage, gas)) {
+                if (!AppendGAs(instance, keys[i], *loc, expected_storage, gas, [&](size_t j, const std::string &) {
+                        return it->second[j].confirmed_missing;
+                    })) {
                     RecordRetained(*task->resources, "invalid_uri", 1);
                     has_invalid_target = true;
                     it = records.erase(it);
@@ -274,6 +294,11 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         if (current.empty()) {
             Finish(true);
+            return;
+        }
+        if (gas.empty()) {
+            // GC has already confirmed all remaining specs missing.
+            Finish(Cad(current, idx, true));
             return;
         }
         Send(current, gas, idx, true);
@@ -321,7 +346,8 @@ struct Batch : std::enable_shared_from_this<Batch> {
     void Send(const ReclaimFreeLocations &targets,
               const std::vector<uint64_t> &gas,
               const std::shared_ptr<MetaIndexer> &idx,
-              bool retry) {
+              bool retry,
+              const std::set<std::string> &skipped = {}) {
         uint64_t needed = 0;
         for (const auto &[key, loc] : targets) {
             needed += FreeBusyTask::RecordBytes(*loc, instance.size());
@@ -363,20 +389,16 @@ struct Batch : std::enable_shared_from_this<Batch> {
             ++task->resources->busy_replies;
             const uint64_t wait = std::max(Jitter(next_delay), result.retry_after_ms);
             next_delay = std::min(next_delay * 2, kMaxLocalDelayMs);
-            std::set<DataStorageType> types;
             for (const auto &[key, loc] : targets) {
-                types.insert(loc->type());
                 if (!retry) {
                     auto &uris = records.at({key, loc->id()});
                     uris.reserve(loc->location_specs().size());
                     for (const auto &spec : loc->location_specs()) {
-                        uris.push_back(spec.uri());
+                        uris.push_back({spec.uri(), skipped.count(spec.uri()) != 0});
                     }
                 }
             }
-            for (auto type : types) {
-                task->Record(type, wait);
-            }
+            task->Record(name, wait);
             KVCM_LOG_DEBUG("Tair Free busy instance[%s] storage[%s] locations[%zu] gas[%zu] retry[%d] wait_ms[%lu]",
                            instance.c_str(),
                            name.c_str(),
@@ -397,13 +419,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
 
         const bool success = result.status == TairReclaimFreeResult::kSuccess;
         if (success && result.provider_free_acknowledged) {
-            std::set<DataStorageType> types;
-            for (const auto &target : targets) {
-                types.insert(target.second->type());
-            }
-            for (auto type : types) {
-                task->Record(type, 0);
-            }
+            task->Record(name, 0);
         } else if (!success) {
             for (const auto &[key, loc] : targets) {
                 for (const auto &spec : loc->location_specs()) {
@@ -438,20 +454,43 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
     struct StorageGroup {
         ReclaimFreeLocations locations;
         std::vector<uint64_t> gas;
+        std::set<std::string> skip;
     };
     std::map<std::string, StorageGroup> groups;
     std::vector<uint64_t> location_gas;
     for (const auto &[key, loc] : locations) {
         std::string name;
         location_gas.clear();
-        if (!AppendGAs(request.instance_id, key, *loc, name, location_gas)) {
+        std::set<std::string> skipped;
+        if (!request.confirmed_missing_uris.empty() && !loc->location_specs().empty()) {
+            name = DataStorageUri(loc->location_specs().front().uri()).GetHostName();
+            const auto backend = storage->GetDataStorageBackend(name);
+            if (!backend || backend->ShouldSkipConfirmedMissingBackendDelete()) {
+                for (const auto &spec : loc->location_specs()) {
+                    if (request.confirmed_missing_uris.count(DataStorageUri(spec.uri()).ToUriString())) {
+                        skipped.insert(spec.uri());
+                    }
+                }
+            }
+        }
+        if (!AppendGAs(request.instance_id, key, *loc, name, location_gas, [&](size_t, const std::string &uri) {
+                return skipped.count(uri) != 0;
+            })) {
             RecordRetained(*request.free_busy->resources, "invalid_uri", 1);
             result = {EC_PARTIAL_OK, "invalid Tair Location", true};
             continue;
         }
         auto &group = groups[name];
+        group.skip.merge(skipped);
         group.locations.emplace_back(key, loc);
         group.gas.insert(group.gas.end(), location_gas.begin(), location_gas.end());
+    }
+    if (request.reservation) {
+        std::set<std::string> active;
+        for (const auto &entry : groups) {
+            active.insert(entry.first);
+        }
+        request.reservation->RetainStorageBatches(active);
     }
     if (groups.empty()) {
         request.free_busy->ReleaseUnused();
@@ -464,9 +503,13 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
     // The extra reference keeps the Future pending through release of unused memory.
     completion->remaining = groups.size() + 1;
     std::vector<std::shared_ptr<Batch>> batches;
-    for (const auto &[name, group] : groups) {
+    for (auto &[name, group] : groups) {
         const auto &targets = group.locations;
         auto batch = std::make_shared<Batch>(executor, storage, meta, indexer, request, name, completion);
+        if (group.gas.empty()) {
+            batch->Finish(batch->Cad(targets, indexer, false));
+            continue;
+        }
         uint64_t bytes = 0;
         for (const auto &[key, loc] : targets) {
             bytes += FreeBusyTask::IdBytes(loc->id(), request.instance_id.size(), name.size());
@@ -480,7 +523,7 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
                               loc->id().c_str(),
                               name.c_str());
             }
-            completion->FinishBatch(false);
+            batch->Finish(false);
             continue;
         }
         batch->reserved = bytes;
@@ -493,7 +536,7 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
         batch->deadline = Clock::now() + kRetryDeadline;
         try {
             const auto &group = groups.at(batch->name);
-            batch->Send(group.locations, group.gas, indexer, false);
+            batch->Send(group.locations, group.gas, indexer, false, group.skip);
         } catch (const std::exception &e) { batch->Stop("local_error", e.what()); } catch (...) {
             batch->Stop("local_error", "initial Free exception");
         }

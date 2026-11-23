@@ -9,6 +9,8 @@
 
 本文档定义 Cache Garbage Collector（以下简称 GC）V1 的行为契约和实现边界。PR #184 仅作为历史实现参考；最终行为以本文档和实现为准。
 
+本文描述来源自身的扫描、跟踪与收尾。当前删除准入由 Executor 统一执行，Tair 按目标 mempool 与其他来源共享额度。配置迁移和整批 busy 的处理见 [三路删除统一流控](free_busy_backpressure.md#6-三路删除统一流控)。
+
 ## 1. 背景
 
 ### 1.1 为什么需要后台 GC

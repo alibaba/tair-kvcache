@@ -480,8 +480,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     }
     result.water_level_exceeded = true;
     const auto process_full = [&]() {
-        return pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
-               pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit;
+        return !sched_plan_executor_->Deletes().RemainingRequests(DeleteSource::Reclaimer);
     };
     if (process_full()) {
         METRICS_(cache_reclaimer, group_lru_backpressure_stop_count) += 1;
@@ -569,7 +568,6 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         BytesByStorageType bytes{};
         CountsByStorageType counts{};
         std::uint64_t predicted_keys = 0;
-        uint64_t retry_bytes = 0;
         AgeStats ages;
         if (!FilterLocIDImpl(request_context.get(),
                              info,
@@ -582,7 +580,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
                              ages,
                              false,
                              true,
-                             &retry_bytes)) {
+                             &request)) {
             continue;
         }
         const auto nonempty_blocks = std::count_if(request.location_ids.begin(),
@@ -596,7 +594,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         }
         ++attempted_requests;
         METRICS_(cache_reclaimer, group_lru_delete_request_count) += 1;
-        if (SubmitDelReq(request_context, info, request, bytes, counts, predicted_keys, retry_bytes)) {
+        if (SubmitDelReq(request_context, info, request, bytes, counts, predicted_keys)) {
             // These gauges describe the last accepted request, not the whole
             // candidate pool. Blocks removed by the final Location filter do
             // not contribute; creation ages already cover its selected Locations.

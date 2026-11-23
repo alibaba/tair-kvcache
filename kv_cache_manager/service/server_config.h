@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -19,6 +20,7 @@ private:
 public:
     bool Parse(const std::string &config_file, const EnvironMap &environ);
     bool Check();
+    DeleteLimits GetDeleteLimits() const;
 
 public:
     const std::string &GetRegistryStorageUri() const { return registry_storage_uri_; }
@@ -184,6 +186,9 @@ private:
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;
+    static SettingFunction DeleteLimitSetting(const char *name, bool require_positive = false);
+    std::unordered_map<std::string, uint64_t> delete_limit_overrides_;
+    bool explicit_group_delete_limit_{false};
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;
 };
 

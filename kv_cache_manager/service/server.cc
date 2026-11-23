@@ -110,7 +110,8 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetMetaQueryParallelThreshold(),
                               config_.GetMetaQueryChunkSize(),
                               cache_gc_config,
-                              group_lru_config)) {
+                              group_lru_config,
+                              config_.GetDeleteLimits())) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;
     }

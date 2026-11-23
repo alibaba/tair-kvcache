@@ -20,6 +20,7 @@
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
+#include "kv_cache_manager/manager/delete_admission.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -82,7 +83,9 @@ struct CacheLocationDelRequest {
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
     // omit Delete for these URIs; remaining specs are deleted normally.
     std::set<std::string> confirmed_missing_uris;
-    std::shared_ptr<FreeBusyTask> free_busy; // Only watermark eviction opts in.
+    std::shared_ptr<FreeBusyTask> free_busy;
+    DeleteDemand demand;
+    std::shared_ptr<DeleteReservation> reservation;
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -102,6 +105,8 @@ struct EventReportMetadataDelRequest {
     std::string instance_id;
     std::vector<int64_t> block_keys;
     std::vector<std::vector<EventReportMetadataDeleteTarget>> targets;
+    DeleteDemand demand;
+    std::shared_ptr<DeleteReservation> reservation;
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -153,8 +158,15 @@ public:
                                   const std::shared_ptr<MetaIndexerManager> &meta_manager,
                                   const std::shared_ptr<DataStorageManager> &storage_manager,
                                   const std::shared_ptr<MetricsRegistry> &metrics_registry,
-                                  unsigned int migration_worker_budget = std::numeric_limits<unsigned int>::max());
+                                  unsigned int migration_worker_budget = std::numeric_limits<unsigned int>::max(),
+                                  DeleteLimits delete_limits = {});
     ~SchedulePlanExecutor();
+    DeleteAdmission &Deletes() const { return *delete_admission_; }
+    ErrorCode SubmitTrimPage(RequestContext *context,
+                             const CacheMetaDelRequest &page,
+                             const std::shared_ptr<MetaIndexer> &indexer,
+                             uint64_t generation,
+                             const std::function<bool(std::future<PlanExecuteResult>)> &on_submit);
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
     // RemoveInstance supplies the indexer after extracting it from MetaIndexerManager.
@@ -190,6 +202,7 @@ private:
         bool needs_physical_delete{false};
     };
 
+    const std::shared_ptr<DeleteAdmission> delete_admission_;
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -228,8 +241,15 @@ private:
     // DataStorageManager lock for every spec of every location.
     bool IsLocationBlockedByReadOnlyStorage(const CacheLocation &location,
                                             std::unordered_map<std::string, bool> &read_only_by_storage) const;
+    // Trim already read these Locations to size the batch. Use the same values
+    // for exact CAS after waiting for capacity on the caller thread.
+    struct TrimBatch {
+        std::shared_ptr<MetaIndexer> indexer;
+        CacheLocationMapVector locations;
+    };
     LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task);
-    LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task);
+    LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task,
+                                                 const TrimBatch *trim_batch = nullptr);
     LocationDelAdmissionResult
     PrepareDeleteTaskImpl(const std::string &instance_id,
                           const std::vector<int64_t> &block_keys,
@@ -237,18 +257,22 @@ private:
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
                           bool authoritative_read = false,
-                          const FreeBusyTask *free_busy = nullptr);
+                          const FreeBusyTask *free_busy = nullptr,
+                          const DeleteReservation *reservation = nullptr,
+                          const TrimBatch *trim_batch = nullptr);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
                             ScheduleTaskClass task_class);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
-                                                  std::function<LocationDelAdmissionResult()> prepare);
+                                                  std::function<LocationDelAdmissionResult()> prepare,
+                                                  std::shared_ptr<DeleteReservation> reservation = {});
     std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task,
                                                     ScheduleTaskClass task_class,
                                                     std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
-                                                        ScheduleTaskClass task_class);
+                                                        ScheduleTaskClass task_class,
+                                                        const TrimBatch *trim_batch = nullptr);
     PlanExecuteResult
     DoLocationDelTask(const CacheLocationDelRequest &task,
                       const std::shared_ptr<MetaIndexer> &indexer,

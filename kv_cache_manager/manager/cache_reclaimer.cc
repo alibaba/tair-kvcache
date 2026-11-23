@@ -273,20 +273,6 @@ std::uint64_t CacheReclaimer::SaturatingAdd(const std::uint64_t lhs, const std::
     return rhs > max - lhs ? max : lhs + rhs;
 }
 
-std::uint64_t CacheReclaimer::GetLocationBytes(const CacheLocation &location) noexcept {
-    std::uint64_t total = 0;
-    for (const auto &location_spec : location.location_specs()) {
-        DataStorageUri uri(location_spec.uri());
-        if (!uri.Valid()) {
-            continue;
-        }
-        std::uint64_t size = 0;
-        uri.GetParamAs<std::uint64_t>("size", size);
-        total = SaturatingAdd(total, size);
-    }
-    return total;
-}
-
 CacheReclaimer::BytesByStorageType
 CacheReclaimer::GetCreditedDeleteBytes(const std::string &instance_group) const noexcept {
     const auto it = credited_delete_bytes_by_group_.find(instance_group);
@@ -374,6 +360,10 @@ void CacheReclaimer::DisableCredit(DeleteHandler &handler, const char *reason) n
 }
 
 void CacheReclaimer::ReleaseDeleteHandlerState(DeleteHandler &handler) noexcept {
+    if (handler.reservation_) {
+        handler.reservation_->Finish();
+    }
+
     DisableCredit(handler, nullptr);
 
     for (const auto &pending_location : handler.pending_locations_) {
@@ -445,7 +435,7 @@ void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {
     METRICS_(cache_reclaimer, credited_delete_bytes) = static_cast<double>(credited_bytes);
     METRICS_(cache_reclaimer, predicted_deleted_key_count) = static_cast<double>(predicted_keys);
     METRICS_(cache_reclaimer, oldest_pending_request_age_ms) = static_cast<double>(oldest_age_ms);
-    if (async_delete_config_.free_busy_enabled) {
+    if (async_delete_config_.free_busy_enabled && free_busy_resources_) {
         METRICS_(cache_reclaimer, free_busy_reject_count) += free_busy_resources_->busy_replies.exchange(0);
         METRICS_(cache_reclaimer, free_busy_retry_attempt_count) += free_busy_resources_->retry_attempts.exchange(0);
         METRICS_(cache_reclaimer, free_busy_reserved_bytes) =
@@ -607,8 +597,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , sleep_interval_ms_(sleep_interval_ms)
     , future_timeout_ms_(kFutureTimeoutMs)
     , async_delete_config_(std::move(async_delete_config))
-    , free_busy_resources_(std::make_shared<FreeBusyResources>(async_delete_config_.free_busy_retry_memory_limit_bytes,
-                                                               metrics_registry_))
+    , free_busy_resources_(sched_plan_executor_ ? sched_plan_executor_->Deletes().resources : nullptr)
     , worker_stop_(false) {
     if (worker_size == 0) {
         worker_size = 1;
@@ -771,7 +760,6 @@ void CacheReclaimer::Stop() noexcept {
         std::unique_lock<std::mutex> lock(job_state_mutex_);
         if (job_state_flag_) {
             job_state_flag_ = false;
-            ++free_busy_resources_->generation;
             cv_job_state_.notify_one();
         }
     }
@@ -780,7 +768,6 @@ void CacheReclaimer::Stop() noexcept {
         reclaimer_.join();
     }
 
-    free_busy_windows_.clear();
     fair_rotation_by_group_.clear();
     group_lru_rotation_by_group_.clear();
 
@@ -794,7 +781,6 @@ bool CacheReclaimer::IsRunning() noexcept {
 
 void CacheReclaimer::Pause() noexcept {
     pause_flag_.store(true);
-    ++free_busy_resources_->generation;
 }
 
 void CacheReclaimer::Resume() noexcept { pause_flag_.store(false); }
@@ -1083,7 +1069,6 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     std::uint64_t predicted_deleted_keys = 0;
     const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
     const bool maintenance_read = indexer && indexer->PreferSingleTaskReclaimSampling();
-    uint64_t retry_bytes = 0;
     if (!FilterLocIDImpl(request_context.get(),
                          instance_info,
                          request.block_keys,
@@ -1095,7 +1080,7 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
                          create_age_stats,
                          false,
                          maintenance_read,
-                         &retry_bytes)) {
+                         &request)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return false;
     }
@@ -1107,13 +1092,8 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
 
     // 4. submit the final deleting request to the executor
     const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
-    const bool submitted = SubmitDelReq(request_context,
-                                        instance_info,
-                                        request,
-                                        bytes_by_type,
-                                        location_counts_by_type,
-                                        predicted_deleted_keys,
-                                        retry_bytes);
+    const bool submitted = SubmitDelReq(
+        request_context, instance_info, request, bytes_by_type, location_counts_by_type, predicted_deleted_keys);
     METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_submit);
 
@@ -1550,7 +1530,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      AgeStats &out_create_age_stats,
                                      bool eligibility_only,
                                      bool maintenance_read,
-                                     uint64_t *retry_bytes) noexcept {
+                                     CacheLocationDelRequest *output) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1560,16 +1540,14 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
 
-    if (!eligibility_only && (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
-                              pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit)) {
+    DeleteDemand scratch;
+    auto &selected = output ? output->demand : scratch;
+    if (output) {
+        selected = {};
+        output->expected_location_values.assign(batch.size(), {});
+    }
+    if (!eligibility_only && !sched_plan_executor_->Deletes().RemainingRequests(DeleteSource::Reclaimer)) {
         RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN,
-                    "process pending delete limit reached, handlers: [%" PRIu64 "/%" PRIu64 "], bytes: [%" PRIu64
-                    "/%" PRIu64 "]",
-                    pending_delete_handler_count_,
-                    async_delete_config_.pending_delete_handler_limit,
-                    pending_delete_bytes_,
-                    async_delete_config_.pending_bytes_limit);
         out_loc_ids.resize(batch.size());
         out_create_age_stats.Clear();
         return true;
@@ -1676,7 +1654,6 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t create_age_sum = 0;
     int64_t create_age_count = 0;
-    std::uint64_t selected_total_bytes = 0;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
         const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
@@ -1788,71 +1765,25 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                     continue;
                 }
 
-                const auto quota_it = pending_quota_by_group_type_.find({ins_gr, base_type});
-                const PendingQuota current_quota =
-                    quota_it == pending_quota_by_group_type_.end() ? PendingQuota{} : quota_it->second;
-                const std::uint64_t location_bytes = GetLocationBytes(loc);
-
-                const bool location_limit_reached =
-                    current_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
-                    out_location_counts_by_type[type_idx] >=
-                        async_delete_config_.pending_location_limit_per_group_type -
-                            std::min(current_quota.location_count,
-                                     async_delete_config_.pending_location_limit_per_group_type);
-                const std::uint64_t current_and_selected_type_bytes =
-                    SaturatingAdd(current_quota.bytes, out_bytes_by_type[type_idx]);
-                const bool type_bytes_limit_reached =
-                    current_and_selected_type_bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
-                    location_bytes > async_delete_config_.pending_bytes_limit_per_group_type -
-                                         std::min(current_and_selected_type_bytes,
-                                                  async_delete_config_.pending_bytes_limit_per_group_type);
-                const std::uint64_t current_and_selected_process_bytes =
-                    SaturatingAdd(pending_delete_bytes_, selected_total_bytes);
-                const bool process_bytes_limit_reached =
-                    current_and_selected_process_bytes >= async_delete_config_.pending_bytes_limit ||
-                    location_bytes >
-                        async_delete_config_.pending_bytes_limit -
-                            std::min(current_and_selected_process_bytes, async_delete_config_.pending_bytes_limit);
-                if (location_limit_reached || type_bytes_limit_reached || process_bytes_limit_reached) {
-                    RecordPendingLimitReject(ins_gr, ToString(base_type));
-                    INTERVAL_LOG_WITH_ID(WARN,
-                                         10000,
-                                         "skip pending-limit location, block: [%ld], location: [%s], storage type: "
-                                         "[%d], bytes: [%" PRIu64 "]",
-                                         batch[block_idx],
-                                         loc.id().c_str(),
-                                         static_cast<int>(base_type),
-                                         location_bytes);
+                auto &admission = sched_plan_executor_->Deletes();
+                const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
+                DeleteBlockReason reason = DeleteBlockReason::Limit;
+                if (!admission.TryAppend(DeleteSource::Reclaimer, selected, cost, &reason)) {
+                    if (reason == DeleteBlockReason::Memory) {
+                        ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
+                    } else if (reason == DeleteBlockReason::Limit) {
+                        RecordPendingLimitReject(ins_gr, ToString(base_type));
+                    }
                     continue;
                 }
-
-                if (retry_bytes && async_delete_config_.free_busy_enabled && IsTairMempoolStorageType(base_type)) {
-                    PendingQuota requested{out_location_counts_by_type[type_idx] + 1,
-                                           SaturatingAdd(out_bytes_by_type[type_idx], location_bytes)};
-                    if (!free_busy_windows_.empty() &&
-                        !FitsFreeBusyWindow({ins_gr, base_type}, current_quota, requested)) {
-                        continue;
-                    }
-                    const auto cost = FreeBusyTask::RecordBytes(loc, ins_id.size());
-                    const auto available = free_busy_resources_->memory_limit - free_busy_resources_->reserved.load();
-                    if (cost > available || *retry_bytes > available - cost) {
-                        ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
-                        if (cost > free_busy_resources_->memory_limit) {
-                            INTERVAL_LOG_WITH_ID(WARN,
-                                                 10000,
-                                                 "free busy retry record too large, key[%ld] location[%s] bytes[%lu]",
-                                                 batch[block_idx],
-                                                 loc.id().c_str(),
-                                                 cost);
-                        }
-                        continue;
-                    }
-                    *retry_bytes += cost;
+                const auto location_bytes = cost.size.bytes;
+                if (output) {
+                    output->expected_location_values[block_idx].push_back(
+                        IsTairMempoolStorageType(base_type) ? loc.ToJsonString() : "");
                 }
                 loc_id_vec.emplace_back(loc.id());
                 out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);
                 out_bytes_by_type[type_idx] = SaturatingAdd(out_bytes_by_type[type_idx], location_bytes);
-                selected_total_bytes = SaturatingAdd(selected_total_bytes, location_bytes);
                 if (loc.create_time() > 0) {
                     const int64_t age = now_us - loc.create_time();
                     out_create_age_stats.min_us = std::min(out_create_age_stats.min_us, age);
@@ -2124,8 +2055,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                                   const CacheLocationDelRequest &req,
                                   const BytesByStorageType &bytes_by_type,
                                   const CountsByStorageType &location_counts_by_type,
-                                  const std::uint64_t predicted_deleted_keys,
-                                  uint64_t retry_bytes) noexcept {
+                                  const std::uint64_t predicted_deleted_keys) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return false;
@@ -2152,6 +2082,9 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
             loc_count = SaturatingAdd(loc_count, req.location_ids[i].size());
             final_req.block_keys.emplace_back(req.block_keys[i]);
             final_req.location_ids.emplace_back(req.location_ids[i]);
+            if (!req.expected_location_values.empty()) {
+                final_req.expected_location_values.push_back(req.expected_location_values[i]);
+            }
             for (const auto &location_id : req.location_ids[i]) {
                 PendingLocationKey pending_location{ins_id, req.block_keys[i], location_id};
                 if (!request_pending_locations.insert(pending_location).second) {
@@ -2178,72 +2111,27 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
         LOG_WITH_ID(DEBUG, "skip empty reclaim request");
         return false;
     }
-    if (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit) {
-        RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN, "skip reclaim request: process pending handler limit reached");
+    if (req.demand.size.locations != loc_count) {
+        LOG_WITH_ID(ERROR, "reclaim admission target count does not match selected Locations");
         return false;
     }
-
-    std::uint64_t request_bytes = 0;
-    for (std::size_t idx = 0; idx < bytes_by_type.size(); ++idx) {
-        request_bytes = SaturatingAdd(request_bytes, bytes_by_type[idx]);
-        if (location_counts_by_type[idx] == 0 && bytes_by_type[idx] == 0) {
-            continue;
+    DeleteBlockReason reason = DeleteBlockReason::Limit;
+    final_req.reservation = sched_plan_executor_->Deletes().TryReserve(DeleteSource::Reclaimer, req.demand, &reason);
+    if (!final_req.reservation) {
+        if (reason == DeleteBlockReason::Memory) {
+            METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) += loc_count;
+        } else if (reason == DeleteBlockReason::Limit) {
+            RecordPendingLimitReject(ins_gr, "executor");
         }
-        const auto type = static_cast<DataStorageType>(idx);
-        const auto pending_it = pending_quota_by_group_type_.find({ins_gr, type});
-        const PendingQuota pending_quota =
-            pending_it == pending_quota_by_group_type_.end() ? PendingQuota{} : pending_it->second;
-        if (pending_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
-            location_counts_by_type[idx] > async_delete_config_.pending_location_limit_per_group_type -
-                                               std::min(pending_quota.location_count,
-                                                        async_delete_config_.pending_location_limit_per_group_type) ||
-            pending_quota.bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
-            bytes_by_type[idx] >
-                async_delete_config_.pending_bytes_limit_per_group_type -
-                    std::min(pending_quota.bytes, async_delete_config_.pending_bytes_limit_per_group_type)) {
-            RecordPendingLimitReject(ins_gr, ToString(type));
-            LOG_WITH_ID(WARN, "skip reclaim request: group/type pending limit reached for type [%zu]", idx);
-            return false;
-        }
-    }
-    if (pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit ||
-        request_bytes > async_delete_config_.pending_bytes_limit -
-                            std::min(pending_delete_bytes_, async_delete_config_.pending_bytes_limit)) {
-        RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN, "skip reclaim request: process pending bytes limit reached");
         return false;
     }
-
-    if (retry_bytes) {
-        for (auto type :
-             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
-            const auto idx = ToIndex(type);
-            if (location_counts_by_type[idx] == 0) {
-                continue;
-            }
-            const auto it = pending_quota_by_group_type_.find({ins_gr, type});
-            const auto pending = it == pending_quota_by_group_type_.end() ? PendingQuota{} : it->second;
-            if (!FitsFreeBusyWindow({ins_gr, type}, pending, {location_counts_by_type[idx], bytes_by_type[idx]})) {
-                return false;
-            }
-        }
-        auto task =
-            std::make_shared<FreeBusyTask>(free_busy_resources_, async_delete_config_.free_busy_initial_backoff_ms);
-        if (IsPaused() || !IsRunning()) {
-            return false;
-        }
-        if (!free_busy_resources_->Reserve(retry_bytes)) {
-            METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) +=
-                location_counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)] +
-                location_counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)];
-            return false;
-        }
-        task->unassigned = retry_bytes;
-        final_req.free_busy = std::move(task);
+    final_req.free_busy = final_req.reservation->protocol;
+    if (IsPaused() || !IsRunning() || !final_req.reservation->Active()) {
+        return false;
     }
     auto submit_result = sched_plan_executor_->SubmitAsync(final_req);
     if (!submit_result.accepted) {
+        final_req.reservation->Finish();
         LOG_WITH_ID(WARN, "schedule plan executor rejected async reclaim request");
         return false;
     }
@@ -2264,7 +2152,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                                    submitted_at,
                                    credit_deadline,
                                    std::move(submit_result.future));
-    delete_handlers_.front().free_busy_ = std::move(final_req.free_busy);
+    delete_handlers_.front().reservation_ = std::move(final_req.reservation);
     AddDeleteHandlerState(delete_handlers_.front());
 
     METRICS_(cache_reclaimer, block_submit_count) += blk_count;
@@ -2333,118 +2221,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
     return data;
 }
 
-bool CacheReclaimer::FitsFreeBusyWindow(const GroupStorageTypeKey &key,
-                                        PendingQuota pending,
-                                        PendingQuota requested) const {
-    auto it = free_busy_windows_.find(key);
-    if (it == free_busy_windows_.end()) {
-        return true;
-    }
-    const auto &window = it->second;
-    if (FreeBusyTask::Clock::now() < window.cooldown_end) {
-        return false;
-    }
-    if (pending.location_count == 0 && pending.bytes == 0 && requested.location_count == 1) {
-        return true; // An otherwise eligible large Location must be able to make progress alone.
-    }
-    return SaturatingAdd(pending.location_count, requested.location_count) <= window.limit.location_count &&
-           SaturatingAdd(pending.bytes, requested.bytes) <= window.limit.bytes;
-}
-
-void CacheReclaimer::CollectFreeBusyFeedback(DeleteHandler &handler, FreeBusyPoll &poll) {
-    if (!handler.free_busy_ || !handler.free_busy_->Active()) {
-        return;
-    }
-    for (const auto &[type, feedback] : handler.free_busy_->Drain()) {
-        GroupStorageTypeKey key{handler.ins_gr_, type};
-        auto it = free_busy_windows_.find(key);
-        if (it != free_busy_windows_.end() && handler.submitted_at_ <= it->second.changed) {
-            continue;
-        }
-        if (!feedback.busy_ms && it == free_busy_windows_.end()) {
-            continue;
-        }
-        auto &entry = poll[key];
-        if (feedback.busy_ms > 0 && entry.feedback.busy_ms == 0) {
-            auto pending = pending_quota_by_group_type_.find(key);
-            if (pending != pending_quota_by_group_type_.end()) {
-                entry.pending = pending->second;
-            }
-        }
-        entry.feedback.busy_ms = std::max(entry.feedback.busy_ms, feedback.busy_ms);
-        entry.feedback.success |= feedback.success;
-    }
-}
-
-void CacheReclaimer::ApplyFreeBusyFeedback(const FreeBusyPoll &poll) {
-    const auto now = FreeBusyTask::Clock::now();
-    for (const auto &[key, entry] : poll) {
-        const auto &feedback = entry.feedback;
-        auto it = free_busy_windows_.find(key);
-        if (feedback.busy_ms == 0) {
-            it->second.saw_success |= feedback.success;
-            continue;
-        }
-        const PendingQuota hard{async_delete_config_.pending_location_limit_per_group_type,
-                                async_delete_config_.pending_bytes_limit_per_group_type};
-        const auto previous = it == free_busy_windows_.end() ? hard : it->second.limit;
-        auto &window = free_busy_windows_[key];
-        window.limit = {std::max<uint64_t>(1, std::min(previous.location_count, entry.pending.location_count) / 2),
-                        std::max<uint64_t>(1, std::min(previous.bytes, entry.pending.bytes) / 2)};
-        // Protect time_point addition even if the peer sends UINT64_MAX.
-        const auto room =
-            std::chrono::duration_cast<std::chrono::milliseconds>(FreeBusyTask::Clock::time_point::max() - now).count();
-        window.interval = std::chrono::milliseconds(std::min<uint64_t>(feedback.busy_ms, room / 2));
-        window.changed = now;
-        window.cooldown_end = now + window.interval;
-        window.observe_until = window.cooldown_end + window.interval;
-        window.saw_success = false;
-        KVCM_LOG_INFO("free busy backoff group[%s] type[%d] locations[%lu] bytes[%lu] wait_ms[%lu] reserved[%lu]",
-                      key.instance_group.c_str(),
-                      static_cast<int>(key.storage_type),
-                      window.limit.location_count,
-                      window.limit.bytes,
-                      feedback.busy_ms,
-                      free_busy_resources_->reserved.load());
-    }
-}
-
-void CacheReclaimer::RecoverFreeBusyWindows(FreeBusyTask::Clock::time_point oldest_pending) {
-    const auto now = FreeBusyTask::Clock::now();
-    for (auto it = free_busy_windows_.begin(); it != free_busy_windows_.end();) {
-        auto &w = it->second;
-        const PendingQuota hard{async_delete_config_.pending_location_limit_per_group_type,
-                                async_delete_config_.pending_bytes_limit_per_group_type};
-        const bool at_hard = w.limit.location_count == hard.location_count && w.limit.bytes == hard.bytes;
-        if (!at_hard && now >= w.observe_until && w.saw_success) {
-            w.limit.location_count =
-                std::min(hard.location_count, SaturatingAdd(w.limit.location_count, w.limit.location_count));
-            w.limit.bytes = std::min(hard.bytes, SaturatingAdd(w.limit.bytes, w.limit.bytes));
-            w.changed = now;
-            w.observe_until = now + w.interval;
-            w.saw_success = false;
-            KVCM_LOG_INFO("free busy recovery group[%s] type[%d] locations[%lu] bytes[%lu]",
-                          it->first.instance_group.c_str(),
-                          static_cast<int>(it->first.storage_type),
-                          w.limit.location_count,
-                          w.limit.bytes);
-        }
-        if (at_hard && now >= w.cooldown_end && oldest_pending > w.changed) {
-            it = free_busy_windows_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 void CacheReclaimer::HandleDelRes() noexcept {
-    const auto generation = free_busy_resources_->generation.load();
-    if (generation != free_busy_generation_) {
-        free_busy_windows_.clear();
-        free_busy_generation_ = generation;
-    }
-    FreeBusyPoll feedback;
-    auto oldest_pending = FreeBusyTask::Clock::time_point::max();
     auto it_pre = delete_handlers_.before_begin();
     auto it = delete_handlers_.begin();
     while (it != delete_handlers_.end()) {
@@ -2465,11 +2242,6 @@ void CacheReclaimer::HandleDelRes() noexcept {
         }
 
         const auto future_status = it->fut_.wait_for(std::chrono::seconds::zero());
-        // A ready future synchronizes with the final feedback write.
-        CollectFreeBusyFeedback(*it, feedback);
-        if (it->free_busy_ && future_status != std::future_status::ready) {
-            oldest_pending = std::min(oldest_pending, it->submitted_at_);
-        }
         if (future_status == std::future_status::ready) {
             bool terminal = false;
             ErrorCode result_code = ErrorCode::EC_ERROR;
@@ -2537,8 +2309,6 @@ void CacheReclaimer::HandleDelRes() noexcept {
         ++it_pre;
         ++it;
     }
-    ApplyFreeBusyFeedback(feedback);
-    RecoverFreeBusyWindows(oldest_pending);
     UpdateAsyncDeleteMetrics();
 }
 

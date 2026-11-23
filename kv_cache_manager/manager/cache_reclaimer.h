@@ -22,7 +22,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/manager/free_busy.h"
+#include "kv_cache_manager/manager/delete_admission.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -407,7 +407,7 @@ private:
         bool credit_enabled_;
         bool outcome_unknown_reported_;
         std::future<PlanExecuteResult> fut_;
-        std::shared_ptr<FreeBusyTask> free_busy_;
+        std::shared_ptr<DeleteReservation> reservation_;
 
         DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
                       std::string ins_id,
@@ -437,24 +437,6 @@ private:
         std::uint64_t location_count{0};
         std::uint64_t bytes{0};
     };
-
-    struct FreeBusyWindow {
-        PendingQuota limit;
-        FreeBusyTask::Clock::time_point changed, cooldown_end, observe_until;
-        std::chrono::milliseconds interval{0};
-        bool saw_success{false};
-    };
-    std::map<GroupStorageTypeKey, FreeBusyWindow> free_busy_windows_;
-    uint64_t free_busy_generation_{0};
-    bool FitsFreeBusyWindow(const GroupStorageTypeKey &key, PendingQuota pending, PendingQuota requested) const;
-    struct WindowFeedback {
-        FreeBusyFeedback feedback;
-        PendingQuota pending;
-    };
-    using FreeBusyPoll = std::map<GroupStorageTypeKey, WindowFeedback>;
-    void CollectFreeBusyFeedback(DeleteHandler &handler, FreeBusyPoll &poll);
-    void ApplyFreeBusyFeedback(const FreeBusyPoll &poll);
-    void RecoverFreeBusyWindows(FreeBusyTask::Clock::time_point oldest_pending);
 
     std::set<PendingLocationKey> pending_locations_;
     std::map<std::string, BytesByStorageType> credited_delete_bytes_by_group_;
@@ -819,7 +801,7 @@ private:
                          AgeStats &out_create_age_stats,
                          bool eligibility_only,
                          bool maintenance_read,
-                         uint64_t *retry_bytes = nullptr) noexcept;
+                         CacheLocationDelRequest *output = nullptr) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。
@@ -833,12 +815,10 @@ private:
                       const CacheLocationDelRequest &req,
                       const BytesByStorageType &bytes_by_type,
                       const CountsByStorageType &location_counts_by_type,
-                      std::uint64_t predicted_deleted_keys,
-                      uint64_t retry_bytes = 0) noexcept;
+                      std::uint64_t predicted_deleted_keys) noexcept;
 
     static std::uint64_t SaturatingSub(std::uint64_t lhs, std::uint64_t rhs) noexcept;
     static std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept;
-    static std::uint64_t GetLocationBytes(const CacheLocation &location) noexcept;
     BytesByStorageType GetCreditedDeleteBytes(const std::string &instance_group) const noexcept;
     std::uint64_t GetPredictedDeletedKeys(const std::string &instance_group) const noexcept;
     void AddDeleteHandlerState(const DeleteHandler &handler) noexcept;

@@ -22,6 +22,7 @@
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
@@ -112,7 +113,8 @@ public:
               std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
               std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE,
               CacheGarbageCollector::Config cache_gc_config = {},
-              CacheReclaimerGroupLruConfig group_lru_config = {});
+              CacheReclaimerGroupLruConfig group_lru_config = {},
+              std::optional<DeleteLimits> delete_limits = std::nullopt);
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();

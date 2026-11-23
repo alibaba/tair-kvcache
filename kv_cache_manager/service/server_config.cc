@@ -57,6 +57,46 @@ const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
     return kDefaults;
 }
 
+ServerConfig::SettingFunction ServerConfig::DeleteLimitSetting(const char *name, bool require_positive) {
+    return [name, require_positive](const std::string &value, ServerConfig *config) {
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+            return false;
+        }
+        const auto number = std::stoull(value);
+        if (require_positive && number == 0) {
+            return false;
+        }
+        config->delete_limit_overrides_[name] = number;
+        return true;
+    };
+}
+
+DeleteLimits ServerConfig::GetDeleteLimits() const {
+    DeleteLimits limits;
+    auto override_value = [&](const std::string &name, uint64_t fallback) {
+        const auto it = delete_limit_overrides_.find(name);
+        return it == delete_limit_overrides_.end() ? fallback : it->second;
+    };
+    limits.cluster.locations = override_value("cluster_locations", limits.cluster.locations);
+    limits.cluster.bytes = override_value("cluster_bytes", limits.cluster.bytes);
+    limits.non_tair_reclaim = {cache_reclaimer_pending_location_limit_per_group_type_,
+                               cache_reclaimer_pending_bytes_limit_per_group_type_};
+    limits.protocol = free_busy_enabled_;
+    limits.initial_backoff_ms = free_busy_initial_backoff_ms_;
+    limits.retry_memory_bytes = free_busy_retry_memory_limit_bytes_;
+    limits.sources[0].requests = cache_reclaimer_pending_delete_handler_limit_;
+    limits.sources[0].size.bytes = cache_reclaimer_pending_bytes_limit_;
+    limits.sources[1].requests = cache_gc_max_inflight_delete_requests_;
+    const std::array<std::string, 3> sources{"reclaimer", "gc", "trim"};
+    for (size_t i = 0; i < sources.size(); ++i) {
+        auto &limit = limits.sources[i];
+        limit.requests = override_value(sources[i] + "_requests", limit.requests);
+        limit.size.locations = override_value(sources[i] + "_locations", limit.size.locations);
+        limit.size.bytes = override_value(sources[i] + "_bytes", limit.size.bytes);
+    }
+    return limits;
+}
+
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
     {"kvcm.registry_storage.uri",
@@ -226,6 +266,17 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          return ParseUint32Setting(value, config->meta_query_chunk_size_);
      }},
+    {"kvcm.delete_admission.cluster_locations", DeleteLimitSetting("cluster_locations", true)},
+    {"kvcm.delete_admission.cluster_bytes", DeleteLimitSetting("cluster_bytes", true)},
+    {"kvcm.delete_admission.reclaimer_requests", DeleteLimitSetting("reclaimer_requests")},
+    {"kvcm.delete_admission.reclaimer_locations", DeleteLimitSetting("reclaimer_locations")},
+    {"kvcm.delete_admission.reclaimer_bytes", DeleteLimitSetting("reclaimer_bytes")},
+    {"kvcm.delete_admission.gc_requests", DeleteLimitSetting("gc_requests")},
+    {"kvcm.delete_admission.gc_locations", DeleteLimitSetting("gc_locations")},
+    {"kvcm.delete_admission.gc_bytes", DeleteLimitSetting("gc_bytes")},
+    {"kvcm.delete_admission.trim_requests", DeleteLimitSetting("trim_requests")},
+    {"kvcm.delete_admission.trim_locations", DeleteLimitSetting("trim_locations")},
+    {"kvcm.delete_admission.trim_bytes", DeleteLimitSetting("trim_bytes")},
     {"kvcm.cache_reclaimer.key_sampling_size_total",
      [](const std::string &value, ServerConfig *config) {
          config->cache_reclaimer_key_sampling_size_total_ = std::stoull(value);
@@ -258,6 +309,7 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      }},
     {"kvcm.cache_reclaimer.pending_location_limit_per_group_type",
      [](const std::string &value, ServerConfig *config) {
+         config->explicit_group_delete_limit_ = true;
          config->cache_reclaimer_pending_location_limit_per_group_type_ = std::stoull(value);
          return true;
      }},
@@ -284,6 +336,7 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      }},
     {"kvcm.cache_reclaimer.pending_bytes_limit_per_group_type",
      [](const std::string &value, ServerConfig *config) {
+         config->explicit_group_delete_limit_ = true;
          config->cache_reclaimer_pending_bytes_limit_per_group_type_ = std::stoull(value);
          return true;
      }},
@@ -435,6 +488,15 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
         fprintf(stderr, "Parse config from environ failed\n");
         return false;
     }
+    if (explicit_group_delete_limit_) {
+        const auto limit = GetDeleteLimits().cluster;
+        fprintf(stderr,
+                "Reclaimer per-group/type limits still apply to non-Tair storage. "
+                "Tair now uses kvcm.delete_admission.cluster_locations=%llu and "
+                "kvcm.delete_admission.cluster_bytes=%llu per endpoint.\n",
+                static_cast<unsigned long long>(limit.locations),
+                static_cast<unsigned long long>(limit.bytes));
+    }
     return ResolveMetricsEnvTags();
 }
 
@@ -487,6 +549,8 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    delete_limit_overrides_.clear();
+    explicit_group_delete_limit_ = false;
     service_grpc_max_threads_ = 0;
     service_grpc_memory_quota_bytes_ = 0;
     http_report_event_body_budget_bytes_ = 0;
