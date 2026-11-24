@@ -28,36 +28,16 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 例如集群实际在途 80 个 Location、4 GiB，首次 busy 可使额度降至 40 个、2 GiB。每次调额用单调时钟记录轮次边界。此前接纳的任务即使在宽限期后才发出 Free，它的回包也只决定本批重试和收尾。冷却结束且该集群已经排空时，允许一个超过临时字节额度的 Location 单独推进，前提是满足共享、来源和内存的硬上限。
 
-## 3. Tair Mempool Free 如何识别 busy
+## 3. KVCM 如何处理 Tair Mempool Free 回包
 
-**灰度顺序。** KVCM 的协议和自动重试共用一个默认开启的开关。Meta 混部期间，或双方尚未确认第 4 节的 GA 身份和重发窗口时，部署须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。旧 follower 转发时可能把新 leader 的 429 写为 501 并保留原正文。启用前，所有可能服务、转发或接任 leader 的 Meta 都要完成升级，并按实际路由核对额度和完整回包。
+开启协议时，KVCM 发送 `X-TairMempool-Free-Protocol: 1`。下表中的 429 和 400 都要求 HTTP 状态、v1 业务码和协议字段匹配，包括 `accepted=false` 和 `rejection_scope=whole_request`。
 
-Meta 在 `HandleDeleteGAs` 对带协议头的请求先校验完整 GA 列表。空列表或任一 GA 非法都返回参数错误，KVCM 发前逐 URI 校验路径完整解析为非零十进制 uint64，按十进制串和逗号组装 GA 列表，跳过空批。非法 spec 按 `(key, location_id, 原 URI)` 记录并保留所属 Location 的元数据，其他可独立完成的 Location 继续处理。一个 Location 有多个 spec 时，记录各 spec 的处理结果，避免过滤一项后把整个 Location 当作成功 CAD。
-
-对合法列表，Meta 在调用 `FreeGAs` 前按正在处理的 Free 批数和 GA 数检查额度。单批能容纳、已有占用使本批加入后超限时，立即返回 `FREE_BUSY_NOT_ACCEPTED`，整批还未向任何 Provider 下发。若单批自身已超过 GA 硬上限，优先返回 HTTP 400 和 `{"protocol_version":1,"code":"FREE_BATCH_TOO_LARGE","status":"error","accepted":false,"rejection_scope":"whole_request","max_gas":1000}`，其中 1000 为示例。KVCM 校验 HTTP 状态和整份协议字段。这类错误直接按未发出失败收尾，保留受影响的 `DELETING`，记录实际项数和该 Meta 的上限供调整组批或配置。接纳的请求占用额度，处理结束时归还。所有显式列表 Free 都计入负载，只有带协议头的请求参与拒收。已下发的请求即使超时或部分失败，也按实际结果返回。
-
-支持盘侧反压的 Meta 还可在下发前检查目标 Provider 上报的 SSD 删除池忙态。如果任一目标繁忙，Meta 使用同一个 `FREE_BUSY_NOT_ACCEPTED` 拒收整批。KVCM 按相同方式退避。
-
-Meta 可按下列格式返回 HTTP 429，其中 `retry_after_ms` 是 Meta 可选的等待建议，单位为毫秒。
-
-```json
-{
-  "protocol_version": 1,
-  "code": "FREE_BUSY_NOT_ACCEPTED",
-  "status": "busy",
-  "accepted": false,
-  "rejection_scope": "whole_request",
-  "retry_after_ms": 50
-}
-```
-
-**入口与接口。** 三个来源在申请额度时标明来源。开启协议后，Executor 负责组批和重试，PACE 存储适配代码校验 GA 地址并调用具体后端。内源客户端为请求带上 `X-TairMempool-Free-Protocol: 1`，在归并错误前识别协议版本、状态码和整批未接纳保证。只清元数据的 EventReport GC 占用 GC 请求名额，跳过物理 Free。[Executor 入口](../../kv_cache_manager/manager/schedule_plan_executor.cc) · [PACE 存储适配](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
-
-**存储访问。** `DataStorageManager::WithRegisteredBackend` 按名称查找后端，回调执行期间持有注册表读锁。PACE 适配代码在回调内发送 Free，重试时先核对注册的仍是首发使用的后端。Free 返回即释放锁，退避期间只保留弱引用。同名存储重新注册后，旧批次会停止重发。[注册表访问](../../kv_cache_manager/data_storage/data_storage_manager.h) · [PACE Free 发送](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
-
-**反馈时机。** v1 的 HTTP 200 成功响应带布尔字段 `provider_free_acknowledged`。只要本批至少一个 Provider 对 Free RPC 返回业务成功，该值就是 `true`，包括同批另有 GA 缺路由的情况。整批因缺路由或节点断连被跳过时，该值为 `false`。KVCM 对成功回包照常执行 CAD，只有明确的布尔值 `true` 才计入额度恢复。旧 Meta 缺字段或字段类型异常时，成功收尾并保持当前额度。
-
-Executor 收到回包时，按本次准入记录中的 storage 找到对应集群，在共享锁内立即处理反馈。明确 busy 清除尚未使用的成功反馈，三路的下一次准入都能看到新额度。[调额逻辑](../../kv_cache_manager/manager/delete_admission.cc)
+| Tair Mempool 回包 | 含义 | KVCM 行为 |
+|---|---|---|
+| HTTP 429 + `FREE_BUSY_NOT_ACCEPTED` | 暂时繁忙，整批尚未下发 | 向该集群反馈 busy，按退避规则重试原批。回包携带 `retry_after_ms` 时，等待时间取本地退避和该建议值的较大值 |
+| HTTP 400 + `FREE_BATCH_TOO_LARGE` | 单批 GA 数超过 `max_gas`，整批尚未下发 | 终止该批，保留对应的 `DELETING` 元数据，记录实际 GA 数和上限。不重试、不降额 |
+| HTTP 200 + `status=success` | 请求处理成功 | 按原规则清理元数据。仅当 `provider_free_acknowledged=true` 时计入额度恢复 |
+| 其他 HTTP 错误（含普通 429）或发送后超时 | 缺少整批未下发的保证 | 沿用原有错误和元数据收尾规则，停止自动重发 |
 
 ## 4. 被拒的原批次如何重试
 
@@ -111,6 +91,8 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 早期仅水位驱逐的版本在同一 Linux 环境，使用真实删除执行器、本地元数据和始终成功的测试后端做了三轮对照。每轮删除 2 万个 Location、40 万个 GA，使用 8 个 worker 和 1 秒读者宽限期。从开始提交到所有 Future 完成，64 MiB 预算约需 2.17 秒，128 MiB 和关闭协议均约需 1.19 秒。128 MiB 在三轮中都没有等待预算。该对照衡量 KVCM 在此工作负载下的排空时间，线上端到端耗时还取决于 Meta 和 Provider。
 
 ## 5. 验收
+
+协议默认开启。Meta 混部或第 4 节的 GA 身份和重发窗口尚未确认时，须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。启用前确认所有可能处理或转发 Free 的 Meta 均已升级，并沿实际路由核对 HTTP 状态和协议字段。
 
 | 场景 | 应看到的结果 |
 |---|---|
