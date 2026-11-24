@@ -1845,6 +1845,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
 void CacheReclaimer::TryMigrateOnGroup(
     const std::shared_ptr<RequestContext> &request_context,
     const std::shared_ptr<const InstanceGroup> &instance_group,
+    const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         return;
@@ -1873,7 +1874,6 @@ void CacheReclaimer::TryMigrateOnGroup(
         return;
     }
 
-    const auto quota = GetReclaimQuota(*instance_group);
     struct CachedMigrationBatch {
         bool built = false;
         bool ok = false;
@@ -2765,17 +2765,18 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         return result;
     }
 
+    const auto quota = GetReclaimQuota(*instance_group);
     const auto budget_policy = reclaim_strategy->instance_reclaim_budget_policy();
     if (budget_policy == InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
         fair_rotation_by_group_.erase(ins_gr);
         group_lru_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupLegacy(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupLegacy(request_context, instance_group, quota, instance_infos);
     } else if (budget_policy == InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL) {
         group_lru_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupFair(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupFair(request_context, instance_group, quota, instance_infos);
     } else if (budget_policy == InstanceReclaimBudgetPolicy::GROUP_LRU) {
         fair_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupLru(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupLru(request_context, instance_group, quota, instance_infos);
     } else {
         LOG_WITH_GR(ERROR, "invalid instance reclaim mode [%d], skip reclaim", static_cast<int>(budget_policy));
     }
@@ -2786,7 +2787,7 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
     // admission; it does not wait for physical deletion. Migration still runs independently
     // when its lower watermark is reached before the reclaim threshold.
     if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
-        TryMigrateOnGroup(request_context, instance_group, instance_infos);
+        TryMigrateOnGroup(request_context, instance_group, quota, instance_infos);
     }
 
     return result;
@@ -2795,9 +2796,10 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
 CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
     const std::shared_ptr<RequestContext> &request_context,
     const std::shared_ptr<const InstanceGroup> &instance_group,
-    const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+    const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     ReclaimResult result;
+    const auto &reclaim_strategy = instance_group->cache_config()->reclaim_strategy();
     const std::string &ins_gr = instance_group->name();
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
     for (const auto &instance_info : instance_infos) {
@@ -2810,8 +2812,8 @@ CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
             continue;
         }
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-        const auto water_level_exceed = GetWaterLevelExceed(
-            request_context.get(), ins_gr, GetReclaimQuota(*instance_group), reclaim_strategy, instance_infos);
+        const auto water_level_exceed =
+            GetWaterLevelExceed(request_context.get(), ins_gr, quota, reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         if (!IsTriggerReclaiming(water_level_exceed)) {
@@ -2849,9 +2851,10 @@ CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
 CacheReclaimer::ReclaimResult
 CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &request_context,
                                       const std::shared_ptr<const InstanceGroup> &instance_group,
-                                      const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                      const InstanceGroupQuota &quota,
                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     ReclaimResult result;
+    const auto &reclaim_strategy = instance_group->cache_config()->reclaim_strategy();
     const std::string &ins_gr = instance_group->name();
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
     METRICS_(cache_reclaimer, fair_effective_instance_count) = 0;
@@ -2861,8 +2864,7 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
 
     const auto read_water_level = [&]() {
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-        auto water_level = GetWaterLevelExceed(
-            request_context.get(), ins_gr, GetReclaimQuota(*instance_group), reclaim_strategy, instance_infos);
+        auto water_level = GetWaterLevelExceed(request_context.get(), ins_gr, quota, reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         return water_level;

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -18,6 +19,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
@@ -93,7 +95,11 @@ public:
     TypedTestBackend(std::shared_ptr<MetricsRegistry> metrics_registry, DataStorageType type)
         : DataStorageBackend(std::move(metrics_registry)), type_(type) {}
 
-    StorageCapacitySnapshot GetStorageCapacity() const override { return snapshot; }
+    StorageCapacitySnapshot GetStorageCapacity() const override {
+        ++capacity_reads;
+        return snapshot;
+    }
+    mutable std::atomic<int> capacity_reads{0};
     StorageCapacitySnapshot snapshot;
     DataStorageType GetType() override { return type_; }
     bool Available() override { return true; }
@@ -4963,6 +4969,27 @@ TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsResetWhenAcceptedBatchHasNoVali
     EXPECT_EQ(4, GroupLruSubmittedBlocks().size());
 }
 
+TEST_F(CacheReclaimerTest, CapacityChangeTakesEffectOnNextGroupRound) {
+    const auto group = SetUpGroupLruScenario();
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    const auto backend = std::make_shared<TypedTestBackend>(mr_, type);
+    backend->snapshot = {100, 1000, EC_OK};
+    dsm_->storage_map_["pool"] = backend;
+    rm_->data_storage_manager_ = dsm_;
+    group->set_storage_candidates({"pool"});
+    QuotaConfig automatic(0, type);
+    automatic.set_mode("auto");
+    automatic.set_ratio(1.0);
+    group->set_quota(InstanceGroupQuota(-1, {automatic}));
+
+    spe_submit_accepted_callback = [backend](const CacheLocationDelRequest &) { backend->snapshot.capacity = 100000; };
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_GT(SubmittedDelRequestCount(), 1);
+    EXPECT_EQ(1, backend->capacity_reads.load());
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).water_level_exceeded);
+    EXPECT_EQ(2, backend->capacity_reads.load());
+}
+
 TEST_F(CacheReclaimerTest, TestGroupLruStopsImmediatelyOnAcceptedCredit) {
     const auto group = SetUpGroupLruScenario();
     AddMetaIndexerForInstance("a", 50, 32);
@@ -5309,9 +5336,7 @@ TEST_F(CacheReclaimerTest, TestGroupLruReusesKeepBothColdReplicaProtection) {
     };
     // Exercise the eviction path only; migration scheduling has separate coverage.
     EXPECT_TRUE(
-        cache_reclaimer_
-            ->TryReclaimOnGroupLru(request_context_, group, group->cache_config()->reclaim_strategy(), instance_infos)
-            .made_progress);
+        cache_reclaimer_->TryReclaimOnGroupLru(request_context_, group, group->quota(), instance_infos).made_progress);
     const auto requests = SubmittedDelRequestsSnapshot();
     ASSERT_FALSE(requests.empty());
     ASSERT_EQ(1, requests[0].block_keys.front());
@@ -8068,16 +8093,17 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
         started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
     }
 
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {first_instance});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, instance_group->quota(), {first_instance});
     const auto pending_after_first_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
 
     sample_reclaim_call_counter = 0;
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {second_instance, third_instance});
+    cache_reclaimer_->TryMigrateOnGroup(
+        request_context_, instance_group, instance_group->quota(), {second_instance, third_instance});
     const auto pending_after_second_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_on_second_tick = sample_reclaim_call_counter;
 
     sample_reclaim_call_counter = 0;
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {third_instance});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, instance_group->quota(), {third_instance});
     const auto pending_after_full_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_when_full = sample_reclaim_call_counter;
 
@@ -8151,7 +8177,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_copy_limits.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {ins_info});
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
@@ -8216,7 +8242,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsBelowThreshold) {
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_mark_keys.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {InstanceInfoFactory()});
 
     ASSERT_TRUE(captured_copy_reqs.empty());
     ASSERT_TRUE(captured_copy_req_batches.empty());
@@ -8269,7 +8295,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsWhenNoCapacity) {
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_mark_keys.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {InstanceInfoFactory()});
 
     ASSERT_TRUE(captured_copy_reqs.empty());
     ASSERT_TRUE(captured_copy_req_batches.empty());
@@ -8321,7 +8347,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
 
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {ins_info});
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
