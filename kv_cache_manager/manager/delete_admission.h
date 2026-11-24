@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "kv_cache_manager/data_storage/pace_reclaim_free.h"
 #include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -16,6 +17,7 @@
 namespace kv_cache_manager {
 
 class DataStorageManager;
+class DataStorageBackend;
 class DeleteAdmission;
 
 struct DeleteTargetCost {
@@ -23,6 +25,7 @@ struct DeleteTargetCost {
     std::string bucket;
     DeleteSize size;
     uint64_t retry_bytes{0};
+    std::weak_ptr<DataStorageBackend> provider_source{};
 };
 
 enum class DeleteBlockReason {
@@ -114,6 +117,8 @@ private:
     };
     struct Bucket {
         DeleteSize used;
+        PaceProviderCount providers;
+        DeleteSize baseline;
         DeleteSize effective;
         Clock::time_point changed{}, cooldown{}, observe{};
         std::chrono::milliseconds interval{0};
@@ -130,19 +135,20 @@ private:
                         bool empty,
                         Clock::time_point now,
                         DeleteBlockReason *reason);
-    bool FitsLocked(DeleteSource source,
-                    const DeleteDemand &demand,
-                    bool empty,
-                    Clock::time_point now,
-                    DeleteBlockReason *reason = nullptr);
-    std::shared_ptr<DeleteReservation> ReserveLocked(DeleteSource source, const DeleteDemand &demand);
+    std::shared_ptr<DeleteReservation>
+    TryReserveLocked(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason = nullptr);
     DeleteSize Hard(const std::string &bucket) const;
+    DeleteSize Baseline(const std::string &bucket, PaceProviderCount providers, Clock::time_point now) const;
+    Bucket &GetBucketLocked(const std::string &key, Clock::time_point now);
+    void ObserveProvidersLocked(const DeleteTargetCost &target, Clock::time_point now);
+    void RefreshWindow(const std::string &key, Bucket &bucket, Clock::time_point now);
     void ReleaseLocked(DeleteReservation &reservation, const DeleteSize &size, const std::string &bucket);
     std::shared_ptr<DataStorageManager> storage_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::array<DeleteSourceLimit, 3> used_{};
     std::map<std::string, Bucket> buckets_;
+    Clock::time_point next_idle_prune_{};
     Counter trim_wait_count_, trim_wait_us_;
     bool paused_{false};
 };

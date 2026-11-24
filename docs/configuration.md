@@ -183,6 +183,7 @@ kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
 
 # 每个进程内，三路删除共用每个 mempool 接入地址的 Location 数和数据字节硬上限。
+# 协议开启时，每个健康 Provider 对应 384 个 Location、20 GiB 的起步额度，两项分别受以下配置封顶。
 kvcm.delete_admission.cluster_locations=24576
 kvcm.delete_admission.cluster_bytes=1374389534720
 

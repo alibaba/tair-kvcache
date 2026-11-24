@@ -27,4 +27,7 @@ PaceReclaimFreeResult FreePaceGAsForReclaim(const DataStorageManager &storage,
 // Identifies the target Meta independently of client-side discovery timeouts.
 std::string GetPaceClusterEndpoint(const StorageConfig &config);
 
+// Reads the backend's last health-poll result without issuing a request.
+PaceProviderCount GetPaceProviderCount(const std::weak_ptr<DataStorageBackend> &source);
+
 } // namespace kv_cache_manager

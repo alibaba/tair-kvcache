@@ -444,6 +444,8 @@ public:
         std::vector<std::vector<uint64_t>> calls;
         size_t ordinary_calls = 0;
         bool skip_missing{false};
+        PaceProviderCount providers;
+        PaceProviderCount GetReclaimProviderCount() const override { return providers; }
         bool ShouldSkipConfirmedMissingBackendDelete() const override { return skip_missing; }
         void Endpoint(const std::string &domain, const std::string &discovery) {
             auto spec = std::make_shared<TairMemPoolStorageSpec>();
@@ -545,6 +547,97 @@ TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim)
     EXPECT_EQ((std::vector<std::vector<uint64_t>>{{2}, {2}}), dram->calls);
     EXPECT_TRUE(Locations(1).empty());
     EXPECT_TRUE(ssd->calls.empty());
+}
+
+TEST_F(FreeBusyDeleteTest, ProviderWindowTracksLiveTopologyAndKeepsConfiguredCeilings) {
+    using Clock = std::chrono::steady_clock;
+    auto backend = Backend("dram", {});
+    backend->Endpoint("pool", "");
+    auto &admission = executor->Deletes();
+    CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://dram/1?size=1")});
+    auto target = admission.Describe(loc, 1, DeleteSource::GC, {}, {});
+    const auto reserve = [&](DeleteAdmission &controller, DeleteSize size) {
+        auto cost = target;
+        cost.size = size;
+        DeleteDemand demand;
+        demand.Add(cost);
+        return controller.TryReserve(DeleteSource::GC, demand);
+    };
+    EXPECT_TRUE(reserve(admission, {384, 20ULL << 30}));
+    EXPECT_FALSE(reserve(admission, {385, 1}));
+    backend->providers = {4, Clock::now()};
+    auto first = reserve(admission, {1536, 80ULL << 30});
+    ASSERT_TRUE(first);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    backend->providers = {40, Clock::now()};
+    auto more = reserve(admission, {15360 - 1536, 720ULL << 30});
+    ASSERT_TRUE(more);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    backend->providers = {1, Clock::now()};
+    more->Finish();
+    EXPECT_FALSE(reserve(admission, {1, 1})); // Outstanding work survives a scale-in.
+    first->Finish();
+    EXPECT_FALSE(reserve(admission, {2, (20ULL << 30) + 1}));
+    EXPECT_TRUE(reserve(admission, {1, (20ULL << 30) + 1})); // One indivisible Location fits the hard limit.
+    backend->providers = {UINT32_MAX, Clock::now()};
+    EXPECT_TRUE(reserve(admission, admission.limits.cluster));
+    EXPECT_FALSE(reserve(admission, {admission.limits.cluster.locations + 1, 1}));
+    backend->providers = {0, Clock::now()};
+    auto probe = reserve(admission, {1, 1});
+    ASSERT_TRUE(probe);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    probe->Finish();
+
+    DeleteLimits limits;
+    auto cold = std::make_shared<DeleteAdmission>(limits, data_storage_manager_, metrics_registry_);
+    backend->providers = {40, Clock::now() - std::chrono::minutes(1)};
+    EXPECT_FALSE(reserve(*cold, {385, 1}));
+    limits.protocol = false;
+    auto legacy = std::make_shared<DeleteAdmission>(limits, data_storage_manager_, metrics_registry_);
+    EXPECT_TRUE(reserve(*legacy, limits.cluster));
+}
+
+TEST_F(FreeBusyDeleteTest, ProviderGrowthRespectsBusyAndRecoveryUsesTheLatestClusterSample) {
+    using Clock = std::chrono::steady_clock;
+    auto dram = Backend("dram", {});
+    auto ssd = Backend("ssd", {});
+    dram->Endpoint("same", "");
+    ssd->Endpoint("same", "");
+    auto &admission = executor->Deletes();
+    const auto demand_for = [&](const std::string &name, DeleteSize size) {
+        CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://" + name + "/1?size=1")});
+        auto cost = admission.Describe(loc, 1, DeleteSource::Trim, {}, {});
+        cost.size = size;
+        DeleteDemand demand;
+        demand.Add(cost);
+        return demand;
+    };
+    auto work = demand_for("dram", {384, 20ULL << 30});
+    auto small = demand_for("ssd", {1, 1});
+    dram->providers = ssd->providers = {1, Clock::now()};
+    auto first = admission.TryReserve(DeleteSource::Reclaimer, work);
+    ASSERT_TRUE(first);
+    first->Feedback("dram", 60000);
+    first->Finish();
+    ssd->providers = {4, Clock::now()};
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, small));
+    auto &bucket = admission.buckets_.at("endpoint/same");
+    EXPECT_EQ(192u, bucket.effective.locations);
+    EXPECT_EQ(1536u, bucket.baseline.locations);
+    bucket.cooldown = bucket.observe = Clock::now();
+    for (size_t expected : {384u, 768u, 1536u}) {
+        auto fresh = admission.TryReserve(DeleteSource::GC, small);
+        ASSERT_TRUE(fresh);
+        fresh->Feedback("ssd", 0);
+        fresh->Finish();
+        bucket.observe = Clock::now();
+        ASSERT_TRUE(admission.TryReserve(DeleteSource::Reclaimer, small));
+        EXPECT_EQ(expected, bucket.effective.locations);
+    }
+    EXPECT_EQ(80ULL << 30, bucket.effective.bytes);
+    EXPECT_EQ(0, bucket.interval.count());
+    EXPECT_TRUE(admission.TryReserve(DeleteSource::Trim, demand_for("dram", {1536, 1})));
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, demand_for("dram", {1537, 1})));
 }
 
 TEST_F(FreeBusyDeleteTest, DiscoveryClientOptionsShareCooldownWhileRoutingOptionsKeepClustersSeparate) {

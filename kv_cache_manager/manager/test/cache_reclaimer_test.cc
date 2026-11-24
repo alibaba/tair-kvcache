@@ -4664,7 +4664,7 @@ TEST_F(CacheReclaimerTest, PaceQuotaAndCooldownPreserveColdKeysForTheNextLruSamp
     cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
 
     DeleteDemand occupied;
-    occupied.Add({"store", "storage/store", admission.limits.cluster});
+    occupied.Add({"store", "storage/store", {1, admission.limits.cluster.bytes}});
     auto gc = admission.TryReserve(DeleteSource::GC, occupied);
     ASSERT_TRUE(gc);
     EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);

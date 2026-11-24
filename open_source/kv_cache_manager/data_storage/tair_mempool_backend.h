@@ -16,6 +16,7 @@ public:
     bool ShouldSkipConfirmedMissingBackendDelete() const override;
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
+    virtual PaceProviderCount GetReclaimProviderCount() const { return {}; }
 
 public:
     ErrorCode DoOpen(const StorageConfig &storage_config, const std::string &trace_id) override;

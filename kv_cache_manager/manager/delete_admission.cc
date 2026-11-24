@@ -11,6 +11,10 @@ namespace kv_cache_manager {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+// One sixty-fourth of the default cluster ceilings. These are outstanding work units, not measured QPS.
+constexpr DeleteSize kWindowPerProvider{384, 20ULL << 30};
+constexpr auto kTopologyMaxAge = std::chrono::seconds(30);
+
 uint64_t Sum(uint64_t a, uint64_t b) { return a + std::min(b, std::numeric_limits<uint64_t>::max() - a); }
 void AddSize(DeleteSize &a, DeleteSize b) { a = {Sum(a.locations, b.locations), Sum(a.bytes, b.bytes)}; }
 void SubSize(DeleteSize &a, DeleteSize b) {
@@ -36,6 +40,7 @@ void DeleteDemand::Add(const DeleteTargetCost &target) {
     if (!target.storage.empty()) {
         auto &part = storages[target.storage];
         part.bucket = target.bucket;
+        part.provider_source = target.provider_source;
         AddSize(part.size, target.size);
     }
 }
@@ -82,10 +87,14 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
     auto known = selected.storages.find(cost.storage);
     if (known != selected.storages.end()) {
         cost.bucket = known->second.bucket;
+        cost.provider_source = known->second.provider_source;
         return cost;
     }
     cost.bucket = "storage/" + cost.storage;
     if (const auto backend = storage_ ? storage_->GetDataStorageBackend(cost.storage) : nullptr) {
+        if (limits.protocol) {
+            cost.provider_source = backend;
+        }
         const auto endpoint = GetPaceClusterEndpoint(backend->GetStorageConfig());
         if (!endpoint.empty()) {
             cost.bucket = "endpoint/" + endpoint;
@@ -96,6 +105,21 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
 
 DeleteSize DeleteAdmission::Hard(const std::string &key) const {
     return key.compare(0, 6, "group/") == 0 ? limits.non_pace_reclaim : limits.cluster;
+}
+
+DeleteSize DeleteAdmission::Baseline(const std::string &key, PaceProviderCount providers, Clock::time_point now) const {
+    const auto hard = Hard(key);
+    if (!limits.protocol || key.compare(0, 6, "group/") == 0) {
+        return hard;
+    }
+    const bool fresh = providers.observed_at != Clock::time_point{} && now - providers.observed_at <= kTopologyMaxAge;
+    // Cold start and stale topology use one provider. A confirmed empty cluster admits just one probe Location.
+    const uint64_t count = fresh ? providers.count : 1;
+    if (count == 0) {
+        return {1, std::min(hard.bytes, kWindowPerProvider.bytes)};
+    }
+    const auto scaled = [count](uint64_t unit, uint64_t limit) { return count > limit / unit ? limit : count * unit; };
+    return {scaled(kWindowPerProvider.locations, hard.locations), scaled(kWindowPerProvider.bytes, hard.bytes)};
 }
 
 uint64_t DeleteAdmission::RemainingRequests(DeleteSource source) const {
@@ -129,50 +153,101 @@ bool DeleteAdmission::FitsSourceLocked(
     return true;
 }
 
-bool DeleteAdmission::FitsBucketLocked(
-    const std::string &key, DeleteSize wanted, bool empty, Clock::time_point now, DeleteBlockReason *reason) {
-    const auto hard = Hard(key);
-    const auto it = buckets_.find(key);
-    const DeleteSize used = empty || it == buckets_.end() ? DeleteSize{} : it->second.used;
-    if (!Fits(used, wanted, hard)) {
-        return false;
+DeleteAdmission::Bucket &DeleteAdmission::GetBucketLocked(const std::string &key, Clock::time_point now) {
+    const auto existing = buckets_.find(key);
+    if (existing != buckets_.end()) {
+        return existing->second;
     }
-    if (it == buckets_.end()) {
-        return true;
+    // Keep a fresh endpoint sample across idle gaps so a lagging DRAM/SSD alias cannot undo a resize.
+    if (now >= next_idle_prune_) {
+        for (auto it = buckets_.begin(); it != buckets_.end();) {
+            const auto &b = it->second;
+            if (!b.used.locations && b.interval.count() == 0 && now - b.providers.observed_at > kTopologyMaxAge) {
+                it = buckets_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        next_idle_prune_ = now + kTopologyMaxAge;
     }
-    auto &b = it->second;
+    auto &bucket = buckets_[key];
+    bucket.baseline = Baseline(key, {}, now);
+    bucket.effective = bucket.baseline;
+    if (resources->metrics && key.compare(0, 6, "group/") != 0) {
+        const auto gauges = [this](const MetricsTags &tags) {
+            return SizeGauges{resources->metrics->GetGauge("delete_admission.cluster_locations", tags),
+                              resources->metrics->GetGauge("delete_admission.cluster_bytes", tags)};
+        };
+        bucket.used_gauges = gauges({{"cluster", key}, {"quota", "used"}});
+        bucket.effective_gauges = gauges({{"cluster", key}, {"quota", "effective"}});
+        bucket.effective_gauges.Set(bucket.effective);
+    }
+    return bucket;
+}
+
+void DeleteAdmission::ObserveProvidersLocked(const DeleteTargetCost &target, Clock::time_point now) {
+    if (!limits.protocol) {
+        return;
+    }
+    const auto sample = GetPaceProviderCount(target.provider_source);
+    if (sample.observed_at == Clock::time_point{} || now - sample.observed_at > kTopologyMaxAge) {
+        return;
+    }
+    auto &latest = GetBucketLocked(target.bucket, now).providers;
+    if (sample.observed_at > latest.observed_at) {
+        latest = sample;
+    }
+}
+
+void DeleteAdmission::RefreshWindow(const std::string &key, Bucket &b, Clock::time_point now) {
+    const auto base = Baseline(key, b.providers, now);
+    if (base.locations != b.baseline.locations || base.bytes != b.baseline.bytes) {
+        b.baseline = base;
+        b.effective = b.interval.count() == 0 ? base
+                                              : DeleteSize{std::min(b.effective.locations, base.locations),
+                                                           std::min(b.effective.bytes, base.bytes)};
+        b.effective_gauges.Set(b.effective);
+    }
     if (b.success && now >= b.observe) {
-        b.effective = {std::min(hard.locations, Sum(b.effective.locations, b.effective.locations)),
-                       std::min(hard.bytes, Sum(b.effective.bytes, b.effective.bytes))};
+        b.effective = {std::min(base.locations, Sum(b.effective.locations, b.effective.locations)),
+                       std::min(base.bytes, Sum(b.effective.bytes, b.effective.bytes))};
         b.effective_gauges.Set(b.effective);
         b.changed = now;
         b.success = false;
-        if (b.effective.locations == hard.locations && b.effective.bytes == hard.bytes) {
+        if (b.effective.locations == base.locations && b.effective.bytes == base.bytes) {
             b.interval = std::chrono::milliseconds::zero();
         }
         auto room = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now);
         b.observe = now + std::min(b.interval, room);
     }
+}
+
+bool DeleteAdmission::FitsBucketLocked(
+    const std::string &key, DeleteSize wanted, bool empty, Clock::time_point now, DeleteBlockReason *reason) {
+    const auto it = buckets_.find(key);
+    DeleteSize used{}, effective;
+    bool cooling = false;
+    if (it == buckets_.end()) {
+        effective = Baseline(key, {}, now);
+    } else {
+        auto &b = it->second;
+        RefreshWindow(key, b, now);
+        if (!empty) {
+            used = b.used;
+            cooling = now < b.cooldown;
+        }
+        effective = b.effective;
+    }
+    if (!Fits(used, wanted, Hard(key))) {
+        return false;
+    }
     // A single Location can exceed only the temporary byte ceiling, after drain.
     const bool single = used.locations == 0 && wanted.locations == 1;
-    if ((!empty && now < b.cooldown) || (!single && !Fits(used, wanted, b.effective))) {
+    if (cooling || (!single && !Fits(used, wanted, effective))) {
         if (reason) {
             *reason = DeleteBlockReason::Busy;
         }
         return false;
-    }
-    return true;
-}
-
-bool DeleteAdmission::FitsLocked(
-    DeleteSource source, const DeleteDemand &demand, bool empty, Clock::time_point now, DeleteBlockReason *reason) {
-    if (!FitsSourceLocked(source, demand.size, demand.retry_bytes, empty, reason)) {
-        return false;
-    }
-    for (const auto &[key, amount] : demand.buckets) {
-        if (!FitsBucketLocked(key, amount, empty, now, reason)) {
-            return false;
-        }
     }
     return true;
 }
@@ -197,6 +272,9 @@ bool DeleteAdmission::FitsNextLocked(DeleteSource source,
     auto it = selected.buckets.find(next.bucket);
     if (it != selected.buckets.end()) {
         AddSize(wanted, it->second);
+    }
+    if (!selected.storages.count(next.storage)) {
+        ObserveProvidersLocked(next, now);
     }
     return FitsBucketLocked(next.bucket, wanted, empty, now, reason);
 }
@@ -230,7 +308,20 @@ DeleteReservation::DeleteReservation(std::shared_ptr<DeleteAdmission> owner,
     , demand_(std::move(demand))
     , submitted_at_(Clock::now()) {}
 
-std::shared_ptr<DeleteReservation> DeleteAdmission::ReserveLocked(DeleteSource source, const DeleteDemand &demand) {
+std::shared_ptr<DeleteReservation>
+DeleteAdmission::TryReserveLocked(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason) {
+    if (!FitsSourceLocked(source, demand.size, demand.retry_bytes, false, reason)) {
+        return {};
+    }
+    const auto now = Clock::now();
+    for (const auto &[name, part] : demand.storages) {
+        ObserveProvidersLocked(part, now);
+    }
+    for (const auto &[key, size] : demand.buckets) {
+        if (!FitsBucketLocked(key, size, false, now, reason)) {
+            return {};
+        }
+    }
     auto task = demand.retry_bytes ? std::make_shared<FreeBusyTask>(resources, limits.initial_backoff_ms) : nullptr;
     auto lease = std::shared_ptr<DeleteReservation>(new DeleteReservation(shared_from_this(), source, demand, task));
     if (task) {
@@ -241,32 +332,18 @@ std::shared_ptr<DeleteReservation> DeleteAdmission::ReserveLocked(DeleteSource s
             }
         };
         if (!resources->Reserve(demand.retry_bytes)) {
+            if (reason) {
+                *reason = DeleteBlockReason::Memory;
+            }
             return {};
         }
         task->unassigned = demand.retry_bytes;
-    }
-    for (const auto &entry : demand.buckets) {
-        const auto &key = entry.first;
-        auto [it, inserted] = buckets_.try_emplace(key);
-        if (inserted) {
-            auto &bucket = it->second;
-            bucket.effective = Hard(key);
-            if (resources->metrics && key.compare(0, 6, "group/") != 0) {
-                const auto gauges = [this](const MetricsTags &tags) {
-                    return SizeGauges{resources->metrics->GetGauge("delete_admission.cluster_locations", tags),
-                                      resources->metrics->GetGauge("delete_admission.cluster_bytes", tags)};
-                };
-                bucket.used_gauges = gauges({{"cluster", key}, {"quota", "used"}});
-                bucket.effective_gauges = gauges({{"cluster", key}, {"quota", "effective"}});
-                bucket.effective_gauges.Set(bucket.effective);
-            }
-        }
     }
     auto &used = used_[Index(source)];
     ++used.requests;
     AddSize(used.size, demand.size);
     for (const auto &[key, size] : demand.buckets) {
-        auto &bucket = buckets_.at(key);
+        auto &bucket = GetBucketLocked(key, now);
         AddSize(bucket.used, size);
         bucket.used_gauges.Set(bucket.used);
     }
@@ -277,14 +354,7 @@ std::shared_ptr<DeleteReservation> DeleteAdmission::ReserveLocked(DeleteSource s
 std::shared_ptr<DeleteReservation>
 DeleteAdmission::TryReserve(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (paused_ || !FitsLocked(source, demand, false, Clock::now(), reason)) {
-        return {};
-    }
-    auto reservation = ReserveLocked(source, demand);
-    if (!reservation && reason) {
-        *reason = DeleteBlockReason::Memory;
-    }
-    return reservation;
+    return paused_ ? nullptr : TryReserveLocked(source, demand, reason);
 }
 
 DeleteAdmission::TrimResult DeleteAdmission::ReserveTrim(const std::vector<DeleteTargetCost> &targets,
@@ -307,11 +377,10 @@ DeleteAdmission::TrimResult DeleteAdmission::ReserveTrim(const std::vector<Delet
         if (end == begin) {
             return TrimResult::TooLarge;
         }
-        if (FitsLocked(DeleteSource::Trim, prefix, false, now)) {
-            lease = ReserveLocked(DeleteSource::Trim, prefix);
-            if (lease) {
-                return TrimResult::Accepted;
-            }
+        if (auto accepted = TryReserveLocked(DeleteSource::Trim, prefix)) {
+            lock.unlock();
+            lease = std::move(accepted);
+            return TrimResult::Accepted;
         }
         // Completions and lifecycle changes notify immediately. Also revisit cooldown
         // expiry and memory returned by a still-running multi-storage task.
@@ -337,7 +406,7 @@ void DeleteAdmission::SetPaused(bool value) {
         ++resources->generation;
         for (auto it = buckets_.begin(); it != buckets_.end();) {
             auto &bucket = it->second;
-            bucket.effective = Hard(it->first);
+            bucket.effective = bucket.baseline;
             bucket.effective_gauges.Set(bucket.effective);
             if (!bucket.used.locations) {
                 it = buckets_.erase(it);
@@ -366,8 +435,9 @@ void DeleteAdmission::ReleaseLocked(DeleteReservation &lease, const DeleteSize &
         auto &b = it->second;
         SubSize(b.used, size);
         b.used_gauges.Set(b.used);
-        const auto hard = Hard(key);
-        if (!b.used.locations && b.effective.locations == hard.locations && b.effective.bytes == hard.bytes) {
+        if (!b.used.locations && b.interval.count() == 0 &&
+            (b.providers.observed_at == Clock::time_point{} ||
+             Clock::now() - b.providers.observed_at > kTopologyMaxAge)) {
             buckets_.erase(it);
         }
     }

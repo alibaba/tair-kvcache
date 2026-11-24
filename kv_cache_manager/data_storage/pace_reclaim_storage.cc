@@ -41,6 +41,11 @@ PaceReclaimFreeResult FreePaceGAsForReclaim(const DataStorageManager &storage,
     });
 }
 
+PaceProviderCount GetPaceProviderCount(const std::weak_ptr<DataStorageBackend> &source) {
+    const auto backend = std::dynamic_pointer_cast<TairMempoolBackend>(source.lock());
+    return backend ? backend->GetReclaimProviderCount() : PaceProviderCount{};
+}
+
 std::string GetPaceClusterEndpoint(const StorageConfig &config) {
     const auto *spec = dynamic_cast<const TairMemPoolStorageSpec *>(config.storage_spec().get());
     if (!spec) {
