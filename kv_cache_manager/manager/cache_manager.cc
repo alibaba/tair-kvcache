@@ -592,7 +592,7 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
         limits.sources[0].requests = cache_reclaimer_async_delete_config.pending_delete_handler_limit;
         limits.sources[0].size.bytes = cache_reclaimer_async_delete_config.pending_bytes_limit;
         limits.sources[1].requests = cache_gc_config.max_inflight_delete_requests;
-        limits.non_tair_reclaim = {cache_reclaimer_async_delete_config.pending_location_limit_per_group_type,
+        limits.non_pace_reclaim = {cache_reclaimer_async_delete_config.pending_location_limit_per_group_type,
                                    cache_reclaimer_async_delete_config.pending_bytes_limit_per_group_type};
         limits.protocol = cache_reclaimer_async_delete_config.free_busy_enabled;
         limits.initial_backoff_ms = cache_reclaimer_async_delete_config.free_busy_initial_backoff_ms;

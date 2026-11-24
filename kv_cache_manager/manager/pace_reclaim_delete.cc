@@ -1,4 +1,4 @@
-#include "kv_cache_manager/manager/tair_reclaim_delete.h"
+#include "kv_cache_manager/manager/pace_reclaim_delete.h"
 
 #include <map>
 #include <random>
@@ -6,6 +6,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -53,8 +54,7 @@ bool AppendGAs(const std::string &instance,
             name = uri.GetHostName();
         }
         uint64_t ga;
-        if (uri.GetProtocol() != kTairMempoolUriScheme || name.empty() || uri.GetHostName() != name ||
-            !ParseReclaimGA(uri.GetPath(), ga)) {
+        if (name.empty() || uri.GetHostName() != name || !ParsePaceReclaimGA(uri, ga)) {
             valid = false;
             KVCM_LOG_WARN("Invalid reclaim GA instance[%s] key[%ld] location[%s] uri[%s]",
                           instance.c_str(),
@@ -68,7 +68,7 @@ bool AppendGAs(const std::string &instance,
     if (!valid) {
         gas.resize(start);
         KVCM_LOG_WARN(
-            "Retain invalid Tair Location instance[%s] key[%ld] location[%s]", instance.c_str(), key, loc.id().c_str());
+            "Retain invalid PACE Location instance[%s] key[%ld] location[%s]", instance.c_str(), key, loc.id().c_str());
     }
     return valid;
 }
@@ -82,7 +82,7 @@ struct TaskCompletion {
     void FinishBatch(bool ok) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!ok && result.status == EC_OK) {
-            result = {EC_PARTIAL_OK, "Tair reclaim Free or CAD failed", true};
+            result = {EC_PARTIAL_OK, "PACE reclaim Free or CAD failed", true};
         }
         if (--remaining == 0) {
             done(std::move(result));
@@ -155,7 +155,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
     void Stop(const char *reason, const char *detail = nullptr) {
         RecordRetained(*task->resources, reason, records.size());
         for (const auto &[id, uris] : records) {
-            KVCM_LOG_WARN("Tair reclaim Free stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
+            KVCM_LOG_WARN("PACE reclaim Free stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
                           detail ? detail : reason,
                           instance.c_str(),
                           id.first,
@@ -377,15 +377,15 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         auto can_send = [&] { return task->Active() && (!retry || Clock::now() < deadline); };
         const auto result =
-            storage->DeleteTairForReclaim("location_del_task_trace", name, gas, backend, retry, can_send);
+            FreePaceGAsForReclaim(*storage, "location_del_task_trace", name, gas, backend, retry, can_send);
         ReleaseSlot();
-        if (result.status == TairReclaimFreeResult::kNotSent) {
+        if (result.status == PaceReclaimFreeResult::kNotSent) {
             if (!StopIfCancelledOrExpired(retry && Clock::now() >= deadline, "dispatch_deadline")) {
                 Stop("backend_unavailable", "Free not sent by backend");
             }
             return;
         }
-        if (result.status == TairReclaimFreeResult::kBusy) {
+        if (result.status == PaceReclaimFreeResult::kBusy) {
             ++task->resources->busy_replies;
             const uint64_t wait = std::max(Jitter(next_delay), result.retry_after_ms);
             next_delay = std::min(next_delay * 2, kMaxLocalDelayMs);
@@ -399,7 +399,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
                 }
             }
             task->Record(name, wait);
-            KVCM_LOG_DEBUG("Tair Free busy instance[%s] storage[%s] locations[%zu] gas[%zu] retry[%d] wait_ms[%lu]",
+            KVCM_LOG_DEBUG("PACE Free busy instance[%s] storage[%s] locations[%zu] gas[%zu] retry[%d] wait_ms[%lu]",
                            instance.c_str(),
                            name.c_str(),
                            targets.size(),
@@ -409,21 +409,21 @@ struct Batch : std::enable_shared_from_this<Batch> {
             Schedule(wait, "busy_deadline");
             return;
         }
-        if (result.status == TairReclaimFreeResult::kTooLarge ||
-            result.status == TairReclaimFreeResult::kBackendChanged) {
+        if (result.status == PaceReclaimFreeResult::kTooLarge ||
+            result.status == PaceReclaimFreeResult::kBackendChanged) {
             KVCM_LOG_WARN(
-                "Tair Free not sent storage[%s] gas[%zu] max_gas[%lu]", name.c_str(), gas.size(), result.max_gas);
-            Stop(result.status == TairReclaimFreeResult::kTooLarge ? "batch_too_large" : "backend_changed");
+                "PACE Free not sent storage[%s] gas[%zu] max_gas[%lu]", name.c_str(), gas.size(), result.max_gas);
+            Stop(result.status == PaceReclaimFreeResult::kTooLarge ? "batch_too_large" : "backend_changed");
             return;
         }
 
-        const bool success = result.status == TairReclaimFreeResult::kSuccess;
+        const bool success = result.status == PaceReclaimFreeResult::kSuccess;
         if (success && result.provider_free_acknowledged) {
             task->Record(name, 0);
         } else if (!success) {
             for (const auto &[key, loc] : targets) {
                 for (const auto &spec : loc->location_specs()) {
-                    KVCM_LOG_WARN("Tair Free failed, possible leak instance[%s] key[%ld] location[%s] uri[%s]",
+                    KVCM_LOG_WARN("PACE Free failed, possible leak instance[%s] key[%ld] location[%s] uri[%s]",
                                   instance.c_str(),
                                   key,
                                   loc->id().c_str(),
@@ -433,7 +433,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         const auto cad_ok = Cad(targets, idx, retry);
         if (!cad_ok) {
-            KVCM_LOG_WARN("Tair reclaim CAD failed instance[%s] storage[%s] locations[%zu]",
+            KVCM_LOG_WARN("PACE reclaim CAD failed instance[%s] storage[%s] locations[%zu]",
                           instance.c_str(),
                           name.c_str(),
                           targets.size());
@@ -443,7 +443,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
 };
 } // namespace
 
-void RunTairReclaimDelete(SchedulePlanExecutor &executor,
+void RunPaceReclaimDelete(SchedulePlanExecutor &executor,
                           const std::shared_ptr<DataStorageManager> &storage,
                           const std::shared_ptr<MetaIndexerManager> &meta,
                           const std::shared_ptr<MetaIndexer> &indexer,
@@ -477,7 +477,7 @@ void RunTairReclaimDelete(SchedulePlanExecutor &executor,
                 return skipped.count(uri) != 0;
             })) {
             RecordRetained(*request.free_busy->resources, "invalid_uri", 1);
-            result = {EC_PARTIAL_OK, "invalid Tair Location", true};
+            result = {EC_PARTIAL_OK, "invalid PACE Location", true};
             continue;
         }
         auto &group = groups[name];

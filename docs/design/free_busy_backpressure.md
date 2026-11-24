@@ -2,13 +2,13 @@
 
 ## 1. 目标与范围
 
-水位驱逐、主动 GC 和运维 `TrimCache` 可以同时向同一个 Tair mempool 发送 Free。每个来源单独限制并发时，后端承担的是三路之和。额度配少会拖慢回收，配多则可能让繁忙的 Meta 或 Provider 超时。
+水位驱逐、主动 GC 和运维 `TrimCache` 可以同时向同一个 Tair Mempool（PACE）发送 Free。每个来源单独限制并发时，后端承担的是三路之和。额度配少会拖慢回收，配多则可能让繁忙的 Meta 或 Provider 超时。
 
 每个 KVCM 进程在 `SchedulePlanExecutor` 中统一管理这三路删除。它按目标 mempool 共享在途 Location 数和待删字节数，也允许给每个来源单独封顶。任一路收到 Meta 明确拒收后，三路的后续批次都遵守该集群收紧后的额度。不同 mempool 各自调额。外部 `RemoveCache`、注销实例时的清理和写入/迁移回滚沿用普通删除入口。[额度与来源配置](#6-三路删除统一流控)
 
 ## 2. 额度如何收紧和恢复
 
-候选筛选读取 Executor 当前额度，提交时在同一把锁内复核并占用来源、集群和重试记录预算。每个已接纳的逻辑任务占一个来源请求名额，包括宽限等待、实际 Free 和元数据收尾。Tair 协议批按 storage 完成时归还对应的 Location 和字节，任务 Future 收尾时归还请求名额及剩余额度。一次 Free 可以包含多个 Location 和更多 GA，配置值计量的是在途工作量。[准入与归还](../../kv_cache_manager/manager/delete_admission.cc)
+候选筛选读取 Executor 当前额度，提交时在同一把锁内复核并占用来源、集群和重试记录预算。每个已接纳的逻辑任务占一个来源请求名额，包括宽限等待、实际 Free 和元数据收尾。Tair Mempool 协议批按 storage 完成时归还对应的 Location 和字节，任务 Future 收尾时归还请求名额及剩余额度。一次 Free 可以包含多个 Location 和更多 GA，配置值计量的是在途工作量。[准入与归还](../../kv_cache_manager/manager/delete_admission.cc)
 
 | 集群收到的反馈 | 对新准入的影响 |
 |---|---|
@@ -19,7 +19,7 @@
 
 例如集群实际在途 80 个 Location、4 GiB，首次 busy 可使额度降至 40 个、2 GiB。每次调额用单调时钟记录轮次边界。此前接纳的任务即使在宽限期后才发出 Free，它的回包也只决定本批重试和收尾。冷却结束且该集群已经排空时，允许一个超过临时字节额度的 Location 单独推进，前提是满足共享、来源和内存的硬上限。
 
-## 3. Tair Free 如何识别 busy
+## 3. Tair Mempool Free 如何识别 busy
 
 **灰度顺序。** KVCM 的协议和自动重试共用一个默认开启的开关。Meta 混部期间，或双方尚未确认第 4 节的 GA 身份和重发窗口时，部署须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。旧 follower 转发时可能把新 leader 的 429 写为 501 并保留原正文。启用前，所有可能服务、转发或接任 leader 的 Meta 都要完成升级，并按实际路由核对额度和完整回包。
 
@@ -42,9 +42,9 @@ Meta 可按下列格式返回 HTTP 429，其中 `retry_after_ms` 是 Meta 可选
 }
 ```
 
-**入口与接口。** 三个来源在申请额度时标明来源，Executor 将本次准入记录传给实际任务。开启协议且任务包含 Tair 目标时，沿用 Tair backend 的专用 Free 入口，HTTP 请求带 `X-TairMempool-Free-Protocol: 1`。后端在错误归并前识别约定的状态码、协议版本和整批未接纳保证。只清元数据的 EventReport GC 也占 GC 请求名额，物理层不会发送 Free。[Executor 入口](../../kv_cache_manager/manager/schedule_plan_executor.cc) · [Tair 存储访问](../../kv_cache_manager/data_storage/data_storage_manager.cc)
+**入口与接口。** 三个来源在申请额度时标明来源。开启协议后，Executor 负责组批和重试，PACE 存储适配代码校验 GA 地址并调用具体后端。内源客户端为请求带上 `X-TairMempool-Free-Protocol: 1`，在归并错误前识别协议版本、状态码和整批未接纳保证。只清元数据的 EventReport GC 占用 GC 请求名额，跳过物理 Free。[Executor 入口](../../kv_cache_manager/manager/schedule_plan_executor.cc) · [PACE 存储适配](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
 
-**存储访问。** 首发和重试都在 `DataStorageManager` 现有删除读锁内查找并调用后端。退避等待期间释放锁，重试时在锁内核对仍是原后端实例，避免注销存储时的 `Close` 和 Delete 同时执行。[存储的删除与注销](../../kv_cache_manager/data_storage/data_storage_manager.cc)
+**存储访问。** `DataStorageManager::WithRegisteredBackend` 按名称查找后端，回调执行期间持有注册表读锁。PACE 适配代码在回调内发送 Free，重试时先核对注册的仍是首发使用的后端。Free 返回即释放锁，退避期间只保留弱引用。同名存储重新注册后，旧批次会停止重发。[注册表访问](../../kv_cache_manager/data_storage/data_storage_manager.h) · [PACE Free 发送](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
 
 **反馈时机。** v1 的 HTTP 200 成功响应带布尔字段 `provider_free_acknowledged`。只要本批至少一个 Provider 对 Free RPC 返回业务成功，该值就是 `true`，包括同批另有 GA 缺路由的情况。整批因缺路由或节点断连被跳过时，该值为 `false`。KVCM 对成功回包照常执行 CAD，只有明确的布尔值 `true` 才计入额度恢复。旧 Meta 缺字段或字段类型异常时，成功收尾并保持当前额度。
 
@@ -60,7 +60,7 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 允许启动重试的总时限为 30 秒，从原批次首次准备 Free 开始计时。延迟投递和回调使用同一截止时间。取得存储读锁后先检查代次和时限，取到 PACE 客户端并准备启动 HTTP 时再检查一次，覆盖等待连接池的时间。已经启动的请求按实际回包收尾。
 
-**重试删除的并发上限。** 每个 KVCM 进程的所有实例组和 Tair 存储共享一组名额，限制三路收到明确 busy 后同时执行的重试批数。按 `SchedulePlanExecutor::GetWorkerCount()` 返回的实际 worker 数 N 计算，联调起点取 `max(1, floor(N / 2))`。2 个 worker 最多同时重试 1 批，8 个最多 4 批。首次 Free 和其他任务共用原线程池，无需申请重试名额，也无需按部署规模另配参数。[Executor 的实际 worker 数](../../kv_cache_manager/manager/schedule_plan_executor.h)
+**重试删除的并发上限。** 每个 KVCM 进程的所有实例组和 Tair Mempool 存储共享一组名额，限制三路收到明确 busy 后同时执行的重试批数。按 `SchedulePlanExecutor::GetWorkerCount()` 返回的实际 worker 数 N 计算，联调起点取 `max(1, floor(N / 2))`。2 个 worker 最多同时重试 1 批，8 个最多 4 批。首次 Free 和其他任务共用原线程池，无需申请重试名额，也无需按部署规模另配参数。[Executor 的实际 worker 数](../../kv_cache_manager/manager/schedule_plan_executor.h)
 
 延迟回调到期后先检查取消和总截止时间，再尝试取一个名额。取到才开始核对元数据，Free 返回就归还。若整批无需重发，或因读取失败、取消而提前结束，退出时也归还名额。名额用满时，回调用原批次记录错开时间再投递，立即让出 worker。排队和退避期间不占重试名额，原 pending、内存预留和总截止时间继续沿用。等待本地名额不计作 Meta busy，不触发降额或下一档退避。
 
@@ -80,7 +80,7 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 ### 重试记录的进程级内存上限
 
-可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes`，以字节为单位，限制单个 KVCM 进程为三路 Tair 删除重试记录预留的内存总量。该进程内的所有实例组和 Tair 存储共用这份预算。常规部署使用默认值，内存余量较小的部署可显式调低。
+可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes`，以字节为单位，限制单个 KVCM 进程为三路 Tair Mempool 删除重试记录预留的内存总量。该进程内的所有实例组和 Tair Mempool 存储共用这份预算。常规部署使用默认值，内存余量较小的部署可显式调低。
 
 退避期间保存**完整 URI 文本和受影响的 Location 关联**，重发时再解析当批 URI。预算覆盖这些文本、关联、容器容量和每批的固定开销。
 
@@ -105,7 +105,7 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 | 场景 | 应看到的结果 |
 |---|---|
-| 未配置协议开关，或显式设为 `false` | 默认三路 Tair 删除携带协议头并预留重试预算。预算充足且无明确 busy 时按共享硬上限和来源上限提交，旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，继续执行静态准入上限 |
+| 未配置协议开关，或显式设为 `false` | 默认三路 Tair Mempool 删除携带协议头并预留重试预算。预算充足且无明确 busy 时按共享硬上限和来源上限提交，旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，继续执行静态准入上限 |
 | 初始退避使用默认值或改为 100 ms | 首次本地等待分别从 50 ms、100 ms 起步并加抖动。如果 Meta 建议等待 200 ms 且长于本地等待，实际重试等待为 200 ms。若本批触发调额，本轮冷却和随后的观察期各为 200 ms |
 | 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
 | 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
@@ -131,7 +131,7 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 原有协议联调用同一份水位驱逐负载对比开关前后的正常回收速度和过载超时数，再混入主动删除观察水位驱逐的让步。评估重试并发上限时，同时看首次 Free 从就绪到 worker 开始执行的排队时间，以及压力解除后积压批次的排空时间。只剩重试时也按同一上限执行，此时排空可能变慢。复用现有的 `pending_location_count`、`pending_delete_bytes` 和回收耗时。`free_busy_reject_count`、`free_busy_retry_attempt_count` 和 `free_busy_reserved_bytes` 分别观测 Meta 的明确拒收、重试尝试次数和进程预留字节数。
 
-- `free_busy_budget_skip_location_count` 统计 Reclaimer 筛选或提交时因内存预留不足被挡住的 Tair 候选次数。同一 Location 下轮再次被挡会再计一次，这些候选保留原状态。
+- `free_busy_budget_skip_location_count` 统计 Reclaimer 筛选或提交时因内存预留不足被挡住的 Tair Mempool 候选次数。同一 Location 下轮再次被挡会再计一次，这些候选保留原状态。
 - `delete_admission.cluster_locations` 和 `delete_admission.cluster_bytes` 分别显示每个 mempool 的在途 Location 数和待删字节数。`cluster` 标签取记账用的 `endpoint/<接入地址>` 或 `storage/<存储名>`，`quota=used` 表示当前占用，`quota=effective` 表示当前有效上限。冷却期间暂停新准入，已接纳的工作仍计入占用。
 - `delete_admission.trim_wait_count` 统计实际等待准入的 Trim 批次数，每批首次等待时加一。`delete_admission.trim_wait_us` 累计这些批次等待额度的微秒数，包括降主取消前的等待。两个计数均按进程汇总，观察一轮压测前后的增量，可估算每个受阻批次的平均等待时间。
 - `free_busy_retained_location_count{reason}` 统计专用删除路径停止处理、交由日志核对的目标个数。等本地名额到期记 `slot_deadline`，等 Meta busy 退避到期记 `busy_deadline`，准备发送时到期记 `dispatch_deadline`，主存储读失败记 `primary_read`，撤销记 `cancelled`。其余原因包括预算、URI、批次大小、实例或后端变化及本地执行失败。累计值按 Location 计算，当前仍在 `DELETING` 的数量可能随后变化。具体目标查终止日志。
@@ -151,12 +151,12 @@ Reclaimer、GC 和 `TrimCache` 各自按批提交并标明来源，由 **`Schedu
 
 Reclaimer 和 GC 在筛选候选时查询 Executor。额度不足时，两者按各自的扫描方式重访候选。
 
-- Reclaimer 筛选时，如果一个 key 因临时反压而整项落选，且其中有可删的 Tair Location 单独能放进空窗口，本地元数据保留它的访问时间和 LRU 位置。临时反压包括当前额度不足、重试内存暂满或集群冷却。Group LRU 用本轮样本中下一个最冷的 key 补这个名额，最多提交原定数量。单项超出硬上限或只有非 Tair Location 被挡住时，沿用原有维护性 touch。[候选筛选](../../kv_cache_manager/manager/cache_reclaimer.cc) · [Group LRU 补位范围](cache_reclaimer_group_lru.md#72-执行和停止)
+- Reclaimer 筛选时，如果一个 key 因临时反压而整项落选，且其中有可删的 Tair Mempool Location 单独能放进空窗口，本地元数据保留它的访问时间和 LRU 位置。临时反压包括当前额度不足、重试内存暂满或集群冷却。Group LRU 用本轮样本中下一个最冷的 key 补这个名额，最多提交原定数量。单项超出硬上限或只有非 Tair Mempool Location 被挡住时，沿用原有维护性 touch。[候选筛选](../../kv_cache_manager/manager/cache_reclaimer.cc) · [Group LRU 补位范围](cache_reclaimer_group_lru.md#72-执行和停止)
 - GC 在扫描前发现自身额度已满时保留游标。若读完一批后才被目标集群挡住，已跳过的候选随游标前进，可能要等下一轮完整扫描才会重访。[GC 扫描与准入](../../kv_cache_manager/manager/cache_garbage_collector.cc)
 
-实际准入由 Executor 记账一次。来源上限按本进程的逻辑任务统计，混合存储任务也占来源名额。Tair 目标另占所属 mempool 的共享额度。同一来源跨集群提交时共用该来源的进程上限。
+实际准入由 Executor 记账一次。来源上限按本进程的逻辑任务统计，混合存储任务也占来源名额。目标位于 Tair Mempool 时，同时占用该集群的共享额度。同一来源跨集群提交时共用该来源的进程上限。
 
-每个 KVCM 进程用存储配置中的 mempool 接入地址记账。优先取 `service_discovery_url`，为空时取 `domain`。计算记账键时忽略 Spectrum 的 `timeout`、`cache_time`、`retry_time` 和 VIPServer 的 `timeout`。仅这些参数不同的存储共用额度和冷却。其余查询参数保留，其中 Spectrum 的 `port` 会覆盖服务发现返回的端口。客户端仍用原配置连接。不同地址别名分别记账，缺少接入地址时按 storage 唯一名记账。[服务发现参数](../../kv_cache_manager/common/service_discovery_factory.cc) · [集群记账](../../kv_cache_manager/manager/delete_admission.cc)
+PACE 存储适配代码从配置中提取集群接入地址，供 Executor 记账。优先取 `service_discovery_url`，为空时取 `domain`。计算记账键时忽略 Spectrum 的 `timeout`、`cache_time`、`retry_time` 和 VIPServer 的 `timeout`。仅这些参数不同的存储共用额度和冷却。其余查询参数保留，其中 Spectrum 的 `port` 会覆盖服务发现返回的端口。客户端仍用原配置连接。不同地址别名分别记账，缺少接入地址时按 storage 唯一名记账。[PACE 接入地址](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc) · [集群记账](../../kv_cache_manager/manager/delete_admission.cc)
 
 任一路收到 Meta 的明确 busy 后，Executor 从下一次准入起收紧该集群的额度。此前已接纳、尚未发 Free 的批次按原计划执行。被 Meta 明确拒收的原批次沿用已占额度，按退避时间重试。
 
@@ -198,7 +198,7 @@ Reclaimer 和 GC 在筛选候选时查询 Executor。额度不足时，两者按
 
 Reclaimer 的旧 `pending_delete_handler_limit`、`pending_bytes_limit` 分别映射到 `reclaimer_requests`、`reclaimer_bytes`。GC 的旧 `max_inflight_delete_requests` 映射到 `gc_requests`。显式的新来源值优先，包括 0。协议开关沿用 `kvcm.cache_reclaimer.free_busy_enabled`，同时控制三路是否发送协议头、预留重试内存和自动重发。关闭时仍执行静态共享额度与来源上限。
 
-例如，旧的 `kvcm.cache_reclaimer.pending_location_limit_per_group_type=8000` 约束一个实例组、一种基础存储类型的水位驱逐。这个数无法推导出一个 mempool 能承受的三路总量。升级时若希望三路合计最多 8,000 个 Location，就显式把新共享上限设为 8,000。只提供这个旧值的部署会看到迁移提示，Tair 共享上限取新默认值。非 Tair 的水位驱逐继续用原组、类型上限，通过同一套准入逻辑执行。[旧配置的计量范围](cache_reclaimer_async_delete.md)
+例如，旧的 `kvcm.cache_reclaimer.pending_location_limit_per_group_type=8000` 约束一个实例组、一种基础存储类型的水位驱逐。这个数无法推导出一个 mempool 能承受的三路总量。升级时若希望三路合计最多 8,000 个 Location，就显式把新共享上限设为 8,000。只提供这个旧值的部署会看到迁移提示，Tair Mempool 共享上限取新默认值。非 Tair Mempool 的水位驱逐继续用原组、类型上限，通过同一套准入逻辑执行。[旧配置的计量范围](cache_reclaimer_async_delete.md)
 
 ### RemoveCache 走普通 Free
 

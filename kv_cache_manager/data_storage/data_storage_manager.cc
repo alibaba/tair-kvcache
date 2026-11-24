@@ -292,25 +292,6 @@ DataStorageBatchCreateResult DataStorageManager::CreateBatch(RequestContext *req
     return results;
 }
 
-TairReclaimFreeResult DataStorageManager::DeleteTairForReclaim(const std::string &trace_id,
-                                                               const std::string &unique_name,
-                                                               const std::vector<uint64_t> &gas,
-                                                               std::weak_ptr<DataStorageBackend> &original,
-                                                               bool retry,
-                                                               const std::function<bool()> &can_send) {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    auto it = storage_map_.find(unique_name);
-    if (it == storage_map_.end() || (retry && original.lock() != it->second)) {
-        return {retry ? TairReclaimFreeResult::kBackendChanged : TairReclaimFreeResult::kNotSent};
-    }
-    auto backend = std::dynamic_pointer_cast<TairMempoolBackend>(it->second);
-    if (!backend || gas.empty() || !can_send()) {
-        return {TairReclaimFreeResult::kNotSent};
-    }
-    original = backend;
-    return backend->DeleteForReclaim(gas, trace_id, can_send);
-}
-
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,
                                                   const std::string &unique_name,
                                                   const std::vector<DataStorageUri> &storage_uris,

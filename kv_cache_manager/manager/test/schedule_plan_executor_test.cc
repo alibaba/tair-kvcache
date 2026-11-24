@@ -4,10 +4,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -19,6 +21,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
@@ -418,7 +421,7 @@ public:
         return uris;
     }
 
-    RequestContext context{"tair_gc_delete_test"};
+    RequestContext context{"gc_delete_test"};
     std::shared_ptr<MetaIndexer> indexer;
     std::unique_ptr<MetaSearcher> searcher;
     std::unique_ptr<SchedulePlanExecutor> executor;
@@ -435,9 +438,9 @@ public:
             .Get();
     }
 
-    struct Tair : TairMempoolBackend {
+    struct FakePaceBackend : TairMempoolBackend {
         using TairMempoolBackend::TairMempoolBackend;
-        std::vector<TairReclaimFreeResult> replies;
+        std::vector<PaceReclaimFreeResult> replies;
         std::vector<std::vector<uint64_t>> calls;
         size_t ordinary_calls = 0;
         bool skip_missing{false};
@@ -450,11 +453,11 @@ public:
         }
         std::function<void()> on_first;
         std::function<void()> on_retry;
-        TairReclaimFreeResult DeleteForReclaim(const std::vector<uint64_t> &gas,
+        PaceReclaimFreeResult DeleteForReclaim(const std::vector<uint64_t> &gas,
                                                const std::string &,
                                                const std::function<bool()> &can_send) override {
             if (!can_send()) {
-                return {TairReclaimFreeResult::kNotSent};
+                return {PaceReclaimFreeResult::kNotSent};
             }
             calls.push_back(gas);
             if (calls.size() == 1 && on_first) {
@@ -470,8 +473,8 @@ public:
             return std::vector<ErrorCode>(uris.size(), EC_OK);
         }
     };
-    std::shared_ptr<Tair> Backend(std::string name, std::vector<TairReclaimFreeResult> replies) {
-        auto backend = std::make_shared<Tair>(metrics_registry_);
+    std::shared_ptr<FakePaceBackend> Backend(std::string name, std::vector<PaceReclaimFreeResult> replies) {
+        auto backend = std::make_shared<FakePaceBackend>(metrics_registry_);
         backend->replies = std::move(replies);
         data_storage_manager_->storage_map_[name] = backend;
         return backend;
@@ -497,8 +500,31 @@ public:
     const DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
 };
 
+TEST_F(FreeBusyDeleteTest, PaceFreeProtectsTheRegisteredBackendThroughFirstSendAndRetry) {
+    std::weak_ptr<DataStorageBackend> original;
+    auto send = [&](bool retry) {
+        return FreePaceGAsForReclaim(
+            *data_storage_manager_, "trace", "store", {1}, original, retry, [] { return true; });
+    };
+    EXPECT_EQ(PaceReclaimFreeResult::kNotSent, send(false).status);
+    auto backend = Backend("store", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    auto check_lock = [&] {
+        auto writer = std::async(std::launch::async, [&] {
+            return std::unique_lock<std::shared_mutex>(data_storage_manager_->rw_lock_, std::try_to_lock).owns_lock();
+        });
+        EXPECT_FALSE(writer.get());
+    };
+    backend->on_first = check_lock;
+    backend->on_retry = check_lock;
+    EXPECT_EQ(PaceReclaimFreeResult::kBusy, send(false).status);
+    EXPECT_EQ(PaceReclaimFreeResult::kSuccess, send(true).status);
+    auto replacement = Backend("store", {});
+    EXPECT_EQ(PaceReclaimFreeResult::kBackendChanged, send(true).status);
+    EXPECT_TRUE(replacement->calls.empty());
+}
+
 TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim) {
-    auto dram = Backend("dram", {{TairReclaimFreeResult::kBusy, 1}, {TairReclaimFreeResult::kSuccess}});
+    auto dram = Backend("dram", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
     auto ssd = Backend("ssd", {});
     dram->skip_missing = true;
     dram->Endpoint("unused", "pool-a");
@@ -555,7 +581,7 @@ TEST_F(FreeBusyDeleteTest, TrimSplitsOversizedPageByLocationAndRetriesOnlyTheRef
     executor =
         std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
     auto backend = Backend(
-        "t", {{TairReclaimFreeResult::kBusy, 1}, {TairReclaimFreeResult::kSuccess}, {TairReclaimFreeResult::kSuccess}});
+        "t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
     for (int64_t key : {1, 2, 3}) {
         SetLocation(key, "target", type, {"pace://t/" + std::to_string(key) + "?size=10"});
     }
@@ -585,7 +611,7 @@ TEST_F(FreeBusyDeleteTest, TrimSkipsChangedLocationsAndDeletesTheRestOfThePage) 
     limits.cluster.locations = 2;
     executor =
         std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
-    auto backend = Backend("t", {{TairReclaimFreeResult::kSuccess}, {TairReclaimFreeResult::kSuccess}});
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
     CacheMetaDelRequest page{kTestInstanceName, {1, 2, 3, 4, 5}};
     for (auto key : page.block_keys) {
         SetLocation(key, "target", type, {"pace://t/" + std::to_string(key)});
@@ -674,10 +700,10 @@ TEST_F(FreeBusyDeleteTest, TrimWaitsForAnIntactPageAndWakesOnDemotion) {
 }
 
 TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailable) {
-    auto first = Backend("a", {{TairReclaimFreeResult::kSuccess}});
-    TairReclaimFreeResult confirmed{TairReclaimFreeResult::kSuccess};
+    auto first = Backend("a", {{PaceReclaimFreeResult::kSuccess}});
+    PaceReclaimFreeResult confirmed{PaceReclaimFreeResult::kSuccess};
     confirmed.provider_free_acknowledged = true;
-    auto second = Backend("b", {{TairReclaimFreeResult::kBusy, 20}, confirmed});
+    auto second = Backend("b", {{PaceReclaimFreeResult::kBusy, 20}, confirmed});
     SetLocation(1, "first", type, {"pace://a/11"});
     SetLocation(1, "second", type, {"pace://b/22", "pace://b/33"});
     std::atomic<bool> ran_between{false};
@@ -699,9 +725,9 @@ TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailabl
 }
 
 TEST_F(FreeBusyDeleteTest, SuccessWithoutProviderAcknowledgementCompletesCadWithoutRecoveryFeedback) {
-    auto backend = Backend("t", {{TairReclaimFreeResult::kSuccess},
-                                 {TairReclaimFreeResult::kBusy, 1},
-                                 {TairReclaimFreeResult::kSuccess}});
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess},
+                                 {PaceReclaimFreeResult::kBusy, 1},
+                                 {PaceReclaimFreeResult::kSuccess}});
     SetLocation(1, "first", type, {"pace://t/11"});
     auto first = Evict(1, {"first"});
     EXPECT_EQ(EC_OK, Run(first).status);
@@ -719,10 +745,10 @@ TEST_F(FreeBusyDeleteTest, SuccessWithoutProviderAcknowledgementCompletesCadWith
 
 TEST_F(FreeBusyDeleteTest, RetainsInvalidTooLargeAndExpiredTargetsAndUsesOrdinaryCadForUnknown) {
     auto backend = Backend("t",
-                           {{TairReclaimFreeResult::kTooLarge, 0, 1},
-                            {TairReclaimFreeResult::kBusy, UINT64_MAX},
-                            {TairReclaimFreeResult::kBusy, 1},
-                            {TairReclaimFreeResult::kError}});
+                           {{PaceReclaimFreeResult::kTooLarge, 0, 1},
+                            {PaceReclaimFreeResult::kBusy, UINT64_MAX},
+                            {PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kError}});
     SetLocation(1, "invalid", type, {"pace://t/1", "pace://t/18446744073709551616"});
     EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"invalid"})).status);
     EXPECT_TRUE(backend->calls.empty());
@@ -739,7 +765,7 @@ TEST_F(FreeBusyDeleteTest, RetainsInvalidTooLargeAndExpiredTargetsAndUsesOrdinar
     EXPECT_EQ(1, backend->ordinary_calls);
     EXPECT_EQ(4, backend->calls.size());
 
-    backend = Backend("t", {{TairReclaimFreeResult::kSuccess}});
+    backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}});
     SetLocation(6, "bad", type, {"pace://t/0", "pace://t/61"});
     SetLocation(6, "good", type, {"pace://t/62"});
     EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(6, {"bad", "good"})).status);
@@ -771,10 +797,10 @@ TEST_F(FreeBusyDeleteTest, RetriesPrimaryReadOnceBeforeSendingTheOriginalTargets
     ASSERT_EQ(EC_OK, reader->Open());
     indexer->backend_manager_->persistent_backend_ = std::move(reader);
     auto backend = Backend("t",
-                           {{TairReclaimFreeResult::kBusy, 1},
-                            {TairReclaimFreeResult::kSuccess},
-                            {TairReclaimFreeResult::kBusy, 1},
-                            {TairReclaimFreeResult::kBusy, 1}});
+                           {{PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kSuccess},
+                            {PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kBusy, 1}});
 
     SetLocation(1, "a", type, {"pace://t/1", "pace://t/2"});
     EXPECT_EQ(EC_OK, Run(Evict(1, {"a"})).status);
@@ -808,7 +834,7 @@ TEST_F(FreeBusyDeleteTest, RetriesPrimaryReadOnceBeforeSendingTheOriginalTargets
 }
 
 TEST_F(FreeBusyDeleteTest, GrownLocationStopsBeforeFreeWhenItsUrisCannotBeReserved) {
-    auto backend = Backend("t", {{TairReclaimFreeResult::kSuccess}});
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}});
     SetLocation(1, "big", type, {"pace://t/501"});
     auto req = Evict(1, {"big"});
     const auto held_by_other_tasks = resources->memory_limit - req.free_busy->unassigned;
@@ -850,7 +876,7 @@ TEST_F(FreeBusyDeleteTest, QueuedEvictionCancelledBeforeAdmissionKeepsLocationSe
 }
 
 TEST_F(FreeBusyDeleteTest, UnsentRetryKeepsLocationMetadata) {
-    auto backend = Backend("t", {{TairReclaimFreeResult::kBusy, 1}, {TairReclaimFreeResult::kNotSent}});
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kNotSent}});
     SetLocation(1, "target", type, {"pace://t/101"});
     auto request = Evict(1, {"target"});
     EXPECT_EQ(EC_PARTIAL_OK, Run(request).status);
@@ -863,7 +889,7 @@ TEST_F(FreeBusyDeleteTest, UnsentRetryKeepsLocationMetadata) {
 
 TEST_F(FreeBusyDeleteTest, ChangedTargetReturnsItsBudgetWhileSiblingStillRetries) {
     auto backend = Backend(
-        "t", {{TairReclaimFreeResult::kBusy, 1}, {TairReclaimFreeResult::kBusy, 1}, {TairReclaimFreeResult::kSuccess}});
+        "t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
     SetLocation(1, "drop", type, {"pace://t/601"});
     SetLocation(1, "keep", type, {"pace://t/602"});
     const auto keep_bytes = FreeBusyTask::RecordBytes(*Locations(1).at("keep"), kTestInstanceName.size());
@@ -876,8 +902,8 @@ TEST_F(FreeBusyDeleteTest, ChangedTargetReturnsItsBudgetWhileSiblingStillRetries
 }
 
 TEST_F(FreeBusyDeleteTest, WaitsForLocalRetrySlotAndRechecksBackendIncarnation) {
-    auto backend = Backend("t", {{TairReclaimFreeResult::kBusy, 2}});
-    auto replacement = std::make_shared<Tair>(metrics_registry_);
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 2}});
+    auto replacement = std::make_shared<FakePaceBackend>(metrics_registry_);
     SetLocation(1, "target", type, {"pace://t/1"});
     ASSERT_TRUE(resources->TryStartRetry(executor->GetWorkerCount()));
     // The only worker must run this queued callback while the batch waits for a slot.
@@ -903,13 +929,13 @@ TEST_F(FreeBusyDeleteTest, WaitsForLocalRetrySlotAndRechecksBackendIncarnation) 
 }
 
 TEST_F(FreeBusyDeleteTest, DropsChangedTargetAndCancelsWaitingRetry) {
-    auto backend = Backend("t", {{TairReclaimFreeResult::kBusy, 10}});
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 10}});
     SetLocation(1, "target", type, {"pace://t/1"});
     backend->on_first = [&] { SetLocation(1, "target", type, {"pace://t/2"}); };
     EXPECT_EQ(EC_OK, Run(Evict(1, {"target"})).status);
     EXPECT_EQ(1, backend->calls.size());
     EXPECT_EQ("pace://t/2", Locations(1).at("target")->location_specs()[0].uri());
-    backend = Backend("t", {{TairReclaimFreeResult::kBusy, 10}});
+    backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 10}});
     backend->on_first = [&] { ++resources->generation; };
     EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"target"})).status);
     EXPECT_EQ(1, backend->calls.size());

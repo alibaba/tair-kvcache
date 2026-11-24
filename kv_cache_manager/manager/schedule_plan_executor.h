@@ -276,7 +276,7 @@ private:
     PlanExecuteResult
     DoLocationDelTask(const CacheLocationDelRequest &task,
                       const std::shared_ptr<MetaIndexer> &indexer,
-                      std::vector<std::pair<int64_t, CacheLocationConstPtr>> *tair_locations = nullptr);
+                      std::vector<std::pair<int64_t, CacheLocationConstPtr>> *pace_locations = nullptr);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

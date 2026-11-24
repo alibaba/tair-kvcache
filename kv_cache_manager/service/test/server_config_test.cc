@@ -568,7 +568,7 @@ TEST_F(ServerConfigTest, DeleteAdmissionUsesEquivalentLegacyLimitsAndExplicitSou
                               {"kvcm.delete_admission.trim_bytes", "99"}}));
     auto limits = config.GetDeleteLimits();
     EXPECT_EQ(24576u, limits.cluster.locations);
-    EXPECT_EQ(11u, limits.non_tair_reclaim.locations);
+    EXPECT_EQ(11u, limits.non_pace_reclaim.locations);
     EXPECT_EQ(44u, limits.sources[0].size.bytes);
     EXPECT_EQ(0u, limits.sources[0].requests);
     EXPECT_EQ(5u, limits.sources[1].requests);

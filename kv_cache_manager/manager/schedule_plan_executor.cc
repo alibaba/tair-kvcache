@@ -17,7 +17,7 @@
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
-#include "kv_cache_manager/manager/tair_reclaim_delete.h"
+#include "kv_cache_manager/manager/pace_reclaim_delete.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -285,7 +285,7 @@ void SchedulePlanExecutor::WorkerRoutine() {
 
 PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
                                                           const std::shared_ptr<MetaIndexer> &indexer,
-                                                          ReclaimFreeLocations *tair_locations) {
+                                                          ReclaimFreeLocations *pace_locations) {
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -332,8 +332,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (tair_locations && !task.metadata_only && IsTairMempoolStorageType(iter->second->type())) {
-                tair_locations->emplace_back(block_key, iter->second);
+            if (pace_locations && !task.metadata_only && IsTairMempoolStorageType(iter->second->type())) {
+                pace_locations->emplace_back(block_key, iter->second);
                 continue; // This storage batch owns its physical Free and CAD.
             }
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
@@ -947,7 +947,7 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
                 if (actual_task.free_busy) {
                     ReclaimFreeLocations locations;
                     auto result = DoLocationDelTask(actual_task, indexer, &locations);
-                    RunTairReclaimDelete(
+                    RunPaceReclaimDelete(
                         *this,
                         data_storage_manager_,
                         meta_manager_,

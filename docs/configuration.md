@@ -167,11 +167,11 @@ kvcm.cache_reclaimer.key_sampling_size_total=100
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 
-# 非 Tair 水位驱逐仍按 Instance Group × BaseStorageType 使用以下上限。
+# 非 Tair Mempool 水位驱逐仍按 Instance Group × BaseStorageType 使用以下上限。
 kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
 kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
 
-# 水位驱逐、主动 GC、TrimCache 的 Tair Free Busy 协议。Meta 混部或 GA 重试安全窗口待确认时显式设为 false。
+# 水位驱逐、主动 GC、TrimCache 的 Tair Mempool Free Busy 协议。Meta 混部或 GA 重试安全窗口待确认时显式设为 false。
 kvcm.cache_reclaimer.free_busy_enabled=true
 # 首次本地退避（毫秒），取值 1 到 5000。Meta 可建议更长的等待时间。
 kvcm.cache_reclaimer.free_busy_initial_backoff_ms=50

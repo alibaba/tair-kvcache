@@ -6,7 +6,7 @@ namespace kv_cache_manager {
 
 using ReclaimFreeLocations = std::vector<std::pair<int64_t, CacheLocationConstPtr>>;
 
-void RunTairReclaimDelete(SchedulePlanExecutor &executor,
+void RunPaceReclaimDelete(SchedulePlanExecutor &executor,
                           const std::shared_ptr<DataStorageManager> &storage,
                           const std::shared_ptr<MetaIndexerManager> &meta,
                           const std::shared_ptr<MetaIndexer> &indexer,

@@ -21,10 +21,10 @@ struct DeleteSourceLimit {
     DeleteSize size;
 };
 
-// Zero disables that source ceiling. Cluster and legacy non-Tair ceilings are positive.
+// Zero disables that source ceiling. Cluster and legacy non-PACE ceilings are positive.
 struct DeleteLimits {
     DeleteSize cluster{24576, 1280ULL << 30};
-    DeleteSize non_tair_reclaim{20000, 1ULL << 40};
+    DeleteSize non_pace_reclaim{20000, 1ULL << 40};
     std::array<DeleteSourceLimit, 3> sources{{{1024, {0, 4ULL << 40}}, {64, {}}, {32, {}}}};
     bool protocol{true};
     uint64_t initial_backoff_ms{50};

@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <limits>
 
-#include "kv_cache_manager/common/service_discovery_url.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -25,34 +25,6 @@ bool Fits(DeleteSize used, DeleteSize next, DeleteSize limit) {
 }
 size_t Index(DeleteSource s) { return static_cast<size_t>(s); }
 
-std::string MempoolQuotaEndpoint(const TairMemPoolStorageSpec &spec) {
-    const auto &url = spec.service_discovery_url();
-    if (url.empty()) {
-        return spec.domain();
-    }
-    const auto query = url.find('?');
-    if (query == std::string::npos || (url.rfind("spectrum://", 0) != 0 && url.rfind("vipserver://", 0) != 0)) {
-        return url;
-    }
-    ServiceDiscoveryUrl parsed;
-    if (!ServiceDiscoveryUrl::Parse(url, parsed) || parsed.body.empty()) {
-        return url;
-    }
-    // Client timing options don't identify the Meta. Preserve routing options such as Spectrum's port.
-    parsed.params.erase("timeout");
-    if (parsed.scheme == "spectrum") {
-        parsed.params.erase("cache_time");
-        parsed.params.erase("retry_time");
-    }
-    auto endpoint = url.substr(0, query);
-    char separator = '?';
-    for (const auto &[name, value] : parsed.params) {
-        endpoint += separator;
-        endpoint.append(name).append("=").append(value);
-        separator = '&';
-    }
-    return endpoint;
-}
 } // namespace
 
 void DeleteDemand::Add(const DeleteTargetCost &target) {
@@ -88,19 +60,19 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
     DeleteTargetCost cost;
     cost.size.locations = 1;
     const auto type = ToBaseType(loc.type());
-    const bool tair = IsTairMempoolStorageType(type);
+    const bool is_pace = IsTairMempoolStorageType(type);
     for (const auto &spec : loc.location_specs()) {
         DataStorageUri uri(spec.uri());
         uint64_t bytes = 0;
         if (uri.Valid()) {
             uri.GetParamAs<uint64_t>("size", bytes);
             cost.size.bytes = Sum(cost.size.bytes, bytes);
-            if (tair && cost.storage.empty()) {
+            if (is_pace && cost.storage.empty()) {
                 cost.storage = uri.GetHostName();
             }
         }
     }
-    if (!tair) {
+    if (!is_pace) {
         if (source == DeleteSource::Reclaimer) {
             cost.bucket = "group/" + std::to_string(static_cast<int>(type)) + "/" + group;
         }
@@ -113,24 +85,17 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
         return cost;
     }
     cost.bucket = "storage/" + cost.storage;
-    if (storage_) {
-        const auto backend = storage_->GetDataStorageBackend(cost.storage);
-        if (backend) {
-            const auto spec =
-                std::dynamic_pointer_cast<TairMemPoolStorageSpec>(backend->GetStorageConfig().storage_spec());
-            if (spec) {
-                const auto endpoint = MempoolQuotaEndpoint(*spec);
-                if (!endpoint.empty()) {
-                    cost.bucket = "endpoint/" + endpoint;
-                }
-            }
+    if (const auto backend = storage_ ? storage_->GetDataStorageBackend(cost.storage) : nullptr) {
+        const auto endpoint = GetPaceClusterEndpoint(backend->GetStorageConfig());
+        if (!endpoint.empty()) {
+            cost.bucket = "endpoint/" + endpoint;
         }
     }
     return cost;
 }
 
 DeleteSize DeleteAdmission::Hard(const std::string &key) const {
-    return key.compare(0, 6, "group/") == 0 ? limits.non_tair_reclaim : limits.cluster;
+    return key.compare(0, 6, "group/") == 0 ? limits.non_pace_reclaim : limits.cluster;
 }
 
 uint64_t DeleteAdmission::RemainingRequests(DeleteSource source) const {
@@ -410,7 +375,7 @@ void DeleteAdmission::ReleaseLocked(DeleteReservation &lease, const DeleteSize &
 }
 
 // Ordinary targets have already finished physical deletion and CAD. Keep only
-// the Tair storage batches that can still be outstanding after this worker exits.
+// the PACE storage batches that can still be outstanding after this worker exits.
 void DeleteReservation::RetainStorageBatches(const std::set<std::string> &names) {
     std::lock_guard<std::mutex> lock(owner_->mutex_);
     if (!charged_) {
