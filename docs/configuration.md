@@ -173,8 +173,10 @@ kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
 
 # 水位驱逐、主动 GC、TrimCache 的 Tair Mempool Free Busy 协议。Meta 混部或 GA 重试安全窗口待确认时显式设为 false。
 kvcm.cache_reclaimer.free_busy_enabled=true
-# 首次本地退避（毫秒），取值 1 到 5000。Meta 可建议更长的等待时间。
+# 首次本地退避（毫秒），必须为正且不超过下面的单次上限。
 kvcm.cache_reclaimer.free_busy_initial_backoff_ms=50
+# 单次本地退避上限（毫秒）。达到上限后仍可重试。Meta 可建议等待更久，整批启动重试的总时限为 30 秒。
+kvcm.cache_reclaimer.free_busy_max_backoff_ms=5000
 # 全进程共享的重试记录预留上限（字节），默认 128 MiB。首发也占预留。
 kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes=134217728
 

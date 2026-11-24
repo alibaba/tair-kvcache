@@ -31,6 +31,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
         EXPECT_TRUE(config.GetFreeBusyEnabled());
         EXPECT_EQ(50, config.GetFreeBusyInitialBackoffMs());
+        EXPECT_EQ(5000u, config.GetDeleteLimits().max_backoff_ms);
         EXPECT_EQ(128ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
         ASSERT_EQ(20000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(1ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
@@ -589,10 +590,26 @@ TEST_F(ServerConfigTest, FreeBusyConfig) {
     EXPECT_TRUE(config.Parse("",
                              {{"kvcm.cache_reclaimer.free_busy_enabled", "false"},
                               {"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "100"},
+                              {"kvcm.cache_reclaimer.free_busy_max_backoff_ms", "250"},
                               {"kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes", "4096"}}));
     EXPECT_FALSE(config.GetFreeBusyEnabled());
     EXPECT_EQ(100, config.GetFreeBusyInitialBackoffMs());
+    EXPECT_EQ(250u, config.GetDeleteLimits().max_backoff_ms);
     EXPECT_EQ(4096, config.GetFreeBusyRetryMemoryLimitBytes());
+    EXPECT_TRUE(config.Parse("",
+                             {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "6000"},
+                              {"kvcm.cache_reclaimer.free_busy_max_backoff_ms", "8000"}}));
+    EXPECT_EQ(6000u, config.GetDeleteLimits().initial_backoff_ms);
+    EXPECT_EQ(8000u, config.GetDeleteLimits().max_backoff_ms);
+    EXPECT_TRUE(config.Parse("",
+                             {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "1"},
+                              {"kvcm.cache_reclaimer.free_busy_max_backoff_ms", "1"}}));
+    EXPECT_FALSE(config.Parse("",
+                              {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "300"},
+                               {"kvcm.cache_reclaimer.free_busy_max_backoff_ms", "250"}}));
+    for (const auto value : {"0", "-1", "20ms", "4294967296"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.free_busy_max_backoff_ms", value}}));
+    }
     for (const auto value : {"0", "-1", "5001", "20ms"}) {
         EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", value}}));
     }

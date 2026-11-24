@@ -32,6 +32,10 @@ bool ParseUint32Setting(const std::string &value, uint32_t &out) {
     } catch (...) { return false; }
 }
 
+bool ParseBackoffMs(const std::string &value, uint32_t &out) {
+    return value.find_first_not_of("0123456789") == std::string::npos && ParseUint32Setting(value, out) && out > 0;
+}
+
 } // namespace
 
 uint32_t ServerConfig::ResolveServiceWorkerThreadNum(unsigned int hardware_threads) const {
@@ -83,6 +87,7 @@ DeleteLimits ServerConfig::GetDeleteLimits() const {
                                cache_reclaimer_pending_bytes_limit_per_group_type_};
     limits.protocol = free_busy_enabled_;
     limits.initial_backoff_ms = free_busy_initial_backoff_ms_;
+    limits.max_backoff_ms = free_busy_max_backoff_ms_;
     limits.retry_memory_bytes = free_busy_retry_memory_limit_bytes_;
     limits.sources[0].requests = cache_reclaimer_pending_delete_handler_limit_;
     limits.sources[0].size.bytes = cache_reclaimer_pending_bytes_limit_;
@@ -320,11 +325,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      }},
     {"kvcm.cache_reclaimer.free_busy_initial_backoff_ms",
      [](const std::string &value, ServerConfig *config) {
-         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
-             return false;
-         }
-         config->free_busy_initial_backoff_ms_ = std::stoull(value);
-         return config->free_busy_initial_backoff_ms_ > 0 && config->free_busy_initial_backoff_ms_ <= 5000;
+         return ParseBackoffMs(value, config->free_busy_initial_backoff_ms_);
+     }},
+    {"kvcm.cache_reclaimer.free_busy_max_backoff_ms",
+     [](const std::string &value, ServerConfig *config) {
+         return ParseBackoffMs(value, config->free_busy_max_backoff_ms_);
      }},
     {"kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes",
      [](const std::string &value, ServerConfig *config) {
@@ -488,6 +493,10 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
         fprintf(stderr, "Parse config from environ failed\n");
         return false;
     }
+    if (free_busy_initial_backoff_ms_ > free_busy_max_backoff_ms_) {
+        fprintf(stderr, "free_busy_initial_backoff_ms must not exceed free_busy_max_backoff_ms\n");
+        return false;
+    }
     if (explicit_group_delete_limit_) {
         const auto limit = GetDeleteLimits().cluster;
         fprintf(stderr,
@@ -581,6 +590,7 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_worker_size_ = 16;
     free_busy_enabled_ = true;
     free_busy_initial_backoff_ms_ = 50;
+    free_busy_max_backoff_ms_ = DeleteLimits::kDefaultMaxBackoffMs;
     free_busy_retry_memory_limit_bytes_ = 128ULL << 20;
     cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
     cache_reclaimer_pending_location_limit_per_group_type_ = 20000;

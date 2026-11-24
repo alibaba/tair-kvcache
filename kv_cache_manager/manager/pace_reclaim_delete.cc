@@ -18,7 +18,6 @@ using Clock = FreeBusyTask::Clock;
 using Millis = std::chrono::milliseconds;
 // Operational limit for starting another attempt, measured from the first physical Free.
 constexpr auto kRetryDeadline = std::chrono::seconds(30);
-constexpr uint64_t kMaxLocalDelayMs = 5000;
 
 // Use fixed reason labels. Location IDs and exception details belong in logs.
 void RecordRetained(const FreeBusyResources &resources, const char *reason, size_t count) {
@@ -30,10 +29,10 @@ void RecordRetained(const FreeBusyResources &resources, const char *reason, size
     }
 }
 
-uint64_t Jitter(uint64_t base) {
+uint64_t Jitter(uint64_t base, uint64_t max_ms) {
     thread_local std::mt19937 random(std::random_device{}());
-    const auto low = base == kMaxLocalDelayMs ? base * 4 / 5 : base;
-    return std::uniform_int_distribution<uint64_t>(low, std::min(kMaxLocalDelayMs, base + base / 4))(random);
+    const auto low = base == max_ms ? std::max<uint64_t>(1, base * 4 / 5) : base;
+    return std::uniform_int_distribution<uint64_t>(low, std::min(max_ms, base + base / 4))(random);
 }
 
 // Keep every spec of a Location together. A malformed sibling keeps the
@@ -271,7 +270,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
             return;
         }
         if (!task->resources->TryStartRetry(executor.GetWorkerCount())) {
-            Schedule(Jitter(task->initial_ms), "slot_deadline");
+            Schedule(Jitter(task->initial_ms, task->max_ms), "slot_deadline");
             return;
         }
         holds_slot = true;
@@ -285,7 +284,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         const auto read = ReadTargets(idx, current, gas);
         if (read == ReadResult::kRetryable && !retried_primary_read) {
             retried_primary_read = true;
-            Schedule(Jitter(task->initial_ms), "primary_read");
+            Schedule(Jitter(task->initial_ms, task->max_ms), "primary_read");
             return;
         }
         if (read != ReadResult::kOk) {
@@ -387,8 +386,8 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         if (result.status == PaceReclaimFreeResult::kBusy) {
             ++task->resources->busy_replies;
-            const uint64_t wait = std::max(Jitter(next_delay), result.retry_after_ms);
-            next_delay = std::min(next_delay * 2, kMaxLocalDelayMs);
+            const uint64_t wait = std::max(Jitter(next_delay, task->max_ms), result.retry_after_ms);
+            next_delay = std::min(next_delay * 2, task->max_ms);
             for (const auto &[key, loc] : targets) {
                 if (!retry) {
                     auto &uris = records.at({key, loc->id()});

@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
@@ -48,8 +49,13 @@ struct FreeBusyResources {
 
 struct FreeBusyTask {
     using Clock = std::chrono::steady_clock;
-    FreeBusyTask(std::shared_ptr<FreeBusyResources> resources, uint64_t initial_ms)
-        : resources(std::move(resources)), generation(this->resources->generation.load()), initial_ms(initial_ms) {}
+    FreeBusyTask(std::shared_ptr<FreeBusyResources> resources,
+                 uint64_t initial_ms,
+                 uint32_t max_ms = DeleteLimits::kDefaultMaxBackoffMs)
+        : resources(std::move(resources))
+        , generation(this->resources->generation.load())
+        , initial_ms(std::min<uint64_t>(initial_ms, max_ms))
+        , max_ms(max_ms) {}
     ~FreeBusyTask() { ReleaseUnused(); }
     bool Active() const { return generation == resources->generation.load(); }
 
@@ -90,6 +96,7 @@ struct FreeBusyTask {
     const std::shared_ptr<FreeBusyResources> resources;
     const uint64_t generation;
     const uint64_t initial_ms;
+    const uint64_t max_ms;
     uint64_t unassigned{0};
 
 };

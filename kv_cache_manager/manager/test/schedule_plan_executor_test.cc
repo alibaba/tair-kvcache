@@ -817,6 +817,41 @@ TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailabl
     EXPECT_TRUE(feedback.at("b").second);
 }
 
+TEST_F(FreeBusyDeleteTest, RepeatedBusyRetriesAtTheConfiguredCapAndHonorsLongerMetaHints) {
+    DeleteLimits limits;
+    limits.initial_backoff_ms = 2;
+    limits.max_backoff_ms = 4;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(2, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    const PaceReclaimFreeResult busy{PaceReclaimFreeResult::kBusy};
+    auto backend =
+        Backend("t", {busy, busy, busy, {PaceReclaimFreeResult::kBusy, 15}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "loc", type, {"pace://t/123"});
+    auto req = Request(1, {"loc"}, {});
+    auto &admission = executor->Deletes();
+    req.demand.Add(admission.Describe(*Locations(1).at("loc"), kTestInstanceName.size(), DeleteSource::GC, {}, {}));
+    req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+    ASSERT_TRUE(req.reservation);
+    req.free_busy = req.reservation->protocol;
+    ASSERT_TRUE(req.free_busy);
+    std::vector<uint64_t> waits;
+    const auto report = req.free_busy->on_feedback;
+    req.free_busy->on_feedback = [&waits, report](const std::string &storage, uint64_t wait) {
+        waits.push_back(wait);
+        report(storage, wait);
+    };
+    ASSERT_EQ(EC_OK, Run(req).status);
+    ASSERT_EQ(4u, waits.size());
+    EXPECT_EQ(2u, waits[0]);
+    for (const auto wait : {waits[1], waits[2]}) {
+        EXPECT_GE(wait, 3u);
+        EXPECT_LE(wait, 4u);
+    }
+    EXPECT_EQ(15u, waits[3]);
+    EXPECT_EQ(5u, backend->calls.size());
+    EXPECT_TRUE(Locations(1).empty());
+}
+
 TEST_F(FreeBusyDeleteTest, SuccessWithoutProviderAcknowledgementCompletesCadWithoutRecoveryFeedback) {
     auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess},
                                  {PaceReclaimFreeResult::kBusy, 1},

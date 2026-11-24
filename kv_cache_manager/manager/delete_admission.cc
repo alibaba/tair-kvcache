@@ -322,7 +322,9 @@ DeleteAdmission::TryReserveLocked(DeleteSource source, const DeleteDemand &deman
             return {};
         }
     }
-    auto task = demand.retry_bytes ? std::make_shared<FreeBusyTask>(resources, limits.initial_backoff_ms) : nullptr;
+    auto task = demand.retry_bytes
+                    ? std::make_shared<FreeBusyTask>(resources, limits.initial_backoff_ms, limits.max_backoff_ms)
+                    : nullptr;
     auto lease = std::shared_ptr<DeleteReservation>(new DeleteReservation(shared_from_this(), source, demand, task));
     if (task) {
         task->on_feedback = [weak = std::weak_ptr<DeleteReservation>(lease)](const std::string &name,

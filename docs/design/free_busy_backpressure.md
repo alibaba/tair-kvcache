@@ -45,7 +45,7 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 **保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查任务的准入代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个 storage 整批被拒时，保存该批原始 URI 文本和对应的 `(block_key, location_id)`。GC 同时保留各 spec 是否按后端策略跳过删除的标记，重试继续跳过已确认缺失的对象。其他 storage 继续执行，已完成的 Location 及时 CAD（按条件删除元数据）。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。每个 storage 批次独立收尾，原任务在最后一个批次结束时释放来源请求名额。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
 
-**何时重发。** KVCM 从可选配置 `kvcm.cache_reclaimer.free_busy_initial_backoff_ms` 读取首次本地退避时间，默认 50 ms，有效范围为 1 至 5000 毫秒。同一批连续 busy 时，本地等待从配置值起逐次翻倍，加入抖动后最多 5 s。Meta 提供 `retry_after_ms` 时，实际等待取它与本地等待的较大值。触发调额的这次实际等待，同时决定第 2 节的冷却期和随后等长的观察期。
+**何时重发。** `kvcm.cache_reclaimer.free_busy_initial_backoff_ms` 设置首次本地退避时间，默认 50 ms。`kvcm.cache_reclaimer.free_busy_max_backoff_ms` 设置单次本地退避上限，默认 5000 ms。两个值都是正整数毫秒，起始值须小于或等于上限。同一批连续收到 busy 时，退避基数逐次翻倍。达到上限后仍可继续重试，每次本地等待加上抖动也不超过该上限。Meta 提供 `retry_after_ms` 时，实际等待取它与本地等待的较大值。触发调额的这次实际等待，同时决定第 2 节的冷却期和随后等长的观察期。
 
 允许启动重试的总时限为 30 秒，从原批次首次准备 Free 开始计时。延迟投递和回调使用同一截止时间。取得存储读锁后先检查代次和时限，取到 PACE 客户端并准备启动 HTTP 时再检查一次，覆盖等待连接池的时间。已经启动的请求按实际回包收尾。
 
@@ -99,7 +99,7 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 | 未配置协议开关，或显式设为 `false` | 默认三路 Tair Mempool 删除携带协议头并预留重试预算，按 Provider 基准额度起步。旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，并使用配置的静态准入上限 |
 | 健康 Provider 从 4 个增至 40 个再缩容，同一接入地址有两个 storage | 正常集群随最新观测扩缩窗口。缩容后占用超额时等待已有任务收尾。两个 storage 共用最新观测，较旧回包不能扩大或缩小窗口 |
 | 退避期间扩容，或健康节点数暂时未知 | 扩容保留当前冷却和已经收紧的额度，只有新轮次的 Provider 确认成功才能逐步放宽。超期观测退回单 Provider 基准，明确的空集群只允许一个 Location 探测 |
-| 初始退避使用默认值或改为 100 ms | 首次本地等待分别从 50 ms、100 ms 起步并加抖动。如果 Meta 建议等待 200 ms 且长于本地等待，实际重试等待为 200 ms。若本批触发调额，本轮冷却和随后的观察期各为 200 ms |
+| 调整起始退避和单次上限，连续返回 busy | 本地等待从起始值加抖动，增长到配置上限后仍可继续重试。Meta 建议更长等待时取建议值，若下一次重试无法在 30 秒总时限内启动，则停止该批重试 |
 | 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
 | 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
 | 同一集群多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
@@ -160,7 +160,7 @@ PACE 存储适配代码从配置中提取集群接入地址，供 Executor 记�
 1. 先看 Reclaimer 和 GC 共用的 `kReclaim` 队列，队里有就绪任务就取一项。
 2. 当 `kReclaim` 没有就绪任务时，再看 Trim 所在的 `kSystem` 队列。
 
-同一队列按可执行时间排序，时间相同则先取先入队的任务。已接纳的批次因 busy 重试时沿用原任务类别，退避到期后参与同样的排序。[任务类别与队内排序](../../kv_cache_manager/manager/schedule_plan_executor.h) · [worker 取任务顺序](../../kv_cache_manager/manager/schedule_plan_executor.cc)
+同一队列按最早可执行时间排序，时间相同则先取先入队的任务。首次删除先标记 `DELETING` 并同步元数据，再把物理 Free 排到读者宽限期结束时执行。收到明确 busy 的批次把重试回调放回同类队列，到退避时间后，由可用的 worker 取出，拿到重试名额并核对目标后才重新发 Free。没有就绪任务时，若队里还有延迟任务，worker 用 `wait_until` 等待最近的到期时间。队列为空时只等通知。新任务入队会唤醒空闲 worker 重新选取。[任务类别与队内排序](../../kv_cache_manager/manager/schedule_plan_executor.h) · [worker 取任务顺序](../../kv_cache_manager/manager/schedule_plan_executor.cc)
 
 例如，只有一个 worker，GC 的两批物理删除和 Trim 的一批物理删除都已就绪，期间也没有新任务加入。worker 会连续取 GC 的两批，再取 Trim 的一批。多个 worker 可以并行执行已经取出的任务。
 
