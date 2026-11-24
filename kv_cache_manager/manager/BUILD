@@ -151,6 +151,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:service_discovery_url",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:meta_searcher",

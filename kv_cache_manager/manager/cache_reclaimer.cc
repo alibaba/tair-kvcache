@@ -1530,7 +1530,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      AgeStats &out_create_age_stats,
                                      bool eligibility_only,
                                      bool maintenance_read,
-                                     CacheLocationDelRequest *output) noexcept {
+                                     CacheLocationDelRequest *output,
+                                     std::size_t *out_tair_deferred_keys) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1539,6 +1540,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_location_counts_by_type.fill(0);
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
+    if (out_tair_deferred_keys) {
+        *out_tair_deferred_keys = 0;
+    }
 
     DeleteDemand scratch;
     auto &selected = output ? output->demand : scratch;
@@ -1771,9 +1775,10 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
                 DeleteBlockReason reason = DeleteBlockReason::Limit;
                 bool fits_alone = false;
-                const bool check_lru = maintenance_read && !deferred_by_quota && IsTairMempoolStorageType(base_type);
+                const bool check_empty_window = (maintenance_read || out_tair_deferred_keys) && !deferred_by_quota &&
+                                                IsTairMempoolStorageType(base_type);
                 if (!admission.TryAppend(
-                        DeleteSource::Reclaimer, selected, cost, &reason, check_lru ? &fits_alone : nullptr)) {
+                        DeleteSource::Reclaimer, selected, cost, &reason, check_empty_window ? &fits_alone : nullptr)) {
                     deferred_by_quota = deferred_by_quota || fits_alone;
                     if (reason == DeleteBlockReason::Memory) {
                         ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
@@ -1805,6 +1810,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         // Backpressure alone must not promote a cold key in the local metadata LRU.
         if (maintenance_read && loc_id_vec.empty() && !deferred_by_quota) {
             keys_to_touch.push_back(block_key);
+        }
+        if (out_tair_deferred_keys && loc_id_vec.empty() && deferred_by_quota) {
+            ++*out_tair_deferred_keys;
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }

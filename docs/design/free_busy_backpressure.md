@@ -52,7 +52,7 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 ## 4. 被拒的原批次如何重试
 
-**重试的安全假设。** Meta 返回 `FREE_BUSY_NOT_ACCEPTED` 时，整批尚未向任何 Provider 下发。KVCM 的重试假定 GA 仍对应原分配。重读元数据后，主动删除仍可能抢先释放同一个 GA。并发删除、Provider 重启或地址复用时的重试安全性，以及允许重发的时长，由双方另行确认。
+**重试的安全假设。** Meta 返回 `FREE_BUSY_NOT_ACCEPTED` 时，整批尚未向任何 Provider 下发。KVCM 的重试假定 GA 仍对应原分配。若 Trim 读页时目标已经是 `DELETING`，或 `RemoveCache` 正好处理该目标，主动删除和原任务仍可能对同一 GA 发 Free。并发删除、Provider 重启或地址复用时的重试安全性，以及允许重发的时长，由双方另行确认。
 
 **保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查任务的准入代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个 storage 整批被拒时，保存该批原始 URI 文本和对应的 `(block_key, location_id)`。GC 同时保留各 spec 是否按后端策略跳过删除的标记，重试继续跳过已确认缺失的对象。其他 storage 继续执行，已完成的 Location 及时 CAD（按条件删除元数据）。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。每个 storage 批次独立收尾，原任务在最后一个批次结束时释放来源请求名额。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
 
@@ -122,11 +122,12 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 
 三路联调还应覆盖以下场景。
 
-- 同一进程的两个 Trim 和 GC 同时访问同一接入地址的 DRAM、SSD。观察三路合计占用、Trim 共用的请求名额以及一个集群 busy 时另一个集群的进展。
+- 同一进程的两个 Trim 和 GC 同时访问同一接入地址的 DRAM、SSD。观察三路合计占用、Trim 共用的请求名额以及一个集群 busy 时另一个集群的进展。两份 Spectrum 配置只改 `timeout` 时应共用额度和冷却，改为另一个 `port` 时可独立准入。
 - 一页 Trim 包含 100 个 Location。把有效额度压到 40，确认页内所有部分都收尾后接口才返回。只临时占用了部分额度时，确认能放进完整窗口的批次保持完整。单项超过硬上限时，确认 Trim 报错并跳过最终的残留清理。
 - Trim 读到 A、B 后，驱逐任务先把 A 标成 `DELETING`。Trim 跳过 A，只为 B 发 Free。B 删除成功、其余收尾也成功时，Trim 返回成功。若 B 的物理删除失败，Trim 按原规则返回错误。
 - 让 Trim 在调用线程等额度后降主，确认等待被唤醒、已接纳任务按取消规则收尾。用普通 `RemoveCache` 对照三路满额时的提交行为。
 - 让 GC 占满集群额度，再触发集群冷却。在本地内存元数据上检查两个可删冷 key 的访问时间和 LRU 顺序。额度恢复后两者同轮被采到时，先选访问时间更早的 key。单个 Location 超过硬上限时仍应让位。
+- 同一组的最冷三个 key 都在冷却中的集群，后续样本位于健康集群，单轮预算为两个 key。Group LRU 应提交第 4、5 个 key，前三个保留访问时间和顺序。若一个 key 仍有可删的其他 Location，该 key 占一个名额。
 
 原有协议联调用同一份水位驱逐负载对比开关前后的正常回收速度和过载超时数，再混入主动删除观察水位驱逐的让步。评估重试并发上限时，同时看首次 Free 从就绪到 worker 开始执行的排队时间，以及压力解除后积压批次的排空时间。只剩重试时也按同一上限执行，此时排空可能变慢。复用现有的 `pending_location_count`、`pending_delete_bytes` 和回收耗时。`free_busy_reject_count`、`free_busy_retry_attempt_count` 和 `free_busy_reserved_bytes` 分别观测 Meta 的明确拒收、重试尝试次数和进程预留字节数。
 
@@ -150,12 +151,12 @@ Reclaimer、GC 和 `TrimCache` 各自按批提交并标明来源，由 **`Schedu
 
 Reclaimer 和 GC 在筛选候选时查询 Executor。额度不足时，两者按各自的扫描方式重访候选。
 
-- Reclaimer 在水位仍超限时重新采样。使用本地内存元数据时，如果 key 有可删的 Tair Location 能单独放进空窗口，只因当前额度、重试内存预算或集群冷却被挡住，就保留该 key 的访问时间和 LRU 位置。业务在此期间访问它，下一轮使用更新后的时间。只有不可删或单项本身超限的 Location 时，沿用原有维护性 touch 让位。[LRU 筛选](../../kv_cache_manager/manager/cache_reclaimer.cc)
+- Reclaimer 筛选时，如果一个 key 因临时反压而整项落选，且其中有可删的 Tair Location 单独能放进空窗口，本地元数据保留它的访问时间和 LRU 位置。临时反压包括当前额度不足、重试内存暂满或集群冷却。Group LRU 用本轮样本中下一个最冷的 key 补这个名额，最多提交原定数量。单项超出硬上限或只有非 Tair Location 被挡住时，沿用原有维护性 touch。[候选筛选](../../kv_cache_manager/manager/cache_reclaimer.cc) · [Group LRU 补位范围](cache_reclaimer_group_lru.md#72-执行和停止)
 - GC 在扫描前发现自身额度已满时保留游标。若读完一批后才被目标集群挡住，已跳过的候选随游标前进，可能要等下一轮完整扫描才会重访。[GC 扫描与准入](../../kv_cache_manager/manager/cache_garbage_collector.cc)
 
 实际准入由 Executor 记账一次。来源上限按本进程的逻辑任务统计，混合存储任务也占来源名额。Tair 目标另占所属 mempool 的共享额度。同一来源跨集群提交时共用该来源的进程上限。
 
-每个 KVCM 进程用存储配置中的 mempool 接入地址标识目标集群。取 `service_discovery_url` 的配置值，为空时取 `domain`。配置相同接入地址的 DRAM 和 SSD 共用额度和 busy 状态。同一物理集群若配置了不同的地址别名，各别名分别记账。无法取得接入地址时按 storage 唯一名记账。[Tair 存储配置](../../kv_cache_manager/data_storage/storage_config.h)
+每个 KVCM 进程用存储配置中的 mempool 接入地址记账。优先取 `service_discovery_url`，为空时取 `domain`。计算记账键时忽略 Spectrum 的 `timeout`、`cache_time`、`retry_time` 和 VIPServer 的 `timeout`。仅这些参数不同的存储共用额度和冷却。其余查询参数保留，其中 Spectrum 的 `port` 会覆盖服务发现返回的端口。客户端仍用原配置连接。不同地址别名分别记账，缺少接入地址时按 storage 唯一名记账。[服务发现参数](../../kv_cache_manager/common/service_discovery_factory.cc) · [集群记账](../../kv_cache_manager/manager/delete_admission.cc)
 
 任一路收到 Meta 的明确 busy 后，Executor 从下一次准入起收紧该集群的额度。此前已接纳、尚未发 Free 的批次按原计划执行。被 Meta 明确拒收的原批次沿用已占额度，按退避时间重试。
 
@@ -205,4 +206,4 @@ Reclaimer 的旧 `pending_delete_handler_limit`、`pending_bytes_limit` 分别�
 
 `RemoveInstance` 使用已经摘除的 MetaIndexer 完成实例清理，保留每次调用 `2 × worker 数` 的窗口以及普通 Delete。
 
-Meta 会把 `RemoveCache` 发来的显式 GA 列表计入 Free 负载。大量普通 Free 占用后端时，Meta 可以向上述三路返回 busy，由 Executor 收紧这三路的共享额度。
+Meta 会把 `RemoveCache` 和 `RemoveInstance` 发来的显式 GA 列表计入 Free 负载。大量普通 Free 持续占满后端时，另外三路可能反复收到 busy，回收速度随之下降。

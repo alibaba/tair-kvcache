@@ -306,7 +306,9 @@ B_request = min(B_cfg, kSizeLimit - 1)
 4. accepted：立即沿用 `SubmitDelReq` 登记 pending、Group/Type bytes credit、predicted deleted keys 和 Future。
 5. 再检查水位；恢复即停止，不等物理删除完成，不要求执行完 Top B。
 
-已选 block 在提交前消失、状态改变或被反压裁剪时，不在同一轮从 Top B 以外重新补足；下一轮重新采样。因此提交仍可能不是严格的 LRU 前缀：较老项可能已不可删除或提交失败。必须区分“按顺序尝试准入”和“按顺序完成物理删除”，异步任务的完成顺序不作保证。
+如果一个 block 在复核时没有选中任何 Location，并且其中有可删的 Tair Location 单独能放进空窗口、只是暂时受限，就从同一份有序样本往后补一个 block。一个 block 只要选中了一个 Location，就占一个名额。样本用尽即止。本轮的 `group_lru_selected_block_count` 仍记初始 Top B 的大小，`group_lru_submitted_block_count` 记实际接纳的 block 数。
+
+候选消失、状态改变、单项超出硬上限或最终提交失败等情况，仍由下一轮重新采样。异步物理删除按各任务的实际进度完成。
 
 ### 7.3 请求数量上限
 
@@ -337,7 +339,7 @@ B_request = min(B_cfg, kSizeLimit - 1)
 - 排序采用简单确定性的 `O(M log M)` 全排序；在总采样上限内优先保持实现易懂，后续再评估 top-k heap。
 - 紧凑候选只保存 Instance 索引、key、时间。65536 个候选按典型 24～32 字节结构估算约 1.5～2 MiB，最终以实现的 `sizeof` 为准；该估算不含属性 map、临时 Location、Instance 字符串和未结束采样任务的内存。
 - Location 读取按小批次处理，不能持有 `S_effective` 份完整 Location map；Group 采样总量上限也不能替代 metadata 返回大小及 in-flight worker 的既有资源约束。
-- 相比容量策略，Group LRU 需要在删除前收集多个 Instance 的候选，并且先对采样项过滤 Location，前置 I/O 会明显增加；不能宣称只是增加一次排序。二次准入读取仅覆盖 Top B 中即将提交的部分。
+- Group LRU 首先读取各 Instance 的样本并过滤 Location。提交前通常只重读 Top B 中将要处理的部分。遇到 Tair 临时反压时，补位可能逐批重读到本轮样本末尾。
 - 基础采样加按 key 数分配会改变各 Instance 的 metadata 访问分布；在不完整计划、超大 Group 或很低的采样放大倍数下，LRU 精度会下降。
 
 ### 9.2 可观测性

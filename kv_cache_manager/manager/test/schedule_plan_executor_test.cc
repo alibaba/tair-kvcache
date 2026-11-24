@@ -521,6 +521,32 @@ TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim)
     EXPECT_TRUE(ssd->calls.empty());
 }
 
+TEST_F(FreeBusyDeleteTest, DiscoveryClientOptionsShareCooldownWhileRoutingOptionsKeepClustersSeparate) {
+    auto &admission = executor->Deletes();
+    const auto cost = [&](const std::string &storage, const std::string &url) {
+        Backend(storage, {})->Endpoint("", url);
+        CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://" + storage + "/1?size=1")});
+        return admission.Describe(loc, kTestInstanceName.size(), DeleteSource::GC, {}, {});
+    };
+    const auto dram = cost("dram", "spectrum://pool?cache_time=30&retry_time=3&timeout=5000&port=12348");
+    const auto ssd = cost("ssd", "spectrum://pool?port=12348&timeout=200");
+    const auto other_port = cost("other", "spectrum://pool?port=12349");
+    EXPECT_EQ("endpoint/spectrum://pool?port=12348", dram.bucket);
+    EXPECT_EQ(dram.bucket, ssd.bucket);
+    EXPECT_NE(dram.bucket, cost("routed", "spectrum://pool?port=12348&zone=b").bucket);
+    EXPECT_EQ("endpoint/vipserver://pool", cost("vip", "vipserver://pool?timeout=2").bucket);
+
+    DeleteDemand demand;
+    demand.Add(dram);
+    auto gc = admission.TryReserve(DeleteSource::GC, demand);
+    ASSERT_TRUE(gc);
+    gc->Feedback(dram.storage, 60000);
+    gc->Finish();
+    DeleteDemand trim;
+    EXPECT_FALSE(admission.TryAppend(DeleteSource::Trim, trim, ssd));
+    EXPECT_TRUE(admission.TryAppend(DeleteSource::Trim, trim, other_port));
+}
+
 TEST_F(FreeBusyDeleteTest, TrimSplitsOversizedPageByLocationAndRetriesOnlyTheRefusedBatch) {
     DeleteLimits limits;
     limits.cluster = {2, 20};

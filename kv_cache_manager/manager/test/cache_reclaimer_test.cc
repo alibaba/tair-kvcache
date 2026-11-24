@@ -4693,6 +4693,53 @@ TEST_F(CacheReclaimerTest, TairQuotaAndCooldownPreserveColdKeysForTheNextLruSamp
     EXPECT_EQ(2, selected.front().second);
 }
 
+TEST_F(CacheReclaimerTest, GroupLruRefillsFromTheSampleWhenTheColdestClusterIsCoolingDown) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *local = UseRealLocalReclaimBackend("a", 0, false, [](KeyType key) {
+        const std::string storage = key <= 3 ? "cooling" : "ready";
+        return MakeCacheLocation("loc",
+                                 CLS_SERVING,
+                                 DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                 "pace://" + storage + "/" + std::to_string(key) + "?size=1");
+    });
+    DeleteDemand demand;
+    demand.Add({"cooling", "storage/cooling", {1, 1}});
+    auto gc = spe_->Deletes().TryReserve(DeleteSource::GC, demand);
+    ASSERT_TRUE(gc);
+    gc->Feedback("cooling", 60000);
+    gc->Finish();
+
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 4}, {"a", 5}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_group_lru_selected_block_count_metrics());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, local->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{1, 2, 3}), order);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(3, EC_OK), local->GetLastAccessTimesForMaintenance(nullptr, order, times));
+    EXPECT_EQ((std::vector<int64_t>{100, 200, 300}), times);
+}
+
+TEST_F(CacheReclaimerTest, GroupLruRefillsOnlyWholeKeysDeferredByTairRetryMemory) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &locations = group_lru_test_backends.at("a").locations;
+    const auto tair = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    locations[1].emplace("tair", MakeCacheLocation("tair", CLS_SERVING, tair, "pace://store/1?size=1"));
+    locations[2] = {{"tair", MakeCacheLocation("tair", CLS_SERVING, tair, "pace://store/2?size=1")}};
+    auto &admission = spe_->Deletes();
+    DeleteDemand occupied;
+    occupied.retry_bytes = admission.resources->memory_limit;
+    auto gc = admission.TryReserve(DeleteSource::GC, occupied);
+    ASSERT_TRUE(gc);
+
+    // Key 1 still has an eligible NFS Location. Only key 2 gives its place to key 3.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 1}, {"a", 3}}), GroupLruSubmittedBlocks());
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2u, requests.size());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"loc"}}), requests.front().location_ids);
+}
+
 TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejectedKeys) {
     SetUpGroupLruScenario({"a"});
     UseRealLocalReclaimBackend("a", 1);
