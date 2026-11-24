@@ -70,6 +70,7 @@ INSTANCE_GROUP_KEYS = {
     "name",
     "user_data",
     "quota_capacity",
+    "quota_config",
     "max_instance_count",
     "reclaim_policy",
     "reclaim_used_percentage",
@@ -153,6 +154,7 @@ class BootstrapConfig:
         self.max_instance_count = DEFAULT_MAX_INSTANCE_COUNT
         self.quota_capacity = DEFAULT_QUOTA_CAPACITY
         self.quota_capacity_explicit = False
+        self.storage_quotas = None
         self.reclaim_policy = DEFAULT_RECLAIM_POLICY
         self.reclaim_used_percentage = DEFAULT_RECLAIM_USED_PERCENTAGE
         self.max_key_count = DEFAULT_MAX_KEY_COUNT
@@ -186,6 +188,12 @@ class BootstrapConfig:
     @property
     def primary_storage_type(self):
         return self.primary_storage.storage_type
+
+    def new_group_quota(self):
+        quotas = self.storage_quotas
+        if quotas is None:
+            quotas = [] if self.quota_capacity == -1 else [StorageQuota(self.primary_storage_type, self.quota_capacity)]
+        return InstanceGroupQuota(self.quota_capacity, quotas)
 
     @property
     def event_report_storage_names(self):
@@ -260,6 +268,30 @@ def _number(value, field, default, env_name):
     if type(result) not in (int, float):
         raise BootstrapError("{}.{} must be a number".format(env_name, field))
     return float(result)
+
+
+def _parse_storage_quotas(items):
+    field = INSTANCE_GROUP_ENV + ".quota_config"
+    if not isinstance(items, list):
+        raise BootstrapError(f"{field} must be an array")
+    quotas = []
+    for index, item in enumerate(items):
+        path = f"{field}[{index}]"
+        if not isinstance(item, dict):
+            raise BootstrapError(f"{path} must be an object")
+        storage_type = _required_string(item, "storage_type", path)
+        mode = item.get("mode", "fixed")
+        if mode not in ("fixed", "auto"):
+            raise BootstrapError(f"{path}.mode must be fixed or auto")
+        required_field = "ratio" if mode == "auto" else "capacity"
+        if required_field not in item or set(item) - {"storage_type", "mode", required_field}:
+            raise BootstrapError(f"{path} in {mode} mode expects storage_type and {required_field}")
+        capacity = _integer(item, "capacity", 0, path, allow_zero=True)
+        try:
+            quotas.append(StorageQuota(storage_type, capacity, mode, item.get("ratio")))
+        except RuntimeError as exc:
+            raise BootstrapError(f"{path}: {exc}") from exc
+    return quotas
 
 
 def _single_query_value(query, name):
@@ -457,6 +489,8 @@ def parse_environment(environ=None):
     config.quota_capacity = _integer(
         value, "quota_capacity", DEFAULT_QUOTA_CAPACITY, INSTANCE_GROUP_ENV, allow_zero=True, allow_unlimited=True)
     config.quota_capacity_explicit = "quota_capacity" in value
+    if "quota_config" in value:
+        config.storage_quotas = _parse_storage_quotas(value["quota_config"])
     config.max_instance_count = _integer(
         value, "max_instance_count", DEFAULT_MAX_INSTANCE_COUNT, INSTANCE_GROUP_ENV)
     config.max_key_count = _integer(
@@ -710,10 +744,6 @@ def ensure_storages(client, config, reconcile=True):
 
 
 def _build_new_instance_group(config):
-    quota = InstanceGroupQuota(
-        config.quota_capacity,
-        [] if config.quota_capacity == -1 else [StorageQuota(config.primary_storage_type, config.quota_capacity)],
-    )
     reclaim_strategy = ReclaimStrategy(
         storage_unique_name=config.primary_storage_name,
         reclaim_policy=config.reclaim_policy,
@@ -742,7 +772,7 @@ def _build_new_instance_group(config):
     return InstanceGroup(
         name=config.instance_group_name,
         storage_candidates=[config.primary_storage_name],
-        instance_group_quota=quota,
+        instance_group_quota=config.new_group_quota(),
         quota_group_name="default_quota_group",
         max_instance_count=config.max_instance_count,
         cache_config=cache_config,
@@ -780,15 +810,13 @@ def _apply_managed_group_fields(current, config):
     updated["storage_candidates"] = [config.primary_storage_name]
     updated["event_report_storage_candidates"] = config.event_report_storage_names
     updated["max_instance_count"] = config.max_instance_count
-    if config.quota_capacity_explicit and config.quota_capacity == -1 and "quota" in updated:
-        updated["quota"]["capacity"] = -1
-    elif config.quota_capacity_explicit or "quota" not in updated:
-        updated["quota"] = {
-            "capacity": config.quota_capacity,
-            "quota_config": [] if config.quota_capacity == -1 else [
-                {"storage_type": config.primary_storage_type, "capacity": config.quota_capacity}
-            ],
-        }
+    if "quota" not in updated or (config.quota_capacity_explicit and config.quota_capacity >= 0):
+        updated["quota"] = config.new_group_quota().to_json_data()
+    else:
+        if config.quota_capacity_explicit:
+            updated["quota"]["capacity"] = config.quota_capacity
+        if config.storage_quotas is not None:
+            updated["quota"]["quota_config"] = [entry.to_json_data() for entry in config.storage_quotas]
     cache_config = updated.setdefault("cache_config", {})
     cache_config["data_storage_strategy"] = config.data_storage_strategy
     reclaim_strategy = cache_config.setdefault("reclaim_strategy", {})
@@ -843,7 +871,7 @@ def _managed_group_view(group, config):
             "storage_type": item.get("storage_type"),
             "capacity": _as_int(item.get("capacity", 0)),
             "mode": item.get("mode") or "fixed",
-            "ratio": item.get("ratio", 1.0),
+            "ratio": item.get("ratio") if item.get("mode") == "auto" else None,
         })
     view = {
         "user_data": group.get("user_data"),

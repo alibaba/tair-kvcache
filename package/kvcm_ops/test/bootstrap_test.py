@@ -117,6 +117,17 @@ class FakeAdminClient:
 
 
 class EnvironmentParsingTest(unittest.TestCase):
+    def test_invalid_storage_quotas_are_rejected(self):
+        for entries in (None, {}, [1], [{"mode": "auto", "ratio": 0.5}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto"}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": True}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 1.1}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "ratio": 0.5}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "capacity": -1}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "typo", "capacity": 0}]):
+            with self.subTest(entries=entries), self.assertRaisesRegex(BootstrapError, "quota_config"):
+                parse_environment(dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(quota_config=entries)))
+
     def test_legacy_search_cache_fields_are_accepted_without_runtime_limits(self):
         environ = dict(BASE_ENV)
         environ["KVCM_INSTANCE_GROUP"] = group_env(search_cache_capacity=4096, search_cache_shard_bits=23)
@@ -526,6 +537,38 @@ class DesiredConfigurationTest(unittest.TestCase):
 
 
 class BootstrapReconciliationTest(unittest.TestCase):
+    def test_explicit_storage_quotas_on_create_and_reconcile(self):
+        client = FakeAdminClient()
+        auto = {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 0.5}
+        fixed = {"storage_type": "ST_NFS", "capacity": 0}
+        env = {"KVCM_PACE_STORAGE": json.dumps({
+            "unique_name": PACE_NAME, "domain": "http://pace.example", "timeout": 5})}
+
+        def run(reconcile=False, **fields):
+            config = parse_environment(dict(env, KVCM_INSTANCE_GROUP=group_env(**fields)))
+            self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=reconcile))
+
+        run(quota_capacity=1234, quota_config=[auto, fixed])
+        self.assertEqual({"capacity": 1234, "quota_config": [auto, fixed]}, client.groups[0]["quota"])
+        # Admin HTTP includes default protobuf fields and represents int64 as strings.
+        client.groups[0]["quota"]["quota_config"][1].update(capacity="0", mode="", ratio=0)
+        run(reconcile=True, quota_capacity=1234, quota_config=[auto, fixed])
+        self.assertEqual(0, client.update_group_calls)
+
+        changed = dict(auto, ratio=0.25)
+        run(quota_config=[changed])
+        self.assertEqual(0, client.update_group_calls)
+        run(reconcile=True, quota_config=[changed])
+        self.assertEqual({"capacity": 1234, "quota_config": [changed]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_capacity=-1)
+        self.assertEqual({"capacity": -1, "quota_config": [changed]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_capacity=-1, quota_config=[auto])
+        self.assertEqual({"capacity": -1, "quota_config": [auto]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_config=[])
+        run(reconcile=True, quota_config=[])
+        self.assertEqual({"capacity": -1, "quota_config": []}, client.groups[0]["quota"])
+        self.assertEqual(4, client.update_group_calls)
+
     def test_legacy_search_cache_only_update_does_not_require_restart(self):
         client = FakeAdminClient()
         self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(parse_environment(dict(BASE_ENV)), client))

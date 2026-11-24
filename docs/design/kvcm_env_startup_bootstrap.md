@@ -116,6 +116,7 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `meta_storage_backend_config` | 是 | 无 |
 | `user_data` | 否 | Group 名称 |
 | `quota_capacity` | 否 | 1000000000 |
+| `quota_config` | 否 | 分类型额度列表。新建时省略该字段且总额有限，会给主存储类型设置同额的固定额度 |
 | `max_instance_count` | 否 | 512 |
 | `reclaim_policy` | 否 | `POLICY_LRU` |
 | `reclaim_used_percentage` | 否 | 0.8 |
@@ -123,6 +124,16 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `mutex_shard_num` | 否 | 131072 |
 | `batch_key_size` | 否 | 1024 |
 | `metadata_backend_mode` | 否 | 新建时不写入；更新已有 Group 时移除旧值 |
+
+下面的 Group 使用关联 TairMempool 容量的 50%，Group 总字节数不限。
+
+```bash
+export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"local","quota_capacity":-1,"quota_config":[{"storage_type":"ST_TAIRMEMPOOL","mode":"auto","ratio":0.5}]}'
+```
+
+`quota_config` 按存储类型配置额度。支持容量查询的后端可以使用 `mode: "auto"` 和 `ratio`（大于 0 且不超过 1）。固定额度使用 `capacity`（字节）。
+普通启动只创建缺失的 Group。对已有 Group 执行 `--reconcile` 时，传入的列表会替换全部分类型配置，`[]` 会清空列表。只传列表会保留现有总额。
+如果只传 `quota_capacity`，`-1` 会保留各类型额度，非负值会给主存储类型设置同额的固定额度。
 
 `meta_storage_backend_config` 支持 `redis,redis://...`、`cached,redis://...`、`local,local://?capacity=65536&num_shard_bits=15&sample_times=1024`，以及简写 `local`。Redis URI 必须包含 `cluster_name`；local URI 不需要 Redis 地址或参数。local 的 `capacity`、`num_shard_bits`、`sample_times` 可分别省略，省略时由 KVCM 后端使用默认值。显式填写时，`capacity` 和 `sample_times` 必须是正整数，`num_shard_bits` 必须是 0～19 的整数，URI 原样传给后端。Bootstrap 只为 `redis` 和 `cached` 补齐缺失的 URI 参数。Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
 
