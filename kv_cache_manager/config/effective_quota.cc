@@ -1,7 +1,6 @@
 #include "kv_cache_manager/config/effective_quota.h"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <set>
 
@@ -37,13 +36,7 @@ InstanceGroupQuota EffectiveGroupQuota::ForAdmission() const { return Enforcemen
 InstanceGroupQuota EffectiveGroupQuota::ForReclaim() const { return EnforcementQuota(*this, true); }
 
 double QuotaUsageRatio(uint64_t usage, int64_t capacity) {
-    if (capacity < 0) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    if (capacity == 0) {
-        return usage == 0 ? 0.0 : std::numeric_limits<double>::infinity();
-    }
-    return static_cast<double>(usage) / capacity;
+    return capacity > 0 ? static_cast<double>(usage) / capacity : 0.0;
 }
 
 std::set<std::string> GetQuotaStorageNames(const InstanceGroup &group) {

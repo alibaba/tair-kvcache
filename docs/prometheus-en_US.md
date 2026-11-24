@@ -5,7 +5,7 @@ at `GET /metrics` on the Admin HTTP service port (default 6492).
 
 Per storage backend, `data_storage.total_capacity_bytes` reports logical capacity in bytes (−1 before the first valid sample). For each group and storage type, `cache_manager_group_storage.usage_bytes`, `effective_quota` and `usage_ratio` expose usage, the current budget and their ratio. Automatic quotas also report `refresh_success` and `last_success_time_s`. With an unlimited group byte budget the group usage ratio uses the sum of effective type quotas.
 
-Per-type usage ratios and the ratio for a group with an unlimited byte budget report `NaN` when the denominator is unknown. A zero denominator yields `+Inf` for positive usage and `0` for zero usage.
+Group and per-type quota usage ratios report `0` when the denominator is zero or unknown, even if usage is positive. The per-type `effective_quota` and the `reference_capacity` of an unlimited group distinguish the two cases. A value of `0` means zero capacity and `-1` means unknown capacity.
 
 ## Quick Start
 

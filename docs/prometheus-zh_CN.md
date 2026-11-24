@@ -5,7 +5,7 @@ KVCacheManager 在 Admin HTTP 服务端口（默认 6492）上提供了兼容 Pr
 
 每个存储后端通过 `data_storage.total_capacity_bytes` 上报总字节数，首次取得有效容量前为 -1。按 Group 和存储类型查看 `cache_manager_group_storage.usage_bytes`、`effective_quota` 和 `usage_ratio`，分别为用量、当前有效额度和两者之比。自动额度还提供 `refresh_success` 和 `last_success_time_s`。Group 总额度不限时，总水位用各类型有效额度之和作分母。
 
-分类型水位，以及 Group 总额度不限时的总水位，分母未知时上报 `NaN`。分母为零时，已有用量上报 `+Inf`，用量也为零时上报 `0`。
+Group 和分类型的 quota 水位在分母为零或未知时都上报 `0`，即使已有用量。查看分类型的 `effective_quota` 或总额度不限时的 Group `reference_capacity` 可以区分这两种情况。其中 `0` 表示额度为零，`-1` 表示未知。
 
 ## 快速开始
 

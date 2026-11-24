@@ -158,14 +158,9 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                                    meta_indexer->GetMemUsage(),
                                    meta_indexer->GetLocationCount()};
             }
-            const int64_t capacity = instance_group->quota().capacity();
-            if (capacity == -1) {
-                group_usage_ratio_map[instance_group_name] =
-                    QuotaUsageRatio(group_byte_size, quota_metric.quota.reference_capacity);
-            } else {
-                group_usage_ratio_map[instance_group_name] =
-                    capacity > 0 ? static_cast<double>(group_byte_size) / capacity : 0;
-            }
+            const auto &quota = quota_metric.quota;
+            const auto limit = quota.configured_capacity == -1 ? quota.reference_capacity : quota.configured_capacity;
+            group_usage_ratio_map[instance_group_name] = QuotaUsageRatio(group_byte_size, limit);
         }
         {
             std::scoped_lock write_guard(mutex_);

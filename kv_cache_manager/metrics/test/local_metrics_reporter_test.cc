@@ -1,6 +1,5 @@
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <future>
 #include <map>
@@ -925,9 +924,17 @@ TEST_F(LocalMetricsReporterTest, UnlimitedQuotaMetricsUseReferenceAndExposeUnkno
         InstanceGroupQuota(-1, {QuotaConfig(50, dram), unknown}));
     ASSERT_TRUE(sample());
     EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
-    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get()));
-    EXPECT_TRUE(std::isnan(metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get()));
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get());
+    EXPECT_DOUBLE_EQ(0.4, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", dram_tags).Get());
     EXPECT_DOUBLE_EQ(-1, metrics_registry_->GetGauge("cache_manager_group_storage.effective_quota", ssd_tags).Get());
+    registry_manager_->instance_group_configs_[group.name()]->set_quota(InstanceGroupQuota(-1, {QuotaConfig(0, ssd)}));
+    ASSERT_TRUE(sample());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group.reference_capacity", tags).Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group.usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.effective_quota", ssd_tags).Get());
+    EXPECT_DOUBLE_EQ(80, metrics_registry_->GetGauge("cache_manager_group_storage.usage_bytes", ssd_tags).Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("cache_manager_group_storage.usage_ratio", ssd_tags).Get());
     const std::string reclaimer_counter = "cache_reclaimer.pending_limit_reject_count";
     metrics_registry_->GetCounter(reclaimer_counter, ssd_tags) += 7;
     registry_manager_->instance_group_configs_[group.name()]->set_quota(
