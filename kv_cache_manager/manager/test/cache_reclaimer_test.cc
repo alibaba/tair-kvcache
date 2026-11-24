@@ -1070,7 +1070,10 @@ public:
     }
 
     MetaLocalBackend *
-    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
+    UseRealLocalReclaimBackend(const std::string &id,
+                               KeyType rejected_prefix = 0,
+                               bool event_report_prefix = false,
+                               const std::function<CacheLocationConstPtr(KeyType)> &make_location = {}) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -1082,13 +1085,16 @@ public:
         EXPECT_EQ(EC_OK, local->Init(id, config));
         EXPECT_EQ(EC_OK, local->Open());
         for (KeyType key = 1; key <= 32; ++key) {
-            const bool rejected = key <= rejected_prefix;
-            auto location = MakeCacheLocation(
-                "loc",
-                rejected && !event_report_prefix ? CacheLocationStatus::CLS_DELETING : CacheLocationStatus::CLS_SERVING,
-                rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
-                                                : DataStorageType::DATA_STORAGE_TYPE_NFS,
-                "nfs://store/key?size=1");
+            CacheLocationConstPtr location;
+            if (make_location) {
+                location = make_location(key);
+            } else {
+                const bool rejected = key <= rejected_prefix;
+                const auto status = rejected && !event_report_prefix ? CLS_DELETING : CLS_SERVING;
+                const auto type = rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                                                  : DataStorageType::DATA_STORAGE_TYPE_NFS;
+                location = MakeCacheLocation("loc", status, type, "nfs://store/key?size=1");
+            }
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK},
                       local->Put(nullptr, {key}, {{{"loc", location}}}, PropertyMapVector(1)));
             EXPECT_TRUE(local->cache_->ApplyToEntryNoTouch(
@@ -3833,12 +3839,24 @@ TEST_F(CacheReclaimerTest, BusyBacksOffAllThreeSourcesOnTheSameEndpointOnly) {
     auto first = submit(DeleteSource::Reclaimer, "dram", "endpoint/a", {4, 400});
     auto other = submit(DeleteSource::GC, "ssd", "endpoint/a", {4, 400});
     ASSERT_TRUE(first && other);
+    const MetricsTags used{{"cluster", "endpoint/a"}, {"quota", "used"}};
+    const MetricsTags effective{{"cluster", "endpoint/a"}, {"quota", "effective"}};
+    auto used_locations = mr_->GetGauge("delete_admission.cluster_locations", used);
+    auto used_bytes = mr_->GetGauge("delete_admission.cluster_bytes", used);
+    auto effective_locations = mr_->GetGauge("delete_admission.cluster_locations", effective);
+    auto effective_bytes = mr_->GetGauge("delete_admission.cluster_bytes", effective);
+    EXPECT_EQ(8, used_locations.Get());
+    EXPECT_EQ(800, used_bytes.Get());
     first->Feedback("dram", 1);
     other->Feedback("ssd", 60000); // both leases pre-date the drop
+    EXPECT_EQ(4, effective_locations.Get());
+    EXPECT_EQ(400, effective_bytes.Get());
     EXPECT_FALSE(submit(DeleteSource::Trim, "ssd", "endpoint/a", {1, 100}));
     EXPECT_TRUE(submit(DeleteSource::Trim, "ssd2", "endpoint/b", {8, 800}));
     first->Finish();
     other->Finish();
+    EXPECT_EQ(0, used_locations.Get());
+    EXPECT_EQ(0, used_bytes.Get());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(3));
     EXPECT_FALSE(submit(DeleteSource::GC, "ssd", "endpoint/a", {5, 400}));
@@ -3848,6 +3866,8 @@ TEST_F(CacheReclaimerTest, BusyBacksOffAllThreeSourcesOnTheSameEndpointOnly) {
     single->Feedback("ssd", 0);
     single->Finish();
     EXPECT_TRUE(submit(DeleteSource::Reclaimer, "dram", "endpoint/a", {8, 800}));
+    EXPECT_EQ(8, effective_locations.Get());
+    EXPECT_EQ(800, effective_bytes.Get());
 }
 
 TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsAreShared) {
@@ -4627,6 +4647,50 @@ TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBounde
     EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_EQ(600, times[5]);
     EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, TairQuotaAndCooldownPreserveColdKeysForTheNextLruSample) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &admission = spe_->Deletes();
+    auto *backend = UseRealLocalReclaimBackend("a", 0, false, [&](KeyType key) {
+        const auto bytes = key == 1 ? admission.limits.cluster.bytes + 1 : 1;
+        return MakeCacheLocation("loc",
+                                 CLS_SERVING,
+                                 DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                 "pace://store/" + std::to_string(key) + "?size=" + std::to_string(bytes));
+    });
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(3);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+
+    DeleteDemand occupied;
+    occupied.Add({"store", "storage/store", admission.limits.cluster});
+    auto gc = admission.TryReserve(DeleteSource::GC, occupied);
+    ASSERT_TRUE(gc);
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(3, EC_OK), backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3}, times));
+    EXPECT_GT(times[0], 100); // Key 1 exceeds even the empty cluster's hard limit.
+    EXPECT_EQ(200, times[1]);
+    EXPECT_EQ(300, times[2]);
+
+    gc->Feedback("store", 60000);
+    gc->Finish();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 2, order));
+    EXPECT_EQ((KeyVector{2, 3}), order);
+    ASSERT_EQ(std::vector<ErrorCode>(2, EC_OK), backend->GetLastAccessTimesForMaintenance(nullptr, {2, 3}, times));
+    EXPECT_EQ((std::vector<int64_t>{200, 300}), times);
+
+    // Reset the cooldown without depending on timer resolution.
+    admission.SetPaused(true);
+    admission.SetPaused(false);
+    cache_reclaimer_->batching_size_.store(1);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1u, selected.size());
+    EXPECT_EQ(2, selected.front().second);
 }
 
 TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejectedKeys) {

@@ -11,6 +11,7 @@
 
 #include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/free_busy.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
 
@@ -74,10 +75,12 @@ public:
                               DeleteSource source,
                               const std::string &group,
                               const DeleteDemand &selected) const;
+    // On rejection, fits_alone tells the LRU selector if this Location can fit an empty window.
     bool TryAppend(DeleteSource source,
                    DeleteDemand &selected,
                    const DeleteTargetCost &target,
-                   DeleteBlockReason *reason = nullptr);
+                   DeleteBlockReason *reason = nullptr,
+                   bool *fits_alone = nullptr);
     uint64_t RemainingRequests(DeleteSource source) const;
     std::shared_ptr<DeleteReservation>
     TryReserve(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason = nullptr);
@@ -102,12 +105,20 @@ public:
 private:
     friend class DeleteReservation;
     using Clock = std::chrono::steady_clock;
+    struct SizeGauges {
+        Gauge locations, bytes;
+        void Set(DeleteSize size) {
+            locations = static_cast<double>(size.locations);
+            bytes = static_cast<double>(size.bytes);
+        }
+    };
     struct Bucket {
         DeleteSize used;
         DeleteSize effective;
         Clock::time_point changed{}, cooldown{}, observe{};
         std::chrono::milliseconds interval{0};
         bool success{false};
+        SizeGauges used_gauges, effective_gauges;
     };
     bool FitsSourceLocked(
         DeleteSource source, DeleteSize size, uint64_t retry_bytes, bool empty, DeleteBlockReason *reason) const;
@@ -132,6 +143,7 @@ private:
     std::condition_variable changed_;
     std::array<DeleteSourceLimit, 3> used_{};
     std::map<std::string, Bucket> buckets_;
+    Counter trim_wait_count_, trim_wait_us_;
     bool paused_{false};
 };
 

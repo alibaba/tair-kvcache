@@ -43,7 +43,12 @@ DeleteAdmission::DeleteAdmission(DeleteLimits config,
                                  std::shared_ptr<MetricsRegistry> metrics)
     : limits(std::move(config))
     , resources(std::make_shared<FreeBusyResources>(limits.retry_memory_bytes, metrics))
-    , storage_(std::move(storage)) {}
+    , storage_(std::move(storage)) {
+    if (metrics) {
+        trim_wait_count_ = metrics->GetCounter("delete_admission.trim_wait_count");
+        trim_wait_us_ = metrics->GetCounter("delete_admission.trim_wait_us");
+    }
+}
 
 DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
                                            size_t instance_length,
@@ -145,6 +150,7 @@ bool DeleteAdmission::FitsBucketLocked(
     if (b.success && now >= b.observe) {
         b.effective = {std::min(hard.locations, Sum(b.effective.locations, b.effective.locations)),
                        std::min(hard.bytes, Sum(b.effective.bytes, b.effective.bytes))};
+        b.effective_gauges.Set(b.effective);
         b.changed = now;
         b.success = false;
         if (b.effective.locations == hard.locations && b.effective.bytes == hard.bytes) {
@@ -204,9 +210,15 @@ bool DeleteAdmission::FitsNextLocked(DeleteSource source,
 bool DeleteAdmission::TryAppend(DeleteSource source,
                                 DeleteDemand &selected,
                                 const DeleteTargetCost &cost,
-                                DeleteBlockReason *reason) {
+                                DeleteBlockReason *reason,
+                                bool *fits_alone) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (paused_ || !FitsNextLocked(source, selected, cost, false, Clock::now(), reason)) {
+        if (fits_alone) {
+            // A single Location may exceed the temporary byte ceiling once the bucket drains.
+            *fits_alone = FitsSourceLocked(source, cost.size, cost.retry_bytes, true, nullptr) &&
+                          (cost.bucket.empty() || Fits({}, cost.size, Hard(cost.bucket)));
+        }
         return false;
     }
     selected.Add(cost);
@@ -240,16 +252,29 @@ std::shared_ptr<DeleteReservation> DeleteAdmission::ReserveLocked(DeleteSource s
         task->unassigned = demand.retry_bytes;
     }
     for (const auto &entry : demand.buckets) {
-        auto [it, inserted] = buckets_.try_emplace(entry.first);
+        const auto &key = entry.first;
+        auto [it, inserted] = buckets_.try_emplace(key);
         if (inserted) {
-            it->second.effective = Hard(entry.first);
+            auto &bucket = it->second;
+            bucket.effective = Hard(key);
+            if (resources->metrics && key.compare(0, 6, "group/") != 0) {
+                const auto gauges = [this](const MetricsTags &tags) {
+                    return SizeGauges{resources->metrics->GetGauge("delete_admission.cluster_locations", tags),
+                                      resources->metrics->GetGauge("delete_admission.cluster_bytes", tags)};
+                };
+                bucket.used_gauges = gauges({{"cluster", key}, {"quota", "used"}});
+                bucket.effective_gauges = gauges({{"cluster", key}, {"quota", "effective"}});
+                bucket.effective_gauges.Set(bucket.effective);
+            }
         }
     }
     auto &used = used_[Index(source)];
     ++used.requests;
     AddSize(used.size, demand.size);
     for (const auto &[key, size] : demand.buckets) {
-        AddSize(buckets_.at(key).used, size);
+        auto &bucket = buckets_.at(key);
+        AddSize(bucket.used, size);
+        bucket.used_gauges.Set(bucket.used);
     }
     lease->charged_ = true;
     return lease;
@@ -274,6 +299,7 @@ DeleteAdmission::TrimResult DeleteAdmission::ReserveTrim(const std::vector<Delet
                                                          size_t &end,
                                                          std::shared_ptr<DeleteReservation> &lease) {
     std::unique_lock<std::mutex> lock(mutex_);
+    bool waited = false;
     while (!paused_ && Generation() == generation) {
         const auto now = Clock::now();
         DeleteDemand prefix;
@@ -295,7 +321,13 @@ DeleteAdmission::TrimResult DeleteAdmission::ReserveTrim(const std::vector<Delet
         }
         // Completions and lifecycle changes notify immediately. Also revisit cooldown
         // expiry and memory returned by a still-running multi-storage task.
+        if (!waited) {
+            ++trim_wait_count_;
+            waited = true;
+        }
+        const auto wait_start = Clock::now();
         changed_.wait_for(lock, std::chrono::milliseconds(100));
+        trim_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - wait_start).count();
     }
     return TrimResult::Cancelled;
 }
@@ -310,10 +342,15 @@ void DeleteAdmission::SetPaused(bool value) {
     if (value && !paused_) {
         ++resources->generation;
         for (auto it = buckets_.begin(); it != buckets_.end();) {
-            if (!it->second.used.locations) {
+            auto &bucket = it->second;
+            bucket.effective = Hard(it->first);
+            bucket.effective_gauges.Set(bucket.effective);
+            if (!bucket.used.locations) {
                 it = buckets_.erase(it);
             } else {
-                it->second = Bucket{it->second.used, Hard(it->first)};
+                bucket.changed = bucket.cooldown = bucket.observe = {};
+                bucket.interval = {};
+                bucket.success = false;
                 ++it;
             }
         }
@@ -334,6 +371,7 @@ void DeleteAdmission::ReleaseLocked(DeleteReservation &lease, const DeleteSize &
     if (it != buckets_.end()) {
         auto &b = it->second;
         SubSize(b.used, size);
+        b.used_gauges.Set(b.used);
         const auto hard = Hard(key);
         if (!b.used.locations && b.effective.locations == hard.locations && b.effective.bytes == hard.bytes) {
             buckets_.erase(it);
@@ -430,6 +468,7 @@ void DeleteReservation::Feedback(const std::string &storage, uint64_t busy_ms) {
     } else {
         bucket.effective = {std::max<uint64_t>(1, std::min(bucket.effective.locations, bucket.used.locations) / 2),
                             std::max<uint64_t>(1, std::min(bucket.effective.bytes, bucket.used.bytes) / 2)};
+        bucket.effective_gauges.Set(bucket.effective);
         const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now).count();
         bucket.interval = std::chrono::milliseconds(std::min<uint64_t>(busy_ms, room / 2));
         bucket.changed = now;

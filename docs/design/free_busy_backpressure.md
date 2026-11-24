@@ -126,10 +126,13 @@ Executor 收到回包时，按本次准入记录中的 storage 找到对应集�
 - 一页 Trim 包含 100 个 Location。把有效额度压到 40，确认页内所有部分都收尾后接口才返回。只临时占用了部分额度时，确认能放进完整窗口的批次保持完整。单项超过硬上限时，确认 Trim 报错并跳过最终的残留清理。
 - Trim 读到 A、B 后，驱逐任务先把 A 标成 `DELETING`。Trim 跳过 A，只为 B 发 Free。B 删除成功、其余收尾也成功时，Trim 返回成功。若 B 的物理删除失败，Trim 按原规则返回错误。
 - 让 Trim 在调用线程等额度后降主，确认等待被唤醒、已接纳任务按取消规则收尾。用普通 `RemoveCache` 对照三路满额时的提交行为。
+- 让 GC 占满集群额度，再触发集群冷却。在本地内存元数据上检查两个可删冷 key 的访问时间和 LRU 顺序。额度恢复后两者同轮被采到时，先选访问时间更早的 key。单个 Location 超过硬上限时仍应让位。
 
 原有协议联调用同一份水位驱逐负载对比开关前后的正常回收速度和过载超时数，再混入主动删除观察水位驱逐的让步。评估重试并发上限时，同时看首次 Free 从就绪到 worker 开始执行的排队时间，以及压力解除后积压批次的排空时间。只剩重试时也按同一上限执行，此时排空可能变慢。复用现有的 `pending_location_count`、`pending_delete_bytes` 和回收耗时。`free_busy_reject_count`、`free_busy_retry_attempt_count` 和 `free_busy_reserved_bytes` 分别观测 Meta 的明确拒收、重试尝试次数和进程预留字节数。
 
 - `free_busy_budget_skip_location_count` 统计 Reclaimer 筛选或提交时因内存预留不足被挡住的 Tair 候选次数。同一 Location 下轮再次被挡会再计一次，这些候选保留原状态。
+- `delete_admission.cluster_locations` 和 `delete_admission.cluster_bytes` 分别显示每个 mempool 的在途 Location 数和待删字节数。`cluster` 标签取记账用的 `endpoint/<接入地址>` 或 `storage/<存储名>`，`quota=used` 表示当前占用，`quota=effective` 表示当前有效上限。冷却期间暂停新准入，已接纳的工作仍计入占用。
+- `delete_admission.trim_wait_count` 统计实际等待准入的 Trim 批次数，每批首次等待时加一。`delete_admission.trim_wait_us` 累计这些批次等待额度的微秒数，包括降主取消前的等待。两个计数均按进程汇总，观察一轮压测前后的增量，可估算每个受阻批次的平均等待时间。
 - `free_busy_retained_location_count{reason}` 统计专用删除路径停止处理、交由日志核对的目标个数。等本地名额到期记 `slot_deadline`，等 Meta busy 退避到期记 `busy_deadline`，准备发送时到期记 `dispatch_deadline`，主存储读失败记 `primary_read`，撤销记 `cancelled`。其余原因包括预算、URI、批次大小、实例或后端变化及本地执行失败。累计值按 Location 计算，当前仍在 `DELETING` 的数量可能随后变化。具体目标查终止日志。
 
 ## 6. 三路删除统一流控
@@ -145,7 +148,12 @@ Reclaimer、GC 和 `TrimCache` 各自按批提交并标明来源，由 **`Schedu
 
 共享默认值在原每组、每类型 20,000 个 Location 和 1 TiB 的数值上留了余量，作为 202 混合负载压测的起点。每个 KVCM 进程独立记账；多个进程访问同一集群时，通过同一 Meta 的 busy 信号各自调整。
 
-Reclaimer 和 GC 筛选候选时查询 Executor，可留给后续扫描重新选择。Reclaimer 继续维护去重、用量预测和观测计数。GC 继续维护扫描游标和已提交目标。实际准入只在 Executor 记账一次。三路的来源请求数、可选 Location 数和 bytes 上限按本进程各自的逻辑任务统计，混合存储任务也占来源名额；只有 Tair 目标占 mempool 集群额度。同一来源跨集群提交时仍共用该来源的进程上限。
+Reclaimer 和 GC 在筛选候选时查询 Executor。额度不足时，两者按各自的扫描方式重访候选。
+
+- Reclaimer 在水位仍超限时重新采样。使用本地内存元数据时，如果 key 有可删的 Tair Location 能单独放进空窗口，只因当前额度、重试内存预算或集群冷却被挡住，就保留该 key 的访问时间和 LRU 位置。业务在此期间访问它，下一轮使用更新后的时间。只有不可删或单项本身超限的 Location 时，沿用原有维护性 touch 让位。[LRU 筛选](../../kv_cache_manager/manager/cache_reclaimer.cc)
+- GC 在扫描前发现自身额度已满时保留游标。若读完一批后才被目标集群挡住，已跳过的候选随游标前进，可能要等下一轮完整扫描才会重访。[GC 扫描与准入](../../kv_cache_manager/manager/cache_garbage_collector.cc)
+
+实际准入由 Executor 记账一次。来源上限按本进程的逻辑任务统计，混合存储任务也占来源名额。Tair 目标另占所属 mempool 的共享额度。同一来源跨集群提交时共用该来源的进程上限。
 
 每个 KVCM 进程用存储配置中的 mempool 接入地址标识目标集群。取 `service_discovery_url` 的配置值，为空时取 `domain`。配置相同接入地址的 DRAM 和 SSD 共用额度和 busy 状态。同一物理集群若配置了不同的地址别名，各别名分别记账。无法取得接入地址时按 storage 唯一名记账。[Tair 存储配置](../../kv_cache_manager/data_storage/storage_config.h)
 

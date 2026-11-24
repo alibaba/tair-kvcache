@@ -224,7 +224,7 @@ Local 的 `SampleReclaimCandidates` 复用 `SampleReclaimKeys` 选择 key，再�
 
 对于本次请求的 `count > 0`，先计算 `R = min(sample_times, 分片总数, count)`，再选取最多 `K = min(R, 非空分片数)` 个冷分片。每个入选分片最多取 `ceil(count / R)` 个 key，且不超过剩余总预算；分片为空或 key 不足时不自动向其他分片补齐。因此 `sample_times` 控制单次采样的分片广度，增大它可能增加入选分片数、减少单分片份额，不代表轮转周期。`K=1` 时仍选最冷分片；同一批分片可以连续入选，不承诺跨轮覆盖全部分片，也不保证取到全局最冷的 `count` 个 key。
 
-采样本身不改变时间或 LRU 顺序，但旧前缀不能回收时，需要在后续过滤阶段让出位置：`FilterLocIDImpl` 完成维护性 Location 过滤后，将没有形成任何可删除 Location 的 key 交给 `TouchKeysForMaintenance`。该操作仅作用于完整的 Local 回收源，按名单更新时间和 LRU 位置，并通过尾部变化回调刷新分片冷度提示；不限于 EventReport-only key。仍有待删 Location 的 key 不 touch；读取失败或全局反压提前返回时也不触发。后续轮次因此有机会采到前缀之后的冷 key，但这不是游标续扫或同轮补采样的保证。
+采样保留访问时间和 LRU 顺序。对完整的 Local 回收源，`FilterLocIDImpl` 用 `TouchKeysForMaintenance` 让没有可删 Location 的 key 移到较热的一端，并通过尾部变化回调刷新分片冷度提示。普通和 EventReport key 均可因此让位。若至少一个可删的 Tair Location 能单独放进空窗口，只因本轮额度或冷却被挡住，整个 key 保留原时间和位置，后续轮次重新采样。已选中的 key、读取失败或全局反压提前退出的批次也保留原位置。[共享额度](free_busy_backpressure.md#6-三路删除统一流控)
 
 维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本，是采样读取之外的显式维护操作。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
 

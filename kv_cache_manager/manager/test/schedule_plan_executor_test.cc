@@ -618,13 +618,24 @@ TEST_F(FreeBusyDeleteTest, TrimWaitsForAnIntactPageAndWakesOnDemotion) {
     const auto generation = admission->Generation();
     size_t end = 0;
     std::shared_ptr<DeleteReservation> trim;
+    auto wait_count = metrics_registry_->GetCounter("delete_admission.trim_wait_count");
+    auto wait_us = metrics_registry_->GetCounter("delete_admission.trim_wait_us");
+    auto wait_for_blocked = [&](auto &request, uint64_t expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (wait_count.Get() < expected && std::chrono::steady_clock::now() < deadline &&
+               request.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout) {}
+        EXPECT_EQ(expected, wait_count.Get());
+    };
     auto submit = [&] { return admission->ReserveTrim(page, 0, generation, end, trim); };
     auto waiting = std::async(std::launch::async, submit);
+    wait_for_blocked(waiting, 1);
     EXPECT_EQ(std::future_status::timeout, waiting.wait_for(std::chrono::milliseconds(10)));
     gc->Finish();
     EXPECT_EQ(DeleteAdmission::TrimResult::Accepted, waiting.get());
     EXPECT_EQ(page.size(), end);
+    EXPECT_GT(wait_us.Get(), 0u);
     auto again = std::async(std::launch::async, submit);
+    wait_for_blocked(again, 2);
     admission->SetPaused(true);
     EXPECT_EQ(DeleteAdmission::TrimResult::Cancelled, again.get());
     admission->SetPaused(false);
@@ -633,6 +644,7 @@ TEST_F(FreeBusyDeleteTest, TrimWaitsForAnIntactPageAndWakesOnDemotion) {
     page[0].size.bytes = 31;
     EXPECT_EQ(DeleteAdmission::TrimResult::TooLarge,
               admission->ReserveTrim(page, 0, admission->Generation(), end, trim));
+    EXPECT_EQ(2u, wait_count.Get());
 }
 
 TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailable) {

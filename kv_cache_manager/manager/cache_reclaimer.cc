@@ -1654,11 +1654,13 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t create_age_sum = 0;
     int64_t create_age_count = 0;
+    KeyVector keys_to_touch;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
         const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
         std::size_t valid_location_count = 0;
+        bool deferred_by_quota = false;
 
         // 总水位超限分支：若 block 同时有冷层与非冷层(热/源)副本，则只淘汰已被冷层覆盖的热副本、保留冷副本。
         bool keep_cold_evict_hot = false;
@@ -1768,7 +1770,11 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 auto &admission = sched_plan_executor_->Deletes();
                 const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
                 DeleteBlockReason reason = DeleteBlockReason::Limit;
-                if (!admission.TryAppend(DeleteSource::Reclaimer, selected, cost, &reason)) {
+                bool fits_alone = false;
+                const bool check_lru = maintenance_read && !deferred_by_quota && IsTairMempoolStorageType(base_type);
+                if (!admission.TryAppend(
+                        DeleteSource::Reclaimer, selected, cost, &reason, check_lru ? &fits_alone : nullptr)) {
+                    deferred_by_quota = deferred_by_quota || fits_alone;
                     if (reason == DeleteBlockReason::Memory) {
                         ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
                     } else if (reason == DeleteBlockReason::Limit) {
@@ -1796,20 +1802,15 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         if (!eligibility_only && !loc_id_vec.empty() && loc_id_vec.size() == valid_location_count) {
             out_predicted_deleted_keys = SaturatingAdd(out_predicted_deleted_keys, 1);
         }
+        // Backpressure alone must not promote a cold key in the local metadata LRU.
+        if (maintenance_read && loc_id_vec.empty() && !deferred_by_quota) {
+            keys_to_touch.push_back(block_key);
+        }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
-    if (maintenance_read) {
-        KeyVector rejected_keys;
-        for (size_t i = 0; i < batch.size(); ++i) {
-            if (out_loc_ids[i].empty()) {
-                rejected_keys.push_back(batch[i]);
-            }
-        }
-        // Yield keys with no deletable locations so later samples can reach
-        // other cold candidates, regardless of the rejected location types.
-        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-            indexer && indexer->SupportsWriteSession() && !rejected_keys.empty()) {
-            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
+    if (!keys_to_touch.empty()) {
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && indexer->SupportsWriteSession()) {
+            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(keys_to_touch);
         }
     }
     if (create_age_count == 0) {
