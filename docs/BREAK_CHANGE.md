@@ -2,6 +2,14 @@
 
 本文档记录需要调用方、部署配置或持久化状态协同升级的不兼容变更。升级前必须按对应条目的前置条件处理，不能仅替换 KVCM 二进制。
 
+## Instance Group 总额度 `quota.capacity=-1`
+
+旧版本把 `-1` 按零容量处理，阻止新分配并可触发按字节回收。从此版本起，`-1` 表示取消 Group
+总字节上限，各存储类型配置的额度仍然生效。`0` 继续表示零容量。
+
+升级前检查已有 Instance Group 的 `quota.capacity`。需要保留零容量行为的 Group 应先改为 `0`。
+回滚前，为需要继续接受写入的 Group 设置合适的正数总额度，旧版本读到 `-1` 会再次阻止新分配。
+
 ## gRPC 默认线程上限
 
 gRPC 默认改为自动限制同步线程数：`kvcm.service.grpc_max_threads=0` 取 `max(2, 硬件并行数)`（开启 optimizer 事件发布时，主 Meta Server 额外加上 `max_subscribers`），配额耗尽可能返回 `RESOURCE_EXHAUSTED`。

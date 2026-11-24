@@ -5,6 +5,8 @@ at `GET /metrics` on the Admin HTTP service port (default 6492).
 
 Per storage backend, `data_storage.total_capacity_bytes` reports logical capacity in bytes (−1 before the first valid sample). For each group and storage type, `cache_manager_group_storage.usage_bytes`, `effective_quota` and `usage_ratio` expose usage, the current budget and their ratio. Automatic quotas also report `refresh_success` and `last_success_time_s`. With an unlimited group byte budget the group usage ratio uses the sum of effective type quotas.
 
+Per-type usage ratios and the ratio for a group with an unlimited byte budget report `NaN` when the denominator is unknown. A zero denominator yields `+Inf` for positive usage and `0` for zero usage.
+
 ## Quick Start
 
 With default settings, the endpoint is enabled automatically. Point
@@ -213,7 +215,7 @@ and adds the configured prefix.
 | `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
-| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers omit this metric and remove previously published series on the next reporting interval after demotion. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
+| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. A value of 1 means full. TairMempool reports its cached ratio, using -1 before the first sample or when a sample cannot yield a ratio. A failed Meta request preserves the previous reading. Negative readings from backends without capacity support are skipped. Followers remove this metric on the next reporting interval after demotion. Health and writability are reported independently |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |

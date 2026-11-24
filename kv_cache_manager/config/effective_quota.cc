@@ -84,9 +84,8 @@ EffectiveTypeQuota ResolveTypeQuota(const QuotaConfig &config, const std::set<st
     bool refreshed = true;
     for (const auto &name : names) {
         const auto it = snapshots.find(name);
-        // An unregistered candidate has no type yet and may belong to this quota.
         if (it == snapshots.end()) {
-            return value;
+            continue;
         }
         const auto &sample = it->second;
         if (ToBaseType(sample.type) != ToBaseType(config.storage_spec())) {

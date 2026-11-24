@@ -58,6 +58,15 @@ TEST_F(EffectiveQuotaTest, ExplicitAutoIncludesMigrationOnlyTarget) {
 }
 
 
+TEST_F(EffectiveQuotaTest, UnregisteredCandidatesDoNotContributeToAutoQuota) {
+    const auto quota = ResolveEffectiveQuota(Group({Auto(kDram, 0.5), Auto(kSsd)}), {{"dram", Capacity(kDram, 100)}});
+    EXPECT_EQ(50, quota.types.at(kDram).capacity);
+    EXPECT_EQ(-1, quota.types.at(kSsd).capacity);
+    const auto reclaim = quota.ForReclaim();
+    ASSERT_EQ(1u, reclaim.quota_config().size());
+    EXPECT_EQ(kDram, reclaim.quota_config().front().storage_spec());
+}
+
 TEST_F(EffectiveQuotaTest, PartialRefreshKeepsEachBackendsLastCapacity) {
     auto group = Group({Auto(kDram, 0.5), Auto(kSsd)});
     group.set_storage_candidates({"a", "b", "ssd"});

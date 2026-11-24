@@ -495,7 +495,8 @@ Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
 总量的较大值，显式分层分别计算 DRAM 和 SSD。Group 总额度 `quota.capacity=-1`
 关闭总字节限制，各类型额度仍生效。
 
-任一关联后端尚未取得容量时，该类型暂停新分配，并跳过按该类型额度触发的回收。
+计算时只计入已注册的关联存储。某个类型没有已注册的关联后端，或其中任一后端尚未取得容量时，
+该类型暂停新分配，并跳过按该类型额度触发的回收。
 取得容量后，刷新失败的后端保留最近的有效值。Admin Get/List 的 `runtime_quota`
 可查看当前有效额度，整对象回写时按 `quota` 更新配置。
 

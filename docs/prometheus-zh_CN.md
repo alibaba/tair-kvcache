@@ -5,6 +5,8 @@ KVCacheManager 在 Admin HTTP 服务端口（默认 6492）上提供了兼容 Pr
 
 每个存储后端通过 `data_storage.total_capacity_bytes` 上报总字节数，首次取得有效容量前为 -1。按 Group 和存储类型查看 `cache_manager_group_storage.usage_bytes`、`effective_quota` 和 `usage_ratio`，分别为用量、当前有效额度和两者之比。自动额度还提供 `refresh_success` 和 `last_success_time_s`。Group 总额度不限时，总水位用各类型有效额度之和作分母。
 
+分类型水位，以及 Group 总额度不限时的总水位，分母未知时上报 `NaN`。分母为零时，已有用量上报 `+Inf`，用量也为零时上报 `0`。
+
 ## 快速开始
 
 默认配置下该端点自动启用。将 Prometheus 实例指向 Admin HTTP 端口即可：
@@ -200,7 +202,7 @@ Prometheus 指标名将点替换为下划线，并添加配置的前缀。
 | `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
-| `data_storage.storage_usage_ratio` | gauge | 存储使用率。follower 不输出该指标，降级后的下一次上报周期移除之前发布的序列。leader（或未配置角色信息的调用方）沿用后端返回值，包括默认值 0；若后端返回负值则跳过更新。健康状态及可写状态独立上报，连接异常仍可告警 |
+| `data_storage.storage_usage_ratio` | gauge | 存储使用率，1 表示已满。TairMempool 上报缓存的水位，首次采样前或样本无法计算水位时为 -1。Meta 请求失败时保留最近一次水位。未实现容量查询的后端返回负值时跳过更新。follower 在降级后的下一次上报周期移除该指标。健康状态及可写状态独立上报 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
