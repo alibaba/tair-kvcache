@@ -117,6 +117,17 @@ class FakeAdminClient:
 
 
 class EnvironmentParsingTest(unittest.TestCase):
+    def test_invalid_storage_quotas_are_rejected(self):
+        for entries in (None, {}, [1], [{"mode": "auto", "ratio": 0.5}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto"}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": True}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 1.1}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "ratio": 0.5}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "capacity": -1}],
+                        [{"storage_type": "ST_TAIRMEMPOOL", "mode": "typo", "capacity": 0}]):
+            with self.subTest(entries=entries), self.assertRaisesRegex(BootstrapError, "quota_config"):
+                parse_environment(dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(quota_config=entries)))
+
     def test_legacy_search_cache_fields_are_accepted_without_runtime_limits(self):
         environ = dict(BASE_ENV)
         environ["KVCM_INSTANCE_GROUP"] = group_env(search_cache_capacity=4096, search_cache_shard_bits=23)
@@ -205,7 +216,7 @@ class EnvironmentParsingTest(unittest.TestCase):
                 "unique_name": L1P5_NAME, "heartbeat_timeout_ms": True}),
               "KVCM_INSTANCE_GROUP": group_env()}, "must be an integer"),
             ({"KVCM_L1P5_STORAGE": storage_env(L1P5_NAME),
-              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=0)}, "must be positive"),
+              "KVCM_INSTANCE_GROUP": group_env(quota_capacity=-2)}, "must be non-negative"),
         )
         for environ, message in cases:
             with self.subTest(message=message):
@@ -474,6 +485,7 @@ class DesiredConfigurationTest(unittest.TestCase):
 
         self.assertEqual([PACE_NAME], group["storage_candidates"])
         self.assertEqual([L1P5_NAME, L2_NAME], group["event_report_storage_candidates"])
+        self.assertEqual(1000000000, group["quota"]["capacity"])
         self.assertEqual("ST_TAIRMEMPOOL", group["quota"]["quota_config"][0]["storage_type"])
         self.assertEqual(PACE_NAME, group["cache_config"]["reclaim_strategy"]["storage_unique_name"])
         self.assertEqual("CPS_PREFER_TAIR_MEMPOOL", group["cache_config"]["data_storage_strategy"])
@@ -525,6 +537,38 @@ class DesiredConfigurationTest(unittest.TestCase):
 
 
 class BootstrapReconciliationTest(unittest.TestCase):
+    def test_explicit_storage_quotas_on_create_and_reconcile(self):
+        client = FakeAdminClient()
+        auto = {"storage_type": "ST_TAIRMEMPOOL", "mode": "auto", "ratio": 0.5}
+        fixed = {"storage_type": "ST_NFS", "capacity": 0}
+        env = {"KVCM_PACE_STORAGE": json.dumps({
+            "unique_name": PACE_NAME, "domain": "http://pace.example", "timeout": 5})}
+
+        def run(reconcile=False, **fields):
+            config = parse_environment(dict(env, KVCM_INSTANCE_GROUP=group_env(**fields)))
+            self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=reconcile))
+
+        run(quota_capacity=1234, quota_config=[auto, fixed])
+        self.assertEqual({"capacity": 1234, "quota_config": [auto, fixed]}, client.groups[0]["quota"])
+        # Admin HTTP includes default protobuf fields and represents int64 as strings.
+        client.groups[0]["quota"]["quota_config"][1].update(capacity="0", mode="", ratio=0)
+        run(reconcile=True, quota_capacity=1234, quota_config=[auto, fixed])
+        self.assertEqual(0, client.update_group_calls)
+
+        changed = dict(auto, ratio=0.25)
+        run(quota_config=[changed])
+        self.assertEqual(0, client.update_group_calls)
+        run(reconcile=True, quota_config=[changed])
+        self.assertEqual({"capacity": 1234, "quota_config": [changed]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_capacity=-1)
+        self.assertEqual({"capacity": -1, "quota_config": [changed]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_capacity=-1, quota_config=[auto])
+        self.assertEqual({"capacity": -1, "quota_config": [auto]}, client.groups[0]["quota"])
+        run(reconcile=True, quota_config=[])
+        run(reconcile=True, quota_config=[])
+        self.assertEqual({"capacity": -1, "quota_config": []}, client.groups[0]["quota"])
+        self.assertEqual(4, client.update_group_calls)
+
     def test_legacy_search_cache_only_update_does_not_require_restart(self):
         client = FakeAdminClient()
         self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(parse_environment(dict(BASE_ENV)), client))
@@ -702,6 +746,20 @@ class BootstrapReconciliationTest(unittest.TestCase):
         self.assertEqual(1, client.update_group_calls)
         self.assertEqual(1, client.list_instance_calls)
 
+    def test_reconcile_preserves_unmanaged_quota_and_verifies_managed_fields(self):
+        client = FakeAdminClient()
+        legacy_env = dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(quota_capacity=1234))
+        bootstrap_once(parse_environment(legacy_env), client)
+        original_quota = copy.deepcopy(client.groups[0]["quota"])
+        environ = dict(BASE_ENV, KVCM_INSTANCE_GROUP=group_env(user_data="updated"))
+        config = parse_environment(environ)
+
+        self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=True))
+        self.assertEqual(original_quota, client.groups[0]["quota"])
+        self.assertEqual("updated", client.groups[0]["user_data"])
+        self.assertEqual(BootstrapOutcome.COMPLETE, bootstrap_once(config, client, reconcile=True))
+        self.assertEqual(1, client.update_group_calls)
+
     def test_reconcile_redis_to_local_updates_group_and_requires_restart(self):
         client = FakeAdminClient()
         bootstrap_once(parse_environment(dict(BASE_ENV)), client)
@@ -824,7 +882,9 @@ class BootstrapReconciliationTest(unittest.TestCase):
         client.groups[0]["max_instance_count"] = 1
         client.version_conflicts_remaining = 1
 
-        self.assertFalse(ensure_instance_group(client, config))
+        restart_required, desired_group = ensure_instance_group(client, config)
+        self.assertFalse(restart_required)
+        self.assertEqual(desired_group, client.groups[0])
         self.assertEqual(2, client.update_group_calls)
         self.assertEqual(512, client.groups[0]["max_instance_count"])
 

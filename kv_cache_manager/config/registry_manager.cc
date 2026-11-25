@@ -9,6 +9,7 @@
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/account.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -132,6 +133,28 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
 
 RegistryManager::~RegistryManager() { DoCleanup(); }
 
+bool RegistryManager::ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const {
+    const auto manager = data_storage_manager();
+    if (!manager) {
+        return true; // Missing backends remain unknown during recovery.
+    }
+    const auto associated = GetQuotaStorageNames(group);
+    for (const auto &quota : group.quota().quota_config()) {
+        if (!quota.automatic()) {
+            continue;
+        }
+        const auto type = ToBaseType(quota.storage_spec());
+        for (const auto &name : associated) {
+            const auto backend = manager->GetDataStorageBackend(name);
+            if (backend && ToBaseType(backend->GetType()) == type && !backend->SupportsStorageCapacity()) {
+                invalid_fields += "{quota: storage '" + name + "' does not support automatic capacity; use fixed quota}";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
     storage_ = RegistryStorageBackendFactory::CreateAndInitStorageBackend(registry_storage_uri_);
@@ -232,9 +255,19 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
     return {EC_OK, storages};
 }
 
-ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
+ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context,
+                                               const InstanceGroup &instance_group,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_EXIST, "create instance group failed: instance group already existed");
@@ -249,9 +282,18 @@ ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, 
 
 ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                const InstanceGroup &instance_group,
-                                               int64_t current_version) {
+                                               int64_t current_version,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {

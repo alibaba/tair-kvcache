@@ -512,7 +512,8 @@ Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
 - 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有
   `pace` Storage 原地更新为 `pace_ssd`。Storage 类型会写入 CacheLocation 和用量账本，
   服务端会拒绝同名 Storage 的类型变更。
-- Instance Group 的 `quota.quota_config` 必须同时为 `pace` 和 `pace_ssd` 配置正容量。
+- 显式分层时，`pace` 和 `pace_ssd` 可以分别设置分类型额度。
+
   类型水位只遍历这里显式出现的类型；缺少 `pace_ssd` 时不会形成 SSD 类型水位和容量上限，
   缺少迁移源 `pace` 时迁移规则不会触发。
 - SSD 仅作为迁移目标时，不要求放入 `storage_candidates`；迁移规则按
@@ -523,6 +524,20 @@ Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
   和选择，不能生成 `pace_ssd://` URI。
 
 详细升级顺序和回滚限制见 [Breaking Changes](BREAK_CHANGE.md#tairmempool-ssd-独立-storage-type)。
+
+### 按后端容量设置分类型额度
+
+每个存储类型默认按 `capacity`（字节）限额。开启自动额度时显式设置
+`mode: "auto"` 和 `ratio`（大于 0 且不超过 1），例如
+`{"storage_type": "pace_ssd", "mode": "auto", "ratio": 0.5}`。额度等于 Group
+关联的同类型后端总容量乘以该比例。后端需支持容量查询。透明分层取池内 DRAM 和 SSD
+总量的较大值，显式分层分别计算 DRAM 和 SSD。Group 总额度 `quota.capacity=-1`
+关闭总字节限制，各类型额度仍生效。
+
+计算时只计入已注册的关联存储。某个类型没有已注册的关联后端，或其中任一后端尚未取得容量时，
+该类型暂停新分配，并跳过按该类型额度触发的回收。
+取得容量后，刷新失败的后端保留最近的有效值。Admin Get/List 的 `runtime_quota`
+可查看当前有效额度，整对象回写时按 `quota` 更新配置。
 
 ## Logger Config
 

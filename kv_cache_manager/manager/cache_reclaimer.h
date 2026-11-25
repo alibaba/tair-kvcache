@@ -557,6 +557,8 @@ private:
 
     std::map<std::string, GroupLruRotationState> group_lru_rotation_by_group_;
 
+    InstanceGroupQuota GetReclaimQuota(const InstanceGroup &group) const;
+
     /**
      * @brief Calculate the group's WaterLevelExceed data
      *
@@ -666,13 +668,13 @@ private:
     ReclaimResult
     TryReclaimOnGroupLegacy(const std::shared_ptr<RequestContext> &request_context,
                             const std::shared_ptr<const InstanceGroup> &instance_group,
-                            const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                            const InstanceGroupQuota &quota,
                             const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
     ReclaimResult
     TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &request_context,
                           const std::shared_ptr<const InstanceGroup> &instance_group,
-                          const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                          const InstanceGroupQuota &quota,
                           const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
     [[nodiscard]] bool BuildFairReclaimPlan(const RequestContext *request_context,
@@ -696,7 +698,7 @@ private:
 
     ReclaimResult TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &request_context,
                                        const std::shared_ptr<const InstanceGroup> &instance_group,
-                                       const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                       const InstanceGroupQuota &quota,
                                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
     bool BuildGroupLruPlan(const RequestContext *request_context,
@@ -801,6 +803,7 @@ private:
      */
     void TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
                            const std::shared_ptr<const InstanceGroup> &instance_group,
+                           const InstanceGroupQuota &quota,
                            const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
     bool SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
