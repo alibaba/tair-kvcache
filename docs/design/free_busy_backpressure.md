@@ -41,7 +41,9 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 | 单批过大、条件身份非法、明确零下发的能力或路由错误 | 保留受影响的 Location，结束该批 |
 | 普通 429、RPC 结果未知、超时和普通失败 | 沿用已有错误和元数据收尾，不触发重发或降额 |
 
-条件 busy 还要求 `free_semantics=conditional`、`status=busy`、`scope=whole_request`。服务器可用 `retry_after_ms` 建议等待时长。已生成身份的记录须路由到支持条件 Free 的 Meta；旧 Meta 可能忽略身份参数。升级时先覆盖所有服务和转发路由，再启用会下发身份的新分配。KVCM 会停止处理缺少条件语义的旧式成功回包，保留关联元数据。该检查发生在下发后，不能替代路由端的升级顺序。
+条件 busy 还要求 `free_semantics=conditional`、`status=busy`、`scope=whole_request`。服务器可用 `retry_after_ms` 建议等待时长。条件请求收到旧式成功回包时，KVCM 保留关联的 Location 元数据。
+
+**部署假设。** 带分配身份的 Free 经支持条件 Free 的 Meta 处理或转发。混部或回滚期间，旧 Meta 可能忽略分配代次，只按 GA 删除。
 
 ## 4. 被拒的原批次如何重试
 
@@ -98,7 +100,7 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 
 ## 5. 验收
 
-协议默认开启。尚未发布过分配身份的集群继续走 v1。Meta 混部会破坏 v1 回包，或第 4 节的裸 GA 重发窗口尚未确认时，须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。启用前确认所有可能处理或转发 Free 的 Meta 均已升级，并沿实际路由核对 HTTP 状态和协议字段。
+协议默认开启。尚未发布过分配身份的集群继续走 v1。v1 灰度时沿实际路由核对 HTTP 状态和协议字段。若旧 Meta 转发时会改写 v1 回包，或第 4 节的裸 GA 重发窗口尚未确认，显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。
 
 | 场景 | 应看到的结果 |
 |---|---|
