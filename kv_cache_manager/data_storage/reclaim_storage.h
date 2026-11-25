@@ -21,7 +21,9 @@ struct ReclaimProviderCount {
     std::chrono::steady_clock::time_point observed_at{};
 };
 
-bool SupportsAdaptiveDelete(DataStorageType type);
+bool UsesReclaimClusterQuota(DataStorageType type);
+bool SupportsAdaptiveDelete(const DataStorageBackend &backend);
+bool RequiresReclaimProtocol(const std::string &uri);
 std::string GetReclaimClusterEndpoint(const StorageConfig &config);
 ReclaimProviderCount GetReclaimProviderCount(const std::weak_ptr<DataStorageBackend> &source);
 
@@ -64,7 +66,7 @@ public:
                                       const std::function<const char *()> &stop_reason) = 0;
 };
 
-// Unsupported storage types use the ordinary Delete path.
+// Create a protocol batch for a managed storage type after the caller has selected the protocol path.
 std::unique_ptr<ReclaimStorageBatch> CreateReclaimStorageBatch(DataStorageType type, const std::string &name);
 
 } // namespace kv_cache_manager

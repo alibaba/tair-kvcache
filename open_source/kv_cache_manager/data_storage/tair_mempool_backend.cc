@@ -12,7 +12,7 @@ namespace kv_cache_manager {
 TairMempoolDataStorageItem TairMempoolDataStorageItem::FromUri(const DataStorageUri &storage_uri) {
     TairMempoolDataStorageItem item;
     storage_uri.GetParamAs<uint16_t>("media_type", item.media_type);
-    storage_uri.GetParamAs<uint32_t>("node_id", item.node_id);
+    storage_uri.GetParamAs<uint16_t>("node_id", item.node_id);
     item.offset = ParsePaceGAPath(storage_uri.GetPath());
     storage_uri.GetParamAs<uint16_t>("range_id", item.range_id);
     storage_uri.GetParamAs<uint64_t>("size", item.size);
@@ -57,12 +57,6 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> TairMempoolBackend::Create(con
                                                                              std::function<void()> cb) {
     KVCM_LOG_ERROR("no implementation for TairMempoolBackend");
     return {};
-}
-
-PaceReclaimFreeResult TairMempoolBackend::DeleteForReclaim(const std::vector<PaceReclaimGA> &,
-                                                           const std::string &,
-                                                           const std::function<bool()> &) {
-    return {PaceReclaimFreeResult::kNotSent};
 }
 
 std::vector<ErrorCode> TairMempoolBackend::Delete(const std::vector<DataStorageUri> &storage_uris,

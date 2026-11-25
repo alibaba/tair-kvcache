@@ -13,7 +13,7 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 候选筛选读取 Executor 当前额度，提交时在同一把锁内复核并占用来源、集群和重试记录预算。每个已接纳的逻辑任务占一个来源请求名额，包括宽限等待、实际 Free 和元数据收尾。Tair Mempool 协议批按 storage 完成时归还对应的 Location 和字节，任务 Future 收尾时归还请求名额及剩余额度。一次 Free 可以包含多个 Location 和更多 GA，配置值计量的是在途工作量。[准入与归还](../../kv_cache_manager/manager/delete_admission.cc)
 
-**按健康 Provider 数起步。** 开启 Free Busy 协议时，PACE 后端复用约每 10 秒一次的健康检查，从同一份 `GET /v1/api/memnode` 回包按节点 ID 去重，只计健康且承担 Provider 角色的节点。共享一个接入地址的存储使用最近一份有效观测，DRAM 和 SSD 上报同一集群时只计一次。Executor 在下次准入时读取缓存，不额外请求 Meta。[PACE 存储适配](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
+**按健康 Provider 数起步。** 支持自适应 Free 的 PACE 后端在协议开启时复用约每 10 秒一次的健康检查，从同一份 `GET /v1/api/memnode` 回包按节点 ID 去重，只计健康且承担 Provider 角色的节点。共享一个接入地址的存储使用最近一份有效观测，DRAM 和 SSD 上报同一集群时只计一次。Executor 在下次准入时读取缓存。[PACE 存储适配](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
 
 每个健康 Provider 给集群提供 **384 个 Location、20 GiB** 的基准在途额度，两项分别以 `cluster_locations`、`cluster_bytes` 为硬上限。在默认配置下，4 个 Provider 从 1,536 个 Location、80 GiB 起步，40 个从 15,360 个、800 GiB 起步。健康 Provider 数达到 64 个时，Location 额度封顶于 24,576 个。达到 103 个时，字节额度封顶于 2 TiB。实际每秒完成量还取决于批大小、Executor 并发和后端耗时。
 
@@ -30,7 +30,9 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 ## 3. KVCM 如何处理 Tair Mempool Free 回包
 
-Executor 按存储能力选择删除路径。普通后端沿用 `Delete`。同一任务混用多种存储时，只有支持退避删除的 Location 交给对应的存储适配层。适配层校验 URI、按协议组批和解释回包，逐个 Location 返回完成、等待重试或保留元数据的结果，并上报 busy 次数、等待建议和恢复反馈。Executor 据此调额，负责延时投递、重读元数据和条件删除。一个 Location 跨两个协议子批时，适配层跟踪各子批的结果，重试只发送仍被拒的那部分。[存储批次接口](../../kv_cache_manager/data_storage/reclaim_storage.h) · [回收任务](../../kv_cache_manager/manager/reclaim_delete_task.cc)
+自适应 Free 是已注册后端的可选能力。公共代码可先合入。搭配旧 PACE 后端时，三路共用配置的静态集群额度，按来源封顶，无身份的 Location 走一次普通 `Delete`，无需预留重试内存。配套后端实现 `PaceReclaimBackend` 且协议开关开启后，该 storage 才按 Provider 数调速并处理 busy。同一任务中的各个 storage 分别选择路径。[能力接口](../../kv_cache_manager/data_storage/pace_reclaim_free.h) · [准入](../../kv_cache_manager/manager/delete_admission.cc)
+
+存储适配层校验 URI、组批和解析回包，逐个 Location 报告完成、需要重试或需要保留。Executor 负责调额、延时重试和元数据收尾。已进入协议路径的批次遇到后端注销或替换时停止重发。回滚到旧 PACE 后端时，如果一个 Location 的任一 URI 携带 `alloc_generation`，三路均保留整条 Location 并报告失败。同批其他 Location 继续处理。[存储批次接口](../../kv_cache_manager/data_storage/reclaim_storage.h) · [回收任务](../../kv_cache_manager/manager/reclaim_delete_task.cc)
 
 KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配没有这个字段，仍发送 v1 裸 GA 请求。带该字段的分配使用条件 Free，按相同顺序发送三列 `ga`、`node_ids`、`alloc_generations`。同一 storage 内按有无身份分开组批。同一 Location 的全部有效 spec 都收尾后才能清理其元数据。分配回包中的身份非法时拒绝登记。已存 URI 的身份非法时保留该 Location。
 
@@ -48,6 +50,8 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 条件 busy 还要求 `free_semantics=conditional`、`status=busy`、`scope=whole_request`。服务器可用 `retry_after_ms` 建议等待时长。条件请求收到旧式成功回包时，KVCM 保留关联的 Location 元数据。
 
 **部署假设。** 带分配身份的 Free 经支持条件 Free 的 Meta 处理或转发。混部或回滚期间，旧 Meta 可能忽略分配代次，只按 GA 删除。
+
+**数据面大节点号留待独立改造。** SDK 和普通存储读写沿用 16 位 `node_id`。条件 Free 使用独立的 32 位字段传回原分配身份，可处理已有 URI 中的完整节点号。新分配若返回超出 16 位的节点号，PACE 后端按已有流程回滚该分配。后续先将 SDK 和普通存储中两处 `GetParamAs<uint16_t>("node_id", ...)` 改为从目标字段推导类型，再扩宽读写和节点查找链路，并验证大节点号的分配、读写和回收。[SDK 地址结构](../../kv_cache_manager/client/src/internal/sdk/sdk_type.h) · [条件 Free 身份](../../kv_cache_manager/data_storage/pace_reclaim_free.h)
 
 ## 4. 被拒的原批次如何重试
 
@@ -105,11 +109,12 @@ Linux/libstdc++ 容器中的校准使用 8 字符 Location ID、30 字符实例�
 
 ## 5. 验收
 
-协议默认开启。尚未发布过分配身份的集群继续走 v1。v1 灰度时沿实际路由核对 HTTP 状态和协议字段。若旧 Meta 转发时会改写 v1 回包，或第 4 节的裸 GA 重发窗口尚未确认，显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。
+协议默认开启。接入自适应 Free 后，尚未发布过分配身份的集群使用 v1。v1 灰度时沿实际路由核对 HTTP 状态和协议字段。若旧 Meta 转发时会改写 v1 回包，或第 4 节的裸 GA 重发窗口尚未确认，显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。
 
 | 场景 | 应看到的结果 |
 |---|---|
-| 未配置协议开关，或显式设为 `false` | 默认三路 Tair Mempool 删除携带协议头并预留重试预算，按 Provider 基准额度起步。旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，并使用配置的静态准入上限 |
+| 新公共代码配旧内源后端 | 组合构建通过。无身份 Location 按静态额度普通删除一次，重试预留为零。回滚遗留的带身份 Location 保留，混合任务中的可独立目标照常收尾 |
+| 已接入新能力的后端，协议开关启用或显式关闭 | 默认三路按 Provider 基准额度起步，遇到明确 busy 时退避重试。显式关闭时沿用普通 Delete 和静态准入上限 |
 | 健康 Provider 从 4 个增至 40 个再缩容，同一接入地址有两个 storage | 正常集群随最新观测扩缩窗口。缩容后占用超额时等待已有任务收尾。两个 storage 共用最新观测，较旧回包不能扩大或缩小窗口 |
 | 退避期间扩容，或健康节点数暂时未知 | 扩容保留当前冷却和已经收紧的额度，只有新轮次的成功反馈才能逐步放宽。超期观测退回单 Provider 基准，明确的空集群只允许一个 Location 探测 |
 | 调整起始退避和单次上限，连续返回 busy | 本地等待从起始值加抖动，增长到配置上限后仍可继续重试。Meta 建议更长等待时取建议值，若下一次重试无法在 30 秒总时限内启动，则停止该批重试 |

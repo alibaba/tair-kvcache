@@ -332,9 +332,30 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (adaptive_locations && !task.metadata_only && SupportsAdaptiveDelete(iter->second->type())) {
-                adaptive_locations->emplace_back(block_key, iter->second);
-                continue; // This storage batch owns its physical Free and CAD.
+            if (!task.metadata_only && (task.reservation || adaptive_locations) &&
+                UsesReclaimClusterQuota(iter->second->type())) {
+                const bool legacy = task.reservation && task.reservation->UsesLegacyBackend(*iter->second);
+                if (adaptive_locations && !legacy) {
+                    adaptive_locations->emplace_back(block_key, iter->second);
+                    continue; // This storage batch owns its physical Free and CAD.
+                }
+                const auto &specs = iter->second->location_specs();
+                // If the name changed after admission, a protocol-enabled task still cannot
+                // send an identified Location down an unreserved ordinary path.
+                if ((legacy || (task.reservation && Deletes().limits.protocol)) &&
+                    std::any_of(specs.begin(), specs.end(), [](const auto &spec) {
+                        return RequiresReclaimProtocol(spec.uri());
+                    })) {
+                    // Ordinary Delete sends only the address. Keep the whole Location, including bare siblings.
+                    result.status = EC_PARTIAL_OK;
+                    result.error_message = "Reclaim delete requires allocation identity support";
+                    KVCM_LOG_WARN("%s, instance[%s] key[%ld] location[%s]",
+                                  result.error_message.c_str(),
+                                  task.instance_id.c_str(),
+                                  block_key,
+                                  location_id.c_str());
+                    continue;
+                }
             }
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {

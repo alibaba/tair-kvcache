@@ -21,6 +21,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/pace_reclaim_free.h"
 #include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -31,7 +32,6 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
-#include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
 using namespace kv_cache_manager;
 namespace {
 class SyncResultBackend : public MetaLocalBackend {
@@ -438,8 +438,9 @@ public:
             .Get();
     }
 
-    struct FakePaceBackend : TairMempoolBackend {
-        using TairMempoolBackend::TairMempoolBackend;
+    struct FakePaceBackend : RecordingDeleteBackend, PaceReclaimBackend {
+        explicit FakePaceBackend(const std::string &name)
+            : RecordingDeleteBackend(name, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {}
         std::vector<PaceReclaimFreeResult> replies;
         std::vector<std::vector<uint64_t>> calls;
         size_t ordinary_calls = 0;
@@ -481,7 +482,7 @@ public:
         }
     };
     std::shared_ptr<FakePaceBackend> Backend(std::string name, std::vector<PaceReclaimFreeResult> replies) {
-        auto backend = std::make_shared<FakePaceBackend>(metrics_registry_);
+        auto backend = std::make_shared<FakePaceBackend>(name);
         backend->replies = std::move(replies);
         data_storage_manager_->storage_map_[name] = backend;
         return backend;
@@ -595,6 +596,82 @@ TEST_F(FreeBusyDeleteTest, OrdinaryLocationsUseDeleteEvenWhenTheSameTaskRetriesA
     EXPECT_EQ((std::vector<std::string>{"nfs://files/1", "nfs://files/2"}), DeletedUris(*nfs));
     EXPECT_EQ((std::vector<std::vector<uint64_t>>{{17}, {17}}), pool->calls);
     EXPECT_EQ(0u, pool->ordinary_calls);
+}
+
+TEST_F(FreeBusyDeleteTest, LegacyPaceUsesTheStaticClusterLimitWithoutReservingRetryMemory) {
+    AddBackend("old", type);
+    SetLocation(1, "loc", type, {"pace://old/1?size=10"});
+    auto &admission = executor->Deletes();
+    auto cost = admission.Describe(*Locations(1).at("loc"), 1, DeleteSource::GC, {}, {});
+    EXPECT_EQ(0u, cost.retry_bytes);
+    cost.size = admission.limits.cluster;
+    DeleteDemand full;
+    full.Add(cost);
+    auto lease = admission.TryReserve(DeleteSource::GC, full);
+    ASSERT_TRUE(lease);
+    EXPECT_FALSE(lease->protocol);
+    EXPECT_EQ(0u, admission.resources->reserved.load());
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, full));
+}
+
+TEST_F(FreeBusyDeleteTest, LegacyPaceDeletesBareLocationsAndRetainsIdentityDuringRollback) {
+    auto old = AddBackend("old", type);
+    auto current = Backend("current", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    auto &admission = executor->Deletes();
+    for (const bool mixed : {false, true}) {
+        const int64_t key = mixed ? 2 : 1;
+        SetLocation(key, "bare", type, {"pace://old/" + std::to_string(key)});
+        SetLocation(key, "identified", type, {"pace://old/10", "pace://old/11?node_id=7&alloc_generation=5"});
+        SetLocation(key, "malformed", type, {"pace://old/12?alloc_generation="});
+        std::vector<std::string> ids{"bare", "identified", "malformed"};
+        if (mixed) {
+            SetLocation(key, "retry", type, {"pace://current/20"});
+            ids.push_back("retry");
+        }
+        auto req = Request(key, ids, {});
+        const auto locations = Locations(key);
+        for (const auto &id : ids) {
+            req.demand.Add(
+                admission.Describe(*locations.at(id), kTestInstanceName.size(), DeleteSource::GC, {}, req.demand));
+        }
+        req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+        ASSERT_TRUE(req.reservation);
+        req.free_busy = req.reservation->protocol;
+        EXPECT_EQ(mixed, req.free_busy != nullptr);
+        EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
+        const auto remaining = Locations(key);
+        ASSERT_EQ(2u, remaining.size());
+        EXPECT_EQ(CLS_DELETING, remaining.at("identified")->status());
+        EXPECT_EQ(CLS_DELETING, remaining.at("malformed")->status());
+        EXPECT_EQ(0u, admission.resources->reserved.load());
+    }
+    EXPECT_EQ((std::vector<std::string>{"pace://old/1", "pace://old/2"}), DeletedUris(*old));
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{20}, {20}}), current->calls);
+}
+
+TEST_F(FreeBusyDeleteTest, DisablingTheProtocolKeepsOrdinaryDeleteOnTheCapableBackend) {
+    DeleteLimits limits;
+    limits.protocol = false;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto current = Backend("current", {});
+    auto old = AddBackend("old", type);
+    SetLocation(1, "current", type, {"pace://current/1?node_id=7&alloc_generation=5"});
+    SetLocation(1, "old", type, {"pace://old/2?node_id=8&alloc_generation=6"});
+    auto req = Request(1, {"current", "old"}, {});
+    auto &admission = executor->Deletes();
+    for (const auto &[id, loc] : Locations(1)) {
+        req.demand.Add(admission.Describe(*loc, 1, DeleteSource::GC, {}, req.demand));
+    }
+    req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+    ASSERT_TRUE(req.reservation);
+    EXPECT_FALSE(req.reservation->protocol);
+    EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
+    EXPECT_EQ(1u, current->ordinary_calls);
+    EXPECT_TRUE(current->calls.empty());
+    EXPECT_TRUE(old->delete_batches.empty());
+    EXPECT_EQ(0u, Locations(1).count("current"));
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("old")->status());
 }
 
 TEST_F(FreeBusyDeleteTest, InvalidLocationRollsBackOnlyItsOwnStagedSpecs) {
@@ -1205,7 +1282,7 @@ TEST_F(FreeBusyDeleteTest, ChangedTargetReturnsItsBudgetWhileSiblingStillRetries
 
 TEST_F(FreeBusyDeleteTest, WaitsForLocalRetrySlotAndRechecksBackendIncarnation) {
     auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 2}});
-    auto replacement = std::make_shared<FakePaceBackend>(metrics_registry_);
+    auto replacement = std::make_shared<RecordingDeleteBackend>("t", type);
     SetLocation(1, "target", type, {"pace://t/1"});
     ASSERT_TRUE(resources->TryStartRetry(executor->GetWorkerCount()));
     // The only worker must run this queued callback while the batch waits for a slot.
@@ -1223,7 +1300,7 @@ TEST_F(FreeBusyDeleteTest, WaitsForLocalRetrySlotAndRechecksBackendIncarnation) 
     auto req = Evict(1, {"target"});
     EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
     EXPECT_EQ(1, backend->calls.size());
-    EXPECT_TRUE(replacement->calls.empty());
+    EXPECT_TRUE(replacement->delete_batches.empty());
     EXPECT_EQ(CLS_DELETING, Locations(1).at("target")->status());
     EXPECT_EQ(1, resources->busy_replies);
     EXPECT_EQ(0, resources->reserved);

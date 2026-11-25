@@ -72,6 +72,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/manager:schedule_plan_executor",
         "@cpp_stub",
     ],

@@ -2,6 +2,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -37,6 +40,16 @@ struct PaceReclaimFreeResult {
     uint64_t retry_after_ms{0};
     uint64_t max_gas{0};
     bool recovery_confirmed{false};
+};
+
+// Implemented by PACE backends that can send and interpret the reclaim Free protocol.
+class PaceReclaimBackend {
+public:
+    virtual ~PaceReclaimBackend() = default;
+    virtual PaceProviderCount GetReclaimProviderCount() const = 0;
+    virtual PaceReclaimFreeResult DeleteForReclaim(const std::vector<PaceReclaimGA> &gas,
+                                                   const std::string &trace_id,
+                                                   const std::function<bool()> &can_send) = 0;
 };
 
 } // namespace kv_cache_manager

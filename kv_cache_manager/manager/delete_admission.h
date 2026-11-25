@@ -26,6 +26,7 @@ struct DeleteTargetCost {
     DeleteSize size;
     uint64_t retry_bytes{0};
     std::weak_ptr<DataStorageBackend> provider_source{};
+    bool legacy_backend{false};
 };
 
 enum class DeleteBlockReason {
@@ -49,6 +50,7 @@ public:
     void ReleaseStorage(const std::string &name);
     void Finish();
     void Feedback(const std::string &storage, uint64_t busy_ms);
+    bool UsesLegacyBackend(const CacheLocation &location) const;
     bool Active() const;
     const DeleteSource source;
     const uint64_t generation;
@@ -62,6 +64,7 @@ private:
                       std::shared_ptr<FreeBusyTask> protocol);
     const std::shared_ptr<DeleteAdmission> owner_;
     DeleteDemand demand_;
+    std::set<std::string> legacy_storages_; // Fixed at admission, also when the protocol switch is off.
     std::chrono::steady_clock::time_point submitted_at_;
     bool charged_{false};
 };
@@ -118,6 +121,7 @@ private:
     struct Bucket {
         DeleteSize used;
         ReclaimProviderCount providers;
+        bool adaptive{false};
         DeleteSize baseline;
         DeleteSize effective;
         Clock::time_point changed{}, cooldown{}, observe{};

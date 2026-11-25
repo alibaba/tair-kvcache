@@ -1,7 +1,6 @@
 #pragma once
 
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
-#include "kv_cache_manager/data_storage/pace_reclaim_free.h"
 
 namespace kv_cache_manager {
 
@@ -16,7 +15,6 @@ public:
     bool ShouldSkipConfirmedMissingBackendDelete() const override;
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
-    virtual PaceProviderCount GetReclaimProviderCount() const { return {}; }
 
 public:
     ErrorCode DoOpen(const StorageConfig &storage_config, const std::string &trace_id) override;
@@ -27,9 +25,6 @@ public:
                                                              size_t size_per_key,
                                                              const std::string &trace_id,
                                                              std::function<void()> cb) override;
-    virtual PaceReclaimFreeResult DeleteForReclaim(const std::vector<PaceReclaimGA> &gas,
-                                                   const std::string &trace_id,
-                                                   const std::function<bool()> &can_send);
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;

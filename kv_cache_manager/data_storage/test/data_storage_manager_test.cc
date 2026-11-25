@@ -9,6 +9,7 @@
 #include "kv_cache_manager/data_storage/common_define.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/dummy_backend.h"
+#include "kv_cache_manager/data_storage/pace_uri.h"
 #include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -321,12 +322,12 @@ TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, pace_ssd_backend->GetType());
 }
 
-TEST_F(DataStorageManagerTest, TestPaceStorageAndReclaimRejectMalformedGAPaths) {
+TEST_F(DataStorageManagerTest, TestPaceReclaimRejectsMalformedGAPaths) {
     auto batch = CreateReclaimStorageBatch(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pool");
     ASSERT_TRUE(batch);
     for (const std::string text : {"pace://pool/123abc", "pace://pool/18446744073709551616"}) {
         const DataStorageUri uri(text);
-        EXPECT_EQ(0u, TairMempoolDataStorageItem::FromUri(uri).offset) << text;
+        EXPECT_EQ(0u, ParsePaceGAPath(uri.GetPath())) << text;
         EXPECT_FALSE(batch->AddLocation({{text, false}})) << text;
     }
     EXPECT_FALSE(batch->HasRequests());

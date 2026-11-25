@@ -41,6 +41,7 @@ void DeleteDemand::Add(const DeleteTargetCost &target) {
         auto &part = storages[target.storage];
         part.bucket = target.bucket;
         part.provider_source = target.provider_source;
+        part.legacy_backend = target.legacy_backend;
         AddSize(part.size, target.size);
     }
 }
@@ -65,40 +66,45 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
     DeleteTargetCost cost;
     cost.size.locations = 1;
     const auto type = ToBaseType(loc.type());
-    const bool adaptive = SupportsAdaptiveDelete(type);
+    const bool uses_cluster_quota = UsesReclaimClusterQuota(type);
     for (const auto &spec : loc.location_specs()) {
         DataStorageUri uri(spec.uri());
         uint64_t bytes = 0;
         if (uri.Valid()) {
             uri.GetParamAs<uint64_t>("size", bytes);
             cost.size.bytes = Sum(cost.size.bytes, bytes);
-            if (adaptive && cost.storage.empty()) {
+            if (uses_cluster_quota && cost.storage.empty()) {
                 cost.storage = uri.GetHostName();
             }
         }
     }
-    if (!adaptive) {
+    if (!uses_cluster_quota) {
         if (source == DeleteSource::Reclaimer) {
             cost.bucket = "group/" + std::to_string(static_cast<int>(type)) + "/" + group;
         }
         return cost;
     }
-    cost.retry_bytes = limits.protocol ? FreeBusyTask::RecordBytes(loc, instance_length) : 0;
     auto known = selected.storages.find(cost.storage);
     if (known != selected.storages.end()) {
         cost.bucket = known->second.bucket;
         cost.provider_source = known->second.provider_source;
-        return cost;
+        cost.legacy_backend = known->second.legacy_backend;
+    } else {
+        cost.bucket = "storage/" + cost.storage;
+        if (const auto backend = storage_ ? storage_->GetDataStorageBackend(cost.storage) : nullptr) {
+            // Missing or mismatched registrations still fail as unsent on the protocol path.
+            cost.legacy_backend = UsesReclaimClusterQuota(backend->GetType()) && !SupportsAdaptiveDelete(*backend);
+            if (limits.protocol && !cost.legacy_backend) {
+                cost.provider_source = backend;
+            }
+            const auto endpoint = GetReclaimClusterEndpoint(backend->GetStorageConfig());
+            if (!endpoint.empty()) {
+                cost.bucket = "endpoint/" + endpoint;
+            }
+        }
     }
-    cost.bucket = "storage/" + cost.storage;
-    if (const auto backend = storage_ ? storage_->GetDataStorageBackend(cost.storage) : nullptr) {
-        if (limits.protocol) {
-            cost.provider_source = backend;
-        }
-        const auto endpoint = GetReclaimClusterEndpoint(backend->GetStorageConfig());
-        if (!endpoint.empty()) {
-            cost.bucket = "endpoint/" + endpoint;
-        }
+    if (limits.protocol && !cost.legacy_backend) {
+        cost.retry_bytes = FreeBusyTask::RecordBytes(loc, instance_length);
     }
     return cost;
 }
@@ -172,7 +178,7 @@ DeleteAdmission::Bucket &DeleteAdmission::GetBucketLocked(const std::string &key
         next_idle_prune_ = now + kTopologyMaxAge;
     }
     auto &bucket = buckets_[key];
-    bucket.baseline = Baseline(key, {}, now);
+    bucket.baseline = Hard(key);
     bucket.effective = bucket.baseline;
     if (resources->metrics && key.compare(0, 6, "group/") != 0) {
         const auto gauges = [this](const MetricsTags &tags) {
@@ -187,21 +193,23 @@ DeleteAdmission::Bucket &DeleteAdmission::GetBucketLocked(const std::string &key
 }
 
 void DeleteAdmission::ObserveProvidersLocked(const DeleteTargetCost &target, Clock::time_point now) {
-    if (!limits.protocol) {
+    if (!limits.protocol || target.legacy_backend) {
         return;
     }
+    auto &bucket = GetBucketLocked(target.bucket, now);
+    bucket.adaptive = true;
     const auto sample = GetReclaimProviderCount(target.provider_source);
     if (sample.observed_at == Clock::time_point{} || now - sample.observed_at > kTopologyMaxAge) {
         return;
     }
-    auto &latest = GetBucketLocked(target.bucket, now).providers;
+    auto &latest = bucket.providers;
     if (sample.observed_at > latest.observed_at) {
         latest = sample;
     }
 }
 
 void DeleteAdmission::RefreshWindow(const std::string &key, Bucket &b, Clock::time_point now) {
-    const auto base = Baseline(key, b.providers, now);
+    const auto base = b.adaptive ? Baseline(key, b.providers, now) : Hard(key);
     if (base.locations != b.baseline.locations || base.bytes != b.baseline.bytes) {
         b.baseline = base;
         b.effective = b.interval.count() == 0 ? base
@@ -229,7 +237,7 @@ bool DeleteAdmission::FitsBucketLocked(
     DeleteSize used{}, effective;
     bool cooling = false;
     if (it == buckets_.end()) {
-        effective = Baseline(key, {}, now);
+        effective = Hard(key);
     } else {
         auto &b = it->second;
         RefreshWindow(key, b, now);
@@ -274,7 +282,7 @@ bool DeleteAdmission::FitsNextLocked(DeleteSource source,
     if (it != selected.buckets.end()) {
         AddSize(wanted, it->second);
     }
-    if (!selected.storages.count(next.storage)) {
+    if (!next.storage.empty() && !selected.storages.count(next.storage)) {
         ObserveProvidersLocked(next, now);
     }
     return FitsBucketLocked(next.bucket, wanted, empty, now, reason);
@@ -307,7 +315,19 @@ DeleteReservation::DeleteReservation(std::shared_ptr<DeleteAdmission> owner,
     , protocol(std::move(task))
     , owner_(std::move(owner))
     , demand_(std::move(demand))
-    , submitted_at_(Clock::now()) {}
+    , submitted_at_(Clock::now()) {
+    for (const auto &[name, part] : demand_.storages) {
+        if (part.legacy_backend) {
+            legacy_storages_.insert(name);
+        }
+    }
+}
+
+bool DeleteReservation::UsesLegacyBackend(const CacheLocation &location) const {
+    const auto &specs = location.location_specs();
+    return !legacy_storages_.empty() && !specs.empty() &&
+           legacy_storages_.count(DataStorageUri(specs.front().uri()).GetHostName()) != 0;
+}
 
 std::shared_ptr<DeleteReservation>
 DeleteAdmission::TryReserveLocked(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason) {

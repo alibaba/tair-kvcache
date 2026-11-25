@@ -10,7 +10,6 @@
 #include "kv_cache_manager/data_storage/pace_uri.h"
 #include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -108,7 +107,7 @@ PaceReclaimFreeResult PaceReclaimBatch::Free(const DataStorageManager &storage,
         if (!current || (check_original && backend_.lock() != current)) {
             return {check_original ? PaceReclaimFreeResult::kBackendChanged : PaceReclaimFreeResult::kNotSent};
         }
-        auto *backend = dynamic_cast<TairMempoolBackend *>(current.get());
+        auto *backend = dynamic_cast<PaceReclaimBackend *>(current.get());
         if (!backend || !can_send()) {
             return {PaceReclaimFreeResult::kNotSent};
         }
@@ -196,14 +195,26 @@ ReclaimStorageResult PaceReclaimBatch::Send(const DataStorageManager &storage,
 }
 } // namespace
 
-bool SupportsAdaptiveDelete(DataStorageType type) { return IsTairMempoolStorageType(type); }
+bool UsesReclaimClusterQuota(DataStorageType type) { return IsTairMempoolStorageType(type); }
+
+bool SupportsAdaptiveDelete(const DataStorageBackend &backend) {
+    return dynamic_cast<const PaceReclaimBackend *>(&backend) != nullptr;
+}
+
+bool RequiresReclaimProtocol(const std::string &uri) {
+    if (uri.find("alloc_generation") == std::string::npos) {
+        return false;
+    }
+    const DataStorageUri parsed(uri);
+    return !parsed.Valid() || parsed.HasParam("alloc_generation");
+}
 
 std::unique_ptr<ReclaimStorageBatch> CreateReclaimStorageBatch(DataStorageType type, const std::string &name) {
-    return SupportsAdaptiveDelete(type) ? std::make_unique<PaceReclaimBatch>(name) : nullptr;
+    return UsesReclaimClusterQuota(type) ? std::make_unique<PaceReclaimBatch>(name) : nullptr;
 }
 
 ReclaimProviderCount GetReclaimProviderCount(const std::weak_ptr<DataStorageBackend> &source) {
-    const auto backend = std::dynamic_pointer_cast<TairMempoolBackend>(source.lock());
+    const auto backend = std::dynamic_pointer_cast<PaceReclaimBackend>(source.lock());
     const auto sample = backend ? backend->GetReclaimProviderCount() : PaceProviderCount{};
     return {sample.count, sample.observed_at};
 }

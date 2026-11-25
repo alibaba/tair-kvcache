@@ -1776,9 +1776,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
                 DeleteBlockReason reason = DeleteBlockReason::Limit;
                 bool fits_alone = false;
-                const bool adaptive = SupportsAdaptiveDelete(base_type);
+                const bool uses_cluster_quota = UsesReclaimClusterQuota(base_type);
                 const bool check_empty_window =
-                    (maintenance_read || out_quota_deferred_keys) && !deferred_by_quota && adaptive;
+                    (maintenance_read || out_quota_deferred_keys) && !deferred_by_quota && uses_cluster_quota;
                 if (!admission.TryAppend(
                         DeleteSource::Reclaimer, selected, cost, &reason, check_empty_window ? &fits_alone : nullptr)) {
                     deferred_by_quota = deferred_by_quota || fits_alone;
@@ -1791,7 +1791,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 }
                 const auto location_bytes = cost.size.bytes;
                 if (output) {
-                    output->expected_location_values[block_idx].push_back(adaptive ? loc.ToJsonString() : "");
+                    output->expected_location_values[block_idx].push_back(uses_cluster_quota ? loc.ToJsonString() : "");
                 }
                 loc_id_vec.emplace_back(loc.id());
                 out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);

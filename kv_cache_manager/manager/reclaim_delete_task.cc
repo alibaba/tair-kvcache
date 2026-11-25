@@ -206,7 +206,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
                 const auto loc = found == maps[i].end() ? nullptr : found->second;
                 // The original URI list also pins the registered storage name.
                 if (read.error_codes[i] == EC_NOENT || !loc || loc->status() != CacheLocationStatus::CLS_DELETING ||
-                    !SupportsAdaptiveDelete(loc->type()) ||
+                    !UsesReclaimClusterQuota(loc->type()) ||
                     !std::equal(it->second.begin(),
                                 it->second.end(),
                                 loc->location_specs().begin(),
