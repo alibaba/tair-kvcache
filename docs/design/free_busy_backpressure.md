@@ -4,8 +4,8 @@
 
 KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理能力变化。使用同一套配置，小集群从较小的回收量起步，大集群有余量时可以更快释放空间。后端过载时要及时降速，压力解除后也要能自动提速，避免长期按低速回收。
 
-- **自适应调速决定接下来能接纳多少删除工作。** KVCM 按健康 Provider 数设置集群的基准在途额度，分别限制尚未完成的 Location 数和待删字节数。即使没有收到 busy，基准额度也会随扩缩容重新计算，最高取配置的硬上限，运维无需按机器数重新调参。Meta 因繁忙拒收时，KVCM 暂停新准入并收紧当前额度。冷却后，新接纳的任务获得 Provider 成功确认，额度才逐步恢复到当前集群规模对应的水平。[调速规则](#2-自适应调速如何决定在途额度)
-- **退避重试负责本次被拒的 Free。** 只有 Meta 以 `FREE_BUSY_NOT_ACCEPTED` 确认整批尚未向任何 Provider 下发时，KVCM 才延后重发该批。等待期间释放 worker，其他任务可以继续执行。[重试规则](#4-被拒的原批次如何重试)
+- **自适应调速决定接下来能接纳多少删除工作。** KVCM 按健康 Provider 数设置集群的基准在途额度，分别限制尚未完成的 Location 数和待删字节数。即使没有收到 busy，基准额度也会随扩缩容重新计算，最高取配置的硬上限，运维无需按机器数重新调参。Meta 因繁忙拒收时，KVCM 暂停新准入并收紧当前额度。冷却后，新接纳的任务获得第 3 节定义的成功反馈，额度才逐步恢复到当前集群规模对应的水平。[调速规则](#2-自适应调速如何决定在途额度)
+- **退避重试负责本次被拒的 Free。** Meta 明确报告容量繁忙时，KVCM 延后重发受影响的批次。带原分配身份的批次也能处理部分下发后的 Provider busy。等待期间释放 worker，其他任务可以继续执行。[重试规则](#4-被拒的原批次如何重试)
 
 每个 KVCM 进程在 `SchedulePlanExecutor` 中统一管理水位驱逐、主动 GC 和运维 `TrimCache`。三路共享目标集群的额度，每个来源可单独封顶，不同集群独立调速。外部 `RemoveCache`、注销实例时的清理和写入/迁移回滚沿用普通删除入口。[额度与来源配置](#6-三路删除统一流控)
 
@@ -24,26 +24,32 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 | 尚未收到 busy | 使用当前健康 Provider 数对应的基准额度，同时遵守来源上限及重试内存预算 |
 | 当前轮次的任务首次收到明确 busy | 两项有效额度分别取当前额度和实际占用的较小值，再减半，向下取整，最低为 1。暂停该集群的新准入一个实际退避间隔 |
 | 冷却到期 | 新任务能放进有效额度就接纳。此前已接纳的任务继续处理，被拒的批次沿用原额度重试 |
-| 新轮次的任务收到 Provider 确认成功 | 冷却后再观察一个等长间隔。期满有成功反馈，后续准入检查可将有效额度翻倍一次，最高回到最近健康 Provider 数对应的基准额度。期间收到本轮 busy 会清掉该成功反馈并再次收紧 |
+| 新轮次的任务收到成功反馈 | 冷却后再观察一个等长间隔。期满有成功反馈，后续准入检查可将有效额度翻倍一次，最高回到最近健康 Provider 数对应的基准额度。期间收到本轮 busy 会清掉该成功反馈并再次收紧 |
 
 例如集群实际在途 80 个 Location、4 GiB，首次 busy 可使额度降至 40 个、2 GiB。每次调额用单调时钟记录轮次边界。此前接纳的任务即使在宽限期后才发出 Free，它的回包也只决定本批重试和收尾。冷却结束且该集群已经排空时，允许一个超过临时字节额度的 Location 单独推进，前提是满足共享、来源和内存的硬上限。
 
 ## 3. KVCM 如何处理 Tair Mempool Free 回包
 
-开启协议时，KVCM 发送 `X-TairMempool-Free-Protocol: 1`。下表中的 429 和 400 都要求 HTTP 状态、v1 业务码和协议字段匹配，包括 `accepted=false` 和 `rejection_scope=whole_request`。
+KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配没有这个字段，仍发送 v1 裸 GA 请求。带该字段的分配使用条件 Free，按相同顺序发送三列 `ga`、`node_ids`、`alloc_generations`。同一 storage 内按有无身份分开组批。同一 Location 的全部有效 spec 都收尾后才能清理其元数据。分配回包中的身份非法时拒绝登记。已存 URI 的身份非法时保留该 Location。
 
-| Tair Mempool 回包 | 含义 | KVCM 行为 |
-|---|---|---|
-| HTTP 429 + `FREE_BUSY_NOT_ACCEPTED` | 暂时繁忙，整批尚未下发 | 向该集群反馈 busy，按退避规则重试原批。回包携带 `retry_after_ms` 时，等待时间取本地退避和该建议值的较大值 |
-| HTTP 400 + `FREE_BATCH_TOO_LARGE` | 单批 GA 数超过 `max_gas`，整批尚未下发 | 终止该批，保留对应的 `DELETING` 元数据，记录实际 GA 数和上限。不重试、不降额 |
-| HTTP 200 + `status=success` | 请求处理成功 | 按原规则清理元数据。仅当 `provider_free_acknowledged=true` 时计入额度恢复 |
-| 其他 HTTP 错误（含普通 429）或发送后超时 | 缺少整批未下发的保证 | 沿用原有错误和元数据收尾规则，停止自动重发 |
+| Tair Mempool 回包 | KVCM 行为 |
+|---|---|
+| v1 返回 429 `FREE_BUSY_NOT_ACCEPTED`，确认整批零下发 | 收紧集群额度，延后重试这一批裸 GA。沿用 v1 协议头、版本和整批拒收校验 |
+| 条件 Free 返回 429 `FREE_BUSY_NOT_ACCEPTED`，原因是 `meta_inflight` 或 `provider_busy` | 校验 `retryable=true`、`dispatch_state=none` 和 `accepted=false`，降额并用原身份重试整批 |
+| 条件 Free 返回 429 `FREE_BATCH_PENDING`，原因是 `provider_busy` | 校验 `retryable=true` 和 `dispatch_state=started`，降额并用原身份重试整个条件子批。此前已释放的分配由 Provider 幂等确认 |
+| 请求成功 | v1 按原规则清理元数据，仅 `provider_free_acknowledged=true` 提供恢复反馈。条件 Free 的 200 `status=success`、`free_semantics=conditional`、`completion_scope=logical_release` 同时确认逻辑释放并提供一次恢复反馈。第 2 节的冷却和观察期继续生效 |
+| 单批过大、条件身份非法、明确零下发的能力或路由错误 | 保留受影响的 Location，结束该批 |
+| 普通 429、RPC 结果未知、超时和普通失败 | 沿用已有错误和元数据收尾，不触发重发或降额 |
+
+条件 busy 还要求 `free_semantics=conditional`、`status=busy`、`scope=whole_request`。服务器可用 `retry_after_ms` 建议等待时长。已生成身份的记录须路由到支持条件 Free 的 Meta；旧 Meta 可能忽略身份参数。升级时先覆盖所有服务和转发路由，再启用会下发身份的新分配。KVCM 会停止处理缺少条件语义的旧式成功回包，保留关联元数据。该检查发生在下发后，不能替代路由端的升级顺序。
 
 ## 4. 被拒的原批次如何重试
 
-**重试的安全假设。** Meta 返回 `FREE_BUSY_NOT_ACCEPTED` 时，整批尚未向任何 Provider 下发。KVCM 的重试假定 GA 仍对应原分配。若 Trim 读页时目标已经是 `DELETING`，或 `RemoveCache` 正好处理该目标，主动删除和原任务仍可能对同一 GA 发 Free。并发删除、Provider 重启或地址复用时的重试安全性，以及允许重发的时长，由双方另行确认。
+**裸 GA 的安全假设。** v1 的 Meta 返回 `FREE_BUSY_NOT_ACCEPTED` 时，整批尚未向任何 Provider 下发。KVCM 的重试假定 GA 仍对应原分配。若 Trim 读页时目标已经是 `DELETING`，或 `RemoveCache` 正好处理该目标，主动删除和原任务仍可能对同一 GA 发 Free。并发删除、Provider 重启或地址复用时的重试安全性，以及允许重发的时长，由双方另行确认。
 
-**保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查任务的准入代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个 storage 整批被拒时，保存该批原始 URI 文本和对应的 `(block_key, location_id)`。GC 同时保留各 spec 是否按后端策略跳过删除的标记，重试继续跳过已确认缺失的对象。其他 storage 继续执行，已完成的 Location 及时 CAD（按条件删除元数据）。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。每个 storage 批次独立收尾，原任务在最后一个批次结束时释放来源请求名额。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
+**条件 Free 适配的已知边界。** Meta 重建编号分配器后，若新节点复用了旧 `node_id`，且 GA 和 `alloc_generation` 也与原分配相同，迟到的条件 Free 可能命中新分配。影响范围包括 30 秒重发期和截止前已发出、仍在途的 Free。本轮将其作为低频恢复风险记录，专项处理留待后续。
+
+**保存和投递。** 首次删除在把 Location 标记为 `DELETING` 前检查任务的准入代次，已撤销的排队任务直接结束。CAS 成功后沿用原有 Sync 和读者宽限期。某个协议子批收到明确 busy 时，只保存尚待重试的 Location 的完整原始 URI 和对应的 `(block_key, location_id)`。GC 同时保留各 spec 是否按后端策略跳过删除的标记，重试继续跳过已确认缺失的对象。其他 storage 继续执行。重试使用已有的 `SubmitRaw(delay)` 让出 worker，每批最多挂一次，连续 busy 复用同一份记录。两种协议共用该 storage 的重试定时任务。已完成的子批不再下发，已完成的独立 Location 可先 CAD（按条件删除元数据）。每个 storage 批次独立收尾，原任务在最后一个批次结束时释放来源请求名额。[现有延迟执行与删除收尾](../../kv_cache_manager/manager/schedule_plan_executor.cc)
 
 **何时重发。** `kvcm.cache_reclaimer.free_busy_initial_backoff_ms` 设置首次本地退避时间，默认 50 ms。`kvcm.cache_reclaimer.free_busy_max_backoff_ms` 设置单次本地退避上限，默认 5000 ms。两个值都是正整数毫秒，起始值须小于或等于上限。同一批连续收到 busy 时，退避基数逐次翻倍。达到上限后仍可继续重试，每次本地等待加上抖动也不超过该上限。Meta 提供 `retry_after_ms` 时，实际等待取它与本地等待的较大值。触发调额的这次实际等待，同时决定第 2 节的冷却期和随后等长的观察期。
 
@@ -59,11 +65,11 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 | 该批最后得到的结果 | KVCM 如何收尾 |
 |---|---|
-| 收到匹配的 400 和 `FREE_BATCH_TOO_LARGE` | 终止原批次的自动重发及降速反馈，保留未释放目标供调整组批或配置 |
+| 收到匹配的 400 和 `FREE_BATCH_TOO_LARGE` / `FREE_INVALID_IDENTITY` | 终止原批次的自动重发及降速反馈，保留未释放目标供调整组批或配置 |
 | Free 已发出并成功 | 按条件删除对应的 Location 元数据 |
 | Free 已发出，但超时、返回无协议的 429/5xx 或部分失败 | 首发和重发都沿用已有错误及 CAD 规则。停止自动重发，记录可能未释放的 GA |
-| 等待重试名额或持续拒收直到截止，或因预算不足、后端只读、缺少客户端、主存储读取最终失败、投递失败、实例或后端失效而停止 | 按未发出收尾。对仍存在的原目标保留 `DELETING`，记录实例、key、Location、storage 和原因，供与 mempool 核对。GC V1 会跳过这类残留 |
-| 关闭协议、降主或停机时仍在等待重发 | 使原任务的重试上下文失效，等待中的批次按取消收尾，沿用未发出目标的记录方式 |
+| 等待重试名额或持续拒收直到截止，或因预算不足、后端只读、缺少客户端、主存储读取最终失败、投递失败、实例或后端失效而停止 | 停止发送并保留仍存在的原目标，状态为 `DELETING`，记录实例、key、Location、storage 和原因，供与 mempool 核对。GC V1 会跳过这类残留 |
+| 关闭协议、降主或停机时仍在等待重发 | 使原任务的重试上下文失效，等待中的批次按取消收尾，记录尚待确认的目标 |
 
 截止时间只限制新的发送。截止前已发出的 Free 仍按回包结果收尾。[现有 CAD 处理](../../kv_cache_manager/manager/schedule_plan_executor.cc) · [GC 扫描范围](cache_garbage_collector.md)
 
@@ -74,7 +80,7 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 退避期间保存**完整 URI 文本和受影响的 Location 关联**，重发时再解析当批 URI。预算覆盖这些文本、关联、容器容量和每批的固定开销。
 
 - **准入时预留。** 开关启用时，在把目标标记为 `DELETING` 前按整批都可能被拒的情况原子预留额度。Reclaimer 和 GC 跳过本轮放不下的候选，后续扫描可再选。Trim 在调用线程等待可用预算，整页超过预算时按 Location 拆批。单个 Location 放不进总预算时，Trim 返回失败。
-- **发送和重试。** 首次 Free 使用执行时核实的完整 URI。如果实际批次变大，先补足额度再发。补额失败时，该 storage 批次立即按未发出收尾，归还预留并保留元数据。只有 Meta 明确拒收后才保存该批 URI，供每次重发时核对。重试剔除已变更的 Location 后立即归还其预算，剩余目标继续退避。
+- **发送和重试。** 首次 Free 使用执行时核实的完整 URI。如果实际批次变大，先补足额度再发。补额失败时，该 storage 批次立即按未发出收尾，归还预留并保留元数据。只有 Meta 明确报告 busy 后才保存待重试 Location 的 URI，供每次重发时核对。重试剔除已变更的 Location 后立即归还其预算，剩余目标继续退避。
 - **收尾时归还。** 跳过的目标及时退还对应预留。每批结束时，释放这批的重试记录并归还剩余额度一次。原任务的 pending 在 Future 完成时统一释放。
 
 在本机 arm64 macOS / libc++ 上，用项目的 URI 类型测了 10 万条合成记录的堆占用。每批 100 条，每条 URI 长 89 或 108 字节，含 `size`、`node_id`、`media_type`、`range_id`。每个 GA 配一个 64 位 block key 和一个 36 字符的 Location ID。范围覆盖两种 URI 长度以及容器预留、自然扩容两种方式。[URI 对象定义](../../kv_cache_manager/common/standard_uri.h)
@@ -92,25 +98,27 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 ## 5. 验收
 
-协议默认开启。Meta 混部或第 4 节的 GA 身份和重发窗口尚未确认时，须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。启用前确认所有可能处理或转发 Free 的 Meta 均已升级，并沿实际路由核对 HTTP 状态和协议字段。
+协议默认开启。尚未发布过分配身份的集群继续走 v1。Meta 混部会破坏 v1 回包，或第 4 节的裸 GA 重发窗口尚未确认时，须显式设置 `kvcm.cache_reclaimer.free_busy_enabled=false`。启用前确认所有可能处理或转发 Free 的 Meta 均已升级，并沿实际路由核对 HTTP 状态和协议字段。
 
 | 场景 | 应看到的结果 |
 |---|---|
 | 未配置协议开关，或显式设为 `false` | 默认三路 Tair Mempool 删除携带协议头并预留重试预算，按 Provider 基准额度起步。旧 Meta 的普通回包沿用原成功、错误及 CAD 规则。显式关闭时走普通 Delete，并使用配置的静态准入上限 |
 | 健康 Provider 从 4 个增至 40 个再缩容，同一接入地址有两个 storage | 正常集群随最新观测扩缩窗口。缩容后占用超额时等待已有任务收尾。两个 storage 共用最新观测，较旧回包不能扩大或缩小窗口 |
-| 退避期间扩容，或健康节点数暂时未知 | 扩容保留当前冷却和已经收紧的额度，只有新轮次的 Provider 确认成功才能逐步放宽。超期观测退回单 Provider 基准，明确的空集群只允许一个 Location 探测 |
+| 退避期间扩容，或健康节点数暂时未知 | 扩容保留当前冷却和已经收紧的额度，只有新轮次的成功反馈才能逐步放宽。超期观测退回单 Provider 基准，明确的空集群只允许一个 Location 探测 |
 | 调整起始退避和单次上限，连续返回 busy | 本地等待从起始值加抖动，增长到配置上限后仍可继续重试。Meta 建议更长等待时取建议值，若下一次重试无法在 30 秒总时限内启动，则停止该批重试 |
-| 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
+| 带协议头的列表为空、含非法 GA、超限，或 Provider 已经开始执行但超时 | 空或非法列表无副作用。v1 的明确 busy 对应零次 Provider 下发。普通显式 Free 计入负载但仍可执行。已下发的超时与普通 429/5xx 均不会触发重试。用真实 spec 数确认空载时正常大小的批次可被接纳 |
 | 空载超大批次，或 URI 中含零、溢出、非法路径 | 超大批次获 400 和专属码，零下发、无原样重试、受影响的 Location 保留；非法 spec 可定位，空批零 HTTP，其他独立 Location 正常完成 |
 | 同一集群多个任务跨越一次调额，读者宽限期大于冷却期 | 首个本轮 busy 只收紧一次。此前准入的任务稍后返回 busy 或成功，都不能再次减半或提前放宽。压力解除后由新准入任务的实际成功逐轮恢复，受软字节额度阻挡的大 Location 可以单独推进 |
 | 同一任务的 Location A、B 分属两个 storage，A 成功，B 明确 busy | A 及时 CAD。只重发 B 的原批次，原 pending 最后释放一次。若重发返回普通错误，按既有规则收尾并记录可能未释放的对象 |
-| 首发或重发收到 200 success | 照常 CAD。只有 `provider_free_acknowledged=true` 产生成功反馈。全批缺路由、全批断连和旧 Meta 缺字段均保持当前额度 |
+| v1 首发或重发收到 200 success | 照常 CAD。只有 `provider_free_acknowledged=true` 产生成功反馈。全批缺路由、全批断连和旧 Meta 缺字段均保持当前额度 |
+| 同一 Location 混合旧分配和带身份的新分配，仅一批 busy | 只重发 busy 子批。重发携带原 GA 和原有身份，已完成的独立 Location 先 CAD，混合 Location 最后只 CAD 一次 |
+| 条件 Free 部分下发后 `provider_busy`、`rpc_unknown`，或节点暂缺 `route_unknown` | 仅 `provider_busy` 降额并重试。仅当收到明确逻辑成功时贡献恢复反馈 |
 | 分别用 2、8 个 worker，让多组重试同时到期，并安排一批已就绪的首次 Free | 同时执行的重试最多分别为 1、4 批。重试名额占满时，空闲 worker 仍可执行首发。等待名额的批次只挂一次，Meta busy 计数和总截止时间不变，名额归还后可继续重试 |
 | KVCM 重发前读到 RemoveCache、Trim 或 RemoveInstance 已处理同一目标 | 跳过已删除、已换 URI 或已注销实例的目标，无需对它再执行 Free 或 CAD。剩余为空时零次 HTTP |
 | 主存储第一次重读超时，或连续读失败 | 超时后恢复时只重发核对过的目标。连续失败时无新增 Free，按剩余 Location 数记录 `primary_read`，名额和预留均归还 |
 | 单个 storage 的首发预算补足失败，或同批两个 Location 中一个在退避期间换了 URI | 补额失败的批次零下发，保留元数据。重试批次在剔除已变更目标后只持有剩余记录的预算 |
 | 排队任务在首次 CAS 前被撤销，或重试在连接池等待期间被撤销或到期 | 前者的 Location 保持可读，后者保留 `DELETING`，两者均无新增 HTTP 请求 |
-| Meta 的建议等待时间超过剩余总时限，或延迟任务排队至截止、取消、停机切主、后端替换 | 停止重发，未发出且仍在的原目标可定位。截止前已发出的请求按实际结果收尾，重试内存预留和原任务 pending 各释放一次 |
+| Meta 的建议等待时间超过剩余总时限，或延迟任务排队至截止、取消、停机切主、后端替换 | 停止重发，仍在等待重试的原目标可定位。截止前已发出的请求按实际结果收尾，重试内存预留和原任务 pending 各释放一次 |
 | 分别使用默认内存预算和显式调低的字节上限，覆盖尚无 busy 和多组同时 busy | 各组预留总和始终在本进程的生效上限内。放不下的新候选保留原状态，已被拒批次复用原预留。归还后恢复准入，集群和来源硬上限始终有效 |
 
 三路联调还应覆盖以下场景。

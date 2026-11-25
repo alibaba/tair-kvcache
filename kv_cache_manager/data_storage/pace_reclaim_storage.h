@@ -14,12 +14,12 @@ class DataStorageBackend;
 class DataStorageManager;
 class StorageConfig;
 
-bool ParsePaceReclaimGA(const DataStorageUri &uri, uint64_t &ga);
+bool ParsePaceReclaimGA(const DataStorageUri &uri, PaceReclaimGA &target);
 
 PaceReclaimFreeResult FreePaceGAsForReclaim(const DataStorageManager &storage,
                                             const std::string &trace_id,
                                             const std::string &name,
-                                            const std::vector<uint64_t> &gas,
+                                            const std::vector<PaceReclaimGA> &gas,
                                             std::weak_ptr<DataStorageBackend> &original,
                                             bool retry,
                                             const std::function<bool()> &can_send);

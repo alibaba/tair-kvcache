@@ -27,7 +27,7 @@ public:
                                                              size_t size_per_key,
                                                              const std::string &trace_id,
                                                              std::function<void()> cb) override;
-    virtual PaceReclaimFreeResult DeleteForReclaim(const std::vector<uint64_t> &gas,
+    virtual PaceReclaimFreeResult DeleteForReclaim(const std::vector<PaceReclaimGA> &gas,
                                                    const std::string &trace_id,
                                                    const std::function<bool()> &can_send);
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,

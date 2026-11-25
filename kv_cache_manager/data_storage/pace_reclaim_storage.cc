@@ -10,21 +10,30 @@
 
 namespace kv_cache_manager {
 
-bool ParsePaceReclaimGA(const DataStorageUri &uri, uint64_t &ga) {
+bool ParsePaceReclaimGA(const DataStorageUri &uri, PaceReclaimGA &target) {
     std::string_view path = uri.GetPath();
     if (uri.GetProtocol() != kTairMempoolUriScheme || path.size() < 2 || path.front() != '/') {
         return false;
     }
     path.remove_prefix(1);
     const auto end = path.data() + path.size();
-    const auto result = std::from_chars(path.data(), end, ga);
-    return result.ec == std::errc{} && result.ptr == end && ga != 0;
+    target = {};
+    const auto result = std::from_chars(path.data(), end, target.ga);
+    if (result.ec != std::errc{} || result.ptr != end || target.ga == 0) {
+        return false;
+    }
+    if (!uri.HasParam("alloc_generation")) {
+        return true;
+    }
+    uri.GetParamAs("alloc_generation", target.generation);
+    uri.GetParamAs("node_id", target.node_id);
+    return target.HasIdentity() && IsValidPaceNodeId(target.node_id);
 }
 
 PaceReclaimFreeResult FreePaceGAsForReclaim(const DataStorageManager &storage,
                                             const std::string &trace_id,
                                             const std::string &name,
-                                            const std::vector<uint64_t> &gas,
+                                            const std::vector<PaceReclaimGA> &gas,
                                             std::weak_ptr<DataStorageBackend> &original,
                                             bool retry,
                                             const std::function<bool()> &can_send) {

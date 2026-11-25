@@ -29,7 +29,7 @@ struct MooncakeDataStorageItem {
 struct TairMempoolDataStorageItem {
     uint64_t offset{0}; // offset node内地址区间
     uint64_t size{0};
-    uint16_t node_id{0};    // 表示资源归属的节点，该地址是由当前节点完成分配
+    uint32_t node_id{0};    // 表示资源归属的节点，该地址是由当前节点完成分配
     uint16_t media_type{0}; // 要感知
     uint16_t range_id{0};   // 多租需求
     static TairMempoolDataStorageItem FromUri(const DataStorageUri &uri);

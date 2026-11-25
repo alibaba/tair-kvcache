@@ -453,15 +453,20 @@ public:
             spec->set_service_discovery_url(discovery);
             config_.set_storage_spec(spec);
         }
+        std::vector<std::vector<PaceReclaimGA>> wire_calls;
         std::function<void()> on_first;
         std::function<void()> on_retry;
-        PaceReclaimFreeResult DeleteForReclaim(const std::vector<uint64_t> &gas,
+        PaceReclaimFreeResult DeleteForReclaim(const std::vector<PaceReclaimGA> &gas,
                                                const std::string &,
                                                const std::function<bool()> &can_send) override {
             if (!can_send()) {
                 return {PaceReclaimFreeResult::kNotSent};
             }
-            calls.push_back(gas);
+            wire_calls.push_back(gas);
+            auto &addresses = calls.emplace_back();
+            for (const auto &target : gas) {
+                addresses.push_back(target.ga);
+            }
             if (calls.size() == 1 && on_first) {
                 on_first();
             } else if (calls.size() > 1 && on_retry) {
@@ -506,7 +511,7 @@ TEST_F(FreeBusyDeleteTest, PaceFreeProtectsTheRegisteredBackendThroughFirstSendA
     std::weak_ptr<DataStorageBackend> original;
     auto send = [&](bool retry) {
         return FreePaceGAsForReclaim(
-            *data_storage_manager_, "trace", "store", {1}, original, retry, [] { return true; });
+            *data_storage_manager_, "trace", "store", {{1}}, original, retry, [] { return true; });
     };
     EXPECT_EQ(PaceReclaimFreeResult::kNotSent, send(false).status);
     auto backend = Backend("store", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
@@ -547,6 +552,69 @@ TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim)
     EXPECT_EQ((std::vector<std::vector<uint64_t>>{{2}, {2}}), dram->calls);
     EXPECT_TRUE(Locations(1).empty());
     EXPECT_TRUE(ssd->calls.empty());
+}
+
+TEST_F(FreeBusyDeleteTest, MixedLocationRetriesOnlyTheBusyProtocolAndKeepsOriginalIdentity) {
+    const std::string identified = "pace://pool/42?node_id=70000&alloc_generation=18446744073709551615";
+    for (bool conditional_busy : {true, false}) {
+        const int64_t key = conditional_busy ? 101 : 102;
+        const PaceReclaimFreeResult busy{PaceReclaimFreeResult::kBusy, 1};
+        const PaceReclaimFreeResult success{PaceReclaimFreeResult::kSuccess, 0, 0, true};
+        auto backend = Backend("pool", {conditional_busy ? success : busy, conditional_busy ? busy : success, success});
+        SetLocation(key, "mixed", type, {"pace://pool/11?node_id=7", identified});
+        SetLocation(key,
+                    "independent",
+                    type,
+                    {conditional_busy ? "pace://pool/21" : "pace://pool/21?node_id=8&alloc_generation=3"});
+        backend->on_retry = [&] {
+            if (backend->calls.size() == 3) {
+                auto locs = Locations(key);
+                EXPECT_EQ(0u, locs.count("independent"));
+                EXPECT_EQ(1u, locs.count("mixed"));
+            }
+        };
+        ASSERT_EQ(EC_OK, Run(Evict(key, {"mixed", "independent"})).status);
+        ASSERT_EQ(3u, backend->wire_calls.size());
+        const auto &last = backend->wire_calls.back();
+        ASSERT_EQ(1u, last.size());
+        EXPECT_EQ(conditional_busy ? 42u : 11u, last[0].ga);
+        EXPECT_EQ(conditional_busy ? 70000u : 0u, last[0].node_id);
+        EXPECT_EQ(conditional_busy ? UINT64_MAX : 0, last[0].generation);
+        EXPECT_TRUE(Locations(key).empty());
+        EXPECT_EQ(0u, resources->reserved.load());
+    }
+}
+
+TEST_F(FreeBusyDeleteTest, RetainsMixedLocationWhenOneProtocolIsRejectedAndTheOtherLaterSucceeds) {
+    auto backend = Backend(
+        "pool",
+        {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kRejected}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "mixed", type, {"pace://pool/1", "pace://pool/2?node_id=8&alloc_generation=3"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"mixed"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1}, {2}, {1}}), backend->calls);
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("mixed")->status());
+    EXPECT_EQ(1u, Retained("protocol_rejected"));
+    EXPECT_EQ(0u, resources->reserved.load());
+}
+
+TEST_F(FreeBusyDeleteTest, InvalidOrChangedGenerationCannotBecomeALegacyFree) {
+    auto backend = Backend("pool", {{PaceReclaimFreeResult::kBusy, 1}});
+    for (const auto query : {"alloc_generation=0&node_id=7",
+                             "alloc_generation=7",
+                             "alloc_generation=&node_id=7",
+                             "alloc_generation=1&node_id=65535",
+                             "alloc_generation=18446744073709551616&node_id=7"}) {
+        SetLocation(1, "invalid", type, {"pace://pool/3", std::string("pace://pool/4?") + query});
+        EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"invalid"})).status);
+        EXPECT_TRUE(backend->calls.empty());
+    }
+    SetLocation(2, "changed", type, {"pace://pool/5?node_id=7&alloc_generation=1"});
+    backend->on_first = [&] {
+        SetLocation(2, "changed", type, {"pace://pool/5?node_id=7&alloc_generation=2"}, CLS_DELETING);
+    };
+    EXPECT_EQ(EC_OK, Run(Evict(2, {"changed"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{5}}), backend->calls);
+    EXPECT_EQ(1u, Locations(2).count("changed"));
 }
 
 TEST_F(FreeBusyDeleteTest, ProviderWindowTracksLiveTopologyAndKeepsConfiguredCeilings) {
@@ -795,7 +863,7 @@ TEST_F(FreeBusyDeleteTest, TrimWaitsForAnIntactPageAndWakesOnDemotion) {
 TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailable) {
     auto first = Backend("a", {{PaceReclaimFreeResult::kSuccess}});
     PaceReclaimFreeResult confirmed{PaceReclaimFreeResult::kSuccess};
-    confirmed.provider_free_acknowledged = true;
+    confirmed.recovery_confirmed = true;
     auto second = Backend("b", {{PaceReclaimFreeResult::kBusy, 20}, confirmed});
     SetLocation(1, "first", type, {"pace://a/11"});
     SetLocation(1, "second", type, {"pace://b/22", "pace://b/33"});
