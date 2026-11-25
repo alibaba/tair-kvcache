@@ -405,6 +405,9 @@ struct Batch : std::enable_shared_from_this<Batch> {
             case PaceReclaimFreeResult::kRejected:
                 retain_reason[mode] = "protocol_rejected";
                 break;
+            case PaceReclaimFreeResult::kReleaseUnconfirmed:
+                retain_reason[mode] = "release_unconfirmed";
+                break;
             case PaceReclaimFreeResult::kError:
                 error.set(mode);
                 failed = true;

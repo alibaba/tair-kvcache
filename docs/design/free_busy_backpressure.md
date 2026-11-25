@@ -38,8 +38,10 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 | 条件 Free 返回 429 `FREE_BUSY_NOT_ACCEPTED`，原因是 `meta_inflight` 或 `provider_busy` | 校验 `retryable=true`、`dispatch_state=none` 和 `accepted=false`，降额并用原身份重试整批 |
 | 条件 Free 返回 429 `FREE_BATCH_PENDING`，原因是 `provider_busy` | 校验 `retryable=true` 和 `dispatch_state=started`，降额并用原身份重试整个条件子批。此前已释放的分配由 Provider 幂等确认 |
 | 请求成功 | v1 按原规则清理元数据，仅 `provider_free_acknowledged=true` 提供恢复反馈。条件 Free 的 200 `status=success`、`free_semantics=conditional`、`completion_scope=logical_release` 同时确认逻辑释放并提供一次恢复反馈。第 2 节的冷却和观察期继续生效 |
-| 单批过大、条件身份非法、明确零下发的能力或路由错误 | 保留受影响的 Location，结束该批 |
-| 普通 429、RPC 结果未知、超时和普通失败 | 沿用已有错误和元数据收尾，不触发重发或降额 |
+| 400 `FREE_BATCH_TOO_LARGE`、`FREE_INVALID_IDENTITY`，或 Meta 转发前返回无业务码的条件协议 400 | 保留受影响的 Location，结束该批。超大批次不自动拆分 |
+| 条件 Free 明确零下发的能力或路由错误 | 保留受影响的 Location，结束该批 |
+| 条件 Free 返回 429 `FREE_BATCH_PENDING`，原因是 `internal_fault`（已下发、不可重试）或 `rpc_unknown`（下发结果未知） | 保留受影响的 Location 为 `DELETING`，结束该批，不重发、不调额。Provider 子批超限也可能返回 `internal_fault`，KVCM 无法据此判断具体原因 |
+| 普通 429、网络超时及其他无匹配协议的错误 | 沿用已有错误和元数据收尾，不触发重发或降额 |
 
 条件 busy 还要求 `free_semantics=conditional`、`status=busy`、`scope=whole_request`。服务器可用 `retry_after_ms` 建议等待时长。条件请求收到旧式成功回包时，KVCM 保留关联的 Location 元数据。
 
@@ -67,9 +69,10 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 
 | 该批最后得到的结果 | KVCM 如何收尾 |
 |---|---|
-| 收到匹配的 400 和 `FREE_BATCH_TOO_LARGE` / `FREE_INVALID_IDENTITY` | 终止原批次的自动重发及降速反馈，保留未释放目标供调整组批或配置 |
+| 收到批次超限、身份非法，或 Meta 在下发前返回路由或能力错误 | 保留受影响的 Location，停止该批 |
+| 条件 Free 明确返回 `internal_fault` 或 `rpc_unknown` | 首发和重发都保留受影响的 Location，按 `release_unconfirmed` 计数，并记录目标地址、GA 数、原因和下发状态。其他独立完成的 Location 照常清理 |
 | Free 已发出并成功 | 按条件删除对应的 Location 元数据 |
-| Free 已发出，但超时、返回无协议的 429/5xx 或部分失败 | 首发和重发都沿用已有错误及 CAD 规则。停止自动重发，记录可能未释放的 GA |
+| Free 已发出，遇到网络超时、无匹配协议的 429/5xx 等普通错误 | 首发和重发都沿用已有错误及 CAD 规则。停止自动重发，记录可能未释放的 GA |
 | 等待重试名额或持续拒收直到截止，或因预算不足、后端只读、缺少客户端、主存储读取最终失败、投递失败、实例或后端失效而停止 | 停止发送并保留仍存在的原目标，状态为 `DELETING`，记录实例、key、Location、storage 和原因，供与 mempool 核对。GC V1 会跳过这类残留 |
 | 关闭协议、降主或停机时仍在等待重发 | 使原任务的重试上下文失效，等待中的批次按取消收尾，记录尚待确认的目标 |
 
@@ -114,7 +117,7 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 | 同一任务的 Location A、B 分属两个 storage，A 成功，B 明确 busy | A 及时 CAD。只重发 B 的原批次，原 pending 最后释放一次。若重发返回普通错误，按既有规则收尾并记录可能未释放的对象 |
 | v1 首发或重发收到 200 success | 照常 CAD。只有 `provider_free_acknowledged=true` 产生成功反馈。全批缺路由、全批断连和旧 Meta 缺字段均保持当前额度 |
 | 同一 Location 混合旧分配和带身份的新分配，仅一批 busy | 只重发 busy 子批。重发携带原 GA 和原有身份，已完成的独立 Location 先 CAD，混合 Location 最后只 CAD 一次 |
-| 条件 Free 部分下发后 `provider_busy`、`rpc_unknown`，或节点暂缺 `route_unknown` | 仅 `provider_busy` 降额并重试。仅当收到明确逻辑成功时贡献恢复反馈 |
+| 条件 Free 返回 `provider_busy`、`rpc_unknown`、`internal_fault`、`route_unknown`，或转发前返回条件协议 400 | 仅容量 busy 降额并重试。其余四种结果均保留对应 Location。仅逻辑成功提供恢复反馈 |
 | 分别用 2、8 个 worker，让多组重试同时到期，并安排一批已就绪的首次 Free | 同时执行的重试最多分别为 1、4 批。重试名额占满时，空闲 worker 仍可执行首发。等待名额的批次只挂一次，Meta busy 计数和总截止时间不变，名额归还后可继续重试 |
 | KVCM 重发前读到 RemoveCache、Trim 或 RemoveInstance 已处理同一目标 | 跳过已删除、已换 URI 或已注销实例的目标，无需对它再执行 Free 或 CAD。剩余为空时零次 HTTP |
 | 主存储第一次重读超时，或连续读失败 | 超时后恢复时只重发核对过的目标。连续失败时无新增 Free，按剩余 Location 数记录 `primary_read`，名额和预留均归还 |

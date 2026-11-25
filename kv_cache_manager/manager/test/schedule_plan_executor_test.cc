@@ -597,6 +597,35 @@ TEST_F(FreeBusyDeleteTest, RetainsMixedLocationWhenOneProtocolIsRejectedAndTheOt
     EXPECT_EQ(0u, resources->reserved.load());
 }
 
+TEST_F(FreeBusyDeleteTest, UnconfirmedReleaseRetainsOnlyAffectedLocations) {
+    using Result = PaceReclaimFreeResult;
+    for (bool after_busy : {false, true}) {
+        const int64_t key = after_busy ? 2 : 1;
+        std::vector<Result> replies{{Result::kSuccess}};
+        if (after_busy) {
+            replies.push_back({Result::kBusy, 1});
+        }
+        replies.push_back({Result::kReleaseUnconfirmed});
+        auto backend = Backend("pool", std::move(replies));
+        SetLocation(key, "mixed", type, {"pace://pool/1", "pace://pool/2?node_id=8&alloc_generation=3"});
+        SetLocation(key, "legacy", type, {"pace://pool/3"});
+        EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(key, {"mixed", "legacy"})).status);
+        auto remaining = Locations(key);
+        ASSERT_EQ(1u, remaining.size());
+        EXPECT_EQ(CLS_DELETING, remaining.at("mixed")->status());
+        ASSERT_EQ(after_busy ? 3u : 2u, backend->calls.size());
+        EXPECT_EQ((std::vector<uint64_t>{2}), backend->calls.back());
+        EXPECT_EQ(after_busy ? 1u : 0u, resources->busy_replies.load());
+        EXPECT_EQ(after_busy ? 1u : 0u, resources->retry_attempts.load());
+        EXPECT_EQ(after_busy, feedback.count("pool") != 0);
+        if (after_busy) {
+            EXPECT_FALSE(feedback.at("pool").second);
+        }
+        EXPECT_EQ(after_busy ? 2u : 1u, Retained("release_unconfirmed"));
+        EXPECT_EQ(0u, resources->reserved.load());
+    }
+}
+
 TEST_F(FreeBusyDeleteTest, InvalidOrChangedGenerationCannotBecomeALegacyFree) {
     auto backend = Backend("pool", {{PaceReclaimFreeResult::kBusy, 1}});
     for (const auto query : {"alloc_generation=0&node_id=7",

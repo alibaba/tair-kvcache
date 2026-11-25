@@ -30,7 +30,8 @@ struct PaceReclaimFreeResult {
         kTooLarge,
         kBackendChanged,
         kRejected,
-        kNotSent
+        kNotSent,
+        kReleaseUnconfirmed
     };
     Status status{kError};
     uint64_t retry_after_ms{0};
