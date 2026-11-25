@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "kv_cache_manager/data_storage/pace_reclaim_free.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -117,7 +117,7 @@ private:
     };
     struct Bucket {
         DeleteSize used;
-        PaceProviderCount providers;
+        ReclaimProviderCount providers;
         DeleteSize baseline;
         DeleteSize effective;
         Clock::time_point changed{}, cooldown{}, observe{};
@@ -138,7 +138,7 @@ private:
     std::shared_ptr<DeleteReservation>
     TryReserveLocked(DeleteSource source, const DeleteDemand &demand, DeleteBlockReason *reason = nullptr);
     DeleteSize Hard(const std::string &bucket) const;
-    DeleteSize Baseline(const std::string &bucket, PaceProviderCount providers, Clock::time_point now) const;
+    DeleteSize Baseline(const std::string &bucket, ReclaimProviderCount providers, Clock::time_point now) const;
     Bucket &GetBucketLocked(const std::string &key, Clock::time_point now);
     void ObserveProvidersLocked(const DeleteTargetCost &target, Clock::time_point now);
     void RefreshWindow(const std::string &key, Bucket &bucket, Clock::time_point now);

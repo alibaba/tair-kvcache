@@ -5,7 +5,7 @@
 
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -65,19 +65,19 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
     DeleteTargetCost cost;
     cost.size.locations = 1;
     const auto type = ToBaseType(loc.type());
-    const bool is_pace = IsTairMempoolStorageType(type);
+    const bool adaptive = SupportsAdaptiveDelete(type);
     for (const auto &spec : loc.location_specs()) {
         DataStorageUri uri(spec.uri());
         uint64_t bytes = 0;
         if (uri.Valid()) {
             uri.GetParamAs<uint64_t>("size", bytes);
             cost.size.bytes = Sum(cost.size.bytes, bytes);
-            if (is_pace && cost.storage.empty()) {
+            if (adaptive && cost.storage.empty()) {
                 cost.storage = uri.GetHostName();
             }
         }
     }
-    if (!is_pace) {
+    if (!adaptive) {
         if (source == DeleteSource::Reclaimer) {
             cost.bucket = "group/" + std::to_string(static_cast<int>(type)) + "/" + group;
         }
@@ -95,7 +95,7 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
         if (limits.protocol) {
             cost.provider_source = backend;
         }
-        const auto endpoint = GetPaceClusterEndpoint(backend->GetStorageConfig());
+        const auto endpoint = GetReclaimClusterEndpoint(backend->GetStorageConfig());
         if (!endpoint.empty()) {
             cost.bucket = "endpoint/" + endpoint;
         }
@@ -104,10 +104,11 @@ DeleteTargetCost DeleteAdmission::Describe(const CacheLocation &loc,
 }
 
 DeleteSize DeleteAdmission::Hard(const std::string &key) const {
-    return key.compare(0, 6, "group/") == 0 ? limits.non_pace_reclaim : limits.cluster;
+    return key.compare(0, 6, "group/") == 0 ? limits.reclaimer_per_group_type : limits.cluster;
 }
 
-DeleteSize DeleteAdmission::Baseline(const std::string &key, PaceProviderCount providers, Clock::time_point now) const {
+DeleteSize
+DeleteAdmission::Baseline(const std::string &key, ReclaimProviderCount providers, Clock::time_point now) const {
     const auto hard = Hard(key);
     if (!limits.protocol || key.compare(0, 6, "group/") == 0) {
         return hard;
@@ -189,7 +190,7 @@ void DeleteAdmission::ObserveProvidersLocked(const DeleteTargetCost &target, Clo
     if (!limits.protocol) {
         return;
     }
-    const auto sample = GetPaceProviderCount(target.provider_source);
+    const auto sample = GetReclaimProviderCount(target.provider_source);
     if (sample.observed_at == Clock::time_point{} || now - sample.observed_at > kTopologyMaxAge) {
         return;
     }
@@ -447,7 +448,7 @@ void DeleteAdmission::ReleaseLocked(DeleteReservation &lease, const DeleteSize &
 }
 
 // Ordinary targets have already finished physical deletion and CAD. Keep only
-// the PACE storage batches that can still be outstanding after this worker exits.
+// the adaptive storage batches that can still be outstanding after this worker exits.
 void DeleteReservation::RetainStorageBatches(const std::set<std::string> &names) {
     std::lock_guard<std::mutex> lock(owner_->mutex_);
     if (!charged_) {

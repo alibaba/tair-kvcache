@@ -570,7 +570,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         CountsByStorageType counts{};
         std::uint64_t predicted_keys = 0;
         AgeStats ages;
-        std::size_t pace_deferred_keys = 0;
+        std::size_t quota_deferred_keys = 0;
         if (!FilterLocIDImpl(request_context.get(),
                              info,
                              request.block_keys,
@@ -583,11 +583,11 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
                              false,
                              true,
                              &request,
-                             &pace_deferred_keys)) {
+                             &quota_deferred_keys)) {
             continue;
         }
-        // Each whole key deferred by PACE backpressure opens one place for the next coldest sampled key.
-        candidate_end += std::min(pace_deferred_keys, candidates.size() - candidate_end);
+        // A whole key deferred by storage backpressure opens one place for the next coldest sampled key.
+        candidate_end += std::min(quota_deferred_keys, candidates.size() - candidate_end);
         const auto nonempty_blocks = std::count_if(request.location_ids.begin(),
                                                    request.location_ids.end(),
                                                    [](const auto &locations) { return !locations.empty(); });

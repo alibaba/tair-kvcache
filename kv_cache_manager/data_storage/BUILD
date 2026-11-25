@@ -30,7 +30,7 @@ cc_library(
         "event_report_backend.h",
         "hf3fs_backend.h",
         "nfs_backend.h",
-        "pace_reclaim_storage.h",
+        "reclaim_storage.h",
     ] + select({
         ":enable_mooncake": ["mooncake_backend.h"],
         "//conditions:default": [],
@@ -79,6 +79,7 @@ cc_library(
         "common_define.h",
         "data_storage_backend.h",
         "data_storage_uri.h",
+        "pace_uri.h",
         "storage_config.h",
         "pace_reclaim_free.h",
     ],

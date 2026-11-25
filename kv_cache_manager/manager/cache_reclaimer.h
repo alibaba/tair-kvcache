@@ -803,7 +803,7 @@ private:
                          bool eligibility_only,
                          bool maintenance_read,
                          CacheLocationDelRequest *output = nullptr,
-                         std::size_t *out_pace_deferred_keys = nullptr) noexcept;
+                         std::size_t *out_quota_deferred_keys = nullptr) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。

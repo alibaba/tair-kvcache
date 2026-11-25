@@ -39,6 +39,7 @@
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
@@ -1531,7 +1532,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      bool eligibility_only,
                                      bool maintenance_read,
                                      CacheLocationDelRequest *output,
-                                     std::size_t *out_pace_deferred_keys) noexcept {
+                                     std::size_t *out_quota_deferred_keys) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1540,8 +1541,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_location_counts_by_type.fill(0);
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
-    if (out_pace_deferred_keys) {
-        *out_pace_deferred_keys = 0;
+    if (out_quota_deferred_keys) {
+        *out_quota_deferred_keys = 0;
     }
 
     DeleteDemand scratch;
@@ -1775,8 +1776,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
                 DeleteBlockReason reason = DeleteBlockReason::Limit;
                 bool fits_alone = false;
-                const bool check_empty_window = (maintenance_read || out_pace_deferred_keys) && !deferred_by_quota &&
-                                                IsTairMempoolStorageType(base_type);
+                const bool adaptive = SupportsAdaptiveDelete(base_type);
+                const bool check_empty_window =
+                    (maintenance_read || out_quota_deferred_keys) && !deferred_by_quota && adaptive;
                 if (!admission.TryAppend(
                         DeleteSource::Reclaimer, selected, cost, &reason, check_empty_window ? &fits_alone : nullptr)) {
                     deferred_by_quota = deferred_by_quota || fits_alone;
@@ -1789,8 +1791,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 }
                 const auto location_bytes = cost.size.bytes;
                 if (output) {
-                    output->expected_location_values[block_idx].push_back(
-                        IsTairMempoolStorageType(base_type) ? loc.ToJsonString() : "");
+                    output->expected_location_values[block_idx].push_back(adaptive ? loc.ToJsonString() : "");
                 }
                 loc_id_vec.emplace_back(loc.id());
                 out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);
@@ -1811,8 +1812,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         if (maintenance_read && loc_id_vec.empty() && !deferred_by_quota) {
             keys_to_touch.push_back(block_key);
         }
-        if (out_pace_deferred_keys && loc_id_vec.empty() && deferred_by_quota) {
-            ++*out_pace_deferred_keys;
+        if (out_quota_deferred_keys && loc_id_vec.empty() && deferred_by_quota) {
+            ++*out_quota_deferred_keys;
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }

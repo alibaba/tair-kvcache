@@ -21,7 +21,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
@@ -508,13 +508,20 @@ public:
 };
 
 TEST_F(FreeBusyDeleteTest, PaceFreeProtectsTheRegisteredBackendThroughFirstSendAndRetry) {
-    std::weak_ptr<DataStorageBackend> original;
-    auto send = [&](bool retry) {
-        return FreePaceGAsForReclaim(
-            *data_storage_manager_, "trace", "store", {{1}}, original, retry, [] { return true; });
+    const std::string uri = "pace://store/1";
+    auto batch = CreateReclaimStorageBatch(type, "store");
+    ASSERT_TRUE(batch);
+    auto send = [&] {
+        EXPECT_TRUE(batch->AddLocation({{uri, false}}));
+        return batch->Send(*data_storage_manager_, "trace", []() -> const char * { return nullptr; });
     };
-    EXPECT_EQ(PaceReclaimFreeResult::kNotSent, send(false).status);
-    auto backend = Backend("store", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    const auto missing = send();
+    ASSERT_EQ(1u, missing.locations.size());
+    ASSERT_EQ(ReclaimStorageResult::Action::Retain, missing.locations[0].action);
+    EXPECT_STREQ("backend_unavailable", missing.locations[0].reason);
+    batch = CreateReclaimStorageBatch(type, "store");
+    ASSERT_TRUE(batch);
+    auto backend = Backend("store", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kBusy, 1}});
     auto check_lock = [&] {
         auto writer = std::async(std::launch::async, [&] {
             return std::unique_lock<std::shared_mutex>(data_storage_manager_->rw_lock_, std::try_to_lock).owns_lock();
@@ -523,10 +530,13 @@ TEST_F(FreeBusyDeleteTest, PaceFreeProtectsTheRegisteredBackendThroughFirstSendA
     };
     backend->on_first = check_lock;
     backend->on_retry = check_lock;
-    EXPECT_EQ(PaceReclaimFreeResult::kBusy, send(false).status);
-    EXPECT_EQ(PaceReclaimFreeResult::kSuccess, send(true).status);
+    EXPECT_EQ(1u, send().busy_replies);
+    EXPECT_EQ(1u, send().busy_replies);
     auto replacement = Backend("store", {});
-    EXPECT_EQ(PaceReclaimFreeResult::kBackendChanged, send(true).status);
+    const auto changed = send();
+    ASSERT_EQ(1u, changed.locations.size());
+    ASSERT_EQ(ReclaimStorageResult::Action::Retain, changed.locations[0].action);
+    EXPECT_STREQ("backend_changed", changed.locations[0].reason);
     EXPECT_TRUE(replacement->calls.empty());
 }
 
@@ -552,6 +562,68 @@ TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim)
     EXPECT_EQ((std::vector<std::vector<uint64_t>>{{2}, {2}}), dram->calls);
     EXPECT_TRUE(Locations(1).empty());
     EXPECT_TRUE(ssd->calls.empty());
+}
+
+TEST_F(FreeBusyDeleteTest, OrdinaryLocationsUseDeleteEvenWhenTheSameTaskRetriesAnotherStorage) {
+    const auto nfs_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto nfs = AddBackend("files", nfs_type, true);
+    auto &admission = executor->Deletes();
+    std::shared_ptr<FakePaceBackend> pool;
+    for (bool mixed : {false, true}) {
+        const int64_t key = mixed ? 2 : 1;
+        const std::string file = "nfs://files/" + std::to_string(key);
+        SetLocation(key, "file", nfs_type, {"nfs://files/missing", file});
+        std::vector<std::string> ids{"file"};
+        if (mixed) {
+            pool = Backend("pool", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+            SetLocation(key, "object", type, {"pace://pool/17"});
+            ids.push_back("object");
+        }
+        auto req = Request(key, ids, {"nfs://files/missing"});
+        const auto locations = Locations(key);
+        for (const auto &id : ids) {
+            req.demand.Add(
+                admission.Describe(*locations.at(id), kTestInstanceName.size(), DeleteSource::GC, {}, req.demand));
+        }
+        req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+        ASSERT_TRUE(req.reservation);
+        req.free_busy = req.reservation->protocol;
+        EXPECT_EQ(mixed, req.free_busy != nullptr);
+        ASSERT_EQ(EC_OK, Run(req).status);
+        EXPECT_TRUE(Locations(key).empty());
+    }
+    EXPECT_EQ((std::vector<std::string>{"nfs://files/1", "nfs://files/2"}), DeletedUris(*nfs));
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{17}, {17}}), pool->calls);
+    EXPECT_EQ(0u, pool->ordinary_calls);
+}
+
+TEST_F(FreeBusyDeleteTest, InvalidLocationRollsBackOnlyItsOwnStagedSpecs) {
+    auto pool = Backend("pool", {{PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "before", type, {"pace://pool/1"});
+    SetLocation(1, "invalid", type, {"pace://pool/2", "pace://pool/3?node_id=7&alloc_generation=1", "pace://pool/0"});
+    SetLocation(1, "after", type, {"pace://pool/4?node_id=8&alloc_generation=1"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"before", "invalid", "after"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1}, {4}}), pool->calls);
+    const auto remaining = Locations(1);
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(CLS_DELETING, remaining.at("invalid")->status());
+}
+
+TEST_F(FreeBusyDeleteTest, ReclaimBatchReportsOnlySpecsSentInTheFailedRequest) {
+    Backend("pool", {{PaceReclaimFreeResult::kError}, {PaceReclaimFreeResult::kBusy, 5}});
+    auto batch = CreateReclaimStorageBatch(type, "pool");
+    ASSERT_TRUE(batch);
+    const std::string missing = "pace://pool/1";
+    const std::string plain = "pace://pool/2";
+    const std::string identified = "pace://pool/3?node_id=8&alloc_generation=1";
+    ASSERT_TRUE(batch->AddLocation({{missing, true}}));
+    ASSERT_TRUE(batch->AddLocation({{missing, true}, {identified, false}, {plain, false}}));
+    const auto reply = batch->Send(*data_storage_manager_, "trace", []() -> const char * { return nullptr; });
+    ASSERT_EQ(2u, reply.locations.size());
+    EXPECT_EQ(ReclaimStorageResult::Action::Complete, reply.locations[0].action);
+    EXPECT_EQ(ReclaimStorageResult::Action::Retry, reply.locations[1].action);
+    EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{1, 2}}), reply.failed_specs);
+    EXPECT_EQ(5u, reply.retry_after_ms);
 }
 
 TEST_F(FreeBusyDeleteTest, MixedLocationRetriesOnlyTheBusyProtocolAndKeepsOriginalIdentity) {

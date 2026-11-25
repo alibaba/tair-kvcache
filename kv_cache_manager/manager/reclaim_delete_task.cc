@@ -1,15 +1,14 @@
-#include "kv_cache_manager/manager/pace_reclaim_delete.h"
-
-#include <array>
-#include <bitset>
+#include <algorithm>
 #include <map>
 #include <random>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
-#include "kv_cache_manager/data_storage/pace_reclaim_storage.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
+#include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -37,61 +36,6 @@ uint64_t Jitter(uint64_t base, uint64_t max_ms) {
     return std::uniform_int_distribution<uint64_t>(low, std::min(max_ms, base + base / 4))(random);
 }
 
-// Keep every spec of a Location together. A malformed sibling keeps the
-// Location in DELETING, while other Locations on the same storage can proceed.
-template <typename ShouldSkip>
-bool AppendGAs(const std::string &instance,
-               int64_t key,
-               const CacheLocation &loc,
-               std::string &name,
-               std::vector<PaceReclaimGA> &gas,
-               ShouldSkip should_skip) {
-    const size_t start = gas.size();
-    bool valid = !loc.location_specs().empty();
-    for (size_t i = 0; i < loc.location_specs().size(); ++i) {
-        const auto &spec = loc.location_specs()[i];
-        DataStorageUri uri(spec.uri());
-        if (name.empty()) {
-            name = uri.GetHostName();
-        }
-        PaceReclaimGA ga;
-        if (name.empty() || uri.GetHostName() != name || !ParsePaceReclaimGA(uri, ga)) {
-            valid = false;
-            KVCM_LOG_WARN("Invalid reclaim GA instance[%s] key[%ld] location[%s] uri[%s]",
-                          instance.c_str(),
-                          key,
-                          loc.id().c_str(),
-                          spec.uri().c_str());
-        } else if (!should_skip(i, spec.uri())) {
-            gas.push_back(ga);
-        }
-    }
-    if (!valid) {
-        gas.resize(start);
-        KVCM_LOG_WARN(
-            "Retain invalid PACE Location instance[%s] key[%ld] location[%s]", instance.c_str(), key, loc.id().c_str());
-    }
-    return valid;
-}
-
-// Each HTTP request is homogeneous. A Location can depend on both replies.
-struct FreeTargets {
-    using Modes = std::bitset<2>;
-    ReclaimFreeLocations locations;
-    std::vector<Modes> modes;
-    std::array<std::vector<PaceReclaimGA>, 2> gas;
-
-    void Add(int64_t key, const CacheLocationConstPtr &loc, const std::vector<PaceReclaimGA> &items) {
-        auto &required = modes.emplace_back();
-        for (const auto &item : items) {
-            const size_t mode = item.HasIdentity();
-            gas[mode].push_back(item);
-            required.set(mode);
-        }
-        locations.emplace_back(key, loc);
-    }
-};
-
 struct TaskCompletion {
     std::mutex mutex;
     size_t remaining = 0;
@@ -101,7 +45,7 @@ struct TaskCompletion {
     void FinishBatch(bool ok) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!ok && result.status == EC_OK) {
-            result = {EC_PARTIAL_OK, "PACE reclaim Free or CAD failed", true};
+            result = {EC_PARTIAL_OK, "reclaim delete or CAD failed", true};
         }
         if (--remaining == 0) {
             done(std::move(result));
@@ -118,6 +62,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
           const std::shared_ptr<MetaIndexer> &indexer,
           const CacheLocationDelRequest &request,
           std::string name,
+          std::unique_ptr<ReclaimStorageBatch> storage_batch,
           std::shared_ptr<TaskCompletion> completion)
         : executor(executor)
         , storage(std::move(storage))
@@ -127,6 +72,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         , reservation(request.reservation)
         , instance(request.instance_id)
         , name(std::move(name))
+        , storage_batch(std::move(storage_batch))
         , completion(std::move(completion))
         , next_delay(task->initial_ms) {}
 
@@ -137,8 +83,8 @@ struct Batch : std::enable_shared_from_this<Batch> {
     const std::shared_ptr<FreeBusyTask> task;
     const std::shared_ptr<DeleteReservation> reservation;
     const std::string instance, name;
+    const std::unique_ptr<ReclaimStorageBatch> storage_batch;
     const std::shared_ptr<TaskCompletion> completion;
-    std::weak_ptr<DataStorageBackend> backend;
     struct SavedSpec {
         std::string uri;
         bool confirmed_missing;
@@ -147,8 +93,6 @@ struct Batch : std::enable_shared_from_this<Batch> {
     uint64_t reserved = 0;
     uint64_t next_delay;
     Clock::time_point deadline;
-    FreeTargets::Modes outstanding{0b11}; // legacy and conditional, until each reply is terminal
-    std::array<const char *, 2> retain_reason{};
     bool failed = false;
     bool holds_slot = false;
     bool retried_primary_read = false;
@@ -176,7 +120,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
     void Stop(const char *reason, const char *detail = nullptr) {
         RecordRetained(*task->resources, reason, records.size());
         for (const auto &[id, uris] : records) {
-            KVCM_LOG_WARN("PACE reclaim Free stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
+            KVCM_LOG_WARN("Reclaim delete stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
                           detail ? detail : reason,
                           instance.c_str(),
                           id.first,
@@ -229,8 +173,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
         kFailed
     };
 
-    ReadResult ReadTargets(const std::shared_ptr<MetaIndexer> &idx, FreeTargets &out) {
-        std::string expected_storage = name;
+    ReadResult ReadTargets(const std::shared_ptr<MetaIndexer> &idx, ReclaimDeleteLocations &out) {
         KeyVector keys;
         for (const auto &[id, _] : records) {
             if (keys.empty() || keys.back() != id.first) {
@@ -255,15 +198,15 @@ struct Batch : std::enable_shared_from_this<Batch> {
         if (retryable_error) {
             return ReadResult::kRetryable;
         }
-        std::vector<PaceReclaimGA> gas;
+        std::vector<ReclaimDeleteUri> specs;
         auto it = records.begin();
         for (size_t i = 0; i < keys.size(); ++i) {
             while (it != records.end() && it->first.first == keys[i]) {
                 const auto found = maps[i].find(it->first.second);
                 const auto loc = found == maps[i].end() ? nullptr : found->second;
+                // The original URI list also pins the registered storage name.
                 if (read.error_codes[i] == EC_NOENT || !loc || loc->status() != CacheLocationStatus::CLS_DELETING ||
-                    !IsTairMempoolStorageType(loc->type()) || loc->location_specs().empty() ||
-                    DataStorageUri(loc->location_specs().front().uri()).GetHostName() != name ||
+                    !SupportsAdaptiveDelete(loc->type()) ||
                     !std::equal(it->second.begin(),
                                 it->second.end(),
                                 loc->location_specs().begin(),
@@ -272,16 +215,17 @@ struct Batch : std::enable_shared_from_this<Batch> {
                     it = records.erase(it);
                     continue;
                 }
-                gas.clear();
-                if (!AppendGAs(instance, keys[i], *loc, expected_storage, gas, [&](size_t j, const std::string &) {
-                        return it->second[j].confirmed_missing;
-                    })) {
+                specs.clear();
+                for (const auto &saved : it->second) {
+                    specs.push_back({saved.uri, saved.confirmed_missing});
+                }
+                if (!storage_batch->AddLocation(specs)) {
                     RecordRetained(*task->resources, "invalid_uri", 1);
                     failed = true;
                     it = records.erase(it);
                     continue;
                 }
-                out.Add(keys[i], loc, gas);
+                out.emplace_back(keys[i], loc);
                 ++it;
             }
         }
@@ -302,7 +246,7 @@ struct Batch : std::enable_shared_from_this<Batch> {
             Stop("instance_changed");
             return;
         }
-        FreeTargets current;
+        ReclaimDeleteLocations current;
         const auto read = ReadTargets(idx, current);
         if (read == ReadResult::kRetryable && !retried_primary_read) {
             retried_primary_read = true;
@@ -313,14 +257,14 @@ struct Batch : std::enable_shared_from_this<Batch> {
             Stop("primary_read", "primary read failed");
             return;
         }
-        if (current.locations.empty()) {
+        if (current.empty()) {
             Finish(true);
             return;
         }
         Send(current, idx, true);
     }
 
-    bool Cad(const ReclaimFreeLocations &targets, const std::shared_ptr<MetaIndexer> &idx, bool retry) {
+    bool Cad(const ReclaimDeleteLocations &targets, const std::shared_ptr<MetaIndexer> &idx, bool retry) {
         KeyVector keys;
         LocationIdsPerKey ids;
         std::vector<std::vector<std::string>> expected;
@@ -359,76 +303,12 @@ struct Batch : std::enable_shared_from_this<Batch> {
         return true;
     }
 
-    uint64_t SendRequests(const FreeTargets &targets, bool retry, FreeTargets::Modes &error) {
-        FreeTargets::Modes busy;
-        bool recovery = false;
-        uint64_t hint = 0;
-        bool check_backend = retry;
-        auto can_send = [&] { return task->Active() && (!retry || Clock::now() < deadline); };
-        for (size_t mode = 0; mode < targets.gas.size(); ++mode) {
-            const auto &gas = targets.gas[mode];
-            if (!outstanding[mode] || gas.empty()) {
-                continue;
-            }
-            if (retry) {
-                ++task->resources->retry_attempts;
-            }
-            const auto result =
-                FreePaceGAsForReclaim(*storage, "location_del_task_trace", name, gas, backend, check_backend, can_send);
-            check_backend = true;
-            switch (result.status) {
-            case PaceReclaimFreeResult::kBusy:
-                ++task->resources->busy_replies;
-                busy.set(mode);
-                hint = std::max(hint, result.retry_after_ms);
-                break;
-            case PaceReclaimFreeResult::kSuccess:
-                recovery |= result.recovery_confirmed;
-                break;
-            case PaceReclaimFreeResult::kTooLarge:
-                KVCM_LOG_WARN(
-                    "PACE Free too large storage[%s] gas[%zu] max_gas[%lu]", name.c_str(), gas.size(), result.max_gas);
-                retain_reason[mode] = "batch_too_large";
-                break;
-            case PaceReclaimFreeResult::kNotSent:
-                if (!task->Active()) {
-                    retain_reason[mode] = "cancelled";
-                } else if (retry && Clock::now() >= deadline) {
-                    retain_reason[mode] = "dispatch_deadline";
-                } else {
-                    retain_reason[mode] = "backend_unavailable";
-                }
-                break;
-            case PaceReclaimFreeResult::kBackendChanged:
-                retain_reason[mode] = "backend_changed";
-                break;
-            case PaceReclaimFreeResult::kRejected:
-                retain_reason[mode] = "protocol_rejected";
-                break;
-            case PaceReclaimFreeResult::kReleaseUnconfirmed:
-                retain_reason[mode] = "release_unconfirmed";
-                break;
-            case PaceReclaimFreeResult::kError:
-                error.set(mode);
-                failed = true;
-                break;
-            }
-        }
-        ReleaseSlot();
-        outstanding = busy;
-        const uint64_t wait = busy.any() ? std::max(Jitter(next_delay, task->max_ms), hint) : 0;
-        if (busy.any() || recovery) {
-            task->Record(name, wait);
-        }
-        return wait;
-    }
-
-    void Send(const FreeTargets &targets,
+    void Send(const ReclaimDeleteLocations &targets,
               const std::shared_ptr<MetaIndexer> &idx,
               bool retry,
               const std::set<std::string> &skipped = {}) {
         uint64_t needed = 0;
-        for (const auto &[key, loc] : targets.locations) {
+        for (const auto &[key, loc] : targets) {
             needed += FreeBusyTask::RecordBytes(*loc, instance.size());
         }
         if (needed > reserved) {
@@ -446,26 +326,48 @@ struct Batch : std::enable_shared_from_this<Batch> {
         if (StopIfCancelledOrExpired(retry && Clock::now() >= deadline, "dispatch_deadline")) {
             return;
         }
-        FreeTargets::Modes error;
-        const uint64_t wait = SendRequests(targets, retry, error);
-        ReclaimFreeLocations completed;
-        uint64_t waiting_bytes = 0;
-        for (size_t i = 0; i < targets.locations.size(); ++i) {
-            const auto &[key, loc] = targets.locations[i];
-            const auto &required = targets.modes[i];
-            if ((required & error).any()) {
-                for (const auto &spec : loc->location_specs()) {
-                    PaceReclaimGA ga;
-                    if (ParsePaceReclaimGA(DataStorageUri(spec.uri()), ga) && error[ga.HasIdentity()]) {
-                        KVCM_LOG_WARN("PACE Free failed, possible leak instance[%s] key[%ld] location[%s] uri[%s]",
-                                      instance.c_str(),
-                                      key,
-                                      loc->id().c_str(),
-                                      spec.uri().c_str());
-                    }
-                }
+        const auto stop_reason = [&]() -> const char * {
+            if (!task->Active()) {
+                return "cancelled";
             }
-            if ((required & outstanding).any()) {
+            return retry && Clock::now() >= deadline ? "dispatch_deadline" : nullptr;
+        };
+        const auto reply = storage_batch->Send(*storage, "location_del_task_trace", stop_reason);
+        ReleaseSlot();
+        if (retry) {
+            task->resources->retry_attempts += reply.requests;
+        }
+        if (reply.busy_replies) {
+            task->resources->busy_replies += reply.busy_replies;
+        }
+        const uint64_t wait = reply.busy_replies ? std::max(Jitter(next_delay, task->max_ms), reply.retry_after_ms) : 0;
+        if (reply.busy_replies || reply.recovery_confirmed) {
+            task->Record(name, wait);
+        }
+        if (reply.locations.size() != targets.size()) {
+            Stop("local_error", "storage returned an inconsistent Location count");
+            return;
+        }
+        for (const auto &[location_index, spec_index] : reply.failed_specs) {
+            if (location_index >= targets.size() ||
+                spec_index >= targets[location_index].second->location_specs().size()) {
+                Stop("local_error", "storage returned an invalid failed spec");
+                return;
+            }
+            const auto &[key, loc] = targets[location_index];
+            KVCM_LOG_WARN("Reclaim delete failed, possible leak instance[%s] key[%ld] location[%s] uri[%s]",
+                          instance.c_str(),
+                          key,
+                          loc->id().c_str(),
+                          loc->location_specs()[spec_index].uri().c_str());
+            failed = true;
+        }
+        ReclaimDeleteLocations completed;
+        uint64_t waiting_bytes = 0;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const auto &[key, loc] = targets[i];
+            const auto &outcome = reply.locations[i];
+            if (outcome.action == ReclaimStorageResult::Action::Retry) {
                 waiting_bytes += FreeBusyTask::RecordBytes(*loc, instance.size());
                 if (!retry) {
                     auto &uris = records.at({key, loc->id()});
@@ -477,15 +379,11 @@ struct Batch : std::enable_shared_from_this<Batch> {
                 continue;
             }
             records.erase({key, loc->id()});
-            const char *reason = required[0] ? retain_reason[0] : nullptr;
-            if (!reason && required[1]) {
-                reason = retain_reason[1];
-            }
-            if (reason) {
+            if (outcome.action == ReclaimStorageResult::Action::Retain) {
                 failed = true;
-                RecordRetained(*task->resources, reason, 1);
-                KVCM_LOG_WARN("PACE reclaim stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
-                              reason,
+                RecordRetained(*task->resources, outcome.reason, 1);
+                KVCM_LOG_WARN("Reclaim delete stopped: %s, instance[%s] key[%ld] location[%s] storage[%s]",
+                              outcome.reason,
                               instance.c_str(),
                               key,
                               loc->id().c_str(),
@@ -496,22 +394,21 @@ struct Batch : std::enable_shared_from_this<Batch> {
         }
         if (!completed.empty() && !Cad(completed, idx, retry)) {
             failed = true;
-            KVCM_LOG_WARN("PACE reclaim CAD failed instance[%s] storage[%s] locations[%zu]",
+            KVCM_LOG_WARN("Reclaim CAD failed instance[%s] storage[%s] locations[%zu]",
                           instance.c_str(),
                           name.c_str(),
                           completed.size());
         }
-        if (outstanding.none()) {
+        if (!reply.busy_replies) {
             Finish(true);
             return;
         }
         task->resources->reserved.fetch_sub(reserved - waiting_bytes);
         reserved = waiting_bytes;
-        KVCM_LOG_DEBUG("PACE Free busy instance[%s] storage[%s] locations[%zu] gas[%zu] retry[%d] wait_ms[%lu]",
+        KVCM_LOG_DEBUG("Reclaim delete busy instance[%s] storage[%s] locations[%zu] retry[%d] wait_ms[%lu]",
                        instance.c_str(),
                        name.c_str(),
                        records.size(),
-                       (outstanding[0] ? targets.gas[0].size() : 0) + (outstanding[1] ? targets.gas[1].size() : 0),
                        retry,
                        wait);
         next_delay = std::min(next_delay * 2, task->max_ms);
@@ -520,44 +417,52 @@ struct Batch : std::enable_shared_from_this<Batch> {
 };
 } // namespace
 
-void RunPaceReclaimDelete(SchedulePlanExecutor &executor,
-                          const std::shared_ptr<DataStorageManager> &storage,
-                          const std::shared_ptr<MetaIndexerManager> &meta,
-                          const std::shared_ptr<MetaIndexer> &indexer,
-                          const CacheLocationDelRequest &request,
-                          const ReclaimFreeLocations &locations,
-                          PlanExecuteResult result,
-                          std::function<void(PlanExecuteResult)> complete) {
-    struct StorageGroup : FreeTargets {
-        std::set<std::string> skip;
+void SchedulePlanExecutor::RunReclaimDeleteTask(const CacheLocationDelRequest &request,
+                                                const std::shared_ptr<MetaIndexer> &indexer,
+                                                std::function<void(PlanExecuteResult)> complete) {
+    ReclaimDeleteLocations locations;
+    auto result = DoLocationDelTask(request, indexer, &locations);
+    struct StorageGroup {
+        std::unique_ptr<ReclaimStorageBatch> storage_batch;
+        ReclaimDeleteLocations locations;
+        std::set<std::string> skipped;
     };
     std::map<std::string, StorageGroup> groups;
-    std::vector<PaceReclaimGA> location_gas;
+    std::vector<ReclaimDeleteUri> uris;
     for (const auto &[key, loc] : locations) {
-        std::string name;
-        location_gas.clear();
-        std::set<std::string> skipped;
-        if (!request.confirmed_missing_uris.empty() && !loc->location_specs().empty()) {
-            name = DataStorageUri(loc->location_specs().front().uri()).GetHostName();
-            const auto backend = storage->GetDataStorageBackend(name);
-            if (!backend || backend->ShouldSkipConfirmedMissingBackendDelete()) {
-                for (const auto &spec : loc->location_specs()) {
-                    if (request.confirmed_missing_uris.count(DataStorageUri(spec.uri()).ToUriString())) {
-                        skipped.insert(spec.uri());
-                    }
-                }
-            }
+        const auto &specs = loc->location_specs();
+        const std::string name = specs.empty() ? std::string{} : DataStorageUri(specs.front().uri()).GetHostName();
+        auto &group = groups[name];
+        if (!group.storage_batch) {
+            group.storage_batch = CreateReclaimStorageBatch(loc->type(), name);
         }
-        if (!AppendGAs(request.instance_id, key, *loc, name, location_gas, [&](size_t, const std::string &uri) {
-                return skipped.count(uri) != 0;
-            })) {
+        const bool skip_missing = !request.confirmed_missing_uris.empty() && !specs.empty() &&
+                                  data_storage_manager_->ShouldSkipConfirmedMissingDelete(name);
+        uris.clear();
+        for (const auto &spec : specs) {
+            const bool skip =
+                skip_missing && request.confirmed_missing_uris.count(DataStorageUri(spec.uri()).ToUriString());
+            uris.push_back({spec.uri(), skip});
+        }
+        if (!group.storage_batch || !group.storage_batch->AddLocation(uris)) {
+            KVCM_LOG_WARN("Invalid reclaim target instance[%s] key[%ld] storage[%s] location[%s]",
+                          request.instance_id.c_str(),
+                          key,
+                          name.c_str(),
+                          loc->ToJsonString().c_str());
             RecordRetained(*request.free_busy->resources, "invalid_uri", 1);
-            result = {EC_PARTIAL_OK, "invalid PACE Location", true};
+            result = {EC_PARTIAL_OK, "invalid reclaim Location", true};
+            if (group.locations.empty()) {
+                groups.erase(name);
+            }
             continue;
         }
-        auto &group = groups[name];
-        group.skip.merge(skipped);
-        group.Add(key, loc, location_gas);
+        group.locations.emplace_back(key, loc);
+        for (const auto &spec : uris) {
+            if (spec.skip) {
+                group.skipped.insert(spec.uri);
+            }
+        }
     }
     if (request.reservation) {
         std::set<std::string> active;
@@ -579,8 +484,15 @@ void RunPaceReclaimDelete(SchedulePlanExecutor &executor,
     std::vector<std::shared_ptr<Batch>> batches;
     for (auto &[name, group] : groups) {
         const auto &targets = group.locations;
-        auto batch = std::make_shared<Batch>(executor, storage, meta, indexer, request, name, completion);
-        if (group.gas[0].empty() && group.gas[1].empty()) {
+        auto batch = std::make_shared<Batch>(*this,
+                                             data_storage_manager_,
+                                             meta_manager_,
+                                             indexer,
+                                             request,
+                                             name,
+                                             std::move(group.storage_batch),
+                                             completion);
+        if (!batch->storage_batch->HasRequests()) {
             batch->Finish(batch->Cad(targets, indexer, false));
             continue;
         }
@@ -610,7 +522,7 @@ void RunPaceReclaimDelete(SchedulePlanExecutor &executor,
         batch->deadline = Clock::now() + kRetryDeadline;
         try {
             const auto &group = groups.at(batch->name);
-            batch->Send(group, indexer, false, group.skip);
+            batch->Send(group.locations, indexer, false, group.skipped);
         } catch (const std::exception &e) { batch->Stop("local_error", e.what()); } catch (...) {
             batch->Stop("local_error", "initial Free exception");
         }

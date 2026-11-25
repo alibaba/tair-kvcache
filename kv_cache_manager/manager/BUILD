@@ -103,6 +103,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/manager:migration_manager",
@@ -146,8 +147,8 @@ cc_library(
 
 cc_library(
     name = "schedule_plan_executor",
-    srcs = ["delete_admission.cc", "pace_reclaim_delete.cc", "schedule_plan_executor.cc"],
-    hdrs = ["delete_admission.h", "delete_limits.h", "free_busy.h", "pace_reclaim_delete.h", "schedule_plan_executor.h"],
+    srcs = ["delete_admission.cc", "reclaim_delete_task.cc", "schedule_plan_executor.cc"],
+    hdrs = ["delete_admission.h", "delete_limits.h", "free_busy.h", "schedule_plan_executor.h"],
     deps = [
         "//kv_cache_manager/meta:meta_indexer",
         "//kv_cache_manager/common",

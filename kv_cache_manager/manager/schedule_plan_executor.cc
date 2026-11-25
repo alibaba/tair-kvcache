@@ -15,9 +15,9 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
-#include "kv_cache_manager/manager/pace_reclaim_delete.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -285,7 +285,7 @@ void SchedulePlanExecutor::WorkerRoutine() {
 
 PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
                                                           const std::shared_ptr<MetaIndexer> &indexer,
-                                                          ReclaimFreeLocations *pace_locations) {
+                                                          ReclaimDeleteLocations *adaptive_locations) {
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -332,8 +332,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (pace_locations && !task.metadata_only && IsTairMempoolStorageType(iter->second->type())) {
-                pace_locations->emplace_back(block_key, iter->second);
+            if (adaptive_locations && !task.metadata_only && SupportsAdaptiveDelete(iter->second->type())) {
+                adaptive_locations->emplace_back(block_key, iter->second);
                 continue; // This storage batch owns its physical Free and CAD.
             }
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
@@ -361,16 +361,14 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     for (auto &storage_uris_pair : delete_uris_by_unique_name) {
         const std::string &storage_unique_name = storage_uris_pair.first;
         auto &storage_uris = storage_uris_pair.second;
-        if (!task.confirmed_missing_uris.empty()) {
-            const auto backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
-            if (!backend || backend->ShouldSkipConfirmedMissingBackendDelete()) {
-                storage_uris.erase(std::remove_if(storage_uris.begin(),
-                                                  storage_uris.end(),
-                                                  [&](const DataStorageUri &uri) {
-                                                      return task.confirmed_missing_uris.count(uri.ToUriString()) != 0;
-                                                  }),
-                                   storage_uris.end());
-            }
+        if (!task.confirmed_missing_uris.empty() &&
+            data_storage_manager_->ShouldSkipConfirmedMissingDelete(storage_unique_name)) {
+            storage_uris.erase(std::remove_if(storage_uris.begin(),
+                                              storage_uris.end(),
+                                              [&](const DataStorageUri &uri) {
+                                                  return task.confirmed_missing_uris.count(uri.ToUriString()) != 0;
+                                              }),
+                               storage_uris.end());
         }
         if (storage_uris.empty()) {
             continue;
@@ -945,17 +943,9 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         auto execute_task = [this, completion, actual_task = std::move(actual_task), indexer = std::move(indexer)]() {
             try {
                 if (actual_task.free_busy) {
-                    ReclaimFreeLocations locations;
-                    auto result = DoLocationDelTask(actual_task, indexer, &locations);
-                    RunPaceReclaimDelete(
-                        *this,
-                        data_storage_manager_,
-                        meta_manager_,
-                        indexer,
-                        actual_task,
-                        locations,
-                        std::move(result),
-                        [completion](PlanExecuteResult done) { completion->Complete(std::move(done)); });
+                    RunReclaimDeleteTask(actual_task, indexer, [completion](PlanExecuteResult done) {
+                        completion->Complete(std::move(done));
+                    });
                 } else {
                     completion->Complete(DoLocationDelTask(actual_task, indexer));
                 }
@@ -1014,7 +1004,7 @@ ErrorCode SchedulePlanExecutor::SubmitTrimPage(RequestContext *ctx,
         return ec == EC_OK ? EC_ERROR : ec;
     }
 
-    ReclaimFreeLocations targets;
+    ReclaimDeleteLocations targets;
     std::vector<DeleteTargetCost> costs;
     DeleteDemand page_cost;
     for (size_t i = 0; i < maps.size(); ++i) {

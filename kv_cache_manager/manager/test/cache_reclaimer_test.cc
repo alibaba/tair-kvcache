@@ -975,8 +975,8 @@ public:
     void ReplaceReclaimer(const CacheReclaimerAsyncDeleteConfig &config) {
         cache_reclaimer_->Stop();
         DeleteLimits limits;
-        limits.non_pace_reclaim = {config.pending_location_limit_per_group_type,
-                                   config.pending_bytes_limit_per_group_type};
+        limits.reclaimer_per_group_type = {config.pending_location_limit_per_group_type,
+                                           config.pending_bytes_limit_per_group_type};
         limits.sources[0] = {config.pending_delete_handler_limit, {0, config.pending_bytes_limit}};
         limits.retry_memory_bytes = config.free_busy_retry_memory_limit_bytes;
         spe_ = std::make_shared<SchedulePlanExecutor>(1, mim_, dsm_, mr_, 1, limits);
@@ -5436,7 +5436,7 @@ TEST_F(CacheReclaimerTest, TestGroupLruPendingQuotaIsAppliedAfterGlobalOrdering)
     auto quota = spe_->Deletes().TryReserve(DeleteSource::Reclaimer,
                                             NonPaceDemand(group->name(),
                                                           DataStorageType::DATA_STORAGE_TYPE_NFS,
-                                                          spe_->Deletes().limits.non_pace_reclaim.locations - 1,
+                                                          spe_->Deletes().limits.reclaimer_per_group_type.locations - 1,
                                                           0));
     ASSERT_TRUE(quota);
     EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);

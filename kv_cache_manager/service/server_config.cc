@@ -83,8 +83,8 @@ DeleteLimits ServerConfig::GetDeleteLimits() const {
     };
     limits.cluster.locations = override_value("cluster_locations", limits.cluster.locations);
     limits.cluster.bytes = override_value("cluster_bytes", limits.cluster.bytes);
-    limits.non_pace_reclaim = {cache_reclaimer_pending_location_limit_per_group_type_,
-                               cache_reclaimer_pending_bytes_limit_per_group_type_};
+    limits.reclaimer_per_group_type = {cache_reclaimer_pending_location_limit_per_group_type_,
+                                       cache_reclaimer_pending_bytes_limit_per_group_type_};
     limits.protocol = free_busy_enabled_;
     limits.initial_backoff_ms = free_busy_initial_backoff_ms_;
     limits.max_backoff_ms = free_busy_max_backoff_ms_;

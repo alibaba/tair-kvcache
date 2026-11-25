@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -40,6 +41,8 @@ class MetaIndexerManager;
 struct FreeBusyTask;
 class MetaIndexer;
 class DataStorageManager;
+
+using ReclaimDeleteLocations = std::vector<std::pair<int64_t, CacheLocationConstPtr>>;
 
 struct CacheMetaDelRequest {
     std::string instance_id;
@@ -273,10 +276,12 @@ private:
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class,
                                                         const TrimBatch *trim_batch = nullptr);
-    PlanExecuteResult
-    DoLocationDelTask(const CacheLocationDelRequest &task,
-                      const std::shared_ptr<MetaIndexer> &indexer,
-                      std::vector<std::pair<int64_t, CacheLocationConstPtr>> *pace_locations = nullptr);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
+                                        const std::shared_ptr<MetaIndexer> &indexer,
+                                        ReclaimDeleteLocations *adaptive_locations = nullptr);
+    void RunReclaimDeleteTask(const CacheLocationDelRequest &task,
+                              const std::shared_ptr<MetaIndexer> &indexer,
+                              std::function<void(PlanExecuteResult)> complete);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

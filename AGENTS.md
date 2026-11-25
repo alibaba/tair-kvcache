@@ -18,6 +18,7 @@ flowchart TD
     meta --> config["config（注册表/选主）"]
     config --> data_storage["data_storage（存储后端）"]
     data_storage --> common["common"]
+    manager -->|"回收任务按 Location 获取存储删除结果"| data_storage
 
     manager --> event["event"]
     event --> protocol["protocol（proto/grpc）"]

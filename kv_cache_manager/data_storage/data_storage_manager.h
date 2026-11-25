@@ -29,6 +29,7 @@ public:
     std::vector<std::string> GetAllStorageNames() const;
     std::vector<std::shared_ptr<DataStorageBackend>> GetAvailableStorages();
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
+    bool ShouldSkipConfirmedMissingDelete(const std::string &name);
     // Runs synchronously under the registry read lock, passing null if the name is absent.
     // The operation must not reenter this manager.
     template <typename Operation>

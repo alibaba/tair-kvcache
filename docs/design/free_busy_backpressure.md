@@ -30,6 +30,8 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 ## 3. KVCM 如何处理 Tair Mempool Free 回包
 
+Executor 按存储能力选择删除路径。普通后端沿用 `Delete`。同一任务混用多种存储时，只有支持退避删除的 Location 交给对应的存储适配层。适配层校验 URI、按协议组批和解释回包，逐个 Location 返回完成、等待重试或保留元数据的结果，并上报 busy 次数、等待建议和恢复反馈。Executor 据此调额，负责延时投递、重读元数据和条件删除。一个 Location 跨两个协议子批时，适配层跟踪各子批的结果，重试只发送仍被拒的那部分。[存储批次接口](../../kv_cache_manager/data_storage/reclaim_storage.h) · [回收任务](../../kv_cache_manager/manager/reclaim_delete_task.cc)
+
 KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配没有这个字段，仍发送 v1 裸 GA 请求。带该字段的分配使用条件 Free，按相同顺序发送三列 `ga`、`node_ids`、`alloc_generations`。同一 storage 内按有无身份分开组批。同一 Location 的全部有效 spec 都收尾后才能清理其元数据。分配回包中的身份非法时拒绝登记。已存 URI 的身份非法时保留该 Location。
 
 | Tair Mempool 回包 | KVCM 行为 |

@@ -571,7 +571,7 @@ TEST_F(ServerConfigTest, DeleteAdmissionUsesEquivalentLegacyLimitsAndExplicitSou
     auto limits = config.GetDeleteLimits();
     EXPECT_EQ(24576u, limits.cluster.locations);
     EXPECT_EQ(2ULL << 40, limits.cluster.bytes);
-    EXPECT_EQ(11u, limits.non_pace_reclaim.locations);
+    EXPECT_EQ(11u, limits.reclaimer_per_group_type.locations);
     EXPECT_EQ(44u, limits.sources[0].size.bytes);
     EXPECT_EQ(0u, limits.sources[0].requests);
     EXPECT_EQ(5u, limits.sources[1].requests);
