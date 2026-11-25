@@ -135,6 +135,7 @@ private:
     };
 
     struct InflightDelete {
+        std::shared_ptr<DeleteReservation> reservation;
         uint64_t round_id{0};
         std::string instance_id;
         std::string action_name;

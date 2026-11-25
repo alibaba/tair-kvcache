@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -19,6 +20,7 @@ private:
 public:
     bool Parse(const std::string &config_file, const EnvironMap &environ);
     bool Check();
+    DeleteLimits GetDeleteLimits() const;
 
 public:
     const std::string &GetRegistryStorageUri() const { return registry_storage_uri_; }
@@ -59,6 +61,9 @@ public:
     uint64_t GetCacheReclaimerPendingLocationLimitPerGroupType() const {
         return cache_reclaimer_pending_location_limit_per_group_type_;
     }
+    bool GetFreeBusyEnabled() const { return free_busy_enabled_; }
+    uint64_t GetFreeBusyInitialBackoffMs() const { return free_busy_initial_backoff_ms_; }
+    uint64_t GetFreeBusyRetryMemoryLimitBytes() const { return free_busy_retry_memory_limit_bytes_; }
     uint64_t GetCacheReclaimerPendingBytesLimitPerGroupType() const {
         return cache_reclaimer_pending_bytes_limit_per_group_type_;
     }
@@ -147,6 +152,10 @@ private:
     uint32_t cache_reclaimer_worker_size_ = 0;
     uint64_t cache_reclaimer_inflight_delete_timeout_ms_ = 0;
     uint64_t cache_reclaimer_pending_location_limit_per_group_type_ = 0;
+    bool free_busy_enabled_{true};
+    uint32_t free_busy_initial_backoff_ms_{50};
+    uint32_t free_busy_max_backoff_ms_{DeleteLimits::kDefaultMaxBackoffMs};
+    uint64_t free_busy_retry_memory_limit_bytes_{DeleteLimits::kDefaultRetryMemoryLimitBytes};
     uint64_t cache_reclaimer_pending_bytes_limit_per_group_type_ = 0;
     uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
     uint64_t cache_reclaimer_pending_bytes_limit_ = 0;
@@ -178,6 +187,9 @@ private:
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;
+    static SettingFunction DeleteLimitSetting(const char *name, bool require_positive = false);
+    std::unordered_map<std::string, uint64_t> delete_limit_overrides_;
+    bool explicit_group_delete_limit_{false};
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;
 };
 

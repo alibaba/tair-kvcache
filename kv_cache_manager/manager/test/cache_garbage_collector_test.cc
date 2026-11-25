@@ -442,6 +442,12 @@ public:
     }
 
     std::unique_ptr<CacheGarbageCollector> MakeGc(const CacheGarbageCollector::Config &config) {
+        if (executor_->Deletes().limits.sources[1].requests != config.max_inflight_delete_requests) {
+            DeleteLimits limits;
+            limits.sources[1].requests = config.max_inflight_delete_requests;
+            executor_ = std::make_shared<SchedulePlanExecutor>(
+                1, meta_indexer_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+        }
         return std::make_unique<CacheGarbageCollector>(config,
                                                        registry_manager_,
                                                        meta_indexer_manager_,
@@ -2146,6 +2152,8 @@ TEST_F(CacheGarbageCollectorTest, RealExecutorBacklogDoesNotBlockGcSubmitAndStop
     stub_.reset(static_cast<SubmitAsyncLocation>(ADDR(SchedulePlanExecutor, SubmitAsync)));
     stub_.set(ADDR(MetaIndexer, GetLocationsFromPrimary), GetLocationsFromPrimaryErrorStub);
 
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
     std::promise<void> blocker_started;
     std::promise<void> release_blocker;
     const auto release_future = release_blocker.get_future().share();
@@ -2155,8 +2163,6 @@ TEST_F(CacheGarbageCollectorTest, RealExecutorBacklogDoesNotBlockGcSubmitAndStop
     }));
     ASSERT_EQ(std::future_status::ready, blocker_started.get_future().wait_for(std::chrono::seconds(1)));
 
-    auto gc = MakeGc(config);
-    PrepareForSingleStep(*gc);
     const auto begin = std::chrono::steady_clock::now();
     gc->RunOneTick();
     const auto submit_cost = std::chrono::steady_clock::now() - begin;
@@ -2165,6 +2171,7 @@ TEST_F(CacheGarbageCollectorTest, RealExecutorBacklogDoesNotBlockGcSubmitAndStop
     ASSERT_EQ(1, scan_calls.size());
 
     gc->RunOneTick();
+    ASSERT_EQ(1, gc->inflight_deletes_.size());
     EXPECT_EQ(1, scan_calls.size());
 
     release_blocker.set_value();

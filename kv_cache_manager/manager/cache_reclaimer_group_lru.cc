@@ -480,8 +480,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     }
     result.water_level_exceeded = true;
     const auto process_full = [&]() {
-        return pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
-               pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit;
+        return !sched_plan_executor_->Deletes().RemainingRequests(DeleteSource::Reclaimer);
     };
     if (process_full()) {
         METRICS_(cache_reclaimer, group_lru_backpressure_stop_count) += 1;
@@ -521,10 +520,10 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     // Requested samples can include duplicates or non-deletable keys. Keep
     // selection headroom in the actual, unique eligible candidate set too.
     // GroupLruBatchSize retains one-key progress for a nonempty tiny tail.
-    candidates.resize(
-        std::min(candidates.size(), GroupLruBatchSize(plan, std::min(successful_sampling_size, candidates.size()))));
+    const auto top_count =
+        std::min(candidates.size(), GroupLruBatchSize(plan, std::min(successful_sampling_size, candidates.size())));
     METRICS_(cache_reclaimer, group_lru_sort_duration_us) = TimestampUtil::GetSteadyTimeUs() - sort_begin;
-    METRICS_(cache_reclaimer, group_lru_selected_block_count) += candidates.size();
+    METRICS_(cache_reclaimer, group_lru_selected_block_count) += top_count;
 
     const auto scope_active = [&]() {
         const auto current = read_water_level();
@@ -544,7 +543,8 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     const auto request_limit = std::min(plan.configured_batch_size, kSizeLimit - 1);
     const auto submit_begin = TimestampUtil::GetSteadyTimeUs();
     std::size_t attempted_requests = 0;
-    for (std::size_t position = 0; position < candidates.size();) {
+    std::size_t candidate_end = top_count;
+    for (std::size_t position = 0; position < candidate_end;) {
         if (!IsRunning() || IsPaused() || !scope_active()) {
             break;
         }
@@ -562,7 +562,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         request.instance_id = info->instance_id();
         request.delay = std::chrono::milliseconds(delay);
         const auto request_begin = position;
-        while (position < candidates.size() && candidates[position].instance_index == index &&
+        while (position < candidate_end && candidates[position].instance_index == index &&
                request.block_keys.size() < request_limit) {
             request.block_keys.push_back(candidates[position++].block_key);
         }
@@ -570,6 +570,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         CountsByStorageType counts{};
         std::uint64_t predicted_keys = 0;
         AgeStats ages;
+        std::size_t quota_deferred_keys = 0;
         if (!FilterLocIDImpl(request_context.get(),
                              info,
                              request.block_keys,
@@ -580,9 +581,13 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
                              predicted_keys,
                              ages,
                              false,
-                             true)) {
+                             true,
+                             &request,
+                             &quota_deferred_keys)) {
             continue;
         }
+        // A whole key deferred by storage backpressure opens one place for the next coldest sampled key.
+        candidate_end += std::min(quota_deferred_keys, candidates.size() - candidate_end);
         const auto nonempty_blocks = std::count_if(request.location_ids.begin(),
                                                    request.location_ids.end(),
                                                    [](const auto &locations) { return !locations.empty(); });
@@ -642,7 +647,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
                    plan.partial,
                    plan.sampling_size,
                    successful_sampling_size,
-                   candidates.size(),
+                   top_count,
                    attempted_requests);
     return result;
 }

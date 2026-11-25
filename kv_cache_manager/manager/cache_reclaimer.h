@@ -22,6 +22,8 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/manager/delete_admission.h"
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -71,6 +73,9 @@ struct CacheReclaimerAsyncDeleteConfig {
     std::uint64_t pending_bytes_limit_per_group_type{1ULL * 1024 * 1024 * 1024 * 1024};
     std::uint64_t pending_delete_handler_limit{1024};
     std::uint64_t pending_bytes_limit{4ULL * 1024 * 1024 * 1024 * 1024};
+    bool free_busy_enabled{true};
+    uint64_t free_busy_initial_backoff_ms{50};
+    uint64_t free_busy_retry_memory_limit_bytes{DeleteLimits::kDefaultRetryMemoryLimitBytes};
 };
 
 struct CacheReclaimerGroupLruConfig {
@@ -372,6 +377,7 @@ private:
     std::atomic<std::uint32_t> future_timeout_ms_;
 
     const CacheReclaimerAsyncDeleteConfig async_delete_config_;
+    const std::shared_ptr<FreeBusyResources> free_busy_resources_;
 
     std::mutex task_queue_mutex_;
     std::condition_variable cv_task_queue_;
@@ -402,6 +408,7 @@ private:
         bool credit_enabled_;
         bool outcome_unknown_reported_;
         std::future<PlanExecuteResult> fut_;
+        std::shared_ptr<DeleteReservation> reservation_;
 
         DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
                       std::string ins_id,
@@ -794,7 +801,9 @@ private:
                          std::uint64_t &out_predicted_deleted_keys,
                          AgeStats &out_create_age_stats,
                          bool eligibility_only,
-                         bool maintenance_read) noexcept;
+                         bool maintenance_read,
+                         CacheLocationDelRequest *output = nullptr,
+                         std::size_t *out_quota_deferred_keys = nullptr) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。
@@ -812,7 +821,6 @@ private:
 
     static std::uint64_t SaturatingSub(std::uint64_t lhs, std::uint64_t rhs) noexcept;
     static std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept;
-    static std::uint64_t GetLocationBytes(const CacheLocation &location) noexcept;
     BytesByStorageType GetCreditedDeleteBytes(const std::string &instance_group) const noexcept;
     std::uint64_t GetPredictedDeletedKeys(const std::string &instance_group) const noexcept;
     void AddDeleteHandlerState(const DeleteHandler &handler) noexcept;
@@ -835,6 +843,9 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_reject_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count)
@@ -890,6 +901,7 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(credited_delete_bytes)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(predicted_deleted_key_count)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(free_busy_reserved_bytes)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_effective_instance_count)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_planned_instance_count)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_sampled_instance_count)

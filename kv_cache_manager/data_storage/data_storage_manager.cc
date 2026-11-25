@@ -68,6 +68,11 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::GetDataStorageBackend(co
     return nullptr;
 }
 
+bool DataStorageManager::ShouldSkipConfirmedMissingDelete(const std::string &name) {
+    const auto backend = GetDataStorageBackend(name);
+    return !backend || backend->ShouldSkipConfirmedMissingBackendDelete();
+}
+
 ErrorCode DataStorageManager::EnableStorage(const std::string &name) {
     std::unique_lock<std::shared_mutex> lock(rw_lock_);
     auto iter = storage_map_.find(name);

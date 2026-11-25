@@ -4,10 +4,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -19,6 +21,9 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/pace_reclaim_free.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
+#include "kv_cache_manager/manager/free_busy.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -363,14 +368,17 @@ public:
         return backend;
     }
 
-    void SetLocation(int64_t key, const std::string &id, DataStorageType type, const std::vector<std::string> &uris) {
+    void SetLocation(int64_t key,
+                     const std::string &id,
+                     DataStorageType type,
+                     const std::vector<std::string> &uris,
+                     CacheLocationStatus status = CLS_SERVING) {
         std::vector<LocationSpec> specs;
         for (size_t i = 0; i < uris.size(); ++i) {
             specs.emplace_back("tp" + std::to_string(i), uris[i]);
         }
         std::vector<ErrorCode> results;
-        ASSERT_EQ(EC_OK,
-                  searcher->BatchReplaceLocationSpecs(&context, {key}, {{{id, type, CLS_SERVING, specs}}}, results));
+        ASSERT_EQ(EC_OK, searcher->BatchReplaceLocationSpecs(&context, {key}, {{{id, type, status, specs}}}, results));
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
     }
 
@@ -413,11 +421,907 @@ public:
         return uris;
     }
 
-    RequestContext context{"tair_gc_delete_test"};
+    RequestContext context{"gc_delete_test"};
     std::shared_ptr<MetaIndexer> indexer;
     std::unique_ptr<MetaSearcher> searcher;
     std::unique_ptr<SchedulePlanExecutor> executor;
 };
+
+class FreeBusyDeleteTest : public BackendGcDeleteTest {
+public:
+    void SetUp() override {
+        BackendGcDeleteTest::SetUp();
+        resources = std::make_shared<FreeBusyResources>(1 << 20, metrics_registry_);
+    }
+    uint64_t Retained(const char *reason) const {
+        return metrics_registry_->GetCounter("cache_reclaimer.free_busy_retained_location_count", {{"reason", reason}})
+            .Get();
+    }
+
+    struct FakePaceBackend : RecordingDeleteBackend, PaceReclaimBackend {
+        explicit FakePaceBackend(const std::string &name)
+            : RecordingDeleteBackend(name, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {}
+        std::vector<PaceReclaimFreeResult> replies;
+        std::vector<std::vector<uint64_t>> calls;
+        size_t ordinary_calls = 0;
+        bool skip_missing{false};
+        PaceProviderCount providers;
+        PaceProviderCount GetReclaimProviderCount() const override { return providers; }
+        bool ShouldSkipConfirmedMissingBackendDelete() const override { return skip_missing; }
+        void Endpoint(const std::string &domain, const std::string &discovery) {
+            auto spec = std::make_shared<TairMemPoolStorageSpec>();
+            spec->set_domain(domain);
+            spec->set_service_discovery_url(discovery);
+            config_.set_storage_spec(spec);
+        }
+        std::vector<std::vector<PaceReclaimGA>> wire_calls;
+        std::function<void()> on_first;
+        std::function<void()> on_retry;
+        PaceReclaimFreeResult DeleteForReclaim(const std::vector<PaceReclaimGA> &gas,
+                                               const std::string &,
+                                               const std::function<bool()> &can_send) override {
+            if (!can_send()) {
+                return {PaceReclaimFreeResult::kNotSent};
+            }
+            wire_calls.push_back(gas);
+            auto &addresses = calls.emplace_back();
+            for (const auto &target : gas) {
+                addresses.push_back(target.ga);
+            }
+            if (calls.size() == 1 && on_first) {
+                on_first();
+            } else if (calls.size() > 1 && on_retry) {
+                on_retry();
+            }
+            return replies.at(calls.size() - 1);
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            ++ordinary_calls;
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+    };
+    std::shared_ptr<FakePaceBackend> Backend(std::string name, std::vector<PaceReclaimFreeResult> replies) {
+        auto backend = std::make_shared<FakePaceBackend>(name);
+        backend->replies = std::move(replies);
+        data_storage_manager_->storage_map_[name] = backend;
+        return backend;
+    }
+    CacheLocationDelRequest Evict(int64_t key, std::vector<std::string> ids) {
+        CacheLocationDelRequest req{kTestInstanceName, {key}, {ids}};
+        req.free_busy = std::make_shared<FreeBusyTask>(resources, 1);
+        feedback.clear();
+        req.free_busy->on_feedback = [this](const std::string &storage, uint64_t busy_ms) {
+            auto &entry = feedback[storage];
+            entry.first = std::max(entry.first, busy_ms);
+            entry.second |= busy_ms == 0;
+        };
+        for (const auto &id : ids) {
+            auto bytes = FreeBusyTask::RecordBytes(*Locations(key).at(id), kTestInstanceName.size());
+            EXPECT_TRUE(resources->Reserve(bytes));
+            req.free_busy->unassigned += bytes;
+        }
+        return req;
+    }
+    std::map<std::string, std::pair<uint64_t, bool>> feedback;
+    std::shared_ptr<FreeBusyResources> resources;
+    const DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+};
+
+TEST_F(FreeBusyDeleteTest, PaceFreeProtectsTheRegisteredBackendThroughFirstSendAndRetry) {
+    const std::string uri = "pace://store/1";
+    auto batch = CreateReclaimStorageBatch(type, "store");
+    ASSERT_TRUE(batch);
+    auto send = [&] {
+        EXPECT_TRUE(batch->AddLocation({{uri, false}}));
+        return batch->Send(*data_storage_manager_, "trace", []() -> const char * { return nullptr; });
+    };
+    const auto missing = send();
+    ASSERT_EQ(1u, missing.locations.size());
+    ASSERT_EQ(ReclaimStorageResult::Action::Retain, missing.locations[0].action);
+    EXPECT_STREQ("backend_unavailable", missing.locations[0].reason);
+    batch = CreateReclaimStorageBatch(type, "store");
+    ASSERT_TRUE(batch);
+    auto backend = Backend("store", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kBusy, 1}});
+    auto check_lock = [&] {
+        auto writer = std::async(std::launch::async, [&] {
+            return std::unique_lock<std::shared_mutex>(data_storage_manager_->rw_lock_, std::try_to_lock).owns_lock();
+        });
+        EXPECT_FALSE(writer.get());
+    };
+    backend->on_first = check_lock;
+    backend->on_retry = check_lock;
+    EXPECT_EQ(1u, send().busy_replies);
+    EXPECT_EQ(1u, send().busy_replies);
+    auto replacement = Backend("store", {});
+    const auto changed = send();
+    ASSERT_EQ(1u, changed.locations.size());
+    ASSERT_EQ(ReclaimStorageResult::Action::Retain, changed.locations[0].action);
+    EXPECT_STREQ("backend_changed", changed.locations[0].reason);
+    EXPECT_TRUE(replacement->calls.empty());
+}
+
+TEST_F(FreeBusyDeleteTest, GcRetriesOnlyPresentSpecsAndSharesTheClusterWithTrim) {
+    auto dram = Backend("dram", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    auto ssd = Backend("ssd", {});
+    dram->skip_missing = true;
+    dram->Endpoint("unused", "pool-a");
+    ssd->Endpoint("pool-a", "");
+    SetLocation(1, "gc", type, {"pace://dram/1", "pace://dram/2"});
+    SetLocation(2, "trim", DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, {"pace://ssd/3"});
+    auto &admission = executor->Deletes();
+    auto req = Request(1, {"gc"}, {"pace://dram/1"});
+    auto gc_cost = admission.Describe(*Locations(1).at("gc"), kTestInstanceName.size(), DeleteSource::GC, {}, {});
+    auto trim_cost = admission.Describe(*Locations(2).at("trim"), kTestInstanceName.size(), DeleteSource::Trim, {}, {});
+    EXPECT_EQ(gc_cost.bucket, trim_cost.bucket);
+    req.demand.Add(gc_cost);
+    req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+    ASSERT_TRUE(req.reservation);
+    req.free_busy = req.reservation->protocol;
+    ASSERT_TRUE(req.free_busy);
+    EXPECT_EQ(EC_OK, Run(req).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{2}, {2}}), dram->calls);
+    EXPECT_TRUE(Locations(1).empty());
+    EXPECT_TRUE(ssd->calls.empty());
+}
+
+TEST_F(FreeBusyDeleteTest, OrdinaryLocationsUseDeleteEvenWhenTheSameTaskRetriesAnotherStorage) {
+    const auto nfs_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto nfs = AddBackend("files", nfs_type, true);
+    auto &admission = executor->Deletes();
+    std::shared_ptr<FakePaceBackend> pool;
+    for (bool mixed : {false, true}) {
+        const int64_t key = mixed ? 2 : 1;
+        const std::string file = "nfs://files/" + std::to_string(key);
+        SetLocation(key, "file", nfs_type, {"nfs://files/missing", file});
+        std::vector<std::string> ids{"file"};
+        if (mixed) {
+            pool = Backend("pool", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+            SetLocation(key, "object", type, {"pace://pool/17"});
+            ids.push_back("object");
+        }
+        auto req = Request(key, ids, {"nfs://files/missing"});
+        const auto locations = Locations(key);
+        for (const auto &id : ids) {
+            req.demand.Add(
+                admission.Describe(*locations.at(id), kTestInstanceName.size(), DeleteSource::GC, {}, req.demand));
+        }
+        req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+        ASSERT_TRUE(req.reservation);
+        req.free_busy = req.reservation->protocol;
+        EXPECT_EQ(mixed, req.free_busy != nullptr);
+        ASSERT_EQ(EC_OK, Run(req).status);
+        EXPECT_TRUE(Locations(key).empty());
+    }
+    EXPECT_EQ((std::vector<std::string>{"nfs://files/1", "nfs://files/2"}), DeletedUris(*nfs));
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{17}, {17}}), pool->calls);
+    EXPECT_EQ(0u, pool->ordinary_calls);
+}
+
+TEST_F(FreeBusyDeleteTest, LegacyPaceUsesTheStaticClusterLimitWithoutReservingRetryMemory) {
+    AddBackend("old", type);
+    SetLocation(1, "loc", type, {"pace://old/1?size=10"});
+    auto &admission = executor->Deletes();
+    auto cost = admission.Describe(*Locations(1).at("loc"), 1, DeleteSource::GC, {}, {});
+    EXPECT_EQ(0u, cost.retry_bytes);
+    cost.size = admission.limits.cluster;
+    DeleteDemand full;
+    full.Add(cost);
+    auto lease = admission.TryReserve(DeleteSource::GC, full);
+    ASSERT_TRUE(lease);
+    EXPECT_FALSE(lease->protocol);
+    EXPECT_EQ(0u, admission.resources->reserved.load());
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, full));
+}
+
+TEST_F(FreeBusyDeleteTest, LegacyPaceDeletesBareLocationsAndRetainsIdentityDuringRollback) {
+    auto old = AddBackend("old", type);
+    auto current = Backend("current", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    auto &admission = executor->Deletes();
+    for (const bool mixed : {false, true}) {
+        const int64_t key = mixed ? 2 : 1;
+        SetLocation(key, "bare", type, {"pace://old/" + std::to_string(key)});
+        SetLocation(key, "identified", type, {"pace://old/10", "pace://old/11?node_id=7&alloc_generation=5"});
+        SetLocation(key, "malformed", type, {"pace://old/12?alloc_generation="});
+        std::vector<std::string> ids{"bare", "identified", "malformed"};
+        if (mixed) {
+            SetLocation(key, "retry", type, {"pace://current/20"});
+            ids.push_back("retry");
+        }
+        auto req = Request(key, ids, {});
+        const auto locations = Locations(key);
+        for (const auto &id : ids) {
+            req.demand.Add(
+                admission.Describe(*locations.at(id), kTestInstanceName.size(), DeleteSource::GC, {}, req.demand));
+        }
+        req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+        ASSERT_TRUE(req.reservation);
+        req.free_busy = req.reservation->protocol;
+        EXPECT_EQ(mixed, req.free_busy != nullptr);
+        EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
+        const auto remaining = Locations(key);
+        ASSERT_EQ(2u, remaining.size());
+        EXPECT_EQ(CLS_DELETING, remaining.at("identified")->status());
+        EXPECT_EQ(CLS_DELETING, remaining.at("malformed")->status());
+        EXPECT_EQ(0u, admission.resources->reserved.load());
+    }
+    EXPECT_EQ((std::vector<std::string>{"pace://old/1", "pace://old/2"}), DeletedUris(*old));
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{20}, {20}}), current->calls);
+}
+
+TEST_F(FreeBusyDeleteTest, DisablingTheProtocolKeepsOrdinaryDeleteOnTheCapableBackend) {
+    DeleteLimits limits;
+    limits.protocol = false;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto current = Backend("current", {});
+    auto old = AddBackend("old", type);
+    SetLocation(1, "current", type, {"pace://current/1?node_id=7&alloc_generation=5"});
+    SetLocation(1, "old", type, {"pace://old/2?node_id=8&alloc_generation=6"});
+    auto req = Request(1, {"current", "old"}, {});
+    auto &admission = executor->Deletes();
+    for (const auto &[id, loc] : Locations(1)) {
+        req.demand.Add(admission.Describe(*loc, 1, DeleteSource::GC, {}, req.demand));
+    }
+    req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+    ASSERT_TRUE(req.reservation);
+    EXPECT_FALSE(req.reservation->protocol);
+    EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
+    EXPECT_EQ(1u, current->ordinary_calls);
+    EXPECT_TRUE(current->calls.empty());
+    EXPECT_TRUE(old->delete_batches.empty());
+    EXPECT_EQ(0u, Locations(1).count("current"));
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("old")->status());
+}
+
+TEST_F(FreeBusyDeleteTest, InvalidLocationRollsBackOnlyItsOwnStagedSpecs) {
+    auto pool = Backend("pool", {{PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "before", type, {"pace://pool/1"});
+    SetLocation(1, "invalid", type, {"pace://pool/2", "pace://pool/3?node_id=7&alloc_generation=1", "pace://pool/0"});
+    SetLocation(1, "after", type, {"pace://pool/4?node_id=8&alloc_generation=1"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"before", "invalid", "after"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1}, {4}}), pool->calls);
+    const auto remaining = Locations(1);
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(CLS_DELETING, remaining.at("invalid")->status());
+}
+
+TEST_F(FreeBusyDeleteTest, ReclaimBatchReportsOnlySpecsSentInTheFailedRequest) {
+    Backend("pool", {{PaceReclaimFreeResult::kError}, {PaceReclaimFreeResult::kBusy, 5}});
+    auto batch = CreateReclaimStorageBatch(type, "pool");
+    ASSERT_TRUE(batch);
+    const std::string missing = "pace://pool/1";
+    const std::string plain = "pace://pool/2";
+    const std::string identified = "pace://pool/3?node_id=8&alloc_generation=1";
+    ASSERT_TRUE(batch->AddLocation({{missing, true}}));
+    ASSERT_TRUE(batch->AddLocation({{missing, true}, {identified, false}, {plain, false}}));
+    const auto reply = batch->Send(*data_storage_manager_, "trace", []() -> const char * { return nullptr; });
+    ASSERT_EQ(2u, reply.locations.size());
+    EXPECT_EQ(ReclaimStorageResult::Action::Complete, reply.locations[0].action);
+    EXPECT_EQ(ReclaimStorageResult::Action::Retry, reply.locations[1].action);
+    EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{1, 2}}), reply.failed_specs);
+    EXPECT_EQ(5u, reply.retry_after_ms);
+}
+
+TEST_F(FreeBusyDeleteTest, MixedLocationRetriesOnlyTheBusyProtocolAndKeepsOriginalIdentity) {
+    const std::string identified = "pace://pool/42?node_id=70000&alloc_generation=18446744073709551615";
+    for (bool conditional_busy : {true, false}) {
+        const int64_t key = conditional_busy ? 101 : 102;
+        const PaceReclaimFreeResult busy{PaceReclaimFreeResult::kBusy, 1};
+        const PaceReclaimFreeResult success{PaceReclaimFreeResult::kSuccess, 0, 0, true};
+        auto backend = Backend("pool", {conditional_busy ? success : busy, conditional_busy ? busy : success, success});
+        SetLocation(key, "mixed", type, {"pace://pool/11?node_id=7", identified});
+        SetLocation(key,
+                    "independent",
+                    type,
+                    {conditional_busy ? "pace://pool/21" : "pace://pool/21?node_id=8&alloc_generation=3"});
+        backend->on_retry = [&] {
+            if (backend->calls.size() == 3) {
+                auto locs = Locations(key);
+                EXPECT_EQ(0u, locs.count("independent"));
+                EXPECT_EQ(1u, locs.count("mixed"));
+            }
+        };
+        ASSERT_EQ(EC_OK, Run(Evict(key, {"mixed", "independent"})).status);
+        ASSERT_EQ(3u, backend->wire_calls.size());
+        const auto &last = backend->wire_calls.back();
+        ASSERT_EQ(1u, last.size());
+        EXPECT_EQ(conditional_busy ? 42u : 11u, last[0].ga);
+        EXPECT_EQ(conditional_busy ? 70000u : 0u, last[0].node_id);
+        EXPECT_EQ(conditional_busy ? UINT64_MAX : 0, last[0].generation);
+        EXPECT_TRUE(Locations(key).empty());
+        EXPECT_EQ(0u, resources->reserved.load());
+    }
+}
+
+TEST_F(FreeBusyDeleteTest, RetainsMixedLocationWhenOneProtocolIsRejectedAndTheOtherLaterSucceeds) {
+    auto backend = Backend(
+        "pool",
+        {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kRejected}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "mixed", type, {"pace://pool/1", "pace://pool/2?node_id=8&alloc_generation=3"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"mixed"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1}, {2}, {1}}), backend->calls);
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("mixed")->status());
+    EXPECT_EQ(1u, Retained("protocol_rejected"));
+    EXPECT_EQ(0u, resources->reserved.load());
+}
+
+TEST_F(FreeBusyDeleteTest, UnconfirmedReleaseRetainsOnlyAffectedLocations) {
+    using Result = PaceReclaimFreeResult;
+    for (bool after_busy : {false, true}) {
+        const int64_t key = after_busy ? 2 : 1;
+        std::vector<Result> replies{{Result::kSuccess}};
+        if (after_busy) {
+            replies.push_back({Result::kBusy, 1});
+        }
+        replies.push_back({Result::kReleaseUnconfirmed});
+        auto backend = Backend("pool", std::move(replies));
+        SetLocation(key, "mixed", type, {"pace://pool/1", "pace://pool/2?node_id=8&alloc_generation=3"});
+        SetLocation(key, "legacy", type, {"pace://pool/3"});
+        EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(key, {"mixed", "legacy"})).status);
+        auto remaining = Locations(key);
+        ASSERT_EQ(1u, remaining.size());
+        EXPECT_EQ(CLS_DELETING, remaining.at("mixed")->status());
+        ASSERT_EQ(after_busy ? 3u : 2u, backend->calls.size());
+        EXPECT_EQ((std::vector<uint64_t>{2}), backend->calls.back());
+        EXPECT_EQ(after_busy ? 1u : 0u, resources->busy_replies.load());
+        EXPECT_EQ(after_busy ? 1u : 0u, resources->retry_attempts.load());
+        EXPECT_EQ(after_busy, feedback.count("pool") != 0);
+        if (after_busy) {
+            EXPECT_FALSE(feedback.at("pool").second);
+        }
+        EXPECT_EQ(after_busy ? 2u : 1u, Retained("release_unconfirmed"));
+        EXPECT_EQ(0u, resources->reserved.load());
+    }
+}
+
+TEST_F(FreeBusyDeleteTest, InvalidOrChangedGenerationCannotBecomeALegacyFree) {
+    auto backend = Backend("pool", {{PaceReclaimFreeResult::kBusy, 1}});
+    for (const auto query : {"alloc_generation=0&node_id=7",
+                             "alloc_generation=7",
+                             "alloc_generation=&node_id=7",
+                             "alloc_generation=1&node_id=65535",
+                             "alloc_generation=18446744073709551616&node_id=7"}) {
+        SetLocation(1, "invalid", type, {"pace://pool/3", std::string("pace://pool/4?") + query});
+        EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"invalid"})).status);
+        EXPECT_TRUE(backend->calls.empty());
+    }
+    SetLocation(2, "changed", type, {"pace://pool/5?node_id=7&alloc_generation=1"});
+    backend->on_first = [&] {
+        SetLocation(2, "changed", type, {"pace://pool/5?node_id=7&alloc_generation=2"}, CLS_DELETING);
+    };
+    EXPECT_EQ(EC_OK, Run(Evict(2, {"changed"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{5}}), backend->calls);
+    EXPECT_EQ(1u, Locations(2).count("changed"));
+}
+
+TEST_F(FreeBusyDeleteTest, ProviderWindowTracksLiveTopologyAndKeepsConfiguredCeilings) {
+    using Clock = std::chrono::steady_clock;
+    auto backend = Backend("dram", {});
+    backend->Endpoint("pool", "");
+    auto &admission = executor->Deletes();
+    CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://dram/1?size=1")});
+    auto target = admission.Describe(loc, 1, DeleteSource::GC, {}, {});
+    const auto reserve = [&](DeleteAdmission &controller, DeleteSize size) {
+        auto cost = target;
+        cost.size = size;
+        DeleteDemand demand;
+        demand.Add(cost);
+        return controller.TryReserve(DeleteSource::GC, demand);
+    };
+    EXPECT_TRUE(reserve(admission, {384, 20ULL << 30}));
+    EXPECT_FALSE(reserve(admission, {385, 1}));
+    backend->providers = {4, Clock::now()};
+    auto first = reserve(admission, {1536, 80ULL << 30});
+    ASSERT_TRUE(first);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    backend->providers = {40, Clock::now()};
+    auto more = reserve(admission, {15360 - 1536, 720ULL << 30});
+    ASSERT_TRUE(more);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    backend->providers = {1, Clock::now()};
+    more->Finish();
+    EXPECT_FALSE(reserve(admission, {1, 1})); // Outstanding work survives a scale-in.
+    first->Finish();
+    EXPECT_FALSE(reserve(admission, {2, (20ULL << 30) + 1}));
+    EXPECT_TRUE(reserve(admission, {1, (20ULL << 30) + 1})); // One indivisible Location fits the hard limit.
+    backend->providers = {102, Clock::now()};
+    EXPECT_FALSE(reserve(admission, {2, 2ULL << 40}));
+    backend->providers = {103, Clock::now()};
+    EXPECT_TRUE(reserve(admission, {2, 2ULL << 40}));
+    EXPECT_FALSE(reserve(admission, {1, (2ULL << 40) + 1}));
+    backend->providers = {UINT32_MAX, Clock::now()};
+    EXPECT_TRUE(reserve(admission, admission.limits.cluster));
+    EXPECT_FALSE(reserve(admission, {admission.limits.cluster.locations + 1, 1}));
+    backend->providers = {0, Clock::now()};
+    auto probe = reserve(admission, {1, 1});
+    ASSERT_TRUE(probe);
+    EXPECT_FALSE(reserve(admission, {1, 1}));
+    probe->Finish();
+
+    DeleteLimits limits;
+    auto cold = std::make_shared<DeleteAdmission>(limits, data_storage_manager_, metrics_registry_);
+    backend->providers = {40, Clock::now() - std::chrono::minutes(1)};
+    EXPECT_FALSE(reserve(*cold, {385, 1}));
+    limits.protocol = false;
+    auto legacy = std::make_shared<DeleteAdmission>(limits, data_storage_manager_, metrics_registry_);
+    EXPECT_TRUE(reserve(*legacy, limits.cluster));
+}
+
+TEST_F(FreeBusyDeleteTest, ProviderGrowthRespectsBusyAndRecoveryUsesTheLatestClusterSample) {
+    using Clock = std::chrono::steady_clock;
+    auto dram = Backend("dram", {});
+    auto ssd = Backend("ssd", {});
+    dram->Endpoint("same", "");
+    ssd->Endpoint("same", "");
+    auto &admission = executor->Deletes();
+    const auto demand_for = [&](const std::string &name, DeleteSize size) {
+        CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://" + name + "/1?size=1")});
+        auto cost = admission.Describe(loc, 1, DeleteSource::Trim, {}, {});
+        cost.size = size;
+        DeleteDemand demand;
+        demand.Add(cost);
+        return demand;
+    };
+    auto work = demand_for("dram", {384, 20ULL << 30});
+    auto small = demand_for("ssd", {1, 1});
+    dram->providers = ssd->providers = {1, Clock::now()};
+    auto first = admission.TryReserve(DeleteSource::Reclaimer, work);
+    ASSERT_TRUE(first);
+    first->Feedback("dram", 60000);
+    first->Finish();
+    ssd->providers = {4, Clock::now()};
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, small));
+    auto &bucket = admission.buckets_.at("endpoint/same");
+    EXPECT_EQ(192u, bucket.effective.locations);
+    EXPECT_EQ(1536u, bucket.baseline.locations);
+    bucket.cooldown = bucket.observe = Clock::now();
+    for (size_t expected : {384u, 768u, 1536u}) {
+        auto fresh = admission.TryReserve(DeleteSource::GC, small);
+        ASSERT_TRUE(fresh);
+        fresh->Feedback("ssd", 0);
+        fresh->Finish();
+        bucket.observe = Clock::now();
+        ASSERT_TRUE(admission.TryReserve(DeleteSource::Reclaimer, small));
+        EXPECT_EQ(expected, bucket.effective.locations);
+    }
+    EXPECT_EQ(80ULL << 30, bucket.effective.bytes);
+    EXPECT_EQ(0, bucket.interval.count());
+    EXPECT_TRUE(admission.TryReserve(DeleteSource::Trim, demand_for("dram", {1536, 1})));
+    EXPECT_FALSE(admission.TryReserve(DeleteSource::Trim, demand_for("dram", {1537, 1})));
+}
+
+TEST_F(FreeBusyDeleteTest, DiscoveryClientOptionsShareCooldownWhileRoutingOptionsKeepClustersSeparate) {
+    auto &admission = executor->Deletes();
+    const auto cost = [&](const std::string &storage, const std::string &url) {
+        Backend(storage, {})->Endpoint("", url);
+        CacheLocation loc("loc", CLS_SERVING, type, 1, {LocationSpec("spec", "pace://" + storage + "/1?size=1")});
+        return admission.Describe(loc, kTestInstanceName.size(), DeleteSource::GC, {}, {});
+    };
+    const auto dram = cost("dram", "spectrum://pool?cache_time=30&retry_time=3&timeout=5000&port=12348");
+    const auto ssd = cost("ssd", "spectrum://pool?port=12348&timeout=200");
+    const auto other_port = cost("other", "spectrum://pool?port=12349");
+    EXPECT_EQ("endpoint/spectrum://pool?port=12348", dram.bucket);
+    EXPECT_EQ(dram.bucket, ssd.bucket);
+    EXPECT_NE(dram.bucket, cost("routed", "spectrum://pool?port=12348&zone=b").bucket);
+    EXPECT_EQ("endpoint/vipserver://pool", cost("vip", "vipserver://pool?timeout=2").bucket);
+
+    DeleteDemand demand;
+    demand.Add(dram);
+    auto gc = admission.TryReserve(DeleteSource::GC, demand);
+    ASSERT_TRUE(gc);
+    gc->Feedback(dram.storage, 60000);
+    gc->Finish();
+    DeleteDemand trim;
+    EXPECT_FALSE(admission.TryAppend(DeleteSource::Trim, trim, ssd));
+    EXPECT_TRUE(admission.TryAppend(DeleteSource::Trim, trim, other_port));
+}
+
+TEST_F(FreeBusyDeleteTest, TrimSplitsOversizedPageByLocationAndRetriesOnlyTheRefusedBatch) {
+    DeleteLimits limits;
+    limits.cluster = {2, 20};
+    limits.initial_backoff_ms = 1;
+    limits.sources[2].requests = 1;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto backend = Backend(
+        "t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
+    for (int64_t key : {1, 2, 3}) {
+        SetLocation(key, "target", type, {"pace://t/" + std::to_string(key) + "?size=10"});
+    }
+    CacheMetaDelRequest page{kTestInstanceName, {1, 2, 3}};
+    std::vector<std::future<PlanExecuteResult>> futures;
+    EXPECT_EQ(
+        EC_OK,
+        executor->SubmitTrimPage(
+            &context, page, indexer, executor->Deletes().Generation(), [&](std::future<PlanExecuteResult> future) {
+                futures.push_back(std::move(future));
+                return true;
+            }));
+    for (auto &future : futures) {
+        EXPECT_EQ(EC_OK, future.get().status);
+    }
+    EXPECT_EQ(2u, futures.size());
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1, 2}, {1, 2}, {3}}), backend->calls);
+    EXPECT_EQ(0u, backend->ordinary_calls);
+    for (auto key : page.block_keys) {
+        EXPECT_TRUE(Locations(key).empty());
+    }
+    EXPECT_EQ(1u, executor->Deletes().RemainingRequests(DeleteSource::Trim));
+}
+
+TEST_F(FreeBusyDeleteTest, TrimSkipsChangedLocationsAndDeletesTheRestOfThePage) {
+    DeleteLimits limits;
+    limits.cluster.locations = 2;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}, {PaceReclaimFreeResult::kSuccess}});
+    CacheMetaDelRequest page{kTestInstanceName, {1, 2, 3, 4, 5}};
+    for (auto key : page.block_keys) {
+        SetLocation(key, "target", type, {"pace://t/" + std::to_string(key)});
+    }
+
+    size_t batches = 0;
+    auto on_submit = [&](std::future<PlanExecuteResult> future) {
+        EXPECT_EQ(EC_OK, future.get().status);
+        if (++batches == 1) {
+            // The page was read before the first batch. Another delete takes key 3,
+            // and key 5 gets a new GA before their batches try to mark them.
+            SetLocation(3, "target", type, {"pace://t/3"}, CLS_DELETING);
+            SetLocation(5, "target", type, {"pace://t/50"});
+        }
+        return true;
+    };
+    EXPECT_EQ(EC_OK, executor->SubmitTrimPage(&context, page, indexer, executor->Deletes().Generation(), on_submit));
+    EXPECT_EQ(3u, batches);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1, 2}, {4}}), backend->calls);
+    EXPECT_EQ(CLS_DELETING, Locations(3).at("target")->status());
+    EXPECT_TRUE(Locations(4).empty());
+    EXPECT_EQ("pace://t/50", Locations(5).at("target")->location_specs().front().uri());
+    EXPECT_EQ(0u, executor->Deletes().resources->reserved.load());
+}
+
+TEST_F(FreeBusyDeleteTest, OrdinaryMetaDeleteBypassesFullClusterAdmission) {
+    DeleteLimits limits;
+    limits.cluster = {1, 10};
+    executor =
+        std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    auto backend = Backend("t", {});
+    SetLocation(1, "target", type, {"pace://t/1?size=10"});
+    DeleteDemand full;
+    full.Add(
+        executor->Deletes().Describe(*Locations(1).at("target"), kTestInstanceName.size(), DeleteSource::GC, {}, full));
+    auto occupying = executor->Deletes().TryReserve(DeleteSource::GC, full);
+    ASSERT_TRUE(occupying);
+    EXPECT_FALSE(executor->Deletes().TryReserve(DeleteSource::Trim, full));
+    EXPECT_EQ(EC_OK, executor->Submit(CacheMetaDelRequest{kTestInstanceName, {1}}).get().status);
+    EXPECT_EQ(1u, backend->ordinary_calls);
+    EXPECT_TRUE(backend->calls.empty());
+    EXPECT_TRUE(Locations(1).empty());
+}
+
+TEST_F(FreeBusyDeleteTest, TrimWaitsForAnIntactPageAndWakesOnDemotion) {
+    DeleteLimits limits;
+    limits.cluster = {3, 30};
+    auto admission = std::make_shared<DeleteAdmission>(limits, data_storage_manager_, metrics_registry_);
+    DeleteTargetCost target{"t", "endpoint/m", {1, 10}};
+    DeleteDemand occupied;
+    occupied.Add(target);
+    occupied.Add(target);
+    auto gc = admission->TryReserve(DeleteSource::GC, occupied);
+    ASSERT_TRUE(gc);
+    std::vector<DeleteTargetCost> page(2, target);
+    const auto generation = admission->Generation();
+    size_t end = 0;
+    std::shared_ptr<DeleteReservation> trim;
+    auto wait_count = metrics_registry_->GetCounter("delete_admission.trim_wait_count");
+    auto wait_us = metrics_registry_->GetCounter("delete_admission.trim_wait_us");
+    auto wait_for_blocked = [&](auto &request, uint64_t expected) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (wait_count.Get() < expected && std::chrono::steady_clock::now() < deadline &&
+               request.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout) {}
+        EXPECT_EQ(expected, wait_count.Get());
+    };
+    auto submit = [&] { return admission->ReserveTrim(page, 0, generation, end, trim); };
+    auto waiting = std::async(std::launch::async, submit);
+    wait_for_blocked(waiting, 1);
+    EXPECT_EQ(std::future_status::timeout, waiting.wait_for(std::chrono::milliseconds(10)));
+    gc->Finish();
+    EXPECT_EQ(DeleteAdmission::TrimResult::Accepted, waiting.get());
+    EXPECT_EQ(page.size(), end);
+    EXPECT_GT(wait_us.Get(), 0u);
+    auto again = std::async(std::launch::async, submit);
+    wait_for_blocked(again, 2);
+    admission->SetPaused(true);
+    EXPECT_EQ(DeleteAdmission::TrimResult::Cancelled, again.get());
+    admission->SetPaused(false);
+    EXPECT_FALSE(trim->Active());
+    trim->Finish();
+    page[0].size.bytes = 31;
+    EXPECT_EQ(DeleteAdmission::TrimResult::TooLarge,
+              admission->ReserveTrim(page, 0, admission->Generation(), end, trim));
+    EXPECT_EQ(2u, wait_count.Get());
+}
+
+TEST_F(FreeBusyDeleteTest, RetriesOnlyTheRejectedStorageAndLeavesWorkersAvailable) {
+    auto first = Backend("a", {{PaceReclaimFreeResult::kSuccess}});
+    PaceReclaimFreeResult confirmed{PaceReclaimFreeResult::kSuccess};
+    confirmed.recovery_confirmed = true;
+    auto second = Backend("b", {{PaceReclaimFreeResult::kBusy, 20}, confirmed});
+    SetLocation(1, "first", type, {"pace://a/11"});
+    SetLocation(1, "second", type, {"pace://b/22", "pace://b/33"});
+    std::atomic<bool> ran_between{false};
+    second->on_first = [&] {
+        EXPECT_EQ(0, Locations(1).count("first"));
+        EXPECT_EQ(CLS_DELETING, Locations(1).at("second")->status());
+        EXPECT_TRUE(executor->SubmitTask([&] { ran_between = true; }));
+    };
+    auto req = Evict(1, {"first", "second"});
+    EXPECT_EQ(EC_OK, Run(req).status);
+    EXPECT_TRUE(ran_between.load());
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{11}}), first->calls);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{22, 33}, {22, 33}}), second->calls);
+    EXPECT_TRUE(Locations(1).empty());
+    EXPECT_EQ(0, resources->reserved);
+    EXPECT_EQ(0, resources->executing_retries);
+    EXPECT_GE(feedback.at("b").first, 20u);
+    EXPECT_TRUE(feedback.at("b").second);
+}
+
+TEST_F(FreeBusyDeleteTest, RepeatedBusyRetriesAtTheConfiguredCapAndHonorsLongerMetaHints) {
+    DeleteLimits limits;
+    limits.initial_backoff_ms = 2;
+    limits.max_backoff_ms = 4;
+    executor =
+        std::make_unique<SchedulePlanExecutor>(2, meta_manager_, data_storage_manager_, metrics_registry_, 1, limits);
+    const PaceReclaimFreeResult busy{PaceReclaimFreeResult::kBusy};
+    auto backend =
+        Backend("t", {busy, busy, busy, {PaceReclaimFreeResult::kBusy, 15}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "loc", type, {"pace://t/123"});
+    auto req = Request(1, {"loc"}, {});
+    auto &admission = executor->Deletes();
+    req.demand.Add(admission.Describe(*Locations(1).at("loc"), kTestInstanceName.size(), DeleteSource::GC, {}, {}));
+    req.reservation = admission.TryReserve(DeleteSource::GC, req.demand);
+    ASSERT_TRUE(req.reservation);
+    req.free_busy = req.reservation->protocol;
+    ASSERT_TRUE(req.free_busy);
+    std::vector<uint64_t> waits;
+    const auto report = req.free_busy->on_feedback;
+    req.free_busy->on_feedback = [&waits, report](const std::string &storage, uint64_t wait) {
+        waits.push_back(wait);
+        report(storage, wait);
+    };
+    ASSERT_EQ(EC_OK, Run(req).status);
+    ASSERT_EQ(4u, waits.size());
+    EXPECT_EQ(2u, waits[0]);
+    for (const auto wait : {waits[1], waits[2]}) {
+        EXPECT_GE(wait, 3u);
+        EXPECT_LE(wait, 4u);
+    }
+    EXPECT_EQ(15u, waits[3]);
+    EXPECT_EQ(5u, backend->calls.size());
+    EXPECT_TRUE(Locations(1).empty());
+}
+
+TEST_F(FreeBusyDeleteTest, SuccessWithoutProviderAcknowledgementCompletesCadWithoutRecoveryFeedback) {
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess},
+                                 {PaceReclaimFreeResult::kBusy, 1},
+                                 {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "first", type, {"pace://t/11"});
+    auto first = Evict(1, {"first"});
+    EXPECT_EQ(EC_OK, Run(first).status);
+    EXPECT_TRUE(Locations(1).empty());
+    EXPECT_TRUE(feedback.empty());
+
+    SetLocation(2, "retry", type, {"pace://t/22"});
+    auto retry = Evict(2, {"retry"});
+    EXPECT_EQ(EC_OK, Run(retry).status);
+    EXPECT_TRUE(Locations(2).empty());
+    EXPECT_GT(feedback.at("t").first, 0u);
+    EXPECT_FALSE(feedback.at("t").second);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{11}, {22}, {22}}), backend->calls);
+}
+
+TEST_F(FreeBusyDeleteTest, RetainsInvalidTooLargeAndExpiredTargetsAndUsesOrdinaryCadForUnknown) {
+    auto backend = Backend("t",
+                           {{PaceReclaimFreeResult::kTooLarge, 0, 1},
+                            {PaceReclaimFreeResult::kBusy, UINT64_MAX},
+                            {PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kError}});
+    SetLocation(1, "invalid", type, {"pace://t/1", "pace://t/18446744073709551616"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"invalid"})).status);
+    EXPECT_TRUE(backend->calls.empty());
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("invalid")->status());
+    for (int key : {2, 3, 4}) {
+        SetLocation(key, "target", type, {"pace://t/11", "pace://t/12"});
+        EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(key, {"target"})).status);
+        EXPECT_EQ(key != 4, Locations(key).count("target") != 0);
+        EXPECT_EQ(0, resources->reserved);
+    }
+    EXPECT_EQ(4, backend->calls.size());
+    SetLocation(5, "ordinary", type, {"pace://t/5"});
+    EXPECT_EQ(EC_OK, Run(CacheLocationDelRequest{kTestInstanceName, {5}, {{"ordinary"}}}).status);
+    EXPECT_EQ(1, backend->ordinary_calls);
+    EXPECT_EQ(4, backend->calls.size());
+
+    backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}});
+    SetLocation(6, "bad", type, {"pace://t/0", "pace://t/61"});
+    SetLocation(6, "good", type, {"pace://t/62"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(6, {"bad", "good"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{62}}), backend->calls);
+    EXPECT_EQ(0, Locations(6).count("good"));
+    EXPECT_EQ(CLS_DELETING, Locations(6).at("bad")->status());
+    EXPECT_EQ(2u, Retained("invalid_uri"));
+    EXPECT_EQ(1u, Retained("batch_too_large"));
+    EXPECT_EQ(1u, Retained("busy_deadline"));
+}
+
+TEST_F(FreeBusyDeleteTest, RetriesPrimaryReadOnceBeforeSendingTheOriginalTargets) {
+    struct FaultyReadBackend : MetaLocalBackend {
+        std::vector<ErrorCode>
+        GetLocations(RequestContext *ctx, const KeyTypeVec &keys, CacheLocationMapVector &maps) noexcept override {
+            if (ctx && ctx->trace_id() == "reclaim_free_retry" && ++reads <= failures) {
+                maps.resize(keys.size());
+                return std::vector<ErrorCode>(keys.size(), error);
+            }
+            return MetaLocalBackend::GetLocations(ctx, keys, maps);
+        }
+        size_t reads = 0;
+        size_t failures = 1;
+        ErrorCode error = EC_TIMEOUT;
+    };
+    auto reader = std::make_unique<FaultyReadBackend>();
+    auto *fault = reader.get();
+    ASSERT_EQ(EC_OK, reader->Init(kTestInstanceName, std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, reader->Open());
+    indexer->backend_manager_->persistent_backend_ = std::move(reader);
+    auto backend = Backend("t",
+                           {{PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kSuccess},
+                            {PaceReclaimFreeResult::kBusy, 1},
+                            {PaceReclaimFreeResult::kBusy, 1}});
+
+    SetLocation(1, "a", type, {"pace://t/1", "pace://t/2"});
+    EXPECT_EQ(EC_OK, Run(Evict(1, {"a"})).status);
+    EXPECT_EQ(2u, fault->reads);
+    EXPECT_TRUE(Locations(1).empty());
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{1, 2}, {1, 2}}), backend->calls);
+    EXPECT_EQ(0u, Retained("primary_read"));
+
+    fault->reads = 0;
+    fault->failures = 2;
+    fault->error = EC_ERROR;
+    SetLocation(2, "b", type, {"pace://t/3", "pace://t/4"});
+    SetLocation(2, "c", type, {"pace://t/5"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(2, {"b", "c"})).status);
+    EXPECT_EQ(2u, fault->reads);
+    EXPECT_EQ(CLS_DELETING, Locations(2).at("b")->status());
+    EXPECT_EQ(CLS_DELETING, Locations(2).at("c")->status());
+    EXPECT_EQ(2u, Retained("primary_read"));
+
+    fault->reads = 0;
+    fault->error = EC_CORRUPTION;
+    SetLocation(3, "d", type, {"pace://t/6"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(3, {"d"})).status);
+    EXPECT_EQ(1u, fault->reads);
+    EXPECT_EQ(3u, Retained("primary_read"));
+    EXPECT_EQ(4u, backend->calls.size());
+    EXPECT_EQ(1u, resources->retry_attempts);
+    EXPECT_EQ(3u, resources->busy_replies);
+    EXPECT_EQ(0u, resources->executing_retries);
+    EXPECT_EQ(0u, resources->reserved);
+}
+
+TEST_F(FreeBusyDeleteTest, GrownLocationStopsBeforeFreeWhenItsUrisCannotBeReserved) {
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "big", type, {"pace://t/501"});
+    auto req = Evict(1, {"big"});
+    const auto held_by_other_tasks = resources->memory_limit - req.free_busy->unassigned;
+    ASSERT_TRUE(resources->Reserve(held_by_other_tasks));
+    SetLocation(1, "big", type, {"pace://t/501?size=1024"});
+    auto submitted = executor->SubmitAsync(req);
+    ASSERT_TRUE(submitted.accepted);
+    EXPECT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(2)));
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("big")->status());
+    SetLocation(1, "big", type, {"pace://t/502"}, CLS_DELETING);
+    resources->reserved.fetch_sub(held_by_other_tasks);
+    EXPECT_EQ(EC_PARTIAL_OK, submitted.future.get().status);
+    EXPECT_TRUE(backend->calls.empty());
+    EXPECT_EQ("pace://t/502", Locations(1).at("big")->location_specs().front().uri());
+    EXPECT_EQ(0, resources->busy_replies);
+    EXPECT_EQ(0, resources->retry_attempts);
+    EXPECT_EQ(0, resources->reserved);
+}
+
+TEST_F(FreeBusyDeleteTest, QueuedEvictionCancelledBeforeAdmissionKeepsLocationServing) {
+    auto backend = Backend("t", {});
+    SetLocation(1, "target", type, {"pace://t/1"});
+    auto request = Evict(1, {"target"});
+    std::promise<void> started, release;
+    auto wait = release.get_future().share();
+    ASSERT_TRUE(executor->SubmitTask([&started, wait] {
+        started.set_value();
+        wait.wait();
+    }));
+    started.get_future().wait();
+    auto submitted = executor->SubmitAsync(request);
+    ++resources->generation;
+    release.set_value();
+    ASSERT_TRUE(submitted.accepted);
+    EXPECT_NE(EC_OK, submitted.future.get().status);
+    EXPECT_TRUE(backend->calls.empty());
+    EXPECT_EQ(CLS_SERVING, Locations(1).at("target")->status());
+    EXPECT_EQ(0u, Retained("cancelled"));
+}
+
+TEST_F(FreeBusyDeleteTest, UnsentRetryKeepsLocationMetadata) {
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kNotSent}});
+    SetLocation(1, "target", type, {"pace://t/101"});
+    auto request = Evict(1, {"target"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(request).status);
+    EXPECT_EQ(2u, backend->calls.size());
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("target")->status());
+    EXPECT_FALSE(feedback.at("t").second);
+    EXPECT_EQ(1u, Retained("backend_unavailable"));
+    EXPECT_EQ(0, resources->reserved);
+}
+
+TEST_F(FreeBusyDeleteTest, ChangedTargetReturnsItsBudgetWhileSiblingStillRetries) {
+    auto backend = Backend(
+        "t", {{PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kBusy, 1}, {PaceReclaimFreeResult::kSuccess}});
+    SetLocation(1, "drop", type, {"pace://t/601"});
+    SetLocation(1, "keep", type, {"pace://t/602"});
+    const auto keep_bytes = FreeBusyTask::RecordBytes(*Locations(1).at("keep"), kTestInstanceName.size());
+    backend->on_first = [&] { SetLocation(1, "drop", type, {"pace://t/603"}, CLS_DELETING); };
+    backend->on_retry = [&] { EXPECT_EQ(keep_bytes, resources->reserved.load()); };
+    EXPECT_EQ(EC_OK, Run(Evict(1, {"drop", "keep"})).status);
+    EXPECT_EQ((std::vector<std::vector<uint64_t>>{{601, 602}, {602}, {602}}), backend->calls);
+    EXPECT_EQ("pace://t/603", Locations(1).at("drop")->location_specs().front().uri());
+    EXPECT_EQ(0, resources->reserved);
+}
+
+TEST_F(FreeBusyDeleteTest, WaitsForLocalRetrySlotAndRechecksBackendIncarnation) {
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 2}});
+    auto replacement = std::make_shared<RecordingDeleteBackend>("t", type);
+    SetLocation(1, "target", type, {"pace://t/1"});
+    ASSERT_TRUE(resources->TryStartRetry(executor->GetWorkerCount()));
+    // The only worker must run this queued callback while the batch waits for a slot.
+    backend->on_first = [&] {
+        EXPECT_TRUE(executor->SubmitTask(
+            [&] {
+                {
+                    std::unique_lock<std::shared_mutex> lock(data_storage_manager_->rw_lock_);
+                    data_storage_manager_->storage_map_["t"] = replacement;
+                }
+                --resources->executing_retries;
+            },
+            std::chrono::milliseconds(15)));
+    };
+    auto req = Evict(1, {"target"});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(req).status);
+    EXPECT_EQ(1, backend->calls.size());
+    EXPECT_TRUE(replacement->delete_batches.empty());
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("target")->status());
+    EXPECT_EQ(1, resources->busy_replies);
+    EXPECT_EQ(0, resources->reserved);
+    EXPECT_EQ(0, resources->executing_retries);
+}
+
+TEST_F(FreeBusyDeleteTest, DropsChangedTargetAndCancelsWaitingRetry) {
+    auto backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 10}});
+    SetLocation(1, "target", type, {"pace://t/1"});
+    backend->on_first = [&] { SetLocation(1, "target", type, {"pace://t/2"}); };
+    EXPECT_EQ(EC_OK, Run(Evict(1, {"target"})).status);
+    EXPECT_EQ(1, backend->calls.size());
+    EXPECT_EQ("pace://t/2", Locations(1).at("target")->location_specs()[0].uri());
+    backend = Backend("t", {{PaceReclaimFreeResult::kBusy, 10}});
+    backend->on_first = [&] { ++resources->generation; };
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Evict(1, {"target"})).status);
+    EXPECT_EQ(1, backend->calls.size());
+    EXPECT_EQ(CLS_DELETING, Locations(1).at("target")->status());
+    EXPECT_EQ(1u, Retained("cancelled"));
+    EXPECT_EQ(0, resources->reserved);
+}
 
 TEST_F(BackendGcDeleteTest, BackendPolicyHandlesAllAndPartiallyMissingLocations) {
     int64_t key = 100;

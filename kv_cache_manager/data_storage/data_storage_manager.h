@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -7,7 +8,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstdint>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
@@ -29,6 +29,15 @@ public:
     std::vector<std::string> GetAllStorageNames() const;
     std::vector<std::shared_ptr<DataStorageBackend>> GetAvailableStorages();
     std::shared_ptr<DataStorageBackend> GetDataStorageBackend(const std::string &name);
+    bool ShouldSkipConfirmedMissingDelete(const std::string &name);
+    // Runs synchronously under the registry read lock, passing null if the name is absent.
+    // The operation must not reenter this manager.
+    template <typename Operation>
+    auto WithRegisteredBackend(const std::string &name, Operation &&operation) const {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto it = storage_map_.find(name);
+        return operation(it == storage_map_.end() ? nullptr : it->second);
+    }
     std::vector<StorageConfig> ListStorageConfig();
 
     ErrorCode EnableStorage(const std::string &name);

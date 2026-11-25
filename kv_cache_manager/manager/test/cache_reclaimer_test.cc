@@ -974,8 +974,23 @@ public:
 
     void ReplaceReclaimer(const CacheReclaimerAsyncDeleteConfig &config) {
         cache_reclaimer_->Stop();
+        DeleteLimits limits;
+        limits.reclaimer_per_group_type = {config.pending_location_limit_per_group_type,
+                                           config.pending_bytes_limit_per_group_type};
+        limits.sources[0] = {config.pending_delete_handler_limit, {0, config.pending_bytes_limit}};
+        limits.retry_memory_bytes = config.free_busy_retry_memory_limit_bytes;
+        spe_ = std::make_shared<SchedulePlanExecutor>(1, mim_, dsm_, mr_, 1, limits);
         cache_reclaimer_ =
             std::make_unique<CacheReclaimer>(10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr, config);
+    }
+
+    DeleteDemand NonPaceDemand(const std::string &group, DataStorageType type, uint64_t count, uint64_t bytes) {
+        auto loc = MakeCacheLocation("target", CLS_SERVING, type, "nfs://store/key");
+        DeleteDemand demand;
+        auto cost = spe_->Deletes().Describe(*loc, 0, DeleteSource::Reclaimer, group, demand);
+        cost.size = {count, bytes};
+        demand.Add(cost);
+        return demand;
     }
 
     bool FilterLocations(const std::shared_ptr<const InstanceInfo> &instance_info,
@@ -1055,7 +1070,10 @@ public:
     }
 
     MetaLocalBackend *
-    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
+    UseRealLocalReclaimBackend(const std::string &id,
+                               KeyType rejected_prefix = 0,
+                               bool event_report_prefix = false,
+                               const std::function<CacheLocationConstPtr(KeyType)> &make_location = {}) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -1067,13 +1085,16 @@ public:
         EXPECT_EQ(EC_OK, local->Init(id, config));
         EXPECT_EQ(EC_OK, local->Open());
         for (KeyType key = 1; key <= 32; ++key) {
-            const bool rejected = key <= rejected_prefix;
-            auto location = MakeCacheLocation(
-                "loc",
-                rejected && !event_report_prefix ? CacheLocationStatus::CLS_DELETING : CacheLocationStatus::CLS_SERVING,
-                rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
-                                                : DataStorageType::DATA_STORAGE_TYPE_NFS,
-                "nfs://store/key?size=1");
+            CacheLocationConstPtr location;
+            if (make_location) {
+                location = make_location(key);
+            } else {
+                const bool rejected = key <= rejected_prefix;
+                const auto status = rejected && !event_report_prefix ? CLS_DELETING : CLS_SERVING;
+                const auto type = rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                                                  : DataStorageType::DATA_STORAGE_TYPE_NFS;
+                location = MakeCacheLocation("loc", status, type, "nfs://store/key?size=1");
+            }
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK},
                       local->Put(nullptr, {key}, {{{"loc", location}}}, PropertyMapVector(1)));
             EXPECT_TRUE(local->cache_->ApplyToEntryNoTouch(
@@ -3556,6 +3577,7 @@ TEST_F(CacheReclaimerTest, TestAsyncDeleteStateIsInstanceIsolatedAndReleasedOnTe
     };
 
     const auto instance_1 = InstanceInfoFactory();
+    request.demand = NonPaceDemand(instance_1->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS, 1, 100);
     ASSERT_TRUE(
         cache_reclaimer_->SubmitDelReq(request_context_, instance_1, request, bytes_by_type, counts_by_type, 1));
     ASSERT_EQ(1, SubmittedDelRequestCount());
@@ -3769,6 +3791,7 @@ TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHar
         .block_keys = {1},
         .location_ids = {{"deadline_location"}},
     };
+    request.demand = NonPaceDemand(instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS, 1, 64);
     ASSERT_TRUE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 1));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -3789,6 +3812,8 @@ TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHar
         .block_keys = {2},
         .location_ids = {{"second_location"}},
     };
+    second_request.demand =
+        NonPaceDemand(instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS, 1, 64);
     EXPECT_FALSE(
         cache_reclaimer_->SubmitDelReq(request_context_, instance, second_request, bytes_by_type, counts_by_type, 1));
     EXPECT_EQ(1, SubmittedDelRequestCount());
@@ -3800,6 +3825,110 @@ TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHar
     EXPECT_TRUE(cache_reclaimer_->pending_quota_by_group_type_.empty());
     EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
     EXPECT_EQ(0, cache_reclaimer_->pending_delete_bytes_);
+}
+
+TEST_F(CacheReclaimerTest, BusyBacksOffAllThreeSourcesOnTheSameEndpointOnly) {
+    DeleteLimits limits;
+    limits.cluster = {8, 800};
+    auto admission = std::make_shared<DeleteAdmission>(limits, dsm_, mr_);
+    auto submit = [&](DeleteSource source, const std::string &storage, const std::string &endpoint, DeleteSize size) {
+        DeleteDemand demand;
+        demand.Add({storage, endpoint, size});
+        return admission->TryReserve(source, demand);
+    };
+    auto first = submit(DeleteSource::Reclaimer, "dram", "endpoint/a", {4, 400});
+    auto other = submit(DeleteSource::GC, "ssd", "endpoint/a", {4, 400});
+    ASSERT_TRUE(first && other);
+    const MetricsTags used{{"cluster", "endpoint/a"}, {"quota", "used"}};
+    const MetricsTags effective{{"cluster", "endpoint/a"}, {"quota", "effective"}};
+    auto used_locations = mr_->GetGauge("delete_admission.cluster_locations", used);
+    auto used_bytes = mr_->GetGauge("delete_admission.cluster_bytes", used);
+    auto effective_locations = mr_->GetGauge("delete_admission.cluster_locations", effective);
+    auto effective_bytes = mr_->GetGauge("delete_admission.cluster_bytes", effective);
+    EXPECT_EQ(8, used_locations.Get());
+    EXPECT_EQ(800, used_bytes.Get());
+    first->Feedback("dram", 1);
+    other->Feedback("ssd", 60000); // both leases pre-date the drop
+    EXPECT_EQ(4, effective_locations.Get());
+    EXPECT_EQ(400, effective_bytes.Get());
+    EXPECT_FALSE(submit(DeleteSource::Trim, "ssd", "endpoint/a", {1, 100}));
+    EXPECT_TRUE(submit(DeleteSource::Trim, "ssd2", "endpoint/b", {8, 800}));
+    first->Finish();
+    other->Finish();
+    EXPECT_EQ(0, used_locations.Get());
+    EXPECT_EQ(0, used_bytes.Get());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    EXPECT_FALSE(submit(DeleteSource::GC, "ssd", "endpoint/a", {5, 400}));
+    EXPECT_FALSE(submit(DeleteSource::Trim, "dram", "endpoint/a", {2, 600}));
+    auto single = submit(DeleteSource::Trim, "ssd", "endpoint/a", {1, 600});
+    ASSERT_TRUE(single);
+    single->Feedback("ssd", 0);
+    single->Finish();
+    EXPECT_TRUE(submit(DeleteSource::Reclaimer, "dram", "endpoint/a", {8, 800}));
+    EXPECT_EQ(8, effective_locations.Get());
+    EXPECT_EQ(800, effective_bytes.Get());
+}
+
+TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsAreShared) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+    auto a = MakeCacheLocation("a", CLS_SERVING, type, "pace://ssd/1?size=8");
+    auto b = MakeCacheLocation("b", CLS_SERVING, type, "pace://ssd/2?size=8");
+    CacheReclaimerAsyncDeleteConfig config;
+    config.free_busy_retry_memory_limit_bytes =
+        FreeBusyTask::RecordBytes(*a, InstanceInfoFactory()->instance_id().size());
+    ReplaceReclaimer(config);
+    auto skipped =
+        mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, free_busy_budget_skip_location_count));
+    cache_reclaimer_->METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) = skipped;
+    batch_get_loc_out_maps = {{{"a", a}, {"b", b}}};
+    std::vector<std::vector<std::string>> ids;
+    CacheReclaimer::BytesByStorageType bytes{};
+    CacheReclaimer::CountsByStorageType counts{};
+    CacheReclaimer::AgeStats ages;
+    uint64_t keys = 0;
+    CacheLocationDelRequest selection;
+    auto instance = InstanceInfoFactory();
+    auto select = [&] {
+        return cache_reclaimer_->FilterLocIDImpl(
+            request_context_.get(), instance, {1}, {}, ids, bytes, counts, keys, ages, false, false, &selection);
+    };
+    ASSERT_TRUE(select());
+    ASSERT_EQ(1u, ids.at(0).size());
+    EXPECT_EQ(1u, skipped.Get());
+    auto resources = cache_reclaimer_->free_busy_resources_;
+    ASSERT_TRUE(resources->Reserve(selection.demand.retry_bytes));
+    EXPECT_FALSE(resources->Reserve(1));
+    ASSERT_TRUE(select());
+    EXPECT_TRUE(ids.at(0).empty());
+    EXPECT_EQ(0u, selection.demand.retry_bytes);
+    EXPECT_EQ(3u, skipped.Get());
+    resources->reserved.fetch_sub(config.free_busy_retry_memory_limit_bytes);
+    for (const size_t n : {2, 8}) {
+        for (size_t i = 0; i < n / 2; ++i) {
+            EXPECT_TRUE(resources->TryStartRetry(n));
+        }
+        EXPECT_FALSE(resources->TryStartRetry(n));
+        resources->executing_retries.fetch_sub(n / 2);
+    }
+}
+
+TEST_F(CacheReclaimerTest, DefaultFreeBusyBudgetAdmitsMultipleGroupsOfTwentySpecLocations) {
+    CacheReclaimerAsyncDeleteConfig config;
+    std::vector<LocationSpec> specs;
+    for (int i = 0; i < 20; ++i) {
+        specs.emplace_back("tp" + std::to_string(i),
+                           "pace://test-cluster/" + std::to_string(1000000000000000000ULL + i) +
+                               "?media_type=5&node_id=1234&range_id=12&size=1048576");
+    }
+    const CacheLocation location(
+        "12345678", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, specs.size(), specs);
+    const auto group_bytes = FreeBusyTask::RecordBytes(location, 30) * config.pending_location_limit_per_group_type;
+    FreeBusyResources budget(config.free_busy_retry_memory_limit_bytes);
+    ASSERT_TRUE(budget.Reserve(group_bytes));
+    ASSERT_TRUE(budget.Reserve(group_bytes));
+    ASSERT_TRUE(budget.Reserve(config.free_busy_retry_memory_limit_bytes - 2 * group_bytes));
+    EXPECT_FALSE(budget.Reserve(1));
 }
 
 TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuota) {
@@ -3816,6 +3945,7 @@ TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuot
         .block_keys = {2},
         .location_ids = {{"invalid_future_location"}},
     };
+    request.demand = NonPaceDemand(instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS, 1, 32);
     ASSERT_TRUE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 1));
     cache_reclaimer_->HandleDelRes();
 
@@ -3829,13 +3959,19 @@ TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuot
 
 TEST_F(CacheReclaimerTest, TestBackpressureCropsOnlySaturatedGroupTypeAndProcessLimitStopsAll) {
     CacheReclaimerAsyncDeleteConfig config;
+    config.pending_delete_handler_limit = 2;
     config.pending_location_limit_per_group_type = 1;
     config.pending_bytes_limit_per_group_type = 1024;
     ReplaceReclaimer(config);
 
     const auto instance = InstanceInfoFactory();
-    cache_reclaimer_->pending_quota_by_group_type_[{instance->instance_group_name(),
-                                                    DataStorageType::DATA_STORAGE_TYPE_HF3FS}] = {1, 1};
+    auto occupy_hf3fs = [&](uint64_t bytes) {
+        return spe_->Deletes().TryReserve(
+            DeleteSource::Reclaimer,
+            NonPaceDemand(instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, bytes));
+    };
+    auto hf3fs = occupy_hf3fs(1);
+    ASSERT_TRUE(hf3fs);
     batch_get_loc_out_maps = {CacheLocationMap{
         {"hf3fs",
          MakeCacheLocation("hf3fs",
@@ -3876,9 +4012,9 @@ TEST_F(CacheReclaimerTest, TestBackpressureCropsOnlySaturatedGroupTypeAndProcess
                   .Get(),
               0);
 
-    cache_reclaimer_
-        ->pending_quota_by_group_type_[{instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_HF3FS}] = {
-        0, config.pending_bytes_limit_per_group_type};
+    hf3fs->Finish();
+    hf3fs = occupy_hf3fs(config.pending_bytes_limit_per_group_type);
+    ASSERT_TRUE(hf3fs);
     ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
                                               instance,
                                               {1},
@@ -3891,7 +4027,8 @@ TEST_F(CacheReclaimerTest, TestBackpressureCropsOnlySaturatedGroupTypeAndProcess
     ASSERT_EQ(1, location_ids.front().size());
     EXPECT_EQ("nfs", location_ids.front().front());
 
-    cache_reclaimer_->pending_delete_handler_count_ = config.pending_delete_handler_limit;
+    auto other_request = spe_->Deletes().TryReserve(DeleteSource::Reclaimer, {});
+    ASSERT_TRUE(other_request);
     ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
                                               instance,
                                               {1},
@@ -3907,8 +4044,12 @@ TEST_F(CacheReclaimerTest, TestBackpressureCropsOnlySaturatedGroupTypeAndProcess
     EXPECT_EQ(0, create_age_stats.max_us);
     EXPECT_EQ(0, create_age_stats.avg_us);
 
-    cache_reclaimer_->pending_delete_handler_count_ = 0;
-    cache_reclaimer_->pending_delete_bytes_ = config.pending_bytes_limit;
+    other_request->Finish();
+    hf3fs->Finish();
+    DeleteDemand byte_limit;
+    byte_limit.size = {1, config.pending_bytes_limit};
+    auto all_bytes = spe_->Deletes().TryReserve(DeleteSource::Reclaimer, byte_limit);
+    ASSERT_TRUE(all_bytes);
     ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
                                               instance,
                                               {1},
@@ -3939,6 +4080,7 @@ TEST_F(CacheReclaimerTest, TestEmptyAndRejectedRequestsLeaveNoAsyncDeleteState) 
         .block_keys = {1},
         .location_ids = {{"rejected_location"}},
     };
+    request.demand = NonPaceDemand(instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS, 1, 0);
     counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = 1;
     EXPECT_FALSE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 0));
     EXPECT_EQ(1, SubmittedDelRequestCount());
@@ -4507,6 +4649,97 @@ TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBounde
     EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_EQ(600, times[5]);
     EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, PaceQuotaAndCooldownPreserveColdKeysForTheNextLruSample) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &admission = spe_->Deletes();
+    auto *backend = UseRealLocalReclaimBackend("a", 0, false, [&](KeyType key) {
+        const auto bytes = key == 1 ? admission.limits.cluster.bytes + 1 : 1;
+        return MakeCacheLocation("loc",
+                                 CLS_SERVING,
+                                 DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                 "pace://store/" + std::to_string(key) + "?size=" + std::to_string(bytes));
+    });
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(3);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+
+    DeleteDemand occupied;
+    occupied.Add({"store", "storage/store", {1, admission.limits.cluster.bytes}});
+    auto gc = admission.TryReserve(DeleteSource::GC, occupied);
+    ASSERT_TRUE(gc);
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(3, EC_OK), backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3}, times));
+    EXPECT_GT(times[0], 100); // Key 1 exceeds even the empty cluster's hard limit.
+    EXPECT_EQ(200, times[1]);
+    EXPECT_EQ(300, times[2]);
+
+    gc->Feedback("store", 60000);
+    gc->Finish();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 2, order));
+    EXPECT_EQ((KeyVector{2, 3}), order);
+    ASSERT_EQ(std::vector<ErrorCode>(2, EC_OK), backend->GetLastAccessTimesForMaintenance(nullptr, {2, 3}, times));
+    EXPECT_EQ((std::vector<int64_t>{200, 300}), times);
+
+    // Reset the cooldown without depending on timer resolution.
+    admission.SetPaused(true);
+    admission.SetPaused(false);
+    cache_reclaimer_->batching_size_.store(1);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1u, selected.size());
+    EXPECT_EQ(2, selected.front().second);
+}
+
+TEST_F(CacheReclaimerTest, GroupLruRefillsFromTheSampleWhenTheColdestClusterIsCoolingDown) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *local = UseRealLocalReclaimBackend("a", 0, false, [](KeyType key) {
+        const std::string storage = key <= 3 ? "cooling" : "ready";
+        return MakeCacheLocation("loc",
+                                 CLS_SERVING,
+                                 DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                 "pace://" + storage + "/" + std::to_string(key) + "?size=1");
+    });
+    DeleteDemand demand;
+    demand.Add({"cooling", "storage/cooling", {1, 1}});
+    auto gc = spe_->Deletes().TryReserve(DeleteSource::GC, demand);
+    ASSERT_TRUE(gc);
+    gc->Feedback("cooling", 60000);
+    gc->Finish();
+
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 4}, {"a", 5}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_group_lru_selected_block_count_metrics());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, local->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{1, 2, 3}), order);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(3, EC_OK), local->GetLastAccessTimesForMaintenance(nullptr, order, times));
+    EXPECT_EQ((std::vector<int64_t>{100, 200, 300}), times);
+}
+
+TEST_F(CacheReclaimerTest, GroupLruRefillsOnlyWholeKeysDeferredByPaceRetryMemory) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &locations = group_lru_test_backends.at("a").locations;
+    const auto pace = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    locations[1].emplace("pace", MakeCacheLocation("pace", CLS_SERVING, pace, "pace://store/1?size=1"));
+    locations[2] = {{"pace", MakeCacheLocation("pace", CLS_SERVING, pace, "pace://store/2?size=1")}};
+    auto &admission = spe_->Deletes();
+    DeleteDemand occupied;
+    occupied.retry_bytes = admission.resources->memory_limit;
+    auto gc = admission.TryReserve(DeleteSource::GC, occupied);
+    ASSERT_TRUE(gc);
+
+    // Key 1 still has an eligible NFS Location. Only key 2 gives its place to key 3.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 1}, {"a", 3}}), GroupLruSubmittedBlocks());
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2u, requests.size());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"loc"}}), requests.front().location_ids);
 }
 
 TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejectedKeys) {
@@ -5143,12 +5376,15 @@ TEST_F(CacheReclaimerTest, TestGroupLruPauseDuringCollectionDoesNotSubmitPartial
 
 TEST_F(CacheReclaimerTest, TestGroupLruFullPendingBudgetAvoidsSampling) {
     const auto group = SetUpGroupLruScenario();
-    cache_reclaimer_->pending_delete_handler_count_ =
-        cache_reclaimer_->async_delete_config_.pending_delete_handler_limit;
+    std::vector<std::shared_ptr<DeleteReservation>> occupied;
+    const auto slots = spe_->Deletes().RemainingRequests(DeleteSource::Reclaimer);
+    for (uint64_t i = 0; i < slots; ++i) {
+        occupied.push_back(spe_->Deletes().TryReserve(DeleteSource::Reclaimer, {}));
+        ASSERT_TRUE(occupied.back());
+    }
     EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
     EXPECT_EQ(0, group_lru_test_backends.at("a").sampling_calls);
     EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_backpressure_stop_count_metrics());
-    cache_reclaimer_->pending_delete_handler_count_ = 0;
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruFiltersProtectedLocationsBeforeTopBAndCreditsOnlyDeletedKeys) {
@@ -5197,9 +5433,12 @@ TEST_F(CacheReclaimerTest, TestGroupLruPendingQuotaIsAppliedAfterGlobalOrdering)
     for (auto &[key, time] : group_lru_test_backends.at("b").times) {
         time = std::to_string(key);
     }
-    auto &quota =
-        cache_reclaimer_->pending_quota_by_group_type_[{group->name(), DataStorageType::DATA_STORAGE_TYPE_NFS}];
-    quota.location_count = cache_reclaimer_->async_delete_config_.pending_location_limit_per_group_type - 1;
+    auto quota = spe_->Deletes().TryReserve(DeleteSource::Reclaimer,
+                                            NonPaceDemand(group->name(),
+                                                          DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                          spe_->Deletes().limits.reclaimer_per_group_type.locations - 1,
+                                                          0));
+    ASSERT_TRUE(quota);
     EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
     EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}}), GroupLruSubmittedBlocks());
     EXPECT_EQ(4, cache_reclaimer_->get_cache_reclaimer_group_lru_selected_block_count_metrics());

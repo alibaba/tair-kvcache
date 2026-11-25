@@ -5,14 +5,15 @@
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/pace_uri.h"
+
 namespace kv_cache_manager {
 
 TairMempoolDataStorageItem TairMempoolDataStorageItem::FromUri(const DataStorageUri &storage_uri) {
     TairMempoolDataStorageItem item;
     storage_uri.GetParamAs<uint16_t>("media_type", item.media_type);
     storage_uri.GetParamAs<uint16_t>("node_id", item.node_id);
-    std::string path = storage_uri.GetPath();
-    item.offset = (path.size() < 2) ? 0 : std::stoull(path.substr(1));
+    item.offset = ParsePaceGAPath(storage_uri.GetPath());
     storage_uri.GetParamAs<uint16_t>("range_id", item.range_id);
     storage_uri.GetParamAs<uint64_t>("size", item.size);
     return item;

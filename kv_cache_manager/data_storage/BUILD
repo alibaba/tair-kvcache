@@ -18,6 +18,7 @@ cc_library(
         "event_report_backend.cc",
         "hf3fs_backend.cc",
         "nfs_backend.cc",
+        "pace_reclaim_storage.cc",
     ] + select({
         ":enable_mooncake": ["mooncake_backend.cc"],
         "//conditions:default": [],
@@ -29,6 +30,7 @@ cc_library(
         "event_report_backend.h",
         "hf3fs_backend.h",
         "nfs_backend.h",
+        "reclaim_storage.h",
     ] + select({
         ":enable_mooncake": ["mooncake_backend.h"],
         "//conditions:default": [],
@@ -44,6 +46,7 @@ cc_library(
         # 不一定用
         # "//3rdparty/3fs:hf3fs",
         "//kv_cache_manager/common/hash",  # for xxph3
+        "//kv_cache_manager/common:service_discovery_url",
         ":common_define",
         ":snapshot_uri_utils",
         # Internal implementations
@@ -76,7 +79,9 @@ cc_library(
         "common_define.h",
         "data_storage_backend.h",
         "data_storage_uri.h",
+        "pace_uri.h",
         "storage_config.h",
+        "pace_reclaim_free.h",
     ],
     deps = [
         "//kv_cache_manager/common",

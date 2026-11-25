@@ -224,7 +224,7 @@ Local 的 `SampleReclaimCandidates` 复用 `SampleReclaimKeys` 选择 key，再�
 
 对于本次请求的 `count > 0`，先计算 `R = min(sample_times, 分片总数, count)`，再选取最多 `K = min(R, 非空分片数)` 个冷分片。每个入选分片最多取 `ceil(count / R)` 个 key，且不超过剩余总预算；分片为空或 key 不足时不自动向其他分片补齐。因此 `sample_times` 控制单次采样的分片广度，增大它可能增加入选分片数、减少单分片份额，不代表轮转周期。`K=1` 时仍选最冷分片；同一批分片可以连续入选，不承诺跨轮覆盖全部分片，也不保证取到全局最冷的 `count` 个 key。
 
-采样本身不改变时间或 LRU 顺序，但旧前缀不能回收时，需要在后续过滤阶段让出位置：`FilterLocIDImpl` 完成维护性 Location 过滤后，将没有形成任何可删除 Location 的 key 交给 `TouchKeysForMaintenance`。该操作仅作用于完整的 Local 回收源，按名单更新时间和 LRU 位置，并通过尾部变化回调刷新分片冷度提示；不限于 EventReport-only key。仍有待删 Location 的 key 不 touch；读取失败或全局反压提前返回时也不触发。后续轮次因此有机会采到前缀之后的冷 key，但这不是游标续扫或同轮补采样的保证。
+采样保留访问时间和 LRU 顺序。对完整的 Local 回收源，`FilterLocIDImpl` 用 `TouchKeysForMaintenance` 让没有可删 Location 的 key 移到较热的一端，并通过尾部变化回调刷新分片冷度提示。普通和 EventReport key 均可因此让位。若至少一个可删的 Tair Mempool Location 能单独放进空窗口，只因本轮额度或冷却被挡住，整个 key 保留原时间和位置，后续轮次重新采样。已选中的 key、读取失败或全局反压提前退出的批次也保留原位置。[共享额度](free_busy_backpressure.md#6-三路删除统一流控)
 
 维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本，是采样读取之外的显式维护操作。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
 
@@ -306,7 +306,9 @@ B_request = min(B_cfg, kSizeLimit - 1)
 4. accepted：立即沿用 `SubmitDelReq` 登记 pending、Group/Type bytes credit、predicted deleted keys 和 Future。
 5. 再检查水位；恢复即停止，不等物理删除完成，不要求执行完 Top B。
 
-已选 block 在提交前消失、状态改变或被反压裁剪时，不在同一轮从 Top B 以外重新补足；下一轮重新采样。因此提交仍可能不是严格的 LRU 前缀：较老项可能已不可删除或提交失败。必须区分“按顺序尝试准入”和“按顺序完成物理删除”，异步任务的完成顺序不作保证。
+如果一个 block 在复核时没有选中任何 Location，并且其中有可删的 Tair Mempool Location 单独能放进空窗口、只是暂时受限，就从同一份有序样本往后补一个 block。一个 block 只要选中了一个 Location，就占一个名额。样本用尽即止。本轮的 `group_lru_selected_block_count` 仍记初始 Top B 的大小，`group_lru_submitted_block_count` 记实际接纳的 block 数。
+
+候选消失、状态改变、单项超出硬上限或最终提交失败等情况，仍由下一轮重新采样。异步物理删除按各任务的实际进度完成。
 
 ### 7.3 请求数量上限
 
@@ -337,7 +339,7 @@ B_request = min(B_cfg, kSizeLimit - 1)
 - 排序采用简单确定性的 `O(M log M)` 全排序；在总采样上限内优先保持实现易懂，后续再评估 top-k heap。
 - 紧凑候选只保存 Instance 索引、key、时间。65536 个候选按典型 24～32 字节结构估算约 1.5～2 MiB，最终以实现的 `sizeof` 为准；该估算不含属性 map、临时 Location、Instance 字符串和未结束采样任务的内存。
 - Location 读取按小批次处理，不能持有 `S_effective` 份完整 Location map；Group 采样总量上限也不能替代 metadata 返回大小及 in-flight worker 的既有资源约束。
-- 相比容量策略，Group LRU 需要在删除前收集多个 Instance 的候选，并且先对采样项过滤 Location，前置 I/O 会明显增加；不能宣称只是增加一次排序。二次准入读取仅覆盖 Top B 中即将提交的部分。
+- Group LRU 首先读取各 Instance 的样本并过滤 Location。提交前通常只重读 Top B 中将要处理的部分。遇到 Tair Mempool临时反压时，补位可能逐批重读到本轮样本末尾。
 - 基础采样加按 key 数分配会改变各 Instance 的 metadata 访问分布；在不完整计划、超大 Group 或很低的采样放大倍数下，LRU 精度会下降。
 
 ### 9.2 可观测性

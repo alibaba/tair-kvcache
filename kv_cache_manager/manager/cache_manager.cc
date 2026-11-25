@@ -132,12 +132,11 @@ bool WaitForOtherOwners(const std::shared_ptr<T> &owner, int64_t timeout_seconds
     return true;
 }
 
-bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
+bool CollectTrimResult(std::future<PlanExecuteResult> future,
                        const std::string &trace_id,
                        const std::string &instance_id,
                        bool &has_error) {
-    const PlanExecuteResult result = inflight.front().get();
-    inflight.pop_front();
+    const PlanExecuteResult result = future.get();
     if (result.status == EC_OK) {
         return false;
     }
@@ -528,6 +527,9 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
+    if (schedule_plan_executor_) {
+        schedule_plan_executor_->Deletes().SetPaused(true);
+    }
     if (cache_garbage_collector_) {
         // Stop admitting new GC work before detaching legacy EventReport
         // callbacks and joining the shared maintenance loop.
@@ -566,7 +568,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         std::size_t meta_query_parallel_threshold,
                         std::size_t meta_query_chunk_size,
                         CacheGarbageCollector::Config cache_gc_config,
-                        CacheReclaimerGroupLruConfig group_lru_config) {
+                        CacheReclaimerGroupLruConfig group_lru_config,
+                        std::optional<DeleteLimits> configured_limits) {
     if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
         schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
         KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
@@ -584,11 +587,23 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                        meta_query_chunk_size);
         return false;
     }
+    DeleteLimits limits = configured_limits.value_or(DeleteLimits{});
+    if (!configured_limits) {
+        limits.sources[0].requests = cache_reclaimer_async_delete_config.pending_delete_handler_limit;
+        limits.sources[0].size.bytes = cache_reclaimer_async_delete_config.pending_bytes_limit;
+        limits.sources[1].requests = cache_gc_config.max_inflight_delete_requests;
+        limits.reclaimer_per_group_type = {cache_reclaimer_async_delete_config.pending_location_limit_per_group_type,
+                                           cache_reclaimer_async_delete_config.pending_bytes_limit_per_group_type};
+        limits.protocol = cache_reclaimer_async_delete_config.free_busy_enabled;
+        limits.initial_backoff_ms = cache_reclaimer_async_delete_config.free_busy_initial_backoff_ms;
+        limits.retry_memory_bytes = cache_reclaimer_async_delete_config.free_busy_retry_memory_limit_bytes;
+    }
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
                                                                      metrics_registry_,
-                                                                     schedule_plan_migration_worker_budget);
+                                                                     schedule_plan_migration_worker_budget,
+                                                                     limits);
     event_manager_ = std::make_shared<EventManager>();
     if (!event_manager_) {
         KVCM_LOG_WARN("create EventManager failed");
@@ -2120,12 +2135,16 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
     const std::string &trace_id = request_context->trace_id();
 
     constexpr std::size_t limit = 256;
-    const std::size_t max_inflight = 2 * schedule_plan_executor_->GetWorkerCount();
+    const auto generation = schedule_plan_executor_->Deletes().Generation();
     std::deque<std::future<PlanExecuteResult>> inflight;
     bool has_error = false;
     bool stop_submit = false;
     std::string cursor = SCAN_BASE_CURSOR;
     do {
+        if (!detached_indexer && !schedule_plan_executor_->Deletes().Accepting(generation)) {
+            has_error = true;
+            break;
+        }
         std::string next_cursor;
 
         CacheMetaDelRequest request;
@@ -2140,31 +2159,62 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
         }
 
         if (!request.block_keys.empty()) {
-            inflight.emplace_back(detached_indexer ? schedule_plan_executor_->Submit(request, meta_indexer)
-                                                   : schedule_plan_executor_->Submit(request));
-            if (inflight.size() >= max_inflight) {
-                stop_submit = CollectTrimResult(inflight, trace_id, instance_id, has_error);
+            if (detached_indexer) {
+                // RemoveInstance owns the detached indexer and its original per-call window.
+                inflight.push_back(schedule_plan_executor_->Submit(request, meta_indexer));
+                if (inflight.size() >= 2 * schedule_plan_executor_->GetWorkerCount()) {
+                    stop_submit = CollectTrimResult(std::move(inflight.front()), trace_id, instance_id, has_error);
+                    inflight.pop_front();
+                }
+            } else {
+                auto collect = [&](std::future<PlanExecuteResult> future) {
+                    inflight.push_back(std::move(future));
+                    bool keep_going = true;
+                    for (auto it = inflight.begin(); it != inflight.end();) {
+                        if (it->wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                            ++it;
+                            continue;
+                        }
+                        if (CollectTrimResult(std::move(*it), trace_id, instance_id, has_error)) {
+                            keep_going = false;
+                        }
+                        it = inflight.erase(it);
+                    }
+                    return keep_going;
+                };
+                if (schedule_plan_executor_->SubmitTrimPage(
+                        request_context, request, meta_indexer, generation, collect) != EC_OK) {
+                    has_error = true;
+                    stop_submit = true;
+                }
             }
         }
         cursor = std::move(next_cursor);
     } while (!stop_submit && cursor != SCAN_BASE_CURSOR);
 
     while (!inflight.empty()) {
-        CollectTrimResult(inflight, trace_id, instance_id, has_error);
+        CollectTrimResult(std::move(inflight.front()), trace_id, instance_id, has_error);
+        inflight.pop_front();
     }
 
     const bool synced = meta_indexer->SyncAll();
     if (!synced) {
         PREFIX_LOG(WARN, "trim cache metadata sync failed");
     }
-    if (has_error || !synced) {
+    if (has_error || !synced || (!detached_indexer && !schedule_plan_executor_->Deletes().Accepting(generation))) {
         return EC_ERROR;
     }
 
     return meta_indexer->TrimResidues(request_context, limit);
 }
-void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
-void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
+void CacheManager::PauseReclaimer() {
+    schedule_plan_executor_->Deletes().SetPaused(true);
+    cache_reclaimer_->Pause();
+}
+void CacheManager::ResumeReclaimer() {
+    schedule_plan_executor_->Deletes().SetPaused(false);
+    cache_reclaimer_->Resume();
+}
 
 ErrorCode CacheManager::StartCacheGarbageCollector() {
     return cache_garbage_collector_ ? cache_garbage_collector_->Start() : EC_ERROR;

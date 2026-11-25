@@ -231,6 +231,11 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, event_report_probe_unknown_count);
     DECLARE_METRICS(cache_gc, event_report_delete_location_count);
 
+    DECLARE_METRICS(delete_admission, cluster_locations);
+    DECLARE_METRICS(delete_admission, cluster_bytes);
+    DECLARE_METRICS(delete_admission, trim_wait_count);
+    DECLARE_METRICS(delete_admission, trim_wait_us);
+
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
@@ -566,6 +571,11 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_unknown_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
+
+    REGISTER_GAUGE_METRIC(delete_admission, cluster_locations);
+    REGISTER_GAUGE_METRIC(delete_admission, cluster_bytes);
+    REGISTER_GAUGE_METRIC(delete_admission, trim_wait_count);
+    REGISTER_GAUGE_METRIC(delete_admission, trim_wait_us);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -1180,6 +1190,12 @@ void KmonitorMetricsReporter::ReportInterval() {
                                "cache_gc.event_report_probe_unknown_count");
         report_registry_metric(ctx_->cache_gc_event_report_delete_location_count_metrics.get(),
                                "cache_gc.event_report_delete_location_count");
+        report_registry_metric(ctx_->delete_admission_cluster_locations_metrics.get(),
+                               "delete_admission.cluster_locations");
+        report_registry_metric(ctx_->delete_admission_cluster_bytes_metrics.get(), "delete_admission.cluster_bytes");
+        report_registry_metric(ctx_->delete_admission_trim_wait_count_metrics.get(),
+                               "delete_admission.trim_wait_count");
+        report_registry_metric(ctx_->delete_admission_trim_wait_us_metrics.get(), "delete_admission.trim_wait_us");
     } while (false);
 
     do {

@@ -167,13 +167,39 @@ kvcm.cache_reclaimer.key_sampling_size_total=100
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 
-# 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
+# 非 Tair Mempool 水位驱逐仍按 Instance Group × BaseStorageType 使用以下上限。
 kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
 kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
+
+# 水位驱逐、主动 GC、TrimCache 的 Tair Mempool Free Busy 协议。Meta 混部或 GA 重试安全窗口待确认时显式设为 false。
+kvcm.cache_reclaimer.free_busy_enabled=true
+# 首次本地退避（毫秒），必须为正且不超过下面的单次上限。
+kvcm.cache_reclaimer.free_busy_initial_backoff_ms=50
+# 单次本地退避上限（毫秒）。达到上限后仍可重试。Meta 可建议等待更久，整批启动重试的总时限为 30 秒。
+kvcm.cache_reclaimer.free_busy_max_backoff_ms=5000
+# 全进程共享的重试记录预留上限（字节），默认 512 MiB。首发也占预留。
+kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes=536870912
 
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
+
+# 每个进程内，三路删除按 mempool 接入地址共享硬上限，默认 24,576 个 Location、2 TiB 待删数据。
+# 协议开启时，每个健康 Provider 对应 384 个 Location、20 GiB 的起步额度，两项分别受以下配置封顶。
+kvcm.delete_admission.cluster_locations=24576
+kvcm.delete_admission.cluster_bytes=2199023255552
+
+# 每个来源可独立设置 requests、locations、bytes。0 表示该维度不限。
+# 下列为默认值。显式新值优先于对应旧键，原有 GC 和 Reclaimer 的等价进程上限会自动继承。
+kvcm.delete_admission.reclaimer_requests=1024
+kvcm.delete_admission.reclaimer_locations=0
+kvcm.delete_admission.reclaimer_bytes=4398046511104
+kvcm.delete_admission.gc_requests=64
+kvcm.delete_admission.gc_locations=0
+kvcm.delete_admission.gc_bytes=0
+kvcm.delete_admission.trim_requests=32
+kvcm.delete_admission.trim_locations=0
+kvcm.delete_admission.trim_bytes=0
 
 # leader 后台 metadata GC，默认开启。处理超过 grace 的 CLS_WRITING、
 # MightExist 明确 missing 的普通 CLS_SERVING 以及 EventReport metadata 回收。

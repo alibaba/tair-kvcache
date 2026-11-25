@@ -37,6 +37,7 @@ cc_library(
         "//kv_cache_manager/event:optimizer_event_publisher",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:schedule_plan_executor",
         "//kv_cache_manager/manager:write_location_manager",
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",

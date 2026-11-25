@@ -3911,7 +3911,9 @@ TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
     blocking_backend->ReleaseDeletes();
 
     EXPECT_TRUE(workers_busy);
-    EXPECT_EQ(worker_count, waiting_tasks);
+    EXPECT_GE(waiting_tasks, worker_count);
+    EXPECT_LE(waiting_tasks + worker_count,
+              cache_manager_->schedule_plan_executor_->Deletes().limits.sources[2].requests);
     EXPECT_EQ(0u, sync_count_while_deleting);
     EXPECT_EQ(EC_OK, trim_future.get());
     EXPECT_EQ(worker_count, blocking_backend->MaxActiveDeletes());
@@ -3936,11 +3938,10 @@ TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
     AddDummyLocationsForTrim(2048, "hot_01");
     cache_manager_->schedule_plan_executor_->Stop();
 
-    const size_t max_inflight = 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount();
     EXPECT_EQ(EC_ERROR,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
-    EXPECT_EQ(max_inflight, meta_backend->GetListKeysCallCount());
+    EXPECT_EQ(0u, meta_backend->GetListKeysCallCount());
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
 }
 

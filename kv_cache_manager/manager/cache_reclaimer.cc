@@ -39,6 +39,7 @@
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/reclaim_storage.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
@@ -112,6 +113,9 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credit_timeout_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_reject_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
@@ -167,6 +171,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_delete_bytes);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credited_delete_bytes);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(predicted_deleted_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(free_busy_reserved_bytes);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_effective_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_planned_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_sampled_instance_count);
@@ -269,20 +274,6 @@ std::uint64_t CacheReclaimer::SaturatingAdd(const std::uint64_t lhs, const std::
     return rhs > max - lhs ? max : lhs + rhs;
 }
 
-std::uint64_t CacheReclaimer::GetLocationBytes(const CacheLocation &location) noexcept {
-    std::uint64_t total = 0;
-    for (const auto &location_spec : location.location_specs()) {
-        DataStorageUri uri(location_spec.uri());
-        if (!uri.Valid()) {
-            continue;
-        }
-        std::uint64_t size = 0;
-        uri.GetParamAs<std::uint64_t>("size", size);
-        total = SaturatingAdd(total, size);
-    }
-    return total;
-}
-
 CacheReclaimer::BytesByStorageType
 CacheReclaimer::GetCreditedDeleteBytes(const std::string &instance_group) const noexcept {
     const auto it = credited_delete_bytes_by_group_.find(instance_group);
@@ -370,6 +361,10 @@ void CacheReclaimer::DisableCredit(DeleteHandler &handler, const char *reason) n
 }
 
 void CacheReclaimer::ReleaseDeleteHandlerState(DeleteHandler &handler) noexcept {
+    if (handler.reservation_) {
+        handler.reservation_->Finish();
+    }
+
     DisableCredit(handler, nullptr);
 
     for (const auto &pending_location : handler.pending_locations_) {
@@ -441,6 +436,12 @@ void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {
     METRICS_(cache_reclaimer, credited_delete_bytes) = static_cast<double>(credited_bytes);
     METRICS_(cache_reclaimer, predicted_deleted_key_count) = static_cast<double>(predicted_keys);
     METRICS_(cache_reclaimer, oldest_pending_request_age_ms) = static_cast<double>(oldest_age_ms);
+    if (async_delete_config_.free_busy_enabled && free_busy_resources_) {
+        METRICS_(cache_reclaimer, free_busy_reject_count) += free_busy_resources_->busy_replies.exchange(0);
+        METRICS_(cache_reclaimer, free_busy_retry_attempt_count) += free_busy_resources_->retry_attempts.exchange(0);
+        METRICS_(cache_reclaimer, free_busy_reserved_bytes) =
+            static_cast<double>(free_busy_resources_->reserved.load());
+    }
 
     if (metrics_registry_ == nullptr) {
         return;
@@ -597,6 +598,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , sleep_interval_ms_(sleep_interval_ms)
     , future_timeout_ms_(kFutureTimeoutMs)
     , async_delete_config_(std::move(async_delete_config))
+    , free_busy_resources_(sched_plan_executor_ ? sched_plan_executor_->Deletes().resources : nullptr)
     , worker_stop_(false) {
     if (worker_size == 0) {
         worker_size = 1;
@@ -662,6 +664,9 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_retry_attempt_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_reject_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(free_busy_budget_skip_location_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
@@ -717,6 +722,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(credited_delete_bytes);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(predicted_deleted_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(free_busy_reserved_bytes);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_effective_instance_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_planned_instance_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_sampled_instance_count);
@@ -774,7 +780,9 @@ bool CacheReclaimer::IsRunning() noexcept {
     return job_state_flag_;
 }
 
-void CacheReclaimer::Pause() noexcept { pause_flag_.store(true); }
+void CacheReclaimer::Pause() noexcept {
+    pause_flag_.store(true);
+}
 
 void CacheReclaimer::Resume() noexcept { pause_flag_.store(false); }
 
@@ -1072,7 +1080,8 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
                          predicted_deleted_keys,
                          create_age_stats,
                          false,
-                         maintenance_read)) {
+                         maintenance_read,
+                         &request)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return false;
     }
@@ -1521,7 +1530,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      std::uint64_t &out_predicted_deleted_keys,
                                      AgeStats &out_create_age_stats,
                                      bool eligibility_only,
-                                     bool maintenance_read) noexcept {
+                                     bool maintenance_read,
+                                     CacheLocationDelRequest *output,
+                                     std::size_t *out_quota_deferred_keys) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1530,17 +1541,18 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_location_counts_by_type.fill(0);
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
+    if (out_quota_deferred_keys) {
+        *out_quota_deferred_keys = 0;
+    }
 
-    if (!eligibility_only && (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
-                              pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit)) {
+    DeleteDemand scratch;
+    auto &selected = output ? output->demand : scratch;
+    if (output) {
+        selected = {};
+        output->expected_location_values.assign(batch.size(), {});
+    }
+    if (!eligibility_only && !sched_plan_executor_->Deletes().RemainingRequests(DeleteSource::Reclaimer)) {
         RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN,
-                    "process pending delete limit reached, handlers: [%" PRIu64 "/%" PRIu64 "], bytes: [%" PRIu64
-                    "/%" PRIu64 "]",
-                    pending_delete_handler_count_,
-                    async_delete_config_.pending_delete_handler_limit,
-                    pending_delete_bytes_,
-                    async_delete_config_.pending_bytes_limit);
         out_loc_ids.resize(batch.size());
         out_create_age_stats.Clear();
         return true;
@@ -1647,12 +1659,13 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t create_age_sum = 0;
     int64_t create_age_count = 0;
-    std::uint64_t selected_total_bytes = 0;
+    KeyVector keys_to_touch;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
         const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
         std::size_t valid_location_count = 0;
+        bool deferred_by_quota = false;
 
         // 总水位超限分支：若 block 同时有冷层与非冷层(热/源)副本，则只淘汰已被冷层覆盖的热副本、保留冷副本。
         bool keep_cold_evict_hot = false;
@@ -1759,48 +1772,30 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                     continue;
                 }
 
-                const auto quota_it = pending_quota_by_group_type_.find({ins_gr, base_type});
-                const PendingQuota current_quota =
-                    quota_it == pending_quota_by_group_type_.end() ? PendingQuota{} : quota_it->second;
-                const std::uint64_t location_bytes = GetLocationBytes(loc);
-
-                const bool location_limit_reached =
-                    current_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
-                    out_location_counts_by_type[type_idx] >=
-                        async_delete_config_.pending_location_limit_per_group_type -
-                            std::min(current_quota.location_count,
-                                     async_delete_config_.pending_location_limit_per_group_type);
-                const std::uint64_t current_and_selected_type_bytes =
-                    SaturatingAdd(current_quota.bytes, out_bytes_by_type[type_idx]);
-                const bool type_bytes_limit_reached =
-                    current_and_selected_type_bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
-                    location_bytes > async_delete_config_.pending_bytes_limit_per_group_type -
-                                         std::min(current_and_selected_type_bytes,
-                                                  async_delete_config_.pending_bytes_limit_per_group_type);
-                const std::uint64_t current_and_selected_process_bytes =
-                    SaturatingAdd(pending_delete_bytes_, selected_total_bytes);
-                const bool process_bytes_limit_reached =
-                    current_and_selected_process_bytes >= async_delete_config_.pending_bytes_limit ||
-                    location_bytes >
-                        async_delete_config_.pending_bytes_limit -
-                            std::min(current_and_selected_process_bytes, async_delete_config_.pending_bytes_limit);
-                if (location_limit_reached || type_bytes_limit_reached || process_bytes_limit_reached) {
-                    RecordPendingLimitReject(ins_gr, ToString(base_type));
-                    INTERVAL_LOG_WITH_ID(WARN,
-                                         10000,
-                                         "skip pending-limit location, block: [%ld], location: [%s], storage type: "
-                                         "[%d], bytes: [%" PRIu64 "]",
-                                         batch[block_idx],
-                                         loc.id().c_str(),
-                                         static_cast<int>(base_type),
-                                         location_bytes);
+                auto &admission = sched_plan_executor_->Deletes();
+                const auto cost = admission.Describe(loc, ins_id.size(), DeleteSource::Reclaimer, ins_gr, selected);
+                DeleteBlockReason reason = DeleteBlockReason::Limit;
+                bool fits_alone = false;
+                const bool uses_cluster_quota = UsesReclaimClusterQuota(base_type);
+                const bool check_empty_window =
+                    (maintenance_read || out_quota_deferred_keys) && !deferred_by_quota && uses_cluster_quota;
+                if (!admission.TryAppend(
+                        DeleteSource::Reclaimer, selected, cost, &reason, check_empty_window ? &fits_alone : nullptr)) {
+                    deferred_by_quota = deferred_by_quota || fits_alone;
+                    if (reason == DeleteBlockReason::Memory) {
+                        ++METRICS_(cache_reclaimer, free_busy_budget_skip_location_count);
+                    } else if (reason == DeleteBlockReason::Limit) {
+                        RecordPendingLimitReject(ins_gr, ToString(base_type));
+                    }
                     continue;
                 }
-
+                const auto location_bytes = cost.size.bytes;
+                if (output) {
+                    output->expected_location_values[block_idx].push_back(uses_cluster_quota ? loc.ToJsonString() : "");
+                }
                 loc_id_vec.emplace_back(loc.id());
                 out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);
                 out_bytes_by_type[type_idx] = SaturatingAdd(out_bytes_by_type[type_idx], location_bytes);
-                selected_total_bytes = SaturatingAdd(selected_total_bytes, location_bytes);
                 if (loc.create_time() > 0) {
                     const int64_t age = now_us - loc.create_time();
                     out_create_age_stats.min_us = std::min(out_create_age_stats.min_us, age);
@@ -1813,20 +1808,18 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         if (!eligibility_only && !loc_id_vec.empty() && loc_id_vec.size() == valid_location_count) {
             out_predicted_deleted_keys = SaturatingAdd(out_predicted_deleted_keys, 1);
         }
+        // Backpressure alone must not promote a cold key in the local metadata LRU.
+        if (maintenance_read && loc_id_vec.empty() && !deferred_by_quota) {
+            keys_to_touch.push_back(block_key);
+        }
+        if (out_quota_deferred_keys && loc_id_vec.empty() && deferred_by_quota) {
+            ++*out_quota_deferred_keys;
+        }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
-    if (maintenance_read) {
-        KeyVector rejected_keys;
-        for (size_t i = 0; i < batch.size(); ++i) {
-            if (out_loc_ids[i].empty()) {
-                rejected_keys.push_back(batch[i]);
-            }
-        }
-        // Yield keys with no deletable locations so later samples can reach
-        // other cold candidates, regardless of the rejected location types.
-        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-            indexer && indexer->SupportsWriteSession() && !rejected_keys.empty()) {
-            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
+    if (!keys_to_touch.empty()) {
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && indexer->SupportsWriteSession()) {
+            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(keys_to_touch);
         }
     }
     if (create_age_count == 0) {
@@ -2099,6 +2092,9 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
             loc_count = SaturatingAdd(loc_count, req.location_ids[i].size());
             final_req.block_keys.emplace_back(req.block_keys[i]);
             final_req.location_ids.emplace_back(req.location_ids[i]);
+            if (!req.expected_location_values.empty()) {
+                final_req.expected_location_values.push_back(req.expected_location_values[i]);
+            }
             for (const auto &location_id : req.location_ids[i]) {
                 PendingLocationKey pending_location{ins_id, req.block_keys[i], location_id};
                 if (!request_pending_locations.insert(pending_location).second) {
@@ -2125,45 +2121,27 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
         LOG_WITH_ID(DEBUG, "skip empty reclaim request");
         return false;
     }
-    if (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit) {
-        RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN, "skip reclaim request: process pending handler limit reached");
+    if (req.demand.size.locations != loc_count) {
+        LOG_WITH_ID(ERROR, "reclaim admission target count does not match selected Locations");
         return false;
     }
-
-    std::uint64_t request_bytes = 0;
-    for (std::size_t idx = 0; idx < bytes_by_type.size(); ++idx) {
-        request_bytes = SaturatingAdd(request_bytes, bytes_by_type[idx]);
-        if (location_counts_by_type[idx] == 0 && bytes_by_type[idx] == 0) {
-            continue;
+    DeleteBlockReason reason = DeleteBlockReason::Limit;
+    final_req.reservation = sched_plan_executor_->Deletes().TryReserve(DeleteSource::Reclaimer, req.demand, &reason);
+    if (!final_req.reservation) {
+        if (reason == DeleteBlockReason::Memory) {
+            METRICS_(cache_reclaimer, free_busy_budget_skip_location_count) += loc_count;
+        } else if (reason == DeleteBlockReason::Limit) {
+            RecordPendingLimitReject(ins_gr, "executor");
         }
-        const auto type = static_cast<DataStorageType>(idx);
-        const auto pending_it = pending_quota_by_group_type_.find({ins_gr, type});
-        const PendingQuota pending_quota =
-            pending_it == pending_quota_by_group_type_.end() ? PendingQuota{} : pending_it->second;
-        if (pending_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
-            location_counts_by_type[idx] > async_delete_config_.pending_location_limit_per_group_type -
-                                               std::min(pending_quota.location_count,
-                                                        async_delete_config_.pending_location_limit_per_group_type) ||
-            pending_quota.bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
-            bytes_by_type[idx] >
-                async_delete_config_.pending_bytes_limit_per_group_type -
-                    std::min(pending_quota.bytes, async_delete_config_.pending_bytes_limit_per_group_type)) {
-            RecordPendingLimitReject(ins_gr, ToString(type));
-            LOG_WITH_ID(WARN, "skip reclaim request: group/type pending limit reached for type [%zu]", idx);
-            return false;
-        }
-    }
-    if (pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit ||
-        request_bytes > async_delete_config_.pending_bytes_limit -
-                            std::min(pending_delete_bytes_, async_delete_config_.pending_bytes_limit)) {
-        RecordPendingLimitReject(ins_gr, "process");
-        LOG_WITH_ID(WARN, "skip reclaim request: process pending bytes limit reached");
         return false;
     }
-
+    final_req.free_busy = final_req.reservation->protocol;
+    if (IsPaused() || !IsRunning() || !final_req.reservation->Active()) {
+        return false;
+    }
     auto submit_result = sched_plan_executor_->SubmitAsync(final_req);
     if (!submit_result.accepted) {
+        final_req.reservation->Finish();
         LOG_WITH_ID(WARN, "schedule plan executor rejected async reclaim request");
         return false;
     }
@@ -2184,6 +2162,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                                    submitted_at,
                                    credit_deadline,
                                    std::move(submit_result.future));
+    delete_handlers_.front().reservation_ = std::move(final_req.reservation);
     AddDeleteHandlerState(delete_handlers_.front());
 
     METRICS_(cache_reclaimer, block_submit_count) += blk_count;
@@ -2203,7 +2182,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                 "cache location count: [%" PRIu64 "], bytes: [%" PRIu64 "]",
                 blk_count,
                 loc_count,
-                request_bytes);
+                req.demand.size.bytes);
     return true;
 }
 
