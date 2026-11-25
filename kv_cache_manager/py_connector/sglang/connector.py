@@ -8,7 +8,7 @@ import threading
 import uuid
 from collections import Counter
 from types import MappingProxyType
-from typing import AbstractSet, Any, Dict, List, Mapping, Optional
+from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional
 import time
 import json
 
@@ -585,6 +585,7 @@ class HiCacheKVCM(HiCacheStorage):
     # Whether a round of _ensure_client_for_write() has already seen every
     # rank of the TP group ready (see that method).
     _tp_init_agreed: bool = False
+    _storage_group_failed: bool = False
     # Immutable so hand-built instances (tests bypass __init__) can read it
     # without sharing one mutable object: late names are added by rebinding,
     # never by mutating a shared set.
@@ -652,6 +653,7 @@ class HiCacheKVCM(HiCacheStorage):
         self._client_ready = False
         self._closed = False
         self._tp_init_agreed = False
+        self._storage_group_failed = False
 
         # SDK handles, created by _ensure_client() and dropped by close().
         self.transfer_client: Any = None
@@ -827,8 +829,11 @@ class HiCacheKVCM(HiCacheStorage):
         if self.storage_tp_group is None:
             return cooperative
         gathered: List[Any] = [None] * self.tp_world_size
-        torch.distributed.all_gather_object(
-            gathered, local, group=self.storage_tp_group
+        self._storage_collective(
+            torch.distributed.all_gather_object,
+            gathered,
+            local,
+            group=self.storage_tp_group,
         )
         if any(report is None for report in gathered):
             # Only a group that did not answer leaves a slot empty, and a
@@ -947,6 +952,20 @@ class HiCacheKVCM(HiCacheStorage):
             return False
         return _sidecars_are_written_by_every_rank() and self._backs_a_sharded_sidecar()
 
+    def _storage_collective(
+        self, collective: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        if self._storage_group_failed:
+            raise RuntimeError(
+                "storage TP group failed; re-attach the backend to write"
+            )
+        try:
+            return collective(*args, **kwargs)
+        except Exception:
+            self._storage_group_failed = True
+            logger.exception("Storage TP collective failed; disabling backend writes")
+            raise
+
     def _ensure_client_for_write(
         self, pool_transfers: Optional[List[PoolTransfer]] = None
     ) -> None:
@@ -987,9 +1006,14 @@ class HiCacheKVCM(HiCacheStorage):
         this backend instance; until such a round happens every write call
         repeats it, which is what keeps a rank that failed once from slipping
         into a later write whose peers would already be waiting for it.
-        Nothing is sticky, so the next call retries initialization.
+        Client initialization failures are retried on the next call. A failed
+        storage collective disables writes until the backend is re-attached.
         """
         self._raise_if_closed()
+        if self._storage_group_failed:
+            raise RuntimeError(
+                "storage TP group failed; re-attach the backend to write"
+            )
         if not self._write_path_uses_tp_collectives(pool_transfers):
             self._ensure_client()
             return
@@ -1017,8 +1041,11 @@ class HiCacheKVCM(HiCacheStorage):
                 "collectives would wait for ranks that cannot answer"
             )
         ready = torch.tensor([0 if local_error is not None else 1], dtype=torch.int)
-        torch.distributed.all_reduce(
-            ready, op=torch.distributed.ReduceOp.MIN, group=group
+        self._storage_collective(
+            torch.distributed.all_reduce,
+            ready,
+            op=torch.distributed.ReduceOp.MIN,
+            group=group,
         )
         if not bool(ready.item()):
             if local_error is not None:
@@ -2005,21 +2032,23 @@ class HiCacheKVCM(HiCacheStorage):
         trace_id: str,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        # NOTE on cross-rank consistency:
+        # NOTE on cross-rank consistency for TP-coordinated writes:
         # start_write_cache and SaveKvCaches failures are synchronised
         # across ranks (via broadcast / all_reduce) so every rank
         # converges on the same result.
         #
-        # finish_write_cache is called only on rank 0 *after* the
-        # all_reduce has already completed. If it throws, rank 0
-        # overrides flag to False while other ranks keep flag = True.
-        # Adding a second all_reduce just for this error path would
-        # penalise the hot path for a rare event. The practical
-        # consequence is that rank 1+ callers may believe the write
-        # succeeded, but the manager was never told to commit, so a
-        # subsequent batch_get on those blocks will miss. This is an
-        # accepted inconsistency -- the caller should tolerate cache
-        # misses gracefully.
+        # finish_write_cache is called only on rank 0 after the upload
+        # all_reduce has completed. Its outcome must also be broadcast:
+        # if rank 0 stops while its peers enter the next batch, their
+        # collective order can diverge and hang the group. While the
+        # storage group is healthy, _sync_finish_result makes every rank
+        # stop the current backup on a FinishWriteCache error, even if
+        # the Manager committed before its response timed out.
+        #
+        # A failed storage collective can partially deliver a broadcast,
+        # so the group cannot safely be reused. _storage_collective marks
+        # it failed, and _ensure_client_for_write rejects future writes
+        # before opening new sessions until the backend is re-attached.
 
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
@@ -2052,7 +2081,8 @@ class HiCacheKVCM(HiCacheStorage):
                 result = None
 
             if self.tp_world_size > 1 and not self.is_mla_model:
-                torch.distributed.broadcast_object_list(
+                self._storage_collective(
+                    torch.distributed.broadcast_object_list,
                     [result, len_prefix, len_new, local_hash],
                     group_src=0,
                     group=self.storage_tp_group,
@@ -2065,8 +2095,11 @@ class HiCacheKVCM(HiCacheStorage):
             return [False] * len_new
         else:
             recv: List[Any] = [None, None, None, None]
-            torch.distributed.broadcast_object_list(
-                recv, group_src=0, group=self.storage_tp_group
+            self._storage_collective(
+                torch.distributed.broadcast_object_list,
+                recv,
+                group_src=0,
+                group=self.storage_tp_group,
             )
             result, len_prefix, len_new, rank0_hash = recv
 
@@ -2126,6 +2159,7 @@ class HiCacheKVCM(HiCacheStorage):
 
         # Early return if all new blocks are already cached.
         if unmatched == 0:
+            finish_ok = False
             if self.tp_rank == 0:
                 try:
                     self._manager_client.finish_write_cache(
@@ -2138,8 +2172,11 @@ class HiCacheKVCM(HiCacheStorage):
                             },
                         }
                     )
+                    finish_ok = True
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
+            if not self._sync_finish_result(finish_ok):
+                return [False] * local_len_new
             return [False] * local_len_new if skip_transfer else [True] * local_len_new
 
         # Data transfer preparation and execution.
@@ -2224,7 +2261,8 @@ class HiCacheKVCM(HiCacheStorage):
 
         # Per-block all_reduce: only blocks ALL ranks wrote are marked success
         if self.tp_world_size > 1 and not self.is_mla_model:
-            torch.distributed.all_reduce(
+            self._storage_collective(
+                torch.distributed.all_reduce,
                 per_block_flags,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.storage_tp_group,
@@ -2232,6 +2270,7 @@ class HiCacheKVCM(HiCacheStorage):
 
         new_block_success = [bool(per_block_flags[j]) for j in range(unmatched)]
         finish_mask = [False] * prefix_write_count + new_block_success
+        finish_ok = False
         if self.tp_rank == 0:
             try:
                 self._manager_client.finish_write_cache(
@@ -2242,10 +2281,11 @@ class HiCacheKVCM(HiCacheStorage):
                         "success_blocks": {"bool_masks": {"values": finish_mask}},
                     }
                 )
+                finish_ok = True
             except Exception as e:
                 logger.error(f"finish_write_cache failed: {e}")
-                # Mark all as failed on rank 0 for the return value.
-                new_block_success = [False] * unmatched
+        if not self._sync_finish_result(finish_ok):
+            return [False] * local_len_new
 
         # Build result list: 1:1 positional mapping with input keys.
         # Use local_len_new so the return length matches the caller's input.
@@ -2260,6 +2300,17 @@ class HiCacheKVCM(HiCacheStorage):
         }
         result_list = [block_flag_map.get(i, True) for i in range(local_len_new)]
         return result_list
+
+    def _sync_finish_result(self, finish_ok: bool) -> bool:
+        finish = [finish_ok]
+        if self.tp_world_size > 1 and not self.is_mla_model:
+            self._storage_collective(
+                torch.distributed.broadcast_object_list,
+                finish,
+                group_src=0,
+                group=self.storage_tp_group,
+            )
+        return finish[0]
 
     def batch_set_v1(
         self,
@@ -2415,15 +2466,19 @@ class HiCacheKVCM(HiCacheStorage):
                             )
                             write_result = None
                     if shared and self.tp_world_size > 1:
-                        torch.distributed.broadcast_object_list(
+                        self._storage_collective(
+                            torch.distributed.broadcast_object_list,
                             [write_result],
                             group_src=0,
                             group=self.storage_tp_group,
                         )
                 elif shared and self.tp_world_size > 1:
                     recv: List[Any] = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, group_src=0, group=self.storage_tp_group
+                    self._storage_collective(
+                        torch.distributed.broadcast_object_list,
+                        recv,
+                        group_src=0,
+                        group=self.storage_tp_group,
                     )
                     write_result = recv[0]
                 else:
@@ -3048,7 +3103,8 @@ class HiCacheKVCM(HiCacheStorage):
         if not (shared and self.tp_world_size > 1):
             return flag
         flag_tensor = torch.tensor(flag, dtype=torch.int)
-        torch.distributed.all_reduce(
+        self._storage_collective(
+            torch.distributed.all_reduce,
             flag_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.storage_tp_group,

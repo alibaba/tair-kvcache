@@ -337,6 +337,7 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
             script.peer_session is not None
             and isinstance(object_list, list)
             and len(object_list) == 1
+            and not isinstance(object_list[0], bool)
         ):
             object_list[0] = script.peer_session()
 
@@ -517,7 +518,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             1,
             "the steady state must not pay a collective per write call",
         )
-        self.assertEqual(len(script.broadcasts), 1, "rank 0's own broadcast only")
+        self.assertEqual(len(script.broadcasts), 2, "session and commit outcome")
         self.assertEqual(
             [shape for _, shape, _, _ in script.write_reduces],
             [(len(WRITE_KEYS) - BLOCKS_TO_WRITE,)],
@@ -549,7 +550,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             [(1,)],
             "the single-block flags belong to the write path",
         )
-        self.assertEqual(len(script.broadcasts), 1)
+        self.assertEqual(len(script.broadcasts), 2)
 
     def test_the_v2_write_path_writes_once_the_group_agreed(self) -> None:
         """The gate must not swallow the v2 path: real session, real reduce.
