@@ -295,6 +295,7 @@ class _CollectiveScript:
         # The write path's own collectives, i.e. what must not be reached when
         # the group agreed that it is not ready to write.
         self.broadcasts: list = []
+        self.awaiting_finish = False
         self.write_reduces: list = []
         self.gathers: list = []
 
@@ -333,13 +334,16 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
 
     def fake_broadcast(object_list: Any = None, **kwargs: Any) -> None:
         script.broadcasts.append(kwargs.get("group"))
-        if (
-            script.peer_session is not None
-            and isinstance(object_list, list)
-            and len(object_list) == 1
-            and not isinstance(object_list[0], bool)
-        ):
-            object_list[0] = script.peer_session()
+        if not isinstance(object_list, list) or len(object_list) != 1:
+            return
+        if isinstance(object_list[0], bool) or script.awaiting_finish:
+            if script.awaiting_finish:
+                object_list[0] = True
+            script.awaiting_finish = False
+        else:
+            if script.peer_session is not None:
+                object_list[0] = script.peer_session()
+            script.awaiting_finish = True
 
     with (
         mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce),
@@ -583,7 +587,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             [(), ()],
             "the v2 flag is a 0-dim tensor, once per transfer",
         )
-        self.assertEqual(len(script.broadcasts), 2, "one per transfer on rank 0")
+        self.assertEqual(len(script.broadcasts), 4, "session and finish per transfer")
 
 
 class TestRankShardedSidecarsAcrossTheGroup(unittest.TestCase):
@@ -651,7 +655,9 @@ class TestRankShardedSidecarsAcrossTheGroup(unittest.TestCase):
         self.assertEqual(result, {PoolName.MAMBA: [True, True]})
         self.assertTrue(connector._tp_init_agreed)
         self.assertEqual(len(script.agreements), 1, "the write joins the group")
-        self.assertEqual(script.broadcasts, [GROUP], "rank 0's session is waited for")
+        self.assertEqual(
+            script.broadcasts, [GROUP, GROUP], "session and finish are waited for"
+        )
         self.assertIsNone(
             _write_sessions(connector).call_args,
             "rank 0 opens the session for the group",
@@ -767,7 +773,7 @@ class TestRankShardedSidecarsAcrossTheGroup(unittest.TestCase):
 
         self.assertEqual(result, {PoolName.MAMBA: [True, True]})
         self.assertEqual(len(script.agreements), 1)
-        self.assertEqual(script.broadcasts, [GROUP])
+        self.assertEqual(script.broadcasts, [GROUP, GROUP])
         self.assertEqual(
             connector.transfer_client.SaveKvCaches.call_args.args[0],
             ["tp_1_linear-0", "tp_1_linear-1"],
