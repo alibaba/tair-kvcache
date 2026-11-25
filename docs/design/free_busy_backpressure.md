@@ -15,7 +15,7 @@ KVCM 的目标是让回收速度随目标 Tair Mempool（PACE）集群的处理�
 
 **按健康 Provider 数起步。** 开启 Free Busy 协议时，PACE 后端复用约每 10 秒一次的健康检查，从同一份 `GET /v1/api/memnode` 回包按节点 ID 去重，只计健康且承担 Provider 角色的节点。共享一个接入地址的存储使用最近一份有效观测，DRAM 和 SSD 上报同一集群时只计一次。Executor 在下次准入时读取缓存，不额外请求 Meta。[PACE 存储适配](../../kv_cache_manager/data_storage/pace_reclaim_storage.cc)
 
-每个健康 Provider 给集群提供 **384 个 Location、20 GiB** 的基准在途额度，两项分别以 `cluster_locations`、`cluster_bytes` 为硬上限。在默认配置下，4 个 Provider 从 1,536 个 Location、80 GiB 起步，40 个从 15,360 个、800 GiB 起步，64 个及以上达到配置上限。这组初值取默认硬上限的 1/64，用于确定首批可放入多少工作。实际每秒完成量还取决于批大小、Executor 并发和后端耗时。
+每个健康 Provider 给集群提供 **384 个 Location、20 GiB** 的基准在途额度，两项分别以 `cluster_locations`、`cluster_bytes` 为硬上限。在默认配置下，4 个 Provider 从 1,536 个 Location、80 GiB 起步，40 个从 15,360 个、800 GiB 起步。健康 Provider 数达到 64 个时，Location 额度封顶于 24,576 个。达到 103 个时，字节额度封顶于 2 TiB。实际每秒完成量还取决于批大小、Executor 并发和后端耗时。
 
 首次尚无观测、观测超过 30 秒时，按 1 个 Provider 起步。短暂查询失败或旧 Meta 未提供完整角色时，沿用仍新鲜的观测。明确观测到 0 个健康 Provider 时，集群一次只放行 1 个 Location 探测。缩容后立即用较小的窗口控制新准入，已接纳任务继续执行。扩容时，正常集群可以立即使用新窗口，处于退避中的集群仍按下表逐轮恢复。
 
@@ -80,7 +80,7 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 
 ### 重试记录的进程级内存上限
 
-可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes`，以字节为单位，限制单个 KVCM 进程为三路 Tair Mempool 删除重试记录预留的内存总量。该进程内的所有实例组和 Tair Mempool 存储共用这份预算。常规部署使用默认值，内存余量较小的部署可显式调低。
+可选配置 `kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes` 以字节为单位，默认 **512 MiB**。每个 KVCM 进程按需预留，三路删除、所有实例组和 Tair Mempool 存储共用这份预算。
 
 退避期间保存**完整 URI 文本和受影响的 Location 关联**，重发时再解析当批 URI。预算覆盖这些文本、关联、容器容量和每批的固定开销。
 
@@ -97,7 +97,7 @@ KVCM 将分配回包中的可选 `alloc_generation` 原样写入 URI。旧分配
 
 以上只计这批记录持有的堆内存。进程峰值还包含已有 pending、发送时的临时对象和分配器碎片。在途字节按 URI 的 `size` 累加后端待删数据量，一个 Location 也可以关联多个 GA。这些配额只能间接约束重试记录。[pending 字节计量](../../kv_cache_manager/manager/delete_admission.cc)
 
-默认预算取 **128 MiB**，按需预留。Linux/libstdc++ 容器中的校准使用 8 字符 Location ID、30 字符实例名，每批 100 个 Location。用 90 字节 URI 时，2 万个单 spec Location 预留 29.1 MiB，20 spec 时预留 **117.5 MiB**。20 spec 的记录实际堆增量约 57.4 MiB。用分层存储集成测试中的 72–77 字节 URI 长度代入同一 20 spec 场景，预留为 103.1–107.1 MiB。128 MiB 可以覆盖上述 2 万个 Location 样本。三路共用预算。在上述 20 spec、90 字节 URI 的场景中，24,576 个 Location 的预留约为 144 MiB，因此即使 Meta 空闲也可能先触及 128 MiB 的进程预算。[Location ID 的生成](../../kv_cache_manager/manager/meta_searcher.cc) · [预留公式](../../kv_cache_manager/manager/free_busy.h)
+Linux/libstdc++ 容器中的校准使用 8 字符 Location ID、30 字符实例名，每批 100 个 Location。用 90 字节 URI 时，2 万个单 spec Location 预留 29.1 MiB，20 spec 时预留 **117.5 MiB**。20 spec 的记录实际堆增量约 57.4 MiB。用分层存储集成测试中的 72–77 字节 URI 长度代入同一 20 spec 场景，预留为 103.1–107.1 MiB。按每个 Location 有 20 个 spec、每个 URI 长 90 字节估算，单个集群的 24,576 个在途 Location 约预留 144 MiB，低于 512 MiB 的进程上限。多个集群同时回收时，预留量累加。[Location ID 的生成](../../kv_cache_manager/manager/meta_searcher.cc) · [预留公式](../../kv_cache_manager/manager/free_busy.h)
 
 早期仅水位驱逐的版本在同一 Linux 环境，使用真实删除执行器、本地元数据和始终成功的测试后端做了三轮对照。每轮删除 2 万个 Location、40 万个 GA，使用 8 个 worker 和 1 秒读者宽限期。从开始提交到所有 Future 完成，64 MiB 预算约需 2.17 秒，128 MiB 和关闭协议均约需 1.19 秒。128 MiB 在三轮中都没有等待预算。该对照衡量 KVCM 在此工作负载下的排空时间，线上端到端耗时还取决于 Meta 和 Provider。
 
@@ -148,7 +148,7 @@ Reclaimer、GC 和 `TrimCache` 各自按批提交并标明来源，由 **`Schedu
 
 | 适用范围 | 计量内容 | 默认策略 |
 |---|---|---|
-| 单个目标 mempool，三路合计 | 在途 Location 数、待删数据字节数 | 硬上限为 24,576 个 Location、1,280 GiB。开启协议时按第 2 节的 Provider 数和 busy 反馈决定实际窗口 |
+| 单个目标 mempool，三路合计 | 在途 Location 数、待删数据字节数 | 硬上限为 24,576 个 Location、2 TiB。开启协议时按第 2 节的 Provider 数和 busy 反馈决定实际窗口 |
 | 单个删除来源 | 在途删除请求数、在途 Location 数、待删数据字节数 | 各项可独立封顶，数值 0 表示该项不限 |
 
 来源的在途请求数按 Executor 已接纳、尚未收尾的逻辑删除任务计量。同一任务按 storage 拆批或因 busy 多次重试，在适用的来源请求数上限中只占一个名额，原任务收尾时归还。各批次收尾时归还对应的 Location 和字节额度。
@@ -197,7 +197,7 @@ PACE 存储适配代码从配置中提取集群接入地址，供 Executor 记�
 
 | 作用范围 | 请求数 | Location 数 | bytes |
 |---|---:|---:|---:|
-| 单个 mempool 接入地址 | — | `cluster_locations=24576` | `cluster_bytes=1374389534720`（1,280 GiB） |
+| 单个 mempool 接入地址 | — | `cluster_locations=24576` | `cluster_bytes=2199023255552`（2 TiB） |
 | Reclaimer | `reclaimer_requests=1024` | `reclaimer_locations=0` | `reclaimer_bytes=4398046511104`（4 TiB） |
 | GC | `gc_requests=64` | `gc_locations=0` | `gc_bytes=0` |
 | Trim | `trim_requests=32` | `trim_locations=0` | `trim_bytes=0` |

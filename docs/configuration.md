@@ -177,17 +177,17 @@ kvcm.cache_reclaimer.free_busy_enabled=true
 kvcm.cache_reclaimer.free_busy_initial_backoff_ms=50
 # 单次本地退避上限（毫秒）。达到上限后仍可重试。Meta 可建议等待更久，整批启动重试的总时限为 30 秒。
 kvcm.cache_reclaimer.free_busy_max_backoff_ms=5000
-# 全进程共享的重试记录预留上限（字节），默认 128 MiB。首发也占预留。
-kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes=134217728
+# 全进程共享的重试记录预留上限（字节），默认 512 MiB。首发也占预留。
+kvcm.cache_reclaimer.free_busy_retry_memory_limit_bytes=536870912
 
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
 
-# 每个进程内，三路删除共用每个 mempool 接入地址的 Location 数和数据字节硬上限。
+# 每个进程内，三路删除按 mempool 接入地址共享硬上限，默认 24,576 个 Location、2 TiB 待删数据。
 # 协议开启时，每个健康 Provider 对应 384 个 Location、20 GiB 的起步额度，两项分别受以下配置封顶。
 kvcm.delete_admission.cluster_locations=24576
-kvcm.delete_admission.cluster_bytes=1374389534720
+kvcm.delete_admission.cluster_bytes=2199023255552
 
 # 每个来源可独立设置 requests、locations、bytes。0 表示该维度不限。
 # 下列为默认值。显式新值优先于对应旧键，原有 GC 和 Reclaimer 的等价进程上限会自动继承。

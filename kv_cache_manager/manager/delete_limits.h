@@ -24,12 +24,13 @@ struct DeleteSourceLimit {
 // Zero disables that source ceiling. Cluster and legacy non-PACE ceilings are positive.
 struct DeleteLimits {
     static constexpr uint32_t kDefaultMaxBackoffMs = 5000;
-    DeleteSize cluster{24576, 1280ULL << 30};
+    static constexpr uint64_t kDefaultRetryMemoryLimitBytes = 512ULL << 20;
+    DeleteSize cluster{24576, 2ULL << 40};
     DeleteSize non_pace_reclaim{20000, 1ULL << 40};
     std::array<DeleteSourceLimit, 3> sources{{{1024, {0, 4ULL << 40}}, {64, {}}, {32, {}}}};
     bool protocol{true};
     uint64_t initial_backoff_ms{50};
-    uint64_t retry_memory_bytes{128ULL << 20};
+    uint64_t retry_memory_bytes{kDefaultRetryMemoryLimitBytes};
     uint32_t max_backoff_ms{kDefaultMaxBackoffMs};
 };
 

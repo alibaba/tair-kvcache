@@ -11,7 +11,7 @@ namespace kv_cache_manager {
 namespace {
 using Clock = std::chrono::steady_clock;
 
-// One sixty-fourth of the default cluster ceilings. These are outstanding work units, not measured QPS.
+// Each healthy provider contributes this much in-flight work, up to the configured cluster limits.
 constexpr DeleteSize kWindowPerProvider{384, 20ULL << 30};
 constexpr auto kTopologyMaxAge = std::chrono::seconds(30);
 

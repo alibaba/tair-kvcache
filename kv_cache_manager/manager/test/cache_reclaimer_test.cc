@@ -3913,7 +3913,7 @@ TEST_F(CacheReclaimerTest, FreeBusyMemoryFiltersBeforeAdmissionAndWorkerPermitsA
     }
 }
 
-TEST_F(CacheReclaimerTest, DefaultFreeBusyBudgetAdmitsAFullGroupOfTwentySpecLocations) {
+TEST_F(CacheReclaimerTest, DefaultFreeBusyBudgetAdmitsMultipleGroupsOfTwentySpecLocations) {
     CacheReclaimerAsyncDeleteConfig config;
     std::vector<LocationSpec> specs;
     for (int i = 0; i < 20; ++i) {
@@ -3923,10 +3923,12 @@ TEST_F(CacheReclaimerTest, DefaultFreeBusyBudgetAdmitsAFullGroupOfTwentySpecLoca
     }
     const CacheLocation location(
         "12345678", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, specs.size(), specs);
-    const auto bytes = FreeBusyTask::RecordBytes(location, 30) * config.pending_location_limit_per_group_type;
+    const auto group_bytes = FreeBusyTask::RecordBytes(location, 30) * config.pending_location_limit_per_group_type;
     FreeBusyResources budget(config.free_busy_retry_memory_limit_bytes);
-    EXPECT_TRUE(budget.Reserve(bytes));
-    EXPECT_FALSE(budget.Reserve(bytes));
+    ASSERT_TRUE(budget.Reserve(group_bytes));
+    ASSERT_TRUE(budget.Reserve(group_bytes));
+    ASSERT_TRUE(budget.Reserve(config.free_busy_retry_memory_limit_bytes - 2 * group_bytes));
+    EXPECT_FALSE(budget.Reserve(1));
 }
 
 TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuota) {

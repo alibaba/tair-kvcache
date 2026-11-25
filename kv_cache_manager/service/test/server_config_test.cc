@@ -32,7 +32,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         EXPECT_TRUE(config.GetFreeBusyEnabled());
         EXPECT_EQ(50, config.GetFreeBusyInitialBackoffMs());
         EXPECT_EQ(5000u, config.GetDeleteLimits().max_backoff_ms);
-        EXPECT_EQ(128ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
+        EXPECT_EQ(512ULL << 20, config.GetFreeBusyRetryMemoryLimitBytes());
+        EXPECT_EQ(512ULL << 20, config.GetDeleteLimits().retry_memory_bytes);
         ASSERT_EQ(20000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(1ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
@@ -569,6 +570,7 @@ TEST_F(ServerConfigTest, DeleteAdmissionUsesEquivalentLegacyLimitsAndExplicitSou
                               {"kvcm.delete_admission.trim_bytes", "99"}}));
     auto limits = config.GetDeleteLimits();
     EXPECT_EQ(24576u, limits.cluster.locations);
+    EXPECT_EQ(2ULL << 40, limits.cluster.bytes);
     EXPECT_EQ(11u, limits.non_pace_reclaim.locations);
     EXPECT_EQ(44u, limits.sources[0].size.bytes);
     EXPECT_EQ(0u, limits.sources[0].requests);
@@ -577,9 +579,11 @@ TEST_F(ServerConfigTest, DeleteAdmissionUsesEquivalentLegacyLimitsAndExplicitSou
     EXPECT_EQ(99u, limits.sources[2].size.bytes);
     ASSERT_TRUE(config.Parse("",
                              {{"kvcm.delete_admission.cluster_locations", "8"},
+                              {"kvcm.delete_admission.cluster_bytes", "1099511627776"},
                               {"kvcm.delete_admission.gc_requests", "7"},
                               {"kvcm.cache_gc.max_inflight_delete_requests", "2"}}));
     EXPECT_EQ(8u, config.GetDeleteLimits().cluster.locations);
+    EXPECT_EQ(1ULL << 40, config.GetDeleteLimits().cluster.bytes);
     EXPECT_EQ(7u, config.GetDeleteLimits().sources[1].requests);
     EXPECT_FALSE(config.Parse("", {{"kvcm.delete_admission.cluster_bytes", "0"}}));
     EXPECT_FALSE(config.Parse("", {{"kvcm.delete_admission.trim_locations", "-1"}}));
@@ -596,6 +600,7 @@ TEST_F(ServerConfigTest, FreeBusyConfig) {
     EXPECT_EQ(100, config.GetFreeBusyInitialBackoffMs());
     EXPECT_EQ(250u, config.GetDeleteLimits().max_backoff_ms);
     EXPECT_EQ(4096, config.GetFreeBusyRetryMemoryLimitBytes());
+    EXPECT_EQ(4096u, config.GetDeleteLimits().retry_memory_bytes);
     EXPECT_TRUE(config.Parse("",
                              {{"kvcm.cache_reclaimer.free_busy_initial_backoff_ms", "6000"},
                               {"kvcm.cache_reclaimer.free_busy_max_backoff_ms", "8000"}}));

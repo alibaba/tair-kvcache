@@ -676,6 +676,11 @@ TEST_F(FreeBusyDeleteTest, ProviderWindowTracksLiveTopologyAndKeepsConfiguredCei
     first->Finish();
     EXPECT_FALSE(reserve(admission, {2, (20ULL << 30) + 1}));
     EXPECT_TRUE(reserve(admission, {1, (20ULL << 30) + 1})); // One indivisible Location fits the hard limit.
+    backend->providers = {102, Clock::now()};
+    EXPECT_FALSE(reserve(admission, {2, 2ULL << 40}));
+    backend->providers = {103, Clock::now()};
+    EXPECT_TRUE(reserve(admission, {2, 2ULL << 40}));
+    EXPECT_FALSE(reserve(admission, {1, (2ULL << 40) + 1}));
     backend->providers = {UINT32_MAX, Clock::now()};
     EXPECT_TRUE(reserve(admission, admission.limits.cluster));
     EXPECT_FALSE(reserve(admission, {admission.limits.cluster.locations + 1, 1}));

@@ -23,6 +23,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/delete_admission.h"
+#include "kv_cache_manager/manager/delete_limits.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -74,7 +75,7 @@ struct CacheReclaimerAsyncDeleteConfig {
     std::uint64_t pending_bytes_limit{4ULL * 1024 * 1024 * 1024 * 1024};
     bool free_busy_enabled{true};
     uint64_t free_busy_initial_backoff_ms{50};
-    uint64_t free_busy_retry_memory_limit_bytes{128ULL << 20};
+    uint64_t free_busy_retry_memory_limit_bytes{DeleteLimits::kDefaultRetryMemoryLimitBytes};
 };
 
 struct CacheReclaimerGroupLruConfig {

@@ -591,7 +591,7 @@ void ServerConfig::UpdateDefaultConfig() {
     free_busy_enabled_ = true;
     free_busy_initial_backoff_ms_ = 50;
     free_busy_max_backoff_ms_ = DeleteLimits::kDefaultMaxBackoffMs;
-    free_busy_retry_memory_limit_bytes_ = 128ULL << 20;
+    free_busy_retry_memory_limit_bytes_ = DeleteLimits::kDefaultRetryMemoryLimitBytes;
     cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
     cache_reclaimer_pending_location_limit_per_group_type_ = 20000;
     cache_reclaimer_pending_bytes_limit_per_group_type_ = 1ULL * 1024 * 1024 * 1024 * 1024;
