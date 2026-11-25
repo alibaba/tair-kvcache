@@ -1234,8 +1234,8 @@ class TestSidecarIndices(unittest.TestCase):
         self.assertEqual(result[SIDECAR_POOL], [False])
         self.assertEqual(
             len(broadcasts),
-            1,
-            "the rank skipped the session broadcast; its peer would block on it",
+            2,
+            "the rank must join both the session and finish broadcasts",
         )
         self.assertEqual(
             len(reduces),

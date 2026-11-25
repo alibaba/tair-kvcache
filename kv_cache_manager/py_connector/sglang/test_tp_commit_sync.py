@@ -44,11 +44,10 @@ class WriteGroup:
         rank = self.local.rank
         assert group is self and group_src == 0
         operation = (
-            "finish" if isinstance(values[0], bool) or len(values) == 1 else "start"
+            "start"
+            if len(values) == 4 or self.ops[rank][-1] in ("schedule", "finish")
+            else "finish"
         )
-        # A receiver's empty one-element list is also a finish broadcast in v1.
-        if len(values) == 4:
-            operation = "start"
         self.ops[rank].append(operation)
         if self.fail_at == operation:
             raise RuntimeError("injected collective failure")
@@ -303,6 +302,139 @@ class TestFailedStorageGroup(unittest.TestCase):
                 self.assertEqual(group.ops, operations)
 
 
+def sidecar_transfer():
+    transfer = _transfer()
+    transfer.keys = list(WRITE_KEYS)
+    transfer.host_indices = torch.arange(len(WRITE_KEYS))
+    return transfer
+
+
+def sidecar_backup(connector):
+    results = []
+    transfer = sidecar_transfer()
+    for _ in range(2):
+        result = connector.batch_set_v2([transfer])[transfer.name]
+        results.append(result)
+        if not all(result):
+            break
+    return results
+
+
+class TestSidecarCommit(unittest.TestCase):
+    def test_timeout_and_success_across_layouts_and_cached_masks(self):
+        for mla in (False, True):
+            for blocks in (0, 2, 4):
+                with self.subTest(mla=mla, blocks=blocks):
+                    group = WriteGroup()
+                    connectors = [
+                        connector_for(
+                            rank, group, is_mla_model=mla, blocks_to_write=blocks
+                        )
+                        for rank in range(2)
+                    ]
+                    connectors[
+                        0
+                    ]._manager_client.finish_write_cache.side_effect = TimeoutError(
+                        "commit response timed out"
+                    )
+                    self.assertEqual(
+                        group.run(lambda rank: sidecar_backup(connectors[rank])),
+                        [[[False] * 4]] * 2,
+                    )
+                    self.assertEqual(group.ops[0], group.ops[1])
+                    self.assertEqual(
+                        connectors[0]._manager_client.start_write_cache.call_count, 1
+                    )
+                    for connector in connectors:
+                        self.assertFalse(connector._storage_group_failed)
+                        connector._manager_client.finish_write_cache.side_effect = None
+                    self.assertEqual(
+                        group.run(lambda rank: sidecar_backup(connectors[rank])),
+                        [[[True] * 4] * 2] * 2,
+                    )
+
+    def test_early_branches_still_join_the_commit_broadcast(self):
+        for failure in ("empty", "unbacked", "invalid_mask", "start"):
+            with self.subTest(failure=failure):
+                group = WriteGroup()
+                connectors = [
+                    connector_for(rank, group, blocks_to_write=4) for rank in range(2)
+                ]
+                transfers = [sidecar_transfer(), sidecar_transfer()]
+                if failure == "empty":
+                    transfers[1].keys = []
+                elif failure == "unbacked":
+                    connectors[1]._get_extra_pool_spec_name = mock.Mock(
+                        return_value=None
+                    )
+                elif failure == "invalid_mask":
+                    connectors[1]._parse_block_mask = mock.Mock(return_value=None)
+                else:
+                    connectors[
+                        0
+                    ]._manager_client.start_write_cache.side_effect = TimeoutError(
+                        "start response timed out"
+                    )
+                results = group.run(
+                    lambda rank: connectors[rank].batch_set_v2([transfers[rank]])
+                )
+                for rank in range(2):
+                    self.assertEqual(
+                        results[rank][transfers[rank].name],
+                        [False] * len(transfers[rank].keys),
+                    )
+                self.assertEqual(group.ops[0], group.ops[1])
+                self.assertEqual(group.ops[0][-1], "finish")
+                self.assertFalse(any(c._storage_group_failed for c in connectors))
+
+    def test_collective_failure_disables_sidecar_writes(self):
+        for phase in ("start", "flags", "finish"):
+            with self.subTest(phase=phase):
+                group = WriteGroup()
+                group.fail_at = phase
+                connectors = [connector_for(rank, group) for rank in range(2)]
+                self.assertEqual(
+                    group.run(lambda rank: sidecar_backup(connectors[rank])),
+                    [[[False] * 4]] * 2,
+                )
+                self.assertTrue(all(c._storage_group_failed for c in connectors))
+                counts = [
+                    c._manager_client.start_write_cache.call_count for c in connectors
+                ]
+                group.fail_at = None
+                for connector in connectors:
+                    self.assertEqual(sidecar_backup(connector), [[False] * 4])
+                self.assertEqual(
+                    [
+                        c._manager_client.start_write_cache.call_count
+                        for c in connectors
+                    ],
+                    counts,
+                )
+
+    def test_rank_zero_only_sidecar_commit_needs_no_peer(self):
+        connector = connector_for(0, None, is_mla_model=True)
+        transfer = sidecar_transfer()
+        with mock.patch(
+            "kv_cache_manager.py_connector.sglang.connector._sidecars_are_written_by_every_rank",
+            return_value=False,
+        ):
+            with mock.patch.object(
+                torch.distributed, "broadcast_object_list"
+            ) as broadcast:
+                connector._manager_client.finish_write_cache.side_effect = TimeoutError(
+                    "commit response timed out"
+                )
+                self.assertEqual(
+                    connector.batch_set_v2([transfer])[transfer.name], [False] * 4
+                )
+                connector._manager_client.finish_write_cache.side_effect = None
+                self.assertEqual(
+                    connector.batch_set_v2([transfer])[transfer.name], [True] * 4
+                )
+            broadcast.assert_not_called()
+
+
 def _gloo_rank(rank, init_file, output):
     torch.distributed.init_process_group(
         "gloo",
@@ -319,7 +451,20 @@ def _gloo_rank(rank, init_file, output):
         failed = backup(connector)
         connector._manager_client.finish_write_cache.side_effect = None
         recovered = backup(connector)
-        output.put((rank, failed, recovered, connector._storage_group_failed))
+        sidecar_results = []
+        for mla in (False, True):
+            sidecar = connector_for(
+                rank, torch.distributed.group.WORLD, is_mla_model=mla
+            )
+            sidecar._manager_client.finish_write_cache.side_effect = TimeoutError(
+                "commit response timed out"
+            )
+            sidecar_failed = sidecar_backup(sidecar)
+            sidecar._manager_client.finish_write_cache.side_effect = None
+            sidecar_results.append((sidecar_failed, sidecar_backup(sidecar)))
+        output.put(
+            (rank, failed, recovered, connector._storage_group_failed, sidecar_results)
+        )
     finally:
         torch.distributed.destroy_process_group()
 
@@ -341,12 +486,15 @@ class TestRealGlooCommit(unittest.TestCase):
                 process.start()
             try:
                 records = sorted(output.get(timeout=60) for _ in processes)
-                for rank, failed, recovered, group_failed in records:
+                for rank, failed, recovered, group_failed, sidecars in records:
                     self.assertEqual(
                         failed, [[False] * 4], f"rank {rank} entered the next batch"
                     )
                     self.assertEqual(recovered, [[True] * 4] * 2)
                     self.assertFalse(group_failed)
+                    for sidecar_failed, sidecar_recovered in sidecars:
+                        self.assertEqual(sidecar_failed, [[False] * 4])
+                        self.assertEqual(sidecar_recovered, [[True] * 4] * 2)
                 for process in processes:
                     process.join(timeout=10)
                     self.assertEqual(process.exitcode, 0)

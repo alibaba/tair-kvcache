@@ -247,6 +247,7 @@ class FakeGroup:
         gathered = [self._reports[other] for other in range(self.world_size)]
         if object_list is not None:
             object_list[:] = [list(report) for report in gathered]
+        self._barrier.wait()
 
     def broadcast_object_list(
         self, object_list: Any = None, group_src: int = 0, group: Any = None
@@ -257,9 +258,14 @@ class FakeGroup:
         self._barrier.wait()
         payload = self._payload
         with self._lock:
-            self.ops[rank].append(("broadcast", _session_of(payload)))
+            self.ops[rank].append(
+                ("finish", payload)
+                if isinstance(payload, bool)
+                else ("broadcast", _session_of(payload))
+            )
         if object_list is not None:
             object_list[:] = [payload]
+        self._barrier.wait()
 
     def all_reduce(self, tensor: Any, op: Any = None, group: Any = None) -> None:
         rank = self._rank()
@@ -270,6 +276,7 @@ class FakeGroup:
         with self._lock:
             self.ops[rank].append(("reduce", folded))
         tensor.fill_(folded)
+        self._barrier.wait()
 
     # -- what a rank handed to the SDK ------------------------------─
     def note_save(self, rank: int, uris: List[str], buffers: List[Any]) -> tuple:
@@ -554,7 +561,15 @@ class TestAgreedSequence(unittest.TestCase):
 
         self.assertEqual(
             [op for op, _detail in world.ops[1]],
-            ["gather", "broadcast", "reduce", "broadcast", "reduce"],
+            [
+                "gather",
+                "broadcast",
+                "reduce",
+                "finish",
+                "broadcast",
+                "reduce",
+                "finish",
+            ],
             "the rank with no keys skipped the collectives of that transfer",
         )
         self.assertEqual(

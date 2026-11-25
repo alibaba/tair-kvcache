@@ -2175,7 +2175,7 @@ class HiCacheKVCM(HiCacheStorage):
                     finish_ok = True
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
-            if not self._sync_finish_result(finish_ok):
+            if not self._sync_finish_result(finish_ok, shared=not self.is_mla_model):
                 return [False] * local_len_new
             return [False] * local_len_new if skip_transfer else [True] * local_len_new
 
@@ -2284,7 +2284,7 @@ class HiCacheKVCM(HiCacheStorage):
                 finish_ok = True
             except Exception as e:
                 logger.error(f"finish_write_cache failed: {e}")
-        if not self._sync_finish_result(finish_ok):
+        if not self._sync_finish_result(finish_ok, shared=not self.is_mla_model):
             return [False] * local_len_new
 
         # Build result list: 1:1 positional mapping with input keys.
@@ -2301,9 +2301,9 @@ class HiCacheKVCM(HiCacheStorage):
         result_list = [block_flag_map.get(i, True) for i in range(local_len_new)]
         return result_list
 
-    def _sync_finish_result(self, finish_ok: bool) -> bool:
+    def _sync_finish_result(self, finish_ok: bool, *, shared: bool) -> bool:
         finish = [finish_ok]
-        if self.tp_world_size > 1 and not self.is_mla_model:
+        if shared and self.tp_world_size > 1:
             self._storage_collective(
                 torch.distributed.broadcast_object_list,
                 finish,
@@ -2364,7 +2364,9 @@ class HiCacheKVCM(HiCacheStorage):
         the mask or find anything left to write can differ, and what a rank is
         able to write decides only what it carries into them -- nothing, i.e.
         "wrote nothing" -- never whether it enters.  A branch that returned
-        early leaves its peers blocked forever.
+        early leaves its peers blocked forever. Every branch also joins the
+        final commit-result broadcast, so a Manager timeout cannot leave peers
+        reporting success or entering a different next batch.
         """
         results = {}
         trace_id = self._get_trace_id()
@@ -2503,6 +2505,7 @@ class HiCacheKVCM(HiCacheStorage):
                     # for symmetry -- a rank without them resolved no indices
                     # either -- so the data path below reads a non-optional pair.
                     self._join_commit_reduce(False, shared)
+                    self._sync_finish_result(False, shared=shared)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
@@ -2537,6 +2540,7 @@ class HiCacheKVCM(HiCacheStorage):
                         except Exception as e:
                             logger.error(f"finish_write_cache failed: {e}")
                     self._join_commit_reduce(False, shared)
+                    self._sync_finish_result(False, shared=shared)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
@@ -2544,6 +2548,7 @@ class HiCacheKVCM(HiCacheStorage):
                 unmatched = len(save_indices)
 
                 if unmatched == 0:
+                    finish_ok = False
                     if self.tp_rank == 0:
                         try:
                             self._manager_client.finish_write_cache(
@@ -2558,13 +2563,15 @@ class HiCacheKVCM(HiCacheStorage):
                                     },
                                 }
                             )
+                            finish_ok = True
                         except Exception as e:
                             logger.error(f"finish_write_cache failed: {e}")
                     # Already in storage on this rank, so it contributes True;
                     # the reduce still has to happen, because a peer that cannot
                     # write this transfer is waiting on it.
                     cached = self._join_commit_reduce(True, shared)
-                    results[transfer.name] = [cached] * len(keys)
+                    finish_ok = self._sync_finish_result(finish_ok, shared=shared)
+                    results[transfer.name] = [cached and finish_ok] * len(keys)
                     continue
 
                 # Data transfer preparation and execution.
@@ -2618,6 +2625,7 @@ class HiCacheKVCM(HiCacheStorage):
                 flag = self._join_commit_reduce(flag, shared)
 
                 finish_mask = [flag] * len(locations)
+                finish_ok = False
                 if self.tp_rank == 0:
                     try:
                         self._manager_client.finish_write_cache(
@@ -2630,12 +2638,16 @@ class HiCacheKVCM(HiCacheStorage):
                                 },
                             }
                         )
+                        finish_ok = True
                     except Exception as e:
                         logger.error(
                             f"finish_write_cache failed: {trace_id=} "
                             f"pool={transfer.name} {e=}"
                         )
-                        flag = False
+
+                if not self._sync_finish_result(finish_ok, shared=shared):
+                    results[transfer.name] = [False] * len(keys)
+                    continue
 
                 per_key = [True] * len(keys)
                 for idx in save_indices:
