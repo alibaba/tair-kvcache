@@ -29,8 +29,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(128u, config.GetMetaQueryChunkSize());
         ASSERT_EQ(100, config.GetCacheReclaimerKeySamplingSizeTotal());
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
-        ASSERT_EQ(20000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
-        ASSERT_EQ(1ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
+        ASSERT_EQ(40000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
+        ASSERT_EQ(2ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
         ASSERT_EQ(4ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimit());
         ASSERT_TRUE(config.IsCacheGcEnabled());
