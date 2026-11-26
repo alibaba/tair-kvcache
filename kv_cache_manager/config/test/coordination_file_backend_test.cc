@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <memory>
@@ -6,6 +7,25 @@
 #include "kv_cache_manager/config/test/coordination_backend_test_base.h"
 
 namespace kv_cache_manager {
+
+class CoordinationDirectoryTest : public TESTBASE {};
+
+TEST_F(CoordinationDirectoryTest, ConcurrentFirstStart) {
+    const auto uri = "file://" + GetPrivateTestRuntimeDataPath() + "shared";
+    std::promise<void> start;
+    auto ready = start.get_future().share();
+    std::vector<std::future<bool>> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.push_back(std::async(std::launch::async, [ready, uri] {
+            ready.wait();
+            return CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri) != nullptr;
+        }));
+    }
+    start.set_value();
+    for (auto &worker : workers) {
+        EXPECT_TRUE(worker.get());
+    }
+}
 
 CoordinationBackendTestConfig file_backend_config{
     .get_test_uri =

@@ -28,14 +28,12 @@ ErrorCode CoordinationFileBackend::Init(const StandardUri &standard_uri) noexcep
         return EC_BADARGS;
     }
 
-    // 确保锁目录存在
+    // Concurrent replicas may create the same directory during startup.
     std::error_code ec;
-    if (!std::filesystem::exists(lock_dir_path_, ec)) {
-        if (!std::filesystem::create_directories(lock_dir_path_, ec)) {
-            KVCM_LOG_ERROR(
-                "failed to create lock directory: %s, error: %s", lock_dir_path_.c_str(), ec.message().c_str());
-            return EC_IO_ERROR;
-        }
+    std::filesystem::create_directories(lock_dir_path_, ec);
+    if (ec) {
+        KVCM_LOG_ERROR("failed to create lock directory: %s, error: %s", lock_dir_path_.c_str(), ec.message().c_str());
+        return EC_IO_ERROR;
     }
 
     KVCM_LOG_INFO("CoordinationFileBackend initialized with directory: %s", lock_dir_path_.c_str());

@@ -59,7 +59,11 @@ def start(binary, directory, options, stack):
                 process.kill()
                 process.wait()
                 raise
-        assert process.returncode == 0, (directory, process.returncode)
+        if process.returncode != 0:
+            service_log = directory / "logs/kv_cache_manager.log"
+            if service_log.exists():
+                print(directory.name, service_log.read_text(errors="replace")[-3000:], file=sys.stderr)
+            raise AssertionError((directory, process.returncode))
     stack.callback(stop)
     return process
 
