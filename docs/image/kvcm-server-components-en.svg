@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title description">
+<title id="title">Tair KVCache Manager — server component relationships</title>
+<desc id="description">Service calls CacheManager, which coordinates foreground and background components. MetaSearcherManager creates MetaSearcher; MetaSearcher reads and updates MetaIndexer. MetaIndexerManager manages per-instance MetaIndexer objects, which access MetaStorageBackendManager. DataStorageSelector uses DataStorageManager via RegistryManager. CacheReclaimer, CacheGarbageCollector and MigrationManager share SchedulePlanExecutor, which operates on indexes and storage backends. Reclaimer can trigger migration. Inference services report their cache state through ReportEvent, which updates indexes via Searcher and maintains EventReportBackend state. EventReportBackend provides reporter visibility and GC cleanup verdicts. ReportEvent and event-report GC operate on metadata only. ReclaimerTaskSupervisor submits and tracks delete tasks.</desc>
+<defs>
+<marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#2865D6"/></marker>
+<marker id="teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#058475"/></marker>
+<marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#C96A20"/></marker>
+<marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#8060B4"/></marker>
+<marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#97A9BE"/></marker>
+<linearGradient id="manager" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#EDF4FF"/><stop offset="1" stop-color="#F7FAFF"/></linearGradient>
+</defs>
+<g font-family="'Alibaba PuHuiTi 2.0', 'Noto Sans CJK SC', 'Microsoft YaHei', Arial, sans-serif">
+<rect x="0" y="0" width="1920" height="1080" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
+<rect x="56" y="51" width="7" height="78" rx="3" fill="#F18536" stroke="none" stroke-width="1.5"/>
+<text x="83" y="88" font-size="42" font-weight="700" fill="#152B48" text-anchor="start">Tair KVCache Manager</text>
+<text x="84" y="132" font-size="24" font-weight="400" fill="#566B83" text-anchor="start">Server components: foreground matching &amp; writes · metadata indexes · reclaim &amp; migration</text>
+<text x="1864" y="82" font-size="18" font-weight="500" fill="#566B83" text-anchor="end">SERVER COMPONENTS</text>
+<text x="1864" y="113" font-size="16" font-weight="400" fill="#8595A9" text-anchor="end">KVCM  /  RUNTIME COLLABORATION</text>
+<rect x="56" y="182" width="464" height="112" rx="16" fill="white" stroke="#DCE4EE" stroke-width="1.5"/>
+<text x="80" y="223" font-size="25" font-weight="600" fill="#152B48" text-anchor="start">service · Server / *ServiceImpl</text>
+<text x="80" y="266" font-size="20" font-weight="400" fill="#566B83" text-anchor="start">gRPC / HTTP · Leader gate · assembly</text>
+<rect x="616" y="182" width="740" height="112" rx="16" fill="url(#manager)" stroke="#B7CDF4" stroke-width="1.5"/>
+<text x="640" y="224" font-size="32" font-weight="600" fill="#2865D6" text-anchor="start">CacheManager</text>
+<text x="640" y="266" font-size="22" font-weight="400" fill="#566B83" text-anchor="start">Facade: foreground requests + background orchestration</text>
+<rect x="1456" y="182" width="408" height="112" rx="16" fill="#F5F7FC" stroke="#D7DEED" stroke-width="1.5"/>
+<text x="1480" y="214" font-size="24" font-weight="600" fill="#152B48" text-anchor="start">config · Registry &amp; HA</text>
+<text x="1480" y="248" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">RegistryManager · instances / storage</text>
+<text x="1480" y="278" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">LeaderElector · leader lifecycle</text>
+<path d="M 522 238 H 614" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="568" y="221" font-size="18" font-weight="500" fill="#2865D6" text-anchor="middle">Calls</text>
+<path d="M 1454 238 H 1358" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" stroke-dasharray="7 6"/>
+<text x="1406" y="221" font-size="18" font-weight="500" fill="#566B83" text-anchor="middle">Config</text>
+<path d="M 986 294 V 320 H 68 V 906" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<path d="M 986 320 V 342" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" stroke-dasharray="7 6"/>
+<path d="M 986 320 H 1660 V 342" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" stroke-dasharray="7 6"/>
+<rect x="56" y="344" width="464" height="610" rx="16" fill="white" stroke="#C9D9F0" stroke-width="1.5"/>
+<text x="80" y="383" font-size="28" font-weight="600" fill="#2865D6" text-anchor="start">Foreground request paths</text>
+<path d="M 68 344 V 906" fill="none" stroke="#97A9BE" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<path d="M 68 446 H 78" fill="none" stroke="#97A9BE" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<path d="M 68 678 H 78" fill="none" stroke="#97A9BE" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<path d="M 68 798 H 78" fill="none" stroke="#97A9BE" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<path d="M 68 906 H 78" fill="none" stroke="#97A9BE" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<rect x="80" y="410" width="416" height="72" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="98" y="441" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">MetaSearcherManager</text>
+<text x="98" y="465" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Create / acquire a Searcher per Instance</text>
+<rect x="80" y="514" width="416" height="88" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="98" y="545" font-size="27" font-weight="600" fill="#152B48" text-anchor="start">MetaSearcher</text>
+<text x="98" y="585" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Prefix / sliding-window / hybrid; updates</text>
+<rect x="80" y="634" width="416" height="88" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="98" y="665" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">WriteLocationManager</text>
+<text x="98" y="705" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Two-phase sessions · locations · expiry</text>
+<rect x="80" y="754" width="416" height="88" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="98" y="785" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">DataStorageSelector</text>
+<text x="98" y="825" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Quota / availability / preference</text>
+<path d="M 288 482 V 512" fill="none" stroke="#2865D6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="80" y="874" width="416" height="64" rx="12" fill="#F0F5FF" stroke="#D2E0FA" stroke-width="1.5"/>
+<text x="98" y="899" font-size="22" font-weight="500" fill="#2865D6" text-anchor="start">ReportEvent / GetHostCacheState</text>
+<text x="98" y="925" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Index updates / queries · reporter visibility</text>
+<rect x="616" y="344" width="740" height="364" rx="16" fill="white" stroke="#C9D9F0" stroke-width="1.5"/>
+<text x="640" y="383" font-size="28" font-weight="600" fill="#2865D6" text-anchor="start">meta · Metadata indexes</text>
+<rect x="640" y="410" width="692" height="64" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="658" y="437" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">MetaIndexerManager</text>
+<text x="658" y="463" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Isolated by instance_id · shared QueryExecutor</text>
+<path d="M 986 474 V 502" fill="none" stroke="#2865D6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="640" y="504" width="692" height="78" rx="12" fill="#EDF4FF" stroke="#B7CDF4" stroke-width="1.5"/>
+<text x="658" y="538" font-size="29" font-weight="600" fill="#2865D6" text-anchor="start">MetaIndexer</text>
+<text x="658" y="568" font-size="20" font-weight="400" fill="#566B83" text-anchor="start">Cache key → CacheLocation · Get / Put / CAS / Sample</text>
+<path d="M 986 582 V 610" fill="none" stroke="#2865D6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<rect x="640" y="612" width="692" height="72" rx="12" fill="#F5F8FE" stroke="#D6E1F1" stroke-width="1.5"/>
+<text x="658" y="643" font-size="25" font-weight="600" fill="#152B48" text-anchor="start">MetaStorageBackendManager</text>
+<text x="658" y="673" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">local / Redis / memory-primary + async Redis · recovery &amp; backup</text>
+<rect x="616" y="744" width="740" height="226" rx="16" fill="white" stroke="#BEDFD4" stroke-width="1.5"/>
+<text x="640" y="782" font-size="27" font-weight="600" fill="#058475" text-anchor="start">data_storage · Backend management</text>
+<rect x="640" y="800" width="692" height="60" rx="12" fill="#ECF8F2" stroke="#BBDDD1" stroke-width="1.5"/>
+<text x="658" y="837" font-size="27" font-weight="600" fill="#058475" text-anchor="start">DataStorageManager</text>
+<text x="1314" y="837" font-size="20" font-weight="400" fill="#566B83" text-anchor="end">URI · health · usage</text>
+<path d="M 986 860 V 878 H 816 V 892" fill="none" stroke="#058475" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#teal)"/>
+<path d="M 986 878 H 1174 V 892" fill="none" stroke="#058475" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#teal)"/>
+<rect x="640" y="894" width="352" height="54" rx="10" fill="#F4FAF7" stroke="#D0E6DD" stroke-width="1.5"/>
+<text x="658" y="918" font-size="23" font-weight="600" fill="#152B48" text-anchor="start">DataStorageBackend</text>
+<text x="658" y="941" font-size="15" font-weight="400" fill="#566B83" text-anchor="start">TairMemPool / HF3FS / Mooncake / NFS</text>
+<rect x="1016" y="894" width="316" height="54" rx="10" fill="#F0F5FF" stroke="#D2E0FA" stroke-width="1.5"/>
+<text x="1032" y="918" font-size="23" font-weight="600" fill="#2865D6" text-anchor="start">EventReportBackend</text>
+<text x="1032" y="941" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">Reporter / snapshot · GC verdicts</text>
+<rect x="1456" y="344" width="408" height="364" rx="16" fill="#FFFCF7" stroke="#E8D7C3" stroke-width="1.5"/>
+<text x="1480" y="383" font-size="27" font-weight="600" fill="#C96A20" text-anchor="start">Background maintenance</text>
+<rect x="1480" y="410" width="360" height="78" rx="12" fill="white" stroke="#E7DCCD" stroke-width="1.5"/>
+<text x="1498" y="441" font-size="27" font-weight="600" fill="#152B48" text-anchor="start">CacheReclaimer</text>
+<text x="1498" y="473" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Quota / watermarks · Group LRU</text>
+<rect x="1480" y="514" width="360" height="78" rx="12" fill="white" stroke="#E7DCCD" stroke-width="1.5"/>
+<text x="1498" y="545" font-size="25" font-weight="600" fill="#152B48" text-anchor="start">CacheGarbageCollector</text>
+<text x="1498" y="577" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Index scan · batch backend checks</text>
+<rect x="1480" y="618" width="360" height="66" rx="12" fill="white" stroke="#E7DCCD" stroke-width="1.5"/>
+<text x="1498" y="649" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">MigrationManager</text>
+<text x="1498" y="669" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Reclaimer / Admin · Copy / Mark</text>
+<path d="M 1478 450 H 1466 V 650 H 1478" fill="none" stroke="#C96A20" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#orange)"/>
+<rect x="1456" y="780" width="408" height="190" rx="16" fill="#FFF9EF" stroke="#E4CDB1" stroke-width="1.5"/>
+<text x="1480" y="816" font-size="27" font-weight="600" fill="#C96A20" text-anchor="start">SchedulePlanExecutor</text>
+<text x="1480" y="851" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Shared pool · priorities · migration budget</text>
+<text x="1480" y="881" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Delete: Get / CAS / Sync → Delete / CAD</text>
+<path d="M 1480 900 H 1840" fill="none" stroke="#E7D8C4" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1480" y="926" font-size="22" font-weight="600" fill="#152B48" text-anchor="start">ReclaimerTaskSupervisor</text>
+<text x="1480" y="952" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Delete task submission &amp; result tracking</text>
+<path d="M 498 558 H 638" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="566" y="538" font-size="17" font-weight="500" fill="#2865D6" text-anchor="middle">Read / write</text>
+<path d="M 498 798 H 556 V 830 H 638" fill="none" stroke="#058475" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#teal)"/>
+<text x="558" y="777" font-size="17" font-weight="500" fill="#058475" text-anchor="middle">Select</text>
+<text x="558" y="858" font-size="15" font-weight="400" fill="#566B83" text-anchor="middle">via Registry</text>
+<path d="M 498 908 H 580 V 978 H 1174 V 950" fill="none" stroke="#2865D6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="640" y="1000" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Inference-side cache state; ReportEvent / GC operate on metadata only</text>
+<path d="M 1454 552 H 1334" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" stroke-dasharray="7 6"/>
+<text x="1394" y="532" font-size="16" font-weight="400" fill="#566B83" text-anchor="middle">Sample / scan</text>
+<path d="M 1842 450 H 1888 V 756 H 1660 V 778" fill="none" stroke="#C96A20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#orange)"/>
+<path d="M 1842 552 H 1888" fill="none" stroke="#C96A20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 1842 650 H 1888" fill="none" stroke="#C96A20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1660" y="744" font-size="19" font-weight="500" fill="#C96A20" text-anchor="middle">Submit asynchronous tasks</text>
+<path d="M 1454 864 H 1384 V 578 H 1334" fill="none" stroke="#C96A20" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#orange)"/>
+<path d="M 1384 830 H 1334" fill="none" stroke="#C96A20" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#orange)"/>
+<rect x="1359" y="716" width="74" height="25" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
+<text x="1394" y="735" font-size="15" font-weight="500" fill="#C96A20" text-anchor="middle">Index / I/O</text>
+<rect x="56" y="1012" width="1808" height="34" rx="8" fill="#ECF1F7" stroke="none" stroke-width="1.5"/>
+<text x="76" y="1036" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">event · EventManager → Optimizer stream</text>
+<text x="778" y="1036" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">metrics · counters / Prometheus</text>
+<text x="1250" y="1036" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">protocol / common · contracts / infrastructure</text>
+<path d="M 56 1065 h 26" fill="none" stroke="#2865D6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="92" y="1072" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Requests / indexes</text>
+<path d="M 300 1065 h 26" fill="none" stroke="#058475" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="336" y="1072" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Backend access</text>
+<path d="M 516 1065 h 26" fill="none" stroke="#C96A20" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="552" y="1072" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Background tasks</text>
+<path d="M 756 1065 h 26" fill="none" stroke="#97A9BE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="792" y="1072" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Create / coordinate</text>
+<text x="1864" y="1072" font-size="16" font-weight="400" fill="#566B83" text-anchor="end">Key runtime relationships; configuration and infrastructure are shared</text>
+</g>
+</svg>

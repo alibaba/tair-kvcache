@@ -3,6 +3,12 @@ load("@rules_python//python:packaging.bzl", "py_wheel")
 
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "dynamic_quota_test",
+    srcs = ["test/dynamic_quota_test.py"],
+    deps = [":kvcm_ops_lib"],
+)
+
 py_library(
     name = "kvcm_ops_lib",
     srcs = glob([
@@ -44,8 +50,14 @@ py_test(
     name = "wheel_install_test",
     size = "medium",
     srcs = ["test/wheel_install_test.py"],
-    args = ["$(location :kvcm_ops_wheel)"],
-    data = [":kvcm_ops_wheel"],
+    args = [
+        "$(location :kvcm_ops_wheel)",
+        "$(location //package/script:start_server_script)",
+    ],
+    data = [
+        ":kvcm_ops_wheel",
+        "//package/script:start_server_script",
+    ],
     main = "test/wheel_install_test.py",
 )
 
@@ -71,5 +83,17 @@ py_test(
     name = "ListInstanceTest",
     srcs = ["test/list_instance_test.py"],
     main = "test/list_instance_test.py",
+    deps = [":kvcm_ops_lib"],
+)
+
+py_test(
+    name = "bootstrap_test",
+    srcs = ["test/bootstrap_test.py"],
+    deps = [":kvcm_ops_lib"],
+)
+
+py_test(
+    name = "legacy_search_cache_config_test",
+    srcs = ["test/legacy_search_cache_config_test.py"],
     deps = [":kvcm_ops_lib"],
 )

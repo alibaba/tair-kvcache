@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from kvcm_ops.kvcm.instance_group.util import (
     InstanceGroup,
     InstanceGroupQuota,
+    MetaIndexerConfig,
     StorageQuota,
     MetaStorageBackendConfig,
     meta_storage_backend_config_value,
@@ -58,12 +59,6 @@ def _get_response(revisit_interval_buckets=None):
                 "mutex_shard_num": 1024,
                 "batch_key_size": 128,
                 "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
-                "meta_cache_policy_config": {
-                    "type": "LRU",
-                    "capacity": 100000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0,
-                },
             },
         },
         "user_data": "",
@@ -75,6 +70,19 @@ def _get_response(revisit_interval_buckets=None):
         "header": {"status": {"code": "OK"}},
         "instance_group": instance_group,
     }
+
+
+class MetaIndexerConfigCompatibilityTest(unittest.TestCase):
+    def test_legacy_search_cache_values_round_trip_with_compatible_output(self):
+        value = _get_response()["instance_group"]["cache_config"]["meta_indexer_config"]
+        value["meta_cache_policy_config"] = {
+            "type": "LRU", "capacity": 1024, "cache_shard_bits": 6, "high_pri_pool_ratio": 0.0
+        }
+        restored = MetaIndexerConfig.from_json_data(value)
+        self.assertEqual(
+            {"type": "LRU", "capacity": 1024, "cache_shard_bits": 6, "high_pri_pool_ratio": 0.0},
+            restored.to_json_data()["meta_cache_policy_config"])
+        self.assertEqual("local", restored.to_json_data()["meta_storage_backend_config"]["storage_type"])
 
 
 class ParseBucketBoundariesTest(unittest.TestCase):

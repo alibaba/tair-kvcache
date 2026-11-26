@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace kv_cache_manager {
 
 namespace proto::optimizer {
@@ -18,7 +20,8 @@ public:
     // Never blocks and never applies back pressure: a sink that cannot ship
     // right now must drop and return false. Events are analysis samples, and
     // losing samples is always preferable to stalling the caller.
-    virtual bool Send(const proto::optimizer::TraceQueryRequest &event) = 0;
+    virtual uint64_t CaptureEpoch() const = 0;
+    virtual bool Send(const proto::optimizer::TraceQueryRequest &event, uint64_t epoch) = 0;
 
     // Releases queue resources. Must tolerate being called more than once
     // and without a preceding Send().

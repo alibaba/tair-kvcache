@@ -38,6 +38,20 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
                                                        IovDevice *iovs_h_to_save,
                                                        size_t max_iov_num,
                                                        GpuStream_t stream) {
+    return GetBlocksHash(block_buffers, iovs_d, crcs_d, iovs_h_to_save, max_iov_num, stream, nullptr);
+}
+
+std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block_buffers,
+                                                       IovDevice *iovs_d,
+                                                       uint32_t *crcs_d,
+                                                       IovDevice *iovs_h_to_save,
+                                                       size_t max_iov_num,
+                                                       GpuStream_t stream,
+                                                       bool *caller_read_pending) {
+    if (caller_read_pending) {
+        *caller_read_pending = false;
+        CHECK_MUSA_ERROR_RETURN(musaStreamQuery(stream), {}, "skipping SDK buffer check on busy stream");
+    }
     size_t iov_num = block_buffers.front().iovs.size();
     size_t iovs_size = 0;
     for (const auto &block_buffer : block_buffers) {
@@ -51,7 +65,8 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
             iovs_size++;
         }
     }
-    auto crcs = GetIovsCrc(iovs_h_to_save, iovs_size, iovs_d, crcs_d, stream);
+    auto crcs = GetIovsCrc(iovs_h_to_save, iovs_size, iovs_d, crcs_d, stream, caller_read_pending);
+    if (crcs.empty()) return {};
     std::vector<int64_t> result;
     result.reserve(iovs_size / iov_num);
     for (size_t offset = 0; offset < crcs.size(); offset += iov_num) {
@@ -83,6 +98,11 @@ SdkBufferCheckPool::SdkBufferCheckPool(size_t cell_num) { cells_.resize(cell_num
 SdkBufferCheckPool::~SdkBufferCheckPool() {
     for (const auto &cell : cells_) {
         if (cell.gpu_stream) {
+            const auto error = musaStreamSynchronize(cell.gpu_stream);
+            if (error != musaSuccess) {
+                CHECK_MUSA_ERROR(error, "retaining unfinished SDK buffer check cell");
+                continue;
+            }
             CHECK_MUSA_ERROR(musaStreamDestroy(cell.gpu_stream), "musa stream destroy failed");
         }
         if (cell.h_iovs) {
@@ -116,6 +136,9 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
     return true;
 }
 
+SdkBufferCheckPool::CellHandle::CellHandle(SdkBufferCheckPool *pool, Cell *cell, int)
+    : pool_(pool), cell_(cell) {}
+
 SdkBufferCheckPool::CellHandle::~CellHandle() {
     if (pool_) {
         pool_->PutCell(cell_);
@@ -127,7 +150,7 @@ SdkBufferCheckPool::CellHandle SdkBufferCheckPool::GetCell() {
     cv_.wait(lock, [this] { return !cell_queue_.empty(); });
     Cell *cell = cell_queue_.front();
     cell_queue_.pop();
-    return CellHandle(this, cell);
+    return CellHandle(this, cell, device_id_);
 }
 
 void SdkBufferCheckPool::PutCell(Cell *cell) {

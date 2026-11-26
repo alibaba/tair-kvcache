@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
 namespace kv_cache_manager {
 
@@ -13,6 +14,13 @@ struct PerCapacityHitInfo {
     double capacity_gb;
     int64_t hit_count;
     double hit_rate = -1.0;
+};
+
+struct TtlQueryMetrics {
+    int64_t ttl_seconds = 0;
+    std::vector<PerCapacityHitInfo> per_capacity_hits;
+    int64_t max_hit_count = -1;
+    double max_hit_rate = -1;
 };
 
 // Re-define macros that were #undef'd at the bottom of metrics_collector.h.
@@ -67,14 +75,22 @@ public:
     void set_input_token_len(int64_t v) { input_token_len_ = v; }
     int64_t input_token_len() const { return input_token_len_; }
 
-    void set_per_capacity_hits(std::vector<PerCapacityHitInfo> v) { per_capacity_hits_ = std::move(v); }
-    const std::vector<PerCapacityHitInfo> &per_capacity_hits() const { return per_capacity_hits_; }
-
-    void set_max_hit_count(int64_t v) { max_hit_count_ = v; }
-    int64_t max_hit_count() const { return max_hit_count_; }
-
-    void set_max_hit_rate(double v) { max_hit_rate_ = v; }
-    double max_hit_rate() const { return max_hit_rate_; }
+    void SetTtlResults(const proto::optimizer::TraceQueryResponse &response) {
+        ttl_results_.clear();
+        for (const auto &result : response.ttl_results()) {
+            TtlQueryMetrics metrics;
+            metrics.ttl_seconds = result.ttl_seconds();
+            metrics.max_hit_count = result.theoretical_result().max_hit_count();
+            metrics.max_hit_rate = result.theoretical_result().hit_rate();
+            for (const auto &capacity : result.capacity_results()) {
+                metrics.per_capacity_hits.push_back(
+                    {capacity.capacity_gb(), capacity.cache_hit_count(), capacity.hit_rate()});
+            }
+            ttl_results_.push_back(std::move(metrics));
+        }
+    }
+    void set_ttl_results(std::vector<TtlQueryMetrics> value) { ttl_results_ = std::move(value); }
+    const std::vector<TtlQueryMetrics> &ttl_results() const { return ttl_results_; }
 
     void set_client_ip(const std::string &v) { client_ip_ = v; }
     const std::string &client_ip() const { return client_ip_; }
@@ -84,9 +100,7 @@ private:
     std::string client_ip_;
     int64_t total_blocks_ = 0;
     int64_t input_token_len_ = 0;
-    std::vector<PerCapacityHitInfo> per_capacity_hits_;
-    int64_t max_hit_count_ = -1;
-    double max_hit_rate_ = 0.0;
+    std::vector<TtlQueryMetrics> ttl_results_;
 };
 
 #undef KVCM_CHRONO_METRICS

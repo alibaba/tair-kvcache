@@ -27,12 +27,23 @@ public:
     int64_t GetLeaderElectorLeaseMs() const { return leader_elector_lease_ms_; }
     int64_t GetLeaderElectorLoopIntervalMs() const { return leader_elector_loop_interval_ms_; }
     int32_t GetServiceIoThreadNum() const { return service_io_thread_num_; }
+    int32_t GetServiceGrpcMaxThreads() const { return service_grpc_max_threads_; }
+    uint64_t GetServiceGrpcMemoryQuotaBytes() const { return service_grpc_memory_quota_bytes_; }
+    uint32_t GetHttpReportEventBodyBudgetBytes() const { return http_report_event_body_budget_bytes_; }
+    uint32_t GetServiceGrpcCqThreadNum() const { return service_grpc_cq_thread_num_; }
+    uint32_t GetServiceWorkerThreadNum() const { return service_worker_thread_num_; }
+    uint32_t ResolveServiceWorkerThreadNum(unsigned int hardware_threads) const;
+    uint32_t GetServiceWorkerQueueCapacity() const { return service_worker_queue_capacity_; }
+    const std::string &GetServiceWorkerShutdownMode() const { return service_worker_shutdown_mode_; }
     int32_t GetServiceRpcPort() const { return service_rpc_port_; }
     int32_t GetServiceHttpPort() const { return service_http_port_; }
     int32_t GetServiceAdminRpcPort() const { return service_admin_rpc_port_; }
     int32_t GetServiceAdminHttpPort() const { return service_admin_http_port_; }
     bool IsEnableDebugService() const { return enable_debug_service_; }
     uint32_t GetLogLevel() const { return log_level_; }
+    bool IncludeAccessLogPayload() const { return include_access_log_payload_; }
+    bool IsReportEventFullAccessLogEnabled() const { return report_event_full_access_log_; }
+    bool IsGetHostCacheStateFullAccessLogEnabled() const { return get_host_cache_state_full_access_log_; }
     const std::string &startup_config() { return startup_config_; }
     int32_t GetSchedulePlanExecutorThreadCount() { return schedule_plan_executor_thread_count_; }
     uint32_t GetSchedulePlanMigrationWorkerBudget() const { return schedule_plan_migration_worker_budget_; }
@@ -67,12 +78,16 @@ public:
     int64_t GetCacheGcOrphanWritingGracePeriodMs() const { return cache_gc_orphan_writing_grace_period_ms_; }
     uint64_t GetCacheGcMaxInflightDeleteRequests() const { return cache_gc_max_inflight_delete_requests_; }
     bool IsCacheGcEventReportCleanupEnabled() const { return cache_gc_event_report_cleanup_enabled_; }
+    bool IsCacheGcEventReportCleanupDuringRecoverEnabled() const {
+        return cache_gc_event_report_cleanup_during_recover_enabled_;
+    }
     uint64_t GetCacheGcEventReportActionBatchSize() const { return cache_gc_event_report_action_batch_size_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
     const MetricsTags &metrics_common_tags() const { return metrics_common_tags_; }
     const MetricsTags &prometheus_common_tags() const { return prometheus_common_tags_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
+    bool redis_health_probe_enabled() const { return redis_health_probe_enabled_; }
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
@@ -103,12 +118,22 @@ private:
     int64_t leader_elector_lease_ms_ = 0;
     int64_t leader_elector_loop_interval_ms_ = 0;
     int32_t service_io_thread_num_ = 0;
+    int32_t service_grpc_max_threads_ = 0;
+    uint64_t service_grpc_memory_quota_bytes_ = 0;
+    uint32_t http_report_event_body_budget_bytes_ = 0;
+    uint32_t service_grpc_cq_thread_num_ = 2;
+    uint32_t service_worker_thread_num_ = 0;
+    uint32_t service_worker_queue_capacity_ = 2048;
+    std::string service_worker_shutdown_mode_ = "discard_pending";
     int32_t service_rpc_port_ = 0;
     int32_t service_http_port_ = 0;
     int32_t service_admin_rpc_port_ = 0;
     int32_t service_admin_http_port_ = 0;
     bool enable_debug_service_ = false;
     uint32_t log_level_ = 0;
+    bool include_access_log_payload_ = false;
+    bool report_event_full_access_log_ = false;
+    bool get_host_cache_state_full_access_log_ = false;
     std::string startup_config_;
     int32_t schedule_plan_executor_thread_count_ = 0;
     uint32_t schedule_plan_migration_worker_budget_ = 0;
@@ -135,6 +160,7 @@ private:
     int64_t cache_gc_orphan_writing_grace_period_ms_ = 0;
     uint64_t cache_gc_max_inflight_delete_requests_ = 0;
     bool cache_gc_event_report_cleanup_enabled_ = true;
+    bool cache_gc_event_report_cleanup_during_recover_enabled_ = true;
     uint64_t cache_gc_event_report_action_batch_size_ = 0;
     std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;
@@ -142,6 +168,7 @@ private:
     MetricsTags metrics_common_tags_;
     MetricsTags prometheus_common_tags_;
     int64_t metrics_report_interval_ms_ = 0;
+    bool redis_health_probe_enabled_ = true;
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm";
     std::string event_publishers_configs_;

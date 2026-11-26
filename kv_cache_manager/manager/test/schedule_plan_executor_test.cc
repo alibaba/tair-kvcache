@@ -14,6 +14,7 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
@@ -94,19 +95,31 @@ void CapturePhysicalDeleteWarnings(int level, const char *, int, const char *fun
 
 Stub *cas_refresh_stub = nullptr;
 std::string location_to_refresh_during_cas;
-ErrorCode RefreshLocationBeforeCas(void *obj,
-                                   RequestContext *context,
-                                   const KeyVector &keys,
-                                   const std::vector<std::vector<MetaSearcher::LocationCASTask>> &tasks,
-                                   std::vector<std::vector<ErrorCode>> &results,
-                                   bool authoritative_read) {
-    cas_refresh_stub->reset(ADDR(MetaSearcher, BatchCASLocationStatus));
-    auto *searcher = static_cast<MetaSearcher *>(obj);
-    std::vector<std::vector<ErrorCode>> update_results;
-    EXPECT_EQ(EC_OK,
-              searcher->BatchUpdateLocationStatus(
-                  context, {keys.front()}, {{{location_to_refresh_during_cas, CLS_WRITING}}}, update_results));
-    return searcher->BatchCASLocationStatus(context, keys, tasks, results, authoritative_read);
+MetaIndexer::LocationResult RefreshLocationBeforeRmw(void *obj,
+                                                     RequestContext *context,
+                                                     const KeyVector &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     const LocationModifierFunc &modifier,
+                                                     bool adjust_reclaimed_key_count,
+                                                     bool fill_missing_cache) {
+    cas_refresh_stub->reset(ADDR(MetaIndexer, ReadModifyWriteLocation));
+    MetaIndexer *indexer = static_cast<MetaIndexer *>(obj);
+    const LocationModifierFunc refresh = [](const std::vector<ErrorCode> &errors,
+                                            const LocationIdVector &,
+                                            size_t,
+                                            CacheLocationVector &locations,
+                                            PropertyMap &) -> LocationModifierResult {
+        EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, errors);
+        auto writing = std::make_shared<CacheLocation>(*locations.front());
+        writing->set_status(CLS_WRITING);
+        locations.front() = std::move(writing);
+        return {MA_OK, errors};
+    };
+    const MetaIndexer::LocationResult refreshed = indexer->ReadModifyWriteLocation(
+        context, {keys.front()}, {{location_to_refresh_during_cas}}, refresh, true, false);
+    EXPECT_EQ(EC_OK, refreshed.ec);
+    return indexer->ReadModifyWriteLocation(
+        context, keys, location_ids, modifier, adjust_reclaimed_key_count, fill_missing_cache);
 }
 
 bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
@@ -260,7 +273,7 @@ public:
         meta_indexer_config->meta_storage_backend_config_ = backend_config;
         meta_indexer_config->mutex_shard_num_ = 32;
         meta_indexer_config->max_key_count_ = 10000;
-        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr);
     }
 
     ErrorCode CreateCachedMetaIndexer(const std::string &instance_id, const std::string &path) {
@@ -272,7 +285,7 @@ public:
         meta_indexer_config->meta_storage_backend_config_ = std::move(backend_config);
         meta_indexer_config->mutex_shard_num_ = 32;
         meta_indexer_config->max_key_count_ = 10000;
-        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config, {}, nullptr);
     }
 
     static void WaitForCachedMetaIndexerRunning(const std::shared_ptr<MetaIndexer> &indexer) {
@@ -537,7 +550,7 @@ TEST_F(BackendGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsa
     Stub cas_stub;
     cas_refresh_stub = &cas_stub;
     location_to_refresh_during_cas = "refreshed";
-    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    cas_stub.set(ADDR(MetaIndexer, ReadModifyWriteLocation), RefreshLocationBeforeRmw);
     const auto result = Run(request);
     cas_refresh_stub = nullptr;
     EXPECT_EQ(EC_OK, result.status);
@@ -769,7 +782,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
 
 TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionAndSync) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
-    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     auto &manager = *indexer->backend_manager_;
     manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
     auto backup = std::make_unique<SyncResultBackend>();
@@ -832,7 +845,7 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionA
 
 TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteForceEnqueuesOnlyUnadmittedKeys) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
-    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     auto &manager = *indexer->backend_manager_;
     manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
     auto backup = std::make_unique<SyncResultBackend>();
@@ -1086,6 +1099,36 @@ TEST_F(SchedulePlanExecutorTest, TestDelayExecution) {
         << "ms, actual execution time: " << execution_duration.count() << "ms";
 }
 
+TEST_F(SchedulePlanExecutorTest, TestAdmittedDeleteRetainsIndexerAfterManagerDetach) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    ASSERT_NE(nullptr, indexer);
+    MetaSearcher meta_searcher(indexer);
+    auto request_context = std::make_shared<RequestContext>("detach_indexer");
+    const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/detach_indexer")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {501}, {location}, location_ids));
+
+    auto future = executor.Submit(CacheMetaDelRequest{
+        .instance_id = kTestInstanceName,
+        .block_keys = {501},
+        .delay = std::chrono::milliseconds(50),
+    });
+    const auto detached_indexer = meta_manager_->ExtractMetaIndexer(kTestInstanceName);
+    EXPECT_EQ(indexer, detached_indexer);
+    EXPECT_EQ(nullptr, meta_manager_->GetMetaIndexer(kTestInstanceName));
+
+    const auto result = future.get();
+    EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+}
+
 // 测试多个延迟任务的执行顺序
 TEST_F(SchedulePlanExecutorTest, TestMultipleDelayedTasksExecutionOrder) {
     // 创建 MetaIndexer
@@ -1299,6 +1342,57 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     ASSERT_EQ(untouched_location_status, location_maps[0].at(original_location_ids[2])->status());
 }
 
+TEST_F(SchedulePlanExecutorTest, TestMetaDeleteDeduplicatesKeysForOrdinaryAndSimpleInstances) {
+    for (const bool simple : {false, true}) {
+        SCOPED_TRACE(simple);
+        const std::string instance = simple ? "simple_duplicate_meta_delete" : "ordinary_duplicate_meta_delete";
+        const std::vector<LocationSpecInfo> specs{LocationSpecInfo("tp0", 4096)};
+        auto info = std::make_shared<InstanceInfo>(
+            "", "group", instance, 1024, specs, ModelDeployment{}, std::vector<LocationSpecGroup>{}, 0);
+        info->set_disable_write_session(simple);
+        auto config = std::make_shared<MetaIndexerConfig>();
+        ASSERT_EQ(EC_OK, meta_manager_->CreateMetaIndexer(instance, config, {}, info));
+        const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(instance);
+        ASSERT_NE(nullptr, indexer);
+        MetaSearcher searcher(indexer);
+        RequestContext context("duplicate_meta_delete");
+        const KeyVector keys{1, 2, 3};
+        const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:1";
+        std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks;
+        for (const int64_t key : keys) {
+            tasks.push_back({MetaSearcher::ReplaceLocationSpecsTask{
+                location_id,
+                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                CLS_SERVING,
+                {LocationSpec("tp0",
+                              "event_report://127.0.0.1:1/mem?s_v=11111111&size=7&block=" + std::to_string(key))}}});
+        }
+        std::vector<ErrorCode> seed_results;
+        ASSERT_EQ(EC_OK, searcher.BatchReplaceLocationSpecs(&context, keys, tasks, seed_results, nullptr));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), seed_results);
+
+        SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+        CacheMetaDelRequest request{.instance_id = instance, .block_keys = {2, 1, 2, 1}};
+        std::future<PlanExecuteResult> pending = executor.Submit(request);
+        ASSERT_TRUE(pending.valid());
+        ASSERT_EQ(std::future_status::ready, pending.wait_for(std::chrono::seconds(3)));
+        const PlanExecuteResult deleted = pending.get();
+        ASSERT_EQ(EC_OK, deleted.status) << deleted.error_message;
+        EXPECT_EQ((KeyVector{2, 1, 2, 1}), request.block_keys);
+
+        CacheLocationMapVector locations;
+        const MetaIndexer::Result read = indexer->GetLocations(&context, keys, locations);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT, EC_OK}), read.error_codes);
+        ASSERT_EQ(3u, locations.size());
+        EXPECT_TRUE(locations[0].empty());
+        EXPECT_TRUE(locations[1].empty());
+        EXPECT_EQ(1u, locations[2].count(location_id));
+        EXPECT_EQ(1u, indexer->GetKeyCount());
+        EXPECT_EQ(1u, indexer->GetLocationCount());
+        EXPECT_EQ(7u, indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    }
+}
+
 TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBackend) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
 
@@ -1355,7 +1449,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBacke
         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec(
-            "tp0", "event_report://external_cache/cache/block701?s_version=11111111111111111111111111111111")});
+            "tp0", "event_report://external_cache/cache/block701?s_v=11111111")});
     std::vector<std::string> location_ids;
     ASSERT_EQ(EC_OK,
               BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
@@ -1419,7 +1513,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBacke
         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec(
-            "tp0", "event_report://external_cache/cache/block704?s_version=11111111111111111111111111111111")});
+            "tp0", "event_report://external_cache/cache/block704?s_v=11111111")});
     auto mixed_ordinary_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_DUMMY,
         1,
@@ -1561,7 +1655,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     Stub cas_stub;
     cas_refresh_stub = &cas_stub;
     location_to_refresh_during_cas = refreshed_id;
-    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    cas_stub.set(ADDR(MetaIndexer, ReadModifyWriteLocation), RefreshLocationBeforeRmw);
     auto partial_submission = executor.SubmitAsync(partial_request);
     ASSERT_TRUE(partial_submission.accepted);
     EXPECT_EQ(EC_OK, partial_submission.future.get().status);
@@ -2643,56 +2737,229 @@ TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAd
     EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
 }
 
-TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetadataBeforeConditionalDelete) {
-    const std::string instance_id = "cached_authoritative_delete";
-    const std::string persistent_path = GetPrivateTestRuntimeDataPath() + "schedule_plan_executor_cached_authoritative";
-    ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
-    const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
-    WaitForCachedMetaIndexerRunning(indexer);
+TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyFillsRecoverMissingKeysAndNeverDeletesSkippedTargets) {
+    for (const std::string scenario : {"recover_missing",
+                                       "recover_deleted",
+                                       "running_missing",
+                                       "recover_target_missing",
+                                       "recover_target_changed"}) {
+        SCOPED_TRACE(scenario);
+        const std::string instance_id = "cached_gc_" + scenario;
+        const std::string persistent_path = GetPrivateTestRuntimeDataPath() + instance_id;
+        ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
+        const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(instance_id);
+        WaitForCachedMetaIndexerRunning(indexer);
+        auto &manager = *indexer->backend_manager_;
 
-    auto request_context = std::make_shared<RequestContext>("cached_authoritative_delete_test");
-    MetaSearcher meta_searcher(indexer);
-    const int64_t block_key = 913;
-    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_NFS,
-        1,
-        {SchedulePlanExecutorTestHelper::CreateLocationSpec("default",
-                                                            "nfs://nfs_01/cached_authoritative_delete?size=1")});
-    std::vector<std::string> location_ids;
-    ASSERT_EQ(EC_OK,
-              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
-    ASSERT_EQ(1u, location_ids.size());
+        auto physical_backend =
+            std::make_shared<RecordingDeleteBackend>("nfs_01", DataStorageType::DATA_STORAGE_TYPE_NFS, false);
+        data_storage_manager_->storage_map_["nfs_01"] = physical_backend;
+        RequestContext context("cached_gc_admission_test");
+        MetaSearcher searcher(indexer);
+        const int64_t key = 913;
+        auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {LocationSpec("default", "nfs://nfs_01/cached_gc?size=1")});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {key}, {location}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<ErrorCode>> status_results;
+        ASSERT_EQ(EC_OK,
+                  searcher.BatchUpdateLocationStatus(&context, {key}, {{{ids.front(), CLS_SERVING}}}, status_results));
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), status_results);
+        CacheLocationMapVector original;
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->GetLocations(nullptr, {key}, original));
+        const auto expected = original.front().at(ids.front())->ToJsonString();
 
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
-    ASSERT_EQ(1u, location_maps.size());
-    const std::string expected_value = location_maps.front().at(location_ids.front())->ToJsonString();
+        if (scenario == "recover_target_missing") {
+            // Emulate a pending persistent deletion: the hot key remains,
+            // while its target is already absent. Never bring it back.
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      manager.cache_backend_->DeleteLocationsForMaintenance(nullptr, {key}, {{ids.front()}}));
+        } else if (scenario == "recover_target_changed") {
+            auto updated = std::make_shared<CacheLocation>(*original.front().at(ids.front()));
+            updated->set_status(CLS_WRITING);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      manager.cache_backend_->Upsert(nullptr, {key}, {{{ids.front(), updated}}}, PropertyMapVector(1)));
+        } else {
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->Delete(nullptr, {key}));
+        }
+        manager.recover_state_.store(scenario == "running_missing" ? MetaStorageBackendManager::RecoverState::kRunning
+                                                                   : MetaStorageBackendManager::RecoverState::kRecover);
+        if (scenario == "recover_deleted") {
+            manager.deleted_keys_.insert(key);
+        }
 
-    // Simulate a Running dual-backend instance whose authoritative metadata
-    // still contains the key after the local hot-cache entry was evicted.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer->backend_manager_->cache_backend_->Delete(nullptr, {block_key}));
-    location_maps.clear();
-    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
-    ASSERT_EQ(1u, location_maps.size());
-    ASSERT_TRUE(location_maps.front().empty());
+        SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+        CacheLocationDelRequest request{
+            .instance_id = instance_id,
+            .block_keys = {key},
+            .location_ids = {{ids.front()}},
+            .expected_location_values = {{expected}},
+            .authoritative_read = true,
+        };
+        auto submitted = executor.SubmitAsync(request);
+        ASSERT_TRUE(submitted.accepted);
+        const auto result = submitted.future.get();
+        ASSERT_EQ(EC_OK, result.status) << result.error_message;
 
+        CacheLocationMapVector persisted;
+        const auto persisted_ec = manager.persistent_backend_->GetLocations(nullptr, {key}, persisted);
+        if (scenario == "recover_missing") {
+            ASSERT_EQ(1u, physical_backend->delete_batches.size());
+            EXPECT_TRUE(persisted_ec.front() == EC_NOENT || persisted.front().empty());
+        } else {
+            EXPECT_TRUE(physical_backend->delete_batches.empty());
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), persisted_ec);
+            EXPECT_EQ(expected, persisted.front().at(ids.front())->ToJsonString());
+            CacheLocationMapVector hot;
+            const auto hot_ec = manager.cache_backend_->GetLocations(nullptr, {key}, hot);
+            if (scenario == "recover_target_changed") {
+                ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), hot_ec);
+                EXPECT_EQ(CLS_WRITING, hot.front().at(ids.front())->status());
+            } else if (scenario == "recover_target_missing") {
+                ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), hot_ec);
+                EXPECT_TRUE(hot.front().empty());
+            } else {
+                EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}), hot_ec);
+            }
+        }
+    }
+}
+
+namespace {
+class MemoryAsyncCopyBackend : public DataStorageBackend {
+public:
+    MemoryAsyncCopyBackend() : DataStorageBackend(nullptr) {}
+    DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+    bool Available() override { return true; }
+    double GetStorageUsageRatio(const std::string &) const override { return 0; }
+    ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+    ErrorCode Close() override { return EC_OK; }
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+        return {};
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<bool>(uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    bool SupportsAsyncCopy() const override { return true; }
+    AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &,
+                                     const std::vector<DataStorageUri> &,
+                                     const std::string &operation_id,
+                                     const std::string &,
+                                     const AsyncCopyOptions &,
+                                     AsyncCopyCompletion completion) override {
+        completion_ = std::move(completion);
+        AsyncCopySubmitResult accepted;
+        accepted.status = EC_OK;
+        accepted.accepted = true;
+        accepted.operation_id = operation_id;
+        return accepted;
+    }
+    AsyncCopyCompletion completion_;
+};
+} // namespace
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyHandoffDoesNotWaitOrRequireAcceptanceChannel) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
     SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
-    CacheLocationDelRequest request{
-        .instance_id = instance_id,
-        .block_keys = {block_key},
-        .location_ids = {{location_ids.front()}},
-        .expected_location_values = {{expected_value}},
-        .metadata_only = true,
-        .authoritative_read = true,
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 1,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
     };
-    const PlanExecuteResult result = executor.Submit(request).get();
-    ASSERT_EQ(EC_OK, result.status) << result.error_message;
+    auto submitted = executor.SubmitAsyncCopy(request, "memory-op", AsyncCopyOptions{});
+    ASSERT_TRUE(submitted.submit_result.accepted);
+    ASSERT_TRUE(submitted.future.valid());
+    EXPECT_EQ(std::future_status::timeout, submitted.future.wait_for(std::chrono::milliseconds(0)));
+    std::promise<void> worker_ran;
+    ASSERT_TRUE(executor.SubmitTask([&worker_ran] { worker_ran.set_value(); }));
+    EXPECT_EQ(std::future_status::ready, worker_ran.get_future().wait_for(std::chrono::seconds(1)));
 
-    CacheLocationMapVector persistent_locations;
-    const auto persistent_results =
-        indexer->backend_manager_->GetLocationsFromPrimary(request_context.get(), {block_key}, persistent_locations);
-    ASSERT_EQ(1u, persistent_results.size());
-    ASSERT_EQ(1u, persistent_locations.size());
-    EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
+    AsyncCopyBatchResult result;
+    result.status = EC_OK;
+    result.items.resize(1);
+    result.items[0].outcome = AsyncCopyOutcome::kSuccess;
+    result.items[0].terminal = true;
+    result.items[0].safe_to_reuse_dst = true;
+    ASSERT_TRUE(backend->completion_);
+    auto completion = std::move(backend->completion_);
+    completion(result);
+    completion(result); // Executor's promise still resolves once.
+    ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_OK, submitted.future.get().status);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyShortOrUnknownCompletionCannotSucceed) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 2,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (bool short_response : {true, false}) {
+        auto submitted = executor.SubmitAsyncCopy(request, "unknown-op", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult unknown;
+        unknown.status = EC_OK;
+        if (!short_response) {
+            unknown.items.resize(1); // Missing terminal/safe remains unknown.
+        }
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(unknown));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        auto result = submitted.future.get();
+        EXPECT_NE(EC_OK, result.status);
+        EXPECT_FALSE(result.terminal);
+        EXPECT_FALSE(result.safe_to_reuse_dst);
+    }
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyAggregateFailureOverridesSuccessfulItems) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 3,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (const auto status : {EC_ERROR, EC_TIMEOUT, EC_PARTIAL_OK, EC_UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(status));
+        auto submitted = executor.SubmitAsyncCopy(request, "aggregate-failure", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult completion_result;
+        completion_result.status = status;
+        completion_result.items.resize(1);
+        auto &item = completion_result.items.front();
+        item.outcome = AsyncCopyOutcome::kSuccess;
+        item.terminal = true;
+        item.safe_to_reuse_dst = true;
+        ASSERT_TRUE(completion_result.AllSucceeded());
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(completion_result));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(status, submitted.future.get().status);
+    }
 }

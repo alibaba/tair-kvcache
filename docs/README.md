@@ -2,20 +2,27 @@
 
 ### 设计文档
 
+- [Checksum 元数据存储](design/checksum_metadata.md) - 接收调用方计算的 checksum，按 block/spec 持久化与查询，支持 v6d 自有 CRC
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+- [HTTP/gRPC 业务线程池设计](design/service_request_dispatch.md) - 仅 Meta 入池，Admin/健康检查保留；含 gRPC 异步适配、配置与停机设计
 - [分层存储设计](design/tiered_storage.md) - 多层缓存读写、Copy / Mark 迁移、回收协同，以及完整配置与 Admin 操作示例
+- [StartWriteCache 按存储类型补写副本](design/start_write_storage_replica.md) - 请求级副本目标、与 min-replica/Mark 的关系、实现范围及验证记录
 - [Client SDK I/O 契约](design/client_sdk_io_contract.md) - deadline 语义、buffer 生命周期、各后端取消能力矩阵
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
+- [KVCM 环境变量启动与自动初始化](design/kvcm_env_startup_bootstrap.md) - 环境变量配置、Storage/Instance Group 映射及参数变化后的更新行为
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
+- [KVCM × PACE CopyGA 异步化设计](design/async_copyga.md) - 缓存异步迁移的执行流程、并发与容量控制、数据一致性及异常处理
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
 - [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到
 - [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
+- [Recover 期间允许 EventReport GC 清理](design/event_report_gc_during_recover.md) - 复用删除标记保护整 key 回收与在线重建，逐 key 处理恢复期清理边界
 - [Meta 内存主存储与 Redis 异步备份](design/meta_memory_primary_async_backup.md) - Recover 保持持久化优先，Running 切换内存优先异步备份并复用原锁外 Sync
+- [元数据内存紧凑化设计与实现](design/meta_location_item_memory_compaction.md) - Location、spec name、item 与分段锁的实现及容量验收边界
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置

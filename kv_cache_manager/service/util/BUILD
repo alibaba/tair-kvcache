@@ -24,6 +24,17 @@ cc_library(
 )
 
 cc_library(
+    name = "report_event_body_budget",
+    srcs = ["report_event_body_budget.cc"],
+    hdrs = ["report_event_body_budget.h"],
+    deps = [
+        "//kv_cache_manager/common:timestamp_util",
+        "@havenask//aios/autil:mem_util",
+        "@havenask//aios/autil:string_helper",
+    ],
+)
+
+cc_library(
     name = "report_event_json_parser",
     srcs = ["report_event_json_parser.cc"],
     hdrs = ["report_event_json_parser.h"],
@@ -42,7 +53,6 @@ cc_library(
         ":grpc_wrapper",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
-        "//kv_cache_manager/config:meta_cache_policy_config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/meta:cache_location",

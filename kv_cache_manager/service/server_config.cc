@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/server_config.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -13,6 +14,7 @@
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 
@@ -31,6 +33,16 @@ bool ParseUint32Setting(const std::string &value, uint32_t &out) {
 }
 
 } // namespace
+
+uint32_t ServerConfig::ResolveServiceWorkerThreadNum(unsigned int hardware_threads) const {
+    if (service_worker_thread_num_ > 0) {
+        return service_worker_thread_num_;
+    }
+    if (service_grpc_max_threads_ > 0) {
+        return service_grpc_max_threads_;
+    }
+    return std::max(2u, hardware_threads);
+}
 
 std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
     auto boundaries = StringUtil::ParseBucketBoundaries(buckets_str);
@@ -85,6 +97,60 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_io_thread_num_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.service.grpc_max_threads",
+     [](const std::string &value, ServerConfig *config) {
+         std::size_t parsed_length = 0;
+         const auto parsed = std::stoll(value, &parsed_length);
+         if (parsed_length != value.size() || parsed < -1 || parsed > std::numeric_limits<int32_t>::max()) {
+             return false;
+         }
+         config->service_grpc_max_threads_ = static_cast<int32_t>(parsed);
+         return true;
+     }},
+    {"kvcm.service.grpc_memory_quota_bytes",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         const auto parsed = std::stoull(value);
+         // gRPC accepts size_t but stores the quota size as int64_t internally.
+         if (parsed > std::numeric_limits<int64_t>::max() || parsed > std::numeric_limits<std::size_t>::max()) {
+             return false;
+         }
+         config->service_grpc_memory_quota_bytes_ = parsed;
+         return true;
+     }},
+    {"kvcm.service.http_report_event_body_budget_bytes",
+     [](const std::string &value, ServerConfig *config) {
+         uint32_t bytes = 0;
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos ||
+             !ParseUint32Setting(value, bytes) || bytes > ReportEventBodyBudget::kMaxBytes) {
+             return false;
+         }
+         config->http_report_event_body_budget_bytes_ = bytes;
+         return true;
+     }},
+    {"kvcm.service.grpc_cq_thread_num",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_grpc_cq_thread_num_) &&
+                config->service_grpc_cq_thread_num_ > 0;
+     }},
+    {"kvcm.service.worker_thread_num",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_worker_thread_num_);
+     }},
+    {"kvcm.service.worker_queue_capacity",
+     [](const std::string &value, ServerConfig *config) {
+         return !value.empty() && value.front() != '-' &&
+                ParseUint32Setting(value, config->service_worker_queue_capacity_);
+     }},
+    {"kvcm.service.worker_shutdown_mode",
+     [](const std::string &value, ServerConfig *config) {
+         config->service_worker_shutdown_mode_ = value;
+         return value == "discard_pending" || value == "drain";
+     }},
     {"kvcm.service.rpc_port",
      [](const std::string &value, ServerConfig *config) {
          config->service_rpc_port_ = std::stoi(value);
@@ -114,6 +180,14 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          // 0: auto, 1: fatal, 2: error, 3: warn, 4: info, 5: debug
          config->log_level_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.logger.access_log_payload_mode",
+     [](const std::string &value, ServerConfig *config) {
+         if (value != "metadata" && value != "full") {
+             return false;
+         }
+         config->include_access_log_payload_ = value == "full";
          return true;
      }},
     {"kvcm.startup_config",
@@ -266,6 +340,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_gc_event_report_action_batch_size_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.cache_gc.event_report_cleanup_during_recover_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_gc_event_report_cleanup_during_recover_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -280,6 +359,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->metrics_env_tag_mappings_ = value;
          return true;
+     }},
+    {"kvcm.metrics.redis_health_probe_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->redis_health_probe_enabled_ = value == "true";
+         return value == "true" || value == "false";
      }},
     {"kvcm.metrics.report_interval_ms",
      [](const std::string &value, ServerConfig *config) {
@@ -382,11 +466,22 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    service_grpc_max_threads_ = 0;
+    service_grpc_memory_quota_bytes_ = 0;
+    http_report_event_body_budget_bytes_ = 0;
+    service_grpc_cq_thread_num_ = 2;
+    service_worker_thread_num_ = 0;
+    service_worker_queue_capacity_ = 2048;
+    service_worker_shutdown_mode_ = "discard_pending";
+    include_access_log_payload_ = false;
+    report_event_full_access_log_ = false;
+    get_host_cache_state_full_access_log_ = false;
     metrics_reporter_type_ = "local";
     metrics_env_tag_mappings_.clear();
     metrics_common_tags_.clear();
     prometheus_common_tags_.clear();
     metrics_report_interval_ms_ = 20000;
+    redis_health_probe_enabled_ = true;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
     schedule_plan_executor_thread_count_ = 2;
@@ -414,6 +509,7 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_gc_orphan_writing_grace_period_ms_ = 24LL * 60 * 60 * 1000;
     cache_gc_max_inflight_delete_requests_ = 64;
     cache_gc_event_report_cleanup_enabled_ = true;
+    cache_gc_event_report_cleanup_during_recover_enabled_ = true;
     cache_gc_event_report_action_batch_size_ = 256;
 }
 
@@ -472,6 +568,8 @@ bool ServerConfig::ParseFromFile(const std::string &config_file) {
 bool ServerConfig::ParseFromEnviron(const EnvironMap &environ) {
     EnvironMap copy_environ = environ;
     UpdateEnviron(copy_environ);
+    report_event_full_access_log_ = EnvUtil::GetEnv("KVCM_REPORT_EVENT_FULL_ACCESS_LOG", false);
+    get_host_cache_state_full_access_log_ = EnvUtil::GetEnv("KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG", false);
 
     bool success = true;
     for (const auto &[k, v] : copy_environ) {
@@ -520,6 +618,13 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 bool ServerConfig::Check() {
     // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
     // falls back to local backend. No validation needed for empty value.
+
+    // A synchronous server needs a polling thread in addition to a handler.
+    // Zero derives the quota from hardware concurrency; -1 keeps the framework default.
+    if (service_grpc_max_threads_ < -1 || service_grpc_max_threads_ == 1) {
+        fprintf(stderr, "kvcm.service.grpc_max_threads must be -1 (framework default), 0 (auto), or at least 2\n");
+        return false;
+    }
 
     if (!MetricsReporterFactory::IsSupportedType(metrics_reporter_type_)) {
         fprintf(stderr,

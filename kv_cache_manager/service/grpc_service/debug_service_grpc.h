@@ -19,6 +19,10 @@ public:
     void Init() { /* currently no metrics registration for debug service */
     }
 
+    grpc::Status GetCacheMetaDetail(grpc::ServerContext *context,
+                                    const proto::debug::GetCacheMetaDetailRequest *request,
+                                    proto::debug::GetCacheMetaDetailResponse *response) override;
+
     grpc::Status InjectFault(grpc::ServerContext *context,
                              const proto::debug::InjectFaultRequest *request,
                              proto::debug::CommonResponse *response) override;

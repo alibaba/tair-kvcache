@@ -17,6 +17,7 @@
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
 
 namespace kv_cache_manager {
 
@@ -38,9 +39,22 @@ bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     return true;
 }
 
+void LocalMetricsReporter::PublishNodeStatus(std::optional<bool> is_leader) {
+    if (!is_leader.has_value()) {
+        return;
+    }
+
+    NodeStatusMetrics::Publish(metrics_registry_, *is_leader);
+}
+
 void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
-    if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
+    if (auto *p = dynamic_cast<GrpcMetricsCollector *>(collector)) {
+        Counter response_counter;
+        COPY_METRICS_(p, grpc, response_counter, response_counter);
+        ++response_counter;
+    } else if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<ServiceMetricsCollector *>(collector);
+        p->PublishQueryKeyCountSample();
 
         do {
             // service query_counter
@@ -65,6 +79,7 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::opti
         } while (false);
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
+        p->UpdateLocationLifetimeMetrics();
         Counter service_query_counter;
         COPY_METRICS_(p, service, query_counter, service_query_counter);
         ++service_query_counter;
@@ -111,7 +126,16 @@ void LocalMetricsReporter::ReportInterval() {
     // purge with EmplaceMetricsCollector calls below
     std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
 
+    // Sample lease ownership for the node-level gauge.
+    const auto &leader_state_provider = GetLeaderStateProvider();
+    const std::optional<bool> is_leader =
+        leader_state_provider ? std::optional<bool>(leader_state_provider()) : std::nullopt;
+    PublishNodeStatus(is_leader);
+    const auto &provider = GetStorageUsageProvider();
+
     do {
+        report_storage_usage_ = !provider || provider();
+        data_storage_interval_metrics_collectors_.Reset();
         // for data storage metrics
         const auto registry_manager = cache_manager_->GetRegistryManager();
         if (!registry_manager) {
@@ -122,21 +146,49 @@ void LocalMetricsReporter::ReportInterval() {
             break;
         }
 
-        data_storage_interval_metrics_collectors_.Reset();
         const auto storage_names = data_storage_manager->GetAllStorageNames();
         for (const auto &unique_name : storage_names) {
             const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
             if (storage_backend == nullptr) {
                 continue;
             }
-            const auto p =
-                data_storage_interval_metrics_collectors_.EmplaceMetricsCollector<DataStorageIntervalMetricsCollector>(
-                    metrics_registry_,
-                    MetricsTags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}});
-            SET_METRICS_(p, data_storage, healthy_status, storage_backend->Available() ? 1.0 : 0.0);
-            SET_METRICS_(p, data_storage, writable_status, storage_backend->Writable() ? 1.0 : 0.0);
-            SET_METRICS_(
-                p, data_storage, storage_usage_ratio, storage_backend->GetStorageUsageRatio("trace_report_interval"));
+            // Potentially slow backend observations run outside the storage
+            // lifecycle lock. Cleanup may finish while they are in flight.
+            const double healthy = storage_backend->Available() ? 1.0 : 0.0;
+            const double writable = storage_backend->Writable() ? 1.0 : 0.0;
+            const double usage_ratio = report_storage_usage_
+                                           ? storage_backend->GetStorageUsageRatio("trace_report_interval")
+                                           : 0.0;
+            const auto capacity =
+                report_storage_usage_ ? storage_backend->GetStorageCapacity() : StorageCapacitySnapshot{};
+            data_storage_manager->PublishMetricsIfCurrent(unique_name, storage_backend, [&]() {
+                const MetricsTags tags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}};
+                if (!report_storage_usage_) {
+                    // A follower may still have a backend awaiting cleanup.
+                    // Omit its capacity without scanning historical series.
+                    metrics_registry_->Remove(
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, storage_usage_ratio), tags);
+                    metrics_registry_->Remove(
+                        SCOPED_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, total_capacity_bytes),
+                        tags);
+                }
+                const auto p = std::make_shared<DataStorageIntervalMetricsCollector>(metrics_registry_, tags);
+                if (!p->Init(report_storage_usage_)) {
+                    return;
+                }
+                data_storage_interval_metrics_collectors_.AddMetricsCollector(p);
+                SET_METRICS_(p, data_storage, healthy_status, healthy);
+                SET_METRICS_(p, data_storage, writable_status, writable);
+                if (report_storage_usage_) {
+                    // The backend retains its last good capacity on errors.
+                    // Unknown/unsupported must not be exported as a real zero.
+                    SET_METRICS_(
+                        p, data_storage, total_capacity_bytes, capacity.HasKnownCapacity() ? capacity.capacity : -1);
+                }
+                if (report_storage_usage_ && (usage_ratio >= 0 || storage_backend->SupportsStorageCapacity())) {
+                    SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);
+                }
+            });
         }
     } while (false);
 
@@ -154,15 +206,18 @@ void LocalMetricsReporter::ReportInterval() {
 
         const auto indexer_map = meta_indexer_manager->GetIndexers();
         std::size_t total_key_count_v = 0;
+        std::size_t total_location_count_v = 0;
         std::size_t total_cache_usage_v = 0;
         for (auto &[_, indexer] : indexer_map) {
             if (indexer) {
                 total_key_count_v += indexer->GetKeyCount();
+                total_location_count_v += indexer->GetLocationCount();
                 total_cache_usage_v += indexer->GetMemUsage();
             }
         }
 
         SET_METRICS_(p, meta_indexer, total_key_count, static_cast<double>(total_key_count_v));
+        SET_METRICS_(p, meta_indexer, total_location_count, static_cast<double>(total_location_count_v));
         SET_METRICS_(p, meta_indexer, total_cache_usage, static_cast<double>(total_cache_usage_v));
     } while (false);
 
@@ -183,6 +238,50 @@ void LocalMetricsReporter::ReportInterval() {
 
         {
             cache_manager_group_interval_metrics_collectors_.Reset();
+            std::set<MetricsTags> current_quota_tags;
+            for (const auto &[name, metric] : cache_manager_metrics_recorder->group_quota_metric_map()) {
+                const MetricsTags tags{{"instance_group", name}};
+                REPORT_DYNAMIC_GAUGE_(
+                    metrics_registry_, "cache_manager_group.reference_capacity", tags, metric.quota.reference_capacity);
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "cache_manager_group.total_bytes_limit_enabled",
+                                      tags,
+                                      metric.quota.configured_capacity != -1 ? 1 : 0);
+                for (const auto &[type, value] : metric.quota.types) {
+                    const MetricsTags type_tags{{"instance_group", name}, {"storage_type", ToString(type)}};
+                    current_quota_tags.insert(type_tags);
+                    const auto usage_it = metric.usage.find(type);
+                    const auto usage = usage_it == metric.usage.end() ? 0 : usage_it->second;
+                    REPORT_DYNAMIC_GAUGE_(
+                        metrics_registry_, "cache_manager_group_storage.usage_bytes", type_tags, usage);
+                    REPORT_DYNAMIC_GAUGE_(
+                        metrics_registry_, "cache_manager_group_storage.effective_quota", type_tags, value.capacity);
+                    REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                          "cache_manager_group_storage.usage_ratio",
+                                          type_tags,
+                                          QuotaUsageRatio(usage, value.capacity));
+                    REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                          "cache_manager_group_storage.refresh_success",
+                                          type_tags,
+                                          value.refresh_success ? 1 : 0);
+                    REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                          "cache_manager_group_storage.last_success_time_s",
+                                          type_tags,
+                                          value.last_success_time_s);
+                }
+            }
+            for (const auto &tags : quota_storage_tags_) {
+                if (current_quota_tags.count(tags) == 0) {
+                    for (const auto *name : {"cache_manager_group_storage.usage_bytes",
+                                             "cache_manager_group_storage.effective_quota",
+                                             "cache_manager_group_storage.usage_ratio",
+                                             "cache_manager_group_storage.refresh_success",
+                                             "cache_manager_group_storage.last_success_time_s"}) {
+                        metrics_registry_->Remove(name, tags);
+                    }
+                }
+            }
+            quota_storage_tags_ = std::move(current_quota_tags);
             const auto group_usage_ratio_map = cache_manager_metrics_recorder->group_usage_ratio_map();
             for (const auto &[instance_group_name, usage_ratio] : group_usage_ratio_map) {
                 const auto p = cache_manager_group_interval_metrics_collectors_
@@ -203,7 +302,15 @@ void LocalMetricsReporter::ReportInterval() {
                                 metrics_registry_,
                                 MetricsTags{{"instance_group", instance_group_name}, {"instance_id", instance_id}});
                     SET_METRICS_(p, cache_manager_instance, key_count, static_cast<double>(instance_metric.key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 location_count,
+                                 static_cast<double>(instance_metric.location_count));
                     SET_METRICS_(p, cache_manager_instance, byte_size, static_cast<double>(instance_metric.byte_size));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 meta_cache_usage,
+                                 static_cast<double>(instance_metric.meta_cache_usage));
                     SET_METRICS_(
                         p, cache_manager_instance, max_lru_age_us, static_cast<double>(instance_metric.max_lru_age_us));
                     SET_METRICS_(p,

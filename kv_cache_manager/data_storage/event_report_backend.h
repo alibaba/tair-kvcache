@@ -29,6 +29,7 @@ public:
     struct QueryVisibilityState {
         bool strict = false;
         std::string committed_version;
+        std::vector<std::string> mediums;
     };
     // Transparent ordering lets GetHostCacheState probe the request snapshot
     // with a string_view borrowed from CacheLocation::id without allocating a

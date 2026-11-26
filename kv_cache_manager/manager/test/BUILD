@@ -106,6 +106,7 @@ cc_test(
         "//kv_cache_manager/meta",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta/simple:simple_kv_cache_backend",
     ],
 )
 
@@ -151,6 +152,9 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service:meta_service_metrics_base",
         "@cpp_stub",
     ],
 )

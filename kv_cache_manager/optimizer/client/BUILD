@@ -1,5 +1,12 @@
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "OptimizerClientTest",
+    srcs = ["client_test.py"],
+    main = "client_test.py",
+    deps = [":optimizer_client"],
+)
+
 py_library(
     name = "optimizer_client",
     srcs = [

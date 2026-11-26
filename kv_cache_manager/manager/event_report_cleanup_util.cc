@@ -30,7 +30,8 @@ bool IsSnapshotLocationStaleForCleanup(const EventReportBackend *event_backend,
     bool contains_in_flight = false;
     for (const auto &spec : location.location_specs()) {
         const size_t version_param_count =
-            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam) +
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kLegacySnapshotVersionParam);
         if (version_param_count == 0) {
             continue;
         }

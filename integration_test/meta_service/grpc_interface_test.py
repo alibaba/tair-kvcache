@@ -6,7 +6,9 @@ from google.protobuf.json_format import ParseDict
 from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     RegisterInstanceRequest,
     GetInstanceInfoRequest,
-    GetCacheLocationRequest, 
+    GetCacheLocationRequest,
+    GetCacheMetaRequest,
+    GetCacheLocationsByBackendRequest,
     StartWriteCacheRequest,
     FinishWriteCacheRequest,
     RemoveCacheRequest,
@@ -17,7 +19,7 @@ from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     BoolMasksType,
     CommonResponse,
     GetInstanceInfoResponse,
-    GetCacheLocationResponse, 
+    GetCacheLocationResponse,
     StartWriteCacheResponse,
 )
 from kv_cache_manager.protocol.protobuf.meta_service_pb2_grpc import MetaServiceStub
@@ -74,6 +76,29 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
             if response_dict['header']['status']['code'] != "OK":
                 raise AssertionError(
                     f"Request to get_cache_location failed with error: {response_dict['header']['status']['message']}")
+        return response_dict
+
+    def get_cache_meta(self, data, check_response=True):
+        """Get cache metadata for specified block keys"""
+        request = self._convert_dict_to_proto(GetCacheMetaRequest, data)
+        response = self._stub.GetCacheMeta(request, timeout=self._timeout)
+        response_dict = self._convert_proto_to_dict(response)
+        if check_response:
+            if response_dict['header']['status']['code'] != "OK":
+                raise AssertionError(
+                    f"Request to get_cache_meta failed with error: {response_dict['header']['status']['message']}")
+        return response_dict
+
+    def get_cache_locations_by_backend(self, data, check_response=True):
+        """Get cache locations using explicit backend selectors"""
+        request = self._convert_dict_to_proto(GetCacheLocationsByBackendRequest, data)
+        response = self._stub.GetCacheLocationsByBackend(request, timeout=self._timeout)
+        response_dict = self._convert_proto_to_dict(response)
+        if check_response:
+            if response_dict['header']['status']['code'] != "OK":
+                raise AssertionError(
+                    "Request to get_cache_locations_by_backend failed with error: "
+                    f"{response_dict['header']['status']['message']}")
         return response_dict
 
     def start_write_cache(self, data, check_response=True):

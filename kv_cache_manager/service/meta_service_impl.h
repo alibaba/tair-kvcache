@@ -15,9 +15,16 @@ class RequestContext;
 
 class MetaServiceImpl : public ServiceImplBase {
 public:
+    struct AccessLogOptions {
+        bool include_payload = false;
+        bool full_report_event = false;
+        bool full_get_host_cache_state = false;
+    };
+
     MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                     std::shared_ptr<MetricsReporter> metrics_reporter,
-                    std::shared_ptr<LeaderElector> leader_elector);
+                    std::shared_ptr<LeaderElector> leader_elector,
+                    AccessLogOptions access_log_options);
     ~MetaServiceImpl() override = default;
 
     // 实现所有MetaService的接口方法
@@ -77,6 +84,7 @@ private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LeaderElector> leader_elector_;
+    const AccessLogOptions access_log_options_;
 };
 
 } // namespace kv_cache_manager

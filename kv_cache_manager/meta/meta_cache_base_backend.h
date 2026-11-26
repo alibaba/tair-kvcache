@@ -11,6 +11,14 @@ class MetaCacheBaseBackend : public MetaStorageBackend {
 public:
     ~MetaCacheBaseBackend() override = default;
 
+    // Check estimated local metadata growth before persistent writes; no reservation.
+    virtual ErrorCode CheckWriteCapacity(KeyType /*key*/,
+                                         const CacheLocationMap & /*locations*/,
+                                         const PropertyMap & /*properties*/,
+                                         bool /*replace*/) noexcept {
+        return EC_OK;
+    }
+
     // Bring base-class write overloads into scope (without previous_error_codes).
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::DeleteLocations;
@@ -21,9 +29,6 @@ public:
     virtual std::vector<ErrorCode> GetLocationsForMaintenance(RequestContext *request_context,
                                                               const KeyTypeVec &keys,
                                                               CacheLocationMapVector &out_locations) noexcept = 0;
-
-    virtual size_t GetMemUsage() const noexcept = 0;
-    virtual int64_t GetOldestAccessTime() const noexcept = 0;
 
     // Reads current access timestamps from the hot cache without marking the
     // keys as hits, updating revisit metrics, or changing LRU positions.

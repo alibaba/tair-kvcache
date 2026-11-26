@@ -1,6 +1,107 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "ServerRedisHealthMetricsTest",
+    srcs = ["server_redis_health_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/metrics:redis_health_metrics",
+        "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "ServiceImplBaseTest",
+    srcs = ["service_impl_base_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/service:service_impl_base",
+    ],
+)
+
+cc_test(
+    name = "ServerInstanceRemovalDrainTest",
+    srcs = ["server_instance_removal_drain_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:meta_searcher",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/service:admin_service_impl",
+        "//kv_cache_manager/service:meta_service_impl",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "GrpcServerOptionsTest",
+    srcs = ["grpc_server_options_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "//kv_cache_manager/service:grpc_wrapper",
+        "//kv_cache_manager/service/grpc_service:grpc_server_options",
+    ],
+)
+
+cc_test(
+    name = "ServiceRequestExecutorTest",
+    srcs = ["service_request_executor_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service:service_request_executor",
+    ],
+)
+
+cc_test(
+    name = "MetaServiceGRpcDispatchTest",
+    srcs = ["meta_service_grpc_dispatch_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:migration_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "//kv_cache_manager/service:meta_service_impl",
+        "//kv_cache_manager/service:service_request_executor",
+        "//kv_cache_manager/service/grpc_service",
+        "//kv_cache_manager/service/grpc_service:grpc_server_options",
+        "//kv_cache_manager/service/util:common",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",
@@ -29,6 +130,20 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/service:meta_service_impl",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "DebugServiceImplTest",
+    srcs = ["debug_service_impl_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:debug_service_impl",
         "@cpp_stub",
     ],
 )
@@ -79,6 +194,21 @@ cc_test(
 )
 
 cc_test(
+    name = "ServerMetricsTest",
+    srcs = ["server_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/service:service_request_executor",
+        "//kv_cache_manager/service/util:report_event_body_budget",
+    ],
+)
+
+cc_test(
     name = "OptimizerEventServiceGRpcTest",
     srcs = [
         "optimizer_event_service_grpc_test.cc",
@@ -97,9 +227,11 @@ cc_test(
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
-        "//kv_cache_manager/service:grpc_wrapper",
         "//kv_cache_manager/service",
+        "//kv_cache_manager/service:grpc_wrapper",
+        "//kv_cache_manager/service/grpc_service:grpc_server_options",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
     ],
 )
@@ -127,6 +259,8 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    # Let cpp_stub patch the function entry used by the code under test.
+    linkstatic = True,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
@@ -135,6 +269,7 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/service:admin_service_impl",
+        "@cpp_stub",
     ],
 )
 
@@ -152,5 +287,59 @@ cc_test(
         "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/service:admin_service_impl",
+    ],
+)
+
+cc_test(
+    name = "ServerNodeStatusMetricsTest",
+    srcs = ["server_node_status_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "ServerStorageUsageMetricsTest",
+    srcs = ["server_storage_usage_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "CoroHttpServiceTest",
+    srcs = ["coro_http_service_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fcoroutines",
+        "-fno-access-control",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:meta_service_impl",
+        "//kv_cache_manager/service:service_request_executor",
+        "//kv_cache_manager/service/http_service",
+        "//kv_cache_manager/service/util:proto_message_json_util",
+        "//kv_cache_manager/service/util:report_event_body_budget",
+        "@yalantinglibs//:ylt",
     ],
 )

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -38,6 +40,7 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_SERVICE_DUPLICATE_ENTITY = 54,
     ER_SERVICE_INSTANCE_NOT_EXIST = 55,
     ER_SERVICE_NOT_LEADER = 56,
+    ER_SERVICE_BUSY = 57,
 
     // sdk
     ER_SDK_TIMEOUT = 100,
@@ -63,6 +66,9 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     // Internal parallel task was stopped before it started backend I/O.
     // SdkWrapper consumes this state; client APIs must never return it.
     ER_TASK_CANCELLED = 118,
+    // Failure with proof that the batch no longer accesses caller buffers.
+    ER_SDK_TIMEOUT_BUFFER_SAFE = 119,
+    ER_SDK_ERROR_BUFFER_SAFE = 120,
 };
 
 enum class QueryType : int {
@@ -103,6 +109,12 @@ enum class BackendSelectStrategy : int32_t {
     LSS_V6D_PREFIX = 1,
     LSS_V6D_COVERAGE = 2,
     LSS_WEIGHTED_RANDOM = 3,
+};
+
+struct StorageReplicaRequirement {
+    StorageType storage_type{StorageType::ST_UNSPECIFIED};
+    int32_t min_location_count{0};
+    std::vector<StorageType> excluded_storage_types{};
 };
 
 struct BackendLocation {

@@ -21,27 +21,36 @@ TEST_F(EventPublishersConfigTest, TestLogPublisherDefaultsAndOverrides) {
     EXPECT_EQ(123u, config.log_event_publisher_config().queue_size());
 }
 
-TEST_F(EventPublishersConfigTest, TestOptimizerPublisherRequiresExplicitEnable) {
+TEST_F(EventPublishersConfigTest, TestOptimizerPublisherDefaults) {
     EventPublishersConfig config;
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
     ASSERT_TRUE(config.FromJsonString(R"({})"));
-    EXPECT_FALSE(config.enable_optimizer_event_publisher());
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
 
     ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{}})"));
-    EXPECT_FALSE(config.enable_optimizer_event_publisher());
 
-    ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{"enable":true}})"));
-    ASSERT_TRUE(config.enable_optimizer_event_publisher());
     const auto &optimizer = config.optimizer_event_publisher_config();
+    EXPECT_TRUE(optimizer.enable());
     EXPECT_EQ(100000u, optimizer.queue_size());
     EXPECT_EQ(4u, optimizer.max_subscribers());
     EXPECT_EQ(10000u, optimizer.subscriber_queue_size());
 }
 
+TEST_F(EventPublishersConfigTest, TestOptimizerPublisherDisableAndRoundTrip) {
+    EventPublishersConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{"enable":false}})"));
+    EXPECT_FALSE(config.enable_optimizer_event_publisher());
+    EventPublishersConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config.ToJsonString()));
+    EXPECT_FALSE(restored.enable_optimizer_event_publisher());
+    ASSERT_TRUE(config.FromJsonString(R"({"optimizer":{}})"));
+    EXPECT_TRUE(config.enable_optimizer_event_publisher());
+}
+
 TEST_F(EventPublishersConfigTest, TestOptimizerPublisherConfigOverridesDefaults) {
     EventPublishersConfig config;
-    ASSERT_TRUE(config.FromJsonString(
-        R"({"optimizer":{"enable":true,"queue_size":123,"max_subscribers":2,"subscriber_queue_size":4096}})"));
-    ASSERT_TRUE(config.enable_optimizer_event_publisher());
+    ASSERT_TRUE(
+        config.FromJsonString(R"({"optimizer":{"queue_size":123,"max_subscribers":2,"subscriber_queue_size":4096}})"));
     const auto &optimizer = config.optimizer_event_publisher_config();
     EXPECT_EQ(123u, optimizer.queue_size());
     EXPECT_EQ(2u, optimizer.max_subscribers());
@@ -55,7 +64,6 @@ TEST_F(EventPublishersConfigTest, TestRejectsInvalidConfig) {
              std::string(R"({"log":{"enable":"true"}})"),
              std::string(R"({"log":{"queue_size":0}})"),
              std::string(R"({"optimizer":[]})"),
-             std::string(R"({"optimizer":{"enable":"true"}})"),
              std::string(R"({"optimizer":{"queue_size":0}})"),
              std::string(R"({"optimizer":{"max_subscribers":0}})"),
              std::string(R"({"optimizer":{"subscriber_queue_size":0}})"),

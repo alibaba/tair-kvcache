@@ -1,6 +1,8 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,9 +62,7 @@ public:
         instance_group->cache_config_->cache_prefer_strategy_ = CachePreferStrategy::CPS_PREFER_3FS;
         auto backend_config = std::make_shared<MetaStorageBackendConfig>();
         backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
-        auto cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
         meta_indexer_config->meta_storage_backend_config_ = backend_config;
-        meta_indexer_config->meta_cache_policy_config_ = cache_policy_config;
 
         std::vector<LocationSpecInfo> spec_infos = {LocationSpecInfo("tp0", 512)};
         ModelDeployment md;
@@ -85,8 +85,12 @@ public:
         ASSERT_TRUE(RegisterDummyStorage("hot_01"));
         ASSERT_TRUE(RegisterDummyStorage("cold_01"));
 
-        admin_ = std::make_shared<AdminServiceImpl>(
-            cache_manager_, /*reporter*/ nullptr, metrics_registry_, registry_manager_, /*leader*/ nullptr);
+        admin_ = std::make_shared<AdminServiceImpl>(cache_manager_,
+                                                    /*reporter*/ nullptr,
+                                                    metrics_registry_,
+                                                    registry_manager_,
+                                                    /*leader*/ nullptr,
+                                                    /*include_access_log_payload=*/false);
         admin_->EnableLeaderOnlyRequests();
 
         // MARK/BOTH 要求 group 配置 migration strategy。默认启用，让 MARK/BOTH 用例走正常路径；
@@ -139,14 +143,17 @@ public:
     }
 
     // 在 meta 中为 block_key 直接登记一个位于 hot_01 的 SERVING 源 location
-    void SeedServingSource(int64_t block_key) {
-        auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    void SeedServingSource(int64_t block_key, std::optional<std::string> checksum = std::nullopt) {
+        const std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
         auto rc = std::make_shared<RequestContext>("seed");
         std::string uri = "dummy://hot_01/blk_" + StringUtil::Uint64ToHex(block_key) + "?size=16";
-        auto loc = std::make_shared<CacheLocation>(
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+        std::vector<LocationSpec> specs{LocationSpec("tp0", uri)};
+        if (checksum.has_value()) {
+            specs.front().set_checksum(*checksum);
+        }
+        auto loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::move(specs));
         std::vector<std::string> ids;
         ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
         ASSERT_EQ(1u, ids.size());
@@ -158,10 +165,8 @@ public:
 
     // 在 meta 中为 block_key 直接添加一个位于指定 storage 的 CacheLocation。
     // status=CLS_SERVING 时 CAS WRITING->SERVING；status=CLS_WRITING 则保持。
-    void SeedLocationOnStorage(int64_t block_key,
-                               const std::string &storage_name,
-                               CacheLocationStatus status) {
-        auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    void SeedLocationOnStorage(int64_t block_key, const std::string &storage_name, CacheLocationStatus status) {
+        std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
         auto rc = std::make_shared<RequestContext>("seed_dst");
@@ -199,6 +204,37 @@ public:
     std::shared_ptr<AdminServiceImpl> admin_;
     const std::string kInstance = "test_instance";
 };
+
+TEST_F(AdminServiceImplTest, TestGetCacheMetaChecksumIsOptIn) {
+    constexpr int64_t kBlockKey = 901;
+    SeedServingSource(kBlockKey, "0");
+
+    proto::admin::GetCacheMetaRequest request;
+    request.set_trace_id("checksum-opt-in");
+    request.set_instance_id(kInstance);
+    request.add_block_keys(kBlockKey);
+    request.mutable_block_mask()->set_offset(0);
+    request.set_detail_level(1);
+
+    auto call = [&](bool include_checksums) {
+        request.set_include_checksums(include_checksums);
+        proto::admin::GetCacheMetaResponse response;
+        RequestContext request_context(include_checksums ? "checksum-visible" : "checksum-hidden");
+        admin_->GetCacheMeta(&request_context, &request, &response);
+        EXPECT_EQ(proto::admin::OK, response.header().status().code());
+        return response;
+    };
+
+    const auto hidden = call(false);
+    ASSERT_EQ(1, hidden.locations_size());
+    ASSERT_EQ(1, hidden.locations(0).location_specs_size());
+    EXPECT_EQ("", hidden.locations(0).location_specs(0).checksum());
+
+    const auto included = call(true);
+    ASSERT_EQ(1, included.locations_size());
+    ASSERT_EQ(1, included.locations(0).location_specs_size());
+    EXPECT_EQ("0", included.locations(0).location_specs(0).checksum());
+}
 
 TEST_F(AdminServiceImplTest, TestInvalidArgs) {
     auto rc = std::make_shared<RequestContext>("t");
@@ -278,6 +314,9 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopyDeduplicatesBeforeConcurre
 
 TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
     SetDefaultCopyConcurrency(1);
+    auto config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    config->set_migration_async_copy_max_concurrency(17);
+    config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
     SeedServingSource(111);
     SeedServingSource(112);
     SeedServingSource(113);
@@ -345,10 +384,20 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     reclaimer_req.instance_group_name = "default";
     reclaimer_req.instance_id = kInstance;
     reclaimer_req.block_key = 142;
-    reclaimer_req.src_location_id = "reclaimer_src_142";
     reclaimer_req.src_storage_name = "hot_01";
     reclaimer_req.dst_storage_name = "cold_01";
-    reclaimer_req.src_specs = {LocationSpec("tp0", "dummy://hot_01/reclaimer_142?size=16")};
+    // Use the actual sampled location, including its identity snapshot.
+    // Invented IDs/specs are correctly rejected before competing for a slot.
+    MetaSearcher searcher(cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance));
+    RequestContext sample_context("reclaimer_sample");
+    std::vector<CacheLocationMap> sampled;
+    ASSERT_EQ(EC_OK, searcher.BatchGetLocation(&sample_context, {142}, {}, sampled));
+    ASSERT_EQ(1u, sampled.size());
+    ASSERT_EQ(1u, sampled.front().size());
+    const auto &source = *sampled.front().begin()->second;
+    reclaimer_req.src_location_id = source.id();
+    reclaimer_req.src_create_time = source.create_time();
+    reclaimer_req.src_specs = source.location_specs();
 
     std::vector<ErrorCode> reclaimer_results;
     std::atomic<int> ready{0};
@@ -368,9 +417,7 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     std::thread reclaimer_thread([&] {
         wait_for_start();
         reclaimer_results = cache_manager_->migration_manager()->BatchSubmit(
-            "admin_reclaimer_limit_reclaimer",
-            {reclaimer_req},
-            MigrationManager::CopyConcurrencyLimit{"default", 1});
+            "admin_reclaimer_limit_reclaimer", {reclaimer_req}, MigrationManager::CopyConcurrencyLimit{"default", 1});
     });
     while (ready.load(std::memory_order_acquire) != 2) {
         std::this_thread::yield();
@@ -554,7 +601,7 @@ TEST_F(AdminServiceImplTest, TestRuleSampling) {
 }
 
 TEST_F(AdminServiceImplTest, TestRuleSamplingFailureReturnsError) {
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    std::shared_ptr<MetaIndexer> indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
     ASSERT_NE(nullptr, indexer);
     ASSERT_EQ(EC_OK, indexer->backend_manager_->Close());
 

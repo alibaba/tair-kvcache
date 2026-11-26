@@ -14,7 +14,7 @@ void LogEventPublisherConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringB
 }
 
 bool OptimizerEventPublisherConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable", enable_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable", enable_, true);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "queue_size", queue_size_, std::size_t(100000));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "max_subscribers", max_subscribers_, std::size_t(4));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "subscriber_queue_size", subscriber_queue_size_, std::size_t(10000));

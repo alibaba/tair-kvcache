@@ -9,7 +9,6 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/model_deployment.h"
@@ -18,7 +17,9 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/meta/cache_location.h"
+#include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/debug_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 namespace kv_cache_manager {
 
@@ -32,7 +33,9 @@ public:
     static void ModelDeploymentFromProto(const T *proto_model_deployment, ModelDeployment &model_deployment_info);
 
     template <typename T>
-    static void CacheLocationViewToProto(const CacheLocationView &cache_location_info, T *proto_cache_location);
+    static void CacheLocationViewToProto(const CacheLocationView &cache_location_info,
+                                         T *proto_cache_location,
+                                         bool include_checksum);
 
     template <typename T>
     static void BlockMaskToProto(const BlockMask &block_mask_info, T *proto_block_mask);
@@ -44,6 +47,12 @@ public:
     static void DataStorageTypeToProto(const DataStorageType &data_storage_type_info, T *proto_data_storage_type);
     template <typename T>
     static void DataStorageTypeFromProto(const T proto_data_storage_type, DataStorageType &data_storage_type_info);
+    static void CacheLocationStatusToProto(const CacheLocationStatus &status_info,
+                                           proto::debug::CacheLocationStatus *proto_status);
+    static void CacheLocationMetaDetailToProto(const CacheLocationMetaDetail &cache_location_info,
+                                               proto::debug::CacheLocationDetail *proto_cache_location);
+    static void CacheKeyMetaDetailToProto(const CacheKeyMetaDetail &cache_meta_detail,
+                                          proto::debug::CacheMetaDetailItem *proto_cache_meta_detail);
 
     static void StorageConfigToProto(const StorageConfig &storage_config,
                                      proto::admin::StorageConfig *proto_storage_config);
@@ -122,7 +131,8 @@ public:
     // LocationSpec转换函数
     template <typename T>
     static std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> ||
-                            std::is_same_v<T, proto::admin::LocationSpec>>
+                            std::is_same_v<T, proto::admin::LocationSpec> ||
+                            std::is_same_v<T, proto::debug::LocationSpec>>
     LocationSpecToProto(const LocationSpec &location_spec_info, T *proto_location_spec);
     template <typename T>
     static std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> ||
@@ -131,7 +141,8 @@ public:
     // LocationSpecs转换函数
     template <typename T>
     static std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> ||
-                            std::is_same_v<T, proto::admin::LocationSpec>>
+                            std::is_same_v<T, proto::admin::LocationSpec> ||
+                            std::is_same_v<T, proto::debug::LocationSpec>>
     LocationSpecsToProto(const std::vector<LocationSpec> &location_spec_infos,
                          google::protobuf::RepeatedPtrField<T> *proto_location_specs);
     template <typename T>
@@ -200,7 +211,9 @@ void ProtoConvert::ModelDeploymentFromProto(const T *proto_model_deployment, Mod
 }
 // DONE
 template <typename T>
-void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_location_info, T *proto_cache_location) {
+void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_location_info,
+                                            T *proto_cache_location,
+                                            bool include_checksum) {
     static_assert(std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>,
                   "T must be either proto::meta::CacheLocation or proto::admin::CacheLocation");
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
@@ -213,11 +226,16 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         DataStorageTypeToProto(cache_location_info.type(), &type);
         proto_cache_location->set_type(type);
     }
-
     for (const auto &location_spec : cache_location_info.location_specs()) {
         auto *proto_spec = proto_cache_location->add_location_specs();
         proto_spec->set_name(location_spec.name());
         proto_spec->set_uri(location_spec.uri());
+        // Leave checksum scalars at their defaults for legacy/non-opt-in
+        // queries. Return only non-empty checksum values.
+        if (include_checksum && location_spec.has_checksum()) {
+            const auto checksum = location_spec.checksum();
+            proto_spec->set_checksum(checksum.data(), checksum.size());
+        }
     }
 }
 // DONE
@@ -242,8 +260,9 @@ void ProtoConvert::BlockMaskToProto(const BlockMask &block_mask_info, T *proto_b
 // DONE
 template <typename T>
 void ProtoConvert::BlockMaskFromProto(const T *proto_block_mask, BlockMask &block_mask_info) {
-    static_assert(std::is_same_v<T, proto::meta::BlockMask> || std::is_same_v<T, proto::admin::BlockMask>,
-                  "T must be proto::meta::BlockMask or proto::admin::BlockMask");
+    static_assert(std::is_same_v<T, proto::meta::BlockMask> || std::is_same_v<T, proto::admin::BlockMask> ||
+                      std::is_same_v<T, proto::debug::BlockMask>,
+                  "T must be a supported proto BlockMask");
     switch (proto_block_mask->info_case()) {
     case T::InfoCase::kOffset: {
         // 处理offset类型
@@ -271,8 +290,9 @@ void ProtoConvert::BlockMaskFromProto(const T *proto_block_mask, BlockMask &bloc
 // DONE
 template <typename T>
 void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_type_info, T *proto_data_storage_type) {
-    static_assert(std::is_same_v<T, proto::meta::StorageType> || std::is_same_v<T, proto::admin::StorageType>,
-                  "T must be either proto::meta::DataStorage or proto::admin::DataStorage");
+    static_assert(std::is_same_v<T, proto::meta::StorageType> || std::is_same_v<T, proto::admin::StorageType> ||
+                      std::is_same_v<T, proto::debug::StorageType>,
+                  "T must be a supported proto StorageType");
     switch (data_storage_type_info) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS: {
         *proto_data_storage_type = T::ST_3FS;
@@ -376,6 +396,68 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
 }
 
+inline void ProtoConvert::CacheLocationStatusToProto(const CacheLocationStatus &status_info,
+                                                     proto::debug::CacheLocationStatus *proto_status) {
+    switch (status_info) {
+    case CacheLocationStatus::CLS_NEW:
+        *proto_status = proto::debug::CLS_NEW;
+        break;
+    case CacheLocationStatus::CLS_WRITING:
+        *proto_status = proto::debug::CLS_WRITING;
+        break;
+    case CacheLocationStatus::CLS_SERVING:
+        *proto_status = proto::debug::CLS_SERVING;
+        break;
+    case CacheLocationStatus::CLS_DELETING:
+        *proto_status = proto::debug::CLS_DELETING;
+        break;
+    case CacheLocationStatus::CLS_NOT_FOUND:
+    default:
+        *proto_status = proto::debug::CLS_NOT_FOUND;
+        break;
+    }
+}
+
+inline void ProtoConvert::CacheLocationMetaDetailToProto(
+    const CacheLocationMetaDetail &cache_location_info,
+    proto::debug::CacheLocationDetail *proto_cache_location) {
+    proto_cache_location->set_location_id(cache_location_info.location_id);
+    proto::debug::CacheLocationStatus status;
+    CacheLocationStatusToProto(cache_location_info.status, &status);
+    proto_cache_location->set_status(status);
+    proto::debug::StorageType type;
+    DataStorageTypeToProto(cache_location_info.type, &type);
+    proto_cache_location->set_type(type);
+    proto_cache_location->set_spec_size(cache_location_info.spec_size);
+    proto_cache_location->set_create_time(cache_location_info.create_time);
+    LocationSpecsToProto(cache_location_info.location_specs, proto_cache_location->mutable_location_specs());
+}
+
+inline void ProtoConvert::CacheKeyMetaDetailToProto(const CacheKeyMetaDetail &cache_meta_detail,
+                                                    proto::debug::CacheMetaDetailItem *proto_cache_meta_detail) {
+    auto *status = proto_cache_meta_detail->mutable_status();
+    if (cache_meta_detail.error_code == EC_OK) {
+        status->set_code(proto::debug::OK);
+    } else {
+        status->set_code(ToPbError<proto::debug::ErrorCode>(cache_meta_detail.error_code));
+        status->set_message("Raw metadata lookup failed with internal error code: " +
+                            std::to_string(static_cast<int32_t>(cache_meta_detail.error_code)));
+    }
+    proto_cache_meta_detail->set_request_index(static_cast<int32_t>(cache_meta_detail.request_index));
+    proto_cache_meta_detail->set_block_key(cache_meta_detail.block_key);
+    auto prev_key_iter = cache_meta_detail.properties.find(PROPERTY_PREV_BLOCK_KEY);
+    if (prev_key_iter != cache_meta_detail.properties.end()) {
+        proto_cache_meta_detail->set_prev_block_key(prev_key_iter->second);
+    }
+    auto *properties = proto_cache_meta_detail->mutable_properties();
+    for (const auto &[key, value] : cache_meta_detail.properties) {
+        (*properties)[key] = value;
+    }
+    for (const auto &location : cache_meta_detail.locations) {
+        CacheLocationMetaDetailToProto(location, proto_cache_meta_detail->add_locations());
+    }
+}
+
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::InstanceInfo> || std::is_same_v<T, proto::admin::InstanceInfo>>
 ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_instance_info) {
@@ -383,6 +465,7 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
     proto_instance_info->set_instance_group_name(instance_info.instance_group_name());
     proto_instance_info->set_instance_id(instance_info.instance_id());
     proto_instance_info->set_block_size(instance_info.block_size());
+    proto_instance_info->set_disable_write_session(instance_info.disable_write_session());
 
     // 添加location_spec_infos字段
     LocationSpecInfosToProto(instance_info.location_spec_infos(), proto_instance_info->mutable_location_spec_infos());
@@ -426,6 +509,7 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     instance_info.set_location_spec_groups(location_spec_groups);
 
     instance_info.set_default_query_type(static_cast<int32_t>(proto_instance_info->default_query_type()));
+    instance_info.set_disable_write_session(proto_instance_info->disable_write_session());
 }
 
 template <typename T>
@@ -510,19 +594,25 @@ ProtoConvert::LocationSpecGroupsFromProto(const google::protobuf::RepeatedPtrFie
     }
 }
 template <typename T>
-std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
+std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec> ||
+                 std::is_same_v<T, proto::debug::LocationSpec>>
 ProtoConvert::LocationSpecToProto(const LocationSpec &location_spec_info, T *proto_location_spec) {
     proto_location_spec->set_name(location_spec_info.name());
     proto_location_spec->set_uri(location_spec_info.uri());
+    const auto checksum = location_spec_info.checksum();
+    proto_location_spec->set_checksum(checksum.data(), checksum.size());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
 ProtoConvert::LocationSpecFromProto(const T *proto_location_spec, LocationSpec &location_spec_info) {
     location_spec_info.set_name(proto_location_spec->name());
     location_spec_info.set_uri(proto_location_spec->uri());
+    // Empty input normalizes to absent, including when reusing an object.
+    location_spec_info.set_checksum(proto_location_spec->checksum());
 }
 template <typename T>
-std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
+std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec> ||
+                 std::is_same_v<T, proto::debug::LocationSpec>>
 ProtoConvert::LocationSpecsToProto(const std::vector<LocationSpec> &location_spec_infos,
                                    google::protobuf::RepeatedPtrField<T> *proto_location_specs) {
     for (const auto &location_spec_info : location_spec_infos) {

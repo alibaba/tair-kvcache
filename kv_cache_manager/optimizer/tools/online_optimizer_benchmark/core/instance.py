@@ -29,7 +29,7 @@ def setup_instance(client: Any, config: BenchmarkConfig):
             name=config.instance_group,
             capacity_gb=config.capacity_gb_list,
             eviction_policy=config.eviction_policy,
-            ttl_seconds=config.ttl_seconds,
+            ttl_seconds_list=[config.ttl_seconds],
             shared_group_quota=config.shared_group_quota,
             enable_theoretical_max_cache=config.enable_theoretical_max_cache,
         )

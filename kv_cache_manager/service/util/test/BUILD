@@ -14,6 +14,16 @@ cc_binary(
 )
 
 cc_test(
+    name = "ReportEventBodyBudgetTest",
+    srcs = ["report_event_body_budget_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:report_event_body_budget",
+    ],
+)
+
+cc_test(
     name = "AccessLogWriterTest",
     srcs = ["access_log_writer_test.cc"],
     deps = [
@@ -21,6 +31,18 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/service/util:access_log_writer",
         "@rapidjson",
+    ],
+)
+
+cc_test(
+    name = "ManagerMessageProtoUtilTest",
+    srcs = [
+        "manager_message_proto_util_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
     ],
 )
 

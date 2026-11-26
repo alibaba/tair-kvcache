@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -242,6 +243,16 @@ public:                                                                         
     }
 #endif
 
+// Transport status metrics are separate from business response status metrics.
+// One immutable collector is shared by responses with the same server/method/status tags.
+class GrpcMetricsCollector final : public MetricsCollector {
+    KVCM_COUNTER_METRICS(grpc, response_counter)
+
+public:
+    GrpcMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
+    bool Init() override;
+};
+
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 #ifndef KVCM_SERVICE_METRICS_COLLECTOR_PTR
@@ -289,12 +300,7 @@ class ServiceMetricsCollector final : public MetricsCollector {
 
     // meta indexer metrics
     KVCM_GAUGE_METRICS(meta_indexer, query_key_count)
-    KVCM_GAUGE_METRICS(meta_indexer, get_not_exist_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, query_batch_num)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_hit_count)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_miss_count)
-    KVCM_GAUGE_METRICS(meta_indexer, search_cache_hit_ratio)
-    KVCM_GAUGE_METRICS(meta_indexer, io_data_size)
     KVCM_GAUGE_METRICS(meta_indexer, put_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, upsert_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, lock_wait_time_us)
@@ -320,12 +326,17 @@ public:
     ~ServiceMetricsCollector() override = default;
 
     bool Init() override;
+    std::shared_ptr<ServiceMetricsCollector> MakeRequestCollector() const;
+    void PublishQueryKeyCountSample();
+
+private:
+    Gauge registry_query_key_count_metrics_;
 };
 
 // Lightweight per-event observability for ReportEvent. It reuses service.*
 // metrics for request outcome and carries only request_key_count from the
-// manager metric family, rather than registering every manager/meta metric
-// from ServiceMetricsCollector.
+// manager metric family. Block-delete collectors also own the instance-tagged
+// lifetime gauges, without registering every manager/meta metric.
 class EventReportMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(service, query_counter)
     KVCM_GAUGE_METRICS(service, query_rt_us)
@@ -334,6 +345,13 @@ class EventReportMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(manager, request_key_count)
 
 public:
+    // One successful deletion batch, reported once with its owning request.
+    struct LocationLifetimeSample {
+        int64_t min_us = 0;
+        int64_t max_us = 0;
+        int64_t avg_us = 0;
+    };
+
     EventReportMetricsCollector() = delete;
     EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
     EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept;
@@ -364,8 +382,27 @@ public:
     [[nodiscard]] double GetRequestKeyCountSample() const noexcept {
         return has_request_key_count_sample_ ? request_key_count_sample_ : get_manager_request_key_count_metrics();
     }
+    void SetLocationLifetimeSample(const LocationLifetimeSample &sample) noexcept {
+        if (!location_lifetime_metrics_tags_.empty()) {
+            location_lifetime_sample_ = sample;
+        }
+    }
+    [[nodiscard]] const std::optional<LocationLifetimeSample> &GetLocationLifetimeSample() const noexcept {
+        return location_lifetime_sample_;
+    }
+    [[nodiscard]] const MetricsTags &GetLocationLifetimeMetricsTags() const noexcept {
+        return location_lifetime_metrics_tags_;
+    }
+    // Write only the handles bound during Init, so a late request cannot
+    // recreate a series removed from the registry.
+    void UpdateLocationLifetimeMetrics();
 
 private:
+    MetricsTags location_lifetime_metrics_tags_;
+    Gauge location_lifetime_min_us_metrics_;
+    Gauge location_lifetime_max_us_metrics_;
+    Gauge location_lifetime_avg_us_metrics_;
+    std::optional<LocationLifetimeSample> location_lifetime_sample_;
     double request_rt_us_sample_ = 0.0;
     double error_code_sample_ = 0.0;
     double request_key_count_sample_ = 0.0;
@@ -426,6 +463,7 @@ class DataStorageIntervalMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(data_storage, healthy_status)
     KVCM_GAUGE_METRICS(data_storage, writable_status)
     KVCM_GAUGE_METRICS(data_storage, storage_usage_ratio)
+    KVCM_GAUGE_METRICS(data_storage, total_capacity_bytes)
 
 public:
     DataStorageIntervalMetricsCollector() = delete;
@@ -435,6 +473,8 @@ public:
     ~DataStorageIntervalMetricsCollector() override = default;
 
     bool Init() override;
+    // Followers retain health/writability without registering a capacity series.
+    bool Init(bool report_storage_usage);
 };
 
 /* ------------ MetaIndexerAccumulativeMetricsCollector ------------- */
@@ -446,6 +486,7 @@ public:
 
 class MetaIndexerAccumulativeMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, total_key_count)
+    KVCM_GAUGE_METRICS(meta_indexer, total_location_count)
     KVCM_GAUGE_METRICS(meta_indexer, total_cache_usage)
 
 public:
@@ -492,7 +533,9 @@ public:
 
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, location_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
+    KVCM_GAUGE_METRICS(cache_manager_instance, meta_cache_usage)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_max_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_avg_size)
@@ -501,6 +544,10 @@ class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, async_pipeline_error_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_metadata_count)
+
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_min_us)
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_max_us)
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_avg_us)
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;

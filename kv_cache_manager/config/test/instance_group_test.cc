@@ -5,6 +5,7 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
+#include "kv_cache_manager/service/util/proto_message_json_util.h"
 
 namespace kv_cache_manager {
 
@@ -13,6 +14,41 @@ public:
     void SetUp() override {}
     void TearDown() override {}
 };
+
+TEST_F(InstanceGroupTest, DynamicQuotaProtoAndPersistenceRoundTrip) {
+    proto::admin::InstanceGroup wire;
+    InstanceGroup defaults;
+    ProtoConvert::InstanceGroupFromProto(&wire, defaults);
+    EXPECT_EQ(0, defaults.quota().capacity());
+    EXPECT_TRUE(defaults.quota().quota_config().empty());
+    wire.mutable_quota()->set_capacity(0);
+    InstanceGroup zero;
+    ProtoConvert::InstanceGroupFromProto(&wire, zero);
+    EXPECT_EQ(0, zero.quota().capacity());
+    wire.mutable_quota()->set_capacity(-1);
+    auto *config = wire.mutable_quota()->add_quota_config();
+    config->set_storage_type(proto::admin::ST_TAIRMEMPOOL);
+    config->set_mode("auto");
+    config->set_ratio(0.5);
+    InstanceGroup group;
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    InstanceGroupQuota restored;
+    ASSERT_TRUE(restored.FromJsonString(group.quota().ToJsonString()));
+    group.set_quota(restored);
+    proto::admin::InstanceGroup result;
+    ProtoConvert::InstanceGroupToProto(group, &result);
+    EXPECT_EQ(-1, result.quota().capacity());
+    ASSERT_EQ(1, result.quota().quota_config_size());
+    EXPECT_EQ("auto", result.quota().quota_config(0).mode());
+    EXPECT_DOUBLE_EQ(0.5, result.quota().quota_config(0).ratio());
+    config->clear_ratio();
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    EXPECT_DOUBLE_EQ(0.0, group.quota().quota_config().front().ratio());
+    config->set_ratio(0);
+    ProtoConvert::InstanceGroupFromProto(&wire, group);
+    std::string invalid;
+    EXPECT_FALSE(group.quota().ValidateRequiredFields(invalid));
+}
 
 // --- InstanceGroup set_revisit_interval_buckets ---
 
@@ -193,6 +229,54 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, ProtoRoundTripPreservesAsyncCopyHttpTimeouts) {
+    InstanceGroup original;
+    original.set_name("test_group");
+    original.set_storage_candidates({"local"});
+    original.set_global_quota_group_name("default");
+    original.set_max_instance_count(10);
+    original.set_version(1);
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    cache_config->set_reclaim_strategy(std::make_shared<CacheReclaimStrategy>());
+    cache_config->set_migration_copy_connect_timeout_ms(750);
+    cache_config->set_migration_copy_submit_timeout_ms(2500);
+    cache_config->set_migration_copy_query_timeout_ms(2800);
+    original.set_cache_config(cache_config);
+
+    proto::admin::InstanceGroup proto_msg;
+    ProtoConvert::InstanceGroupToProto(original, &proto_msg);
+    ASSERT_TRUE(proto_msg.has_cache_config());
+    ASSERT_TRUE(proto_msg.cache_config().has_migration_config());
+    const auto &migration_config = proto_msg.cache_config().migration_config();
+    ASSERT_TRUE(migration_config.has_copy_connect_timeout_ms());
+    ASSERT_TRUE(migration_config.has_copy_submit_timeout_ms());
+    ASSERT_TRUE(migration_config.has_copy_query_timeout_ms());
+    EXPECT_EQ(750, migration_config.copy_connect_timeout_ms().value());
+    EXPECT_EQ(2500, migration_config.copy_submit_timeout_ms().value());
+    EXPECT_EQ(2800, migration_config.copy_query_timeout_ms().value());
+
+    InstanceGroup restored;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored);
+    ASSERT_NE(nullptr, restored.cache_config());
+    EXPECT_EQ(750, restored.cache_config()->migration_copy_connect_timeout_ms());
+    EXPECT_EQ(2500, restored.cache_config()->migration_copy_submit_timeout_ms());
+    EXPECT_EQ(2800, restored.cache_config()->migration_copy_query_timeout_ms());
+
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_connect_timeout_ms();
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_submit_timeout_ms();
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_query_timeout_ms();
+    InstanceGroup restored_legacy;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored_legacy);
+    ASSERT_NE(nullptr, restored_legacy.cache_config());
+    EXPECT_EQ(MigrationConfig::kDefaultCopyConnectTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_connect_timeout_ms());
+    EXPECT_EQ(MigrationConfig::kDefaultCopySubmitTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_submit_timeout_ms());
+    EXPECT_EQ(MigrationConfig::kDefaultCopyQueryTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_query_timeout_ms());
+}
+
 TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings) {
     proto::admin::StorageConfig legacy_proto_config;
     legacy_proto_config.set_global_unique_name("legacy_event_report");
@@ -318,6 +402,54 @@ TEST_F(InstanceGroupTest, TairMempoolGcDeletePolicySurvivesProtoAndRegistryRound
             EXPECT_EQ(skip, restored_spec->skip_confirmed_missing_backend_delete());
         }
     }
+}
+
+TEST_F(InstanceGroupTest, LegacySearchCacheValuesSurviveProtoAndRegistryRoundTrip) {
+    proto::admin::CacheConfig request;
+    request.mutable_meta_indexer_config()->mutable_meta_storage_backend_config()->set_storage_type("local");
+    request.mutable_meta_indexer_config()->set_mutex_shard_num(MetaIndexerConfig::kDefaultMutexShardNum);
+    CacheConfig model;
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    proto::admin::CacheConfig response;
+    ProtoConvert::CacheConfigToProto(model, &response);
+    ASSERT_TRUE(response.meta_indexer_config().has_meta_cache_policy_config());
+    EXPECT_EQ("LRU", response.meta_indexer_config().meta_cache_policy_config().type());
+    EXPECT_EQ(0u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(6, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
+    std::string json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&response, json));
+    rapidjson::Document wire;
+    wire.Parse(json.c_str());
+    ASSERT_FALSE(wire.HasParseError());
+    const rapidjson::Value &legacy = wire["meta_indexer_config"]["meta_cache_policy_config"];
+    ASSERT_TRUE(legacy.HasMember("type"));
+    EXPECT_STREQ("LRU", legacy["type"].GetString());
+    EXPECT_TRUE(legacy.HasMember("capacity"));
+    EXPECT_TRUE(legacy.HasMember("cache_shard_bits"));
+    EXPECT_TRUE(legacy.HasMember("high_pri_pool_ratio"));
+
+    proto::admin::MetaCachePolicyConfig *policy =
+        request.mutable_meta_indexer_config()->mutable_meta_cache_policy_config();
+    policy->set_type("LRU");
+    policy->set_capacity(3072);
+    policy->set_cache_shard_bits(9);
+    policy->set_high_pri_pool_ratio(0.25);
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    CacheConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(model.ToJsonString()));
+    ProtoConvert::CacheConfigToProto(restored, &response);
+    ASSERT_TRUE(response.meta_indexer_config().has_meta_cache_policy_config());
+    EXPECT_EQ(3072u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(9, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
+    EXPECT_EQ("LRU", response.meta_indexer_config().meta_cache_policy_config().type());
+    EXPECT_DOUBLE_EQ(0.0, response.meta_indexer_config().meta_cache_policy_config().high_pri_pool_ratio());
+
+    policy->set_capacity(0);
+    policy->set_cache_shard_bits(0);
+    ProtoConvert::CacheConfigFromProto(&request, model);
+    ProtoConvert::CacheConfigToProto(model, &response);
+    EXPECT_EQ(0u, response.meta_indexer_config().meta_cache_policy_config().capacity());
+    EXPECT_EQ(0, response.meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
 }
 
 TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPerInstance) {
@@ -449,5 +581,49 @@ TEST_F(InstanceGroupTest, TairMempoolHealthTimeoutProtoDefaultsAndRoundTrip) {
     ProtoConvert::StorageFromProto(&config, restored);
     EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
     EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
+}
+
+TEST_F(InstanceGroupTest, TairMempoolAllocateConcurrencyProtoDefaultsAndRoundTrip) {
+    for (auto storage_type : {proto::admin::ST_TAIRMEMPOOL, proto::admin::ST_TAIRMEMPOOL_SSD}) {
+        proto::admin::StorageConfig config;
+        config.set_global_unique_name("pace_allocation");
+        config.set_storage_type(storage_type);
+        auto *proto_spec = config.mutable_tair_mem_pool();
+        proto_spec->set_domain("pace.meta");
+        proto_spec->set_timeout(5);
+        proto_spec->set_media_type(storage_type == proto::admin::ST_TAIRMEMPOOL_SSD ? 5 : 2);
+
+        StorageConfig default_config;
+        ProtoConvert::StorageFromProto(&config, default_config);
+        const auto default_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(default_config.storage_spec());
+        ASSERT_NE(nullptr, default_spec);
+        EXPECT_EQ(0, default_spec->allocate_concurrency());
+
+        // A proto3 implicit or explicit zero stays automatic through the round trip.
+        for (int32_t concurrency : {0, 1, 8, 64}) {
+            proto_spec->set_allocate_concurrency(concurrency);
+            StorageConfig restored;
+            ProtoConvert::StorageFromProto(&config, restored);
+            const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+            ASSERT_NE(nullptr, spec);
+            EXPECT_EQ(concurrency, spec->allocate_concurrency());
+            std::string invalid_fields;
+            EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+            proto::admin::StorageConfig round_trip;
+            ProtoConvert::StorageConfigToProto(restored, &round_trip);
+            EXPECT_EQ(storage_type, round_trip.storage_type());
+            EXPECT_EQ(concurrency, round_trip.tair_mem_pool().allocate_concurrency());
+        }
+
+        for (int32_t concurrency : {-1, 65}) {
+            proto_spec->set_allocate_concurrency(concurrency);
+            StorageConfig restored;
+            ProtoConvert::StorageFromProto(&config, restored);
+            std::string invalid_fields;
+            EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
+            EXPECT_NE(std::string::npos, invalid_fields.find("allocate_concurrency"));
+        }
+    }
 }
 } // namespace kv_cache_manager

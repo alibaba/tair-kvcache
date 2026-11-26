@@ -902,6 +902,14 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
         return actions;
     }
 
+    // Apply the startup recovery gate only to EventReport candidates. Keep
+    // ordinary GC and the selection of periodic versus legacy cleanup intact.
+    const auto indexer = config_.event_report_cleanup_enabled && meta_indexer_manager_
+                             ? meta_indexer_manager_->GetMetaIndexer(instance_id)
+                             : nullptr;
+    const bool event_report_cleanup_enabled =
+        indexer && (config_.event_report_cleanup_during_recover_enabled || !indexer->IsRecovering());
+
     std::map<CandidateKey, DeleteCandidate> candidates;
     std::vector<ServingProbe> serving_probes;
     std::map<StorageProbeKey, StorageProbeBatch> storage_probe_batches;
@@ -943,7 +951,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             }
 
             if (IsEventReportStorageType(storage_type)) {
-                if (!config_.event_report_cleanup_enabled) {
+                if (!event_report_cleanup_enabled) {
                     continue;
                 }
                 auto &probe_batch = event_report_probe_batches[storage_type];

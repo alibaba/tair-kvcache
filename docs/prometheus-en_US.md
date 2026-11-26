@@ -3,6 +3,10 @@
 KVCacheManager exposes a Prometheus-compatible metrics scrape endpoint
 at `GET /metrics` on the Admin HTTP service port (default 6492).
 
+Per storage backend, `data_storage.total_capacity_bytes` reports logical capacity in bytes (−1 before the first valid sample). For each group and storage type, `cache_manager_group_storage.usage_bytes`, `effective_quota` and `usage_ratio` expose usage, the current budget and their ratio. Automatic quotas also report `refresh_success` and `last_success_time_s`. With an unlimited group byte budget the group usage ratio uses the sum of effective type quotas.
+
+Group and per-type quota usage ratios report `0` when the denominator is zero or unknown, even if usage is positive. The per-type `effective_quota` and the `reference_capacity` of an unlimited group distinguish the two cases. A value of `0` means zero capacity and `-1` means unknown capacity.
+
 ## Quick Start
 
 With default settings, the endpoint is enabled automatically. Point
@@ -23,9 +27,6 @@ Then query metrics with PromQL:
 ```promql
 # Service QPS (rate over 1 minute)
 rate(kvcm_service_query_counter[1m])
-
-# Search cache hit ratio
-kvcm_meta_indexer_search_cache_hit_ratio
 
 # GetCacheLocation block-level hit rate (5-minute window)
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
@@ -176,7 +177,8 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `service.query_counter` | counter | Total query count |
 | `service.error_counter` | counter | Total error count |
 | `service.query_rt_us` | gauge | Last query response time (us) |
-| `service.request_queue_size` | gauge | Request queue size |
+| `service.request_queue_size` | gauge | Reserved; queue depth is not currently collected |
+| `grpc.response_counter` | counter | Total gRPC responses, labeled by `server` (`meta`/`admin`), `method` (`Service/Method`), and `grpc_code` (standard status name); counted once per RPC |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
@@ -186,22 +188,93 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.get_io_time_us` | gauge | Wall-time union of metadata-backend call intervals; local mode includes LRU/locks/copies, excludes parallel projection, and does not imply Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | Wall-time union of GetHostCacheState visibility and host/spec projection callback intervals (us) |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
-| `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
+
+`grpc.response_counter` counts the final gRPC status the server prepares to send, including framework
+`RESOURCE_EXHAUSTED` rejections when the thread quota is exhausted; this status can also indicate other
+resource limits. When the main and Admin services share a gRPC port, both use `server=meta`. Business
+errors in response bodies remain in `service.error_counter`.
+`method` omits the protobuf package prefix, e.g. `MetaService/GetCacheLocation`; methods absent from the protobuf descriptors use `unknown`.
 
 ### Interval Metrics
 
+The Meta request pool exports queue capacity, current depth, window maximum and time-weighted average depth,
+running requests, queue wait MAX/AVG and execution time MAX/AVG (microseconds). Names are
+`service.request_queue_capacity`, `service.request_queue_length`, `service.request_queue_length_max/avg`,
+`service.request_running`, `service.request_wait_time_us_max/avg`, and `service.request_execution_time_us_max/avg`.
+`service.request_completed`, `service.request_rejected`, and `service.request_discarded` are cumulative counters;
+`service.request_queue_wait_seconds` is a cumulative histogram. Empty timing windows report zero.
+See [dispatch metric semantics](design/service_request_dispatch.md). Prometheus replaces dots with underscores
+and adds the configured prefix.
+
 | Metric | Type | Description |
 |---|---|---|
+| `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
+| `role_state` | gauge | Current leader lifecycle phase, exported as `kvcm_role_state{state="..."}`. The sampled phase is 1 and the other three are 0 |
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
-| `meta_indexer.total_cache_usage` | gauge | Total cache usage bytes |
+| `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
-| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
+| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. A value of 1 means full. TairMempool reports its cached ratio, using -1 before the first sample or when a sample cannot yield a ratio. A failed Meta request preserves the previous reading. Negative readings from backends without capacity support are skipped. Followers remove this metric on the next reporting interval after demotion. Health and writability are reported independently |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
+| `cache_manager_instance.meta_cache_usage` | gauge | Estimated per-instance local metadata memory (LRU charge, bytes), labeled by `instance_group` and `instance_id` |
+
+`cache_manager_instance.meta_cache_usage` reuses `MetaIndexer::GetMemUsage()` and is sampled by the existing
+recorder approximately every 5 seconds. Its Prometheus name is `kvcm_cache_manager_instance_meta_cache_usage`.
+Local mode reports the instance's LRU charge, cached mode reports the local portion, and Redis-only mode reports 0.
+It uses the same accounting as `meta_indexer.total_cache_usage`, but sampling times differ, so concurrent writes
+can prevent an exact instantaneous sum. Charge is not RSS or actual container memory and does not fully account
+for fixed lock arrays, allocator overhead, and similar costs. `byte_size` measures KVCache data quota usage.
+
+`is_leader` is a node-level metric without storage labels. It reports ownership
+of the leader lease (1/0), including promotion/recovery, and does not imply that
+business APIs are ready. Reporting only observes role state and does not alter
+request admission. Offline tools without a leader-state provider do not export it.
+
+`role_state` observes `LeaderElector::GetRoleState()` on a separate lightweight thread at
+`kvcm.metrics.report_interval_ms` (20 seconds by default). It performs no network I/O and
+holds no business/lifecycle lock, so a blocked recovery, cleanup or ordinary metrics report
+cannot prevent phase sampling. All four fixed series are refreshed each interval; old
+phases are reset to 0. A phase shorter than the reporting/scraping interval may not be observed.
+This is sampled state, not a transition-event history. `is_leader` keeps its existing reporting
+path; the two metrics are independent observations, not a transactional readiness snapshot.
+`role_state` also works with the dummy reporter because it is published directly into the registry.
+
+Example during promotion:
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+To detect a prolonged transition, use this alert expression with a `for` duration such as
+`5m`, adjusted to the expected recovery/cleanup time:
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+To select nodes reporting both lease ownership and the stable leader phase:
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+This combination does not guarantee request readiness, complete instance recovery or healthy
+dependencies. The metric only exposes the existing state machine; it changes neither admission
+nor election/recovery behavior.
+
+For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
+
+Storage unload removes all metric series tagged with its unique name, including health, writability and capacity. Local sampling checks backend identity before publishing so unloaded backends cannot re-register old series. Unloaded backends are removed from the local registry rather than reporting artificial zero values. While a follower still has loaded backends, health and writability remain actual observations and capacity is omitted.
+
+Known KMonitor limitation: demotion, unload or same-name replacement between Local sampling and KMonitor submission may still allow the current round to push old samples, including capacity. The next Local interval refreshes collectors and capacity eligibility. Stopping pushes does not retract data already sent; downstream expiry and alert windows determine how long old values can affect alerts.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
@@ -228,6 +301,7 @@ reducer. Use `rate(<counter>[Xm])` in PromQL instead.
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `grpc.response_qps` | `rate(kvcm_grpc_response_counter[1m])`, preserving `server`, `method`, and `grpc_code` labels |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
 | `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
 
@@ -263,3 +337,71 @@ Prometheus  --GET /metrics-->  AdminServiceHttp
 The endpoint is orthogonal to the `MetricsReporter` pipeline. Any
 reporter type (`kmonitor`, `local`, `logging`, `dummy`) populates
 the same `MetricsRegistry`, and the Prometheus endpoint reads from it.
+
+### Active metadata Redis health checks
+
+Both active Redis probes are enabled by default (`kvcm.metrics.redis_health_probe_enabled=true`). To disable them, set `kvcm.metrics.redis_health_probe_enabled=false` in the startup configuration and restart. When disabled, neither probe object nor thread is created, and neither Redis health metric is published. Existing business/election connections and ordinary metric reporting are unaffected.
+
+
+`kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` reports the latest metadata Redis probe:
+`1` means connection, required authentication, PING and configured database selection succeeded;
+`0` means any step failed or timed out. It covers `redis`, `async_redis`, and the Redis persistent layer
+of `cached` (including memory-primary async backups). Loaded Redis groups are probed even without
+business requests or registered instances.
+
+A dedicated thread and connection probe every `kvcm.metrics.report_interval_ms` (20 seconds by default,
+plus probe duration). Connect and each socket operation have a 1-second timeout, without retries or data writes.
+Groups sharing the same URI share a probe per cycle. Probing does not block `/metrics`, capacity collection,
+or use the business connection pool. Targets are checked sequentially, so failures can lengthen a cycle.
+Labels are `instance_group`, `host` and `port`, using the configured Redis endpoint without resolving
+hostnames to IP addresses. Full URIs, credentials and query parameters are not exposed.
+Targets include both loaded group configurations and the immutable configuration of existing
+instances. Updating a group does not reconnect existing instances, so both old and new endpoints
+remain monitored while needed. When a group/host/port has multiple live database or authentication
+settings, its gauge is 1 only if all of them pass. Unused old endpoint series are removed.
+
+Only the leader publishes probes for loaded groups. No series is published before the first probe, for
+groups with no configured or runtime Redis dependency, or on followers. Removing the last dependency
+or demotion removes its series at the next probe-thread check. Busy registry, indexer or lifecycle
+locks skip collection/publication without waiting or inventing a failure. Network I/O holds none
+of those locks. Shutdown cancels further probes and stops serving/releases leadership before
+joining the outstanding probe thread. Absence does not imply health. This metric does not change request admission or verify business read/write permissions,
+capacity, data integrity or all Redis shards, or cover
+Registry / Coordination Redis.
+
+Example alert (for expected leader series; alert on absence separately):
+
+```promql
+kvcm_meta_storage_redis_healthy_status == 0
+```
+
+### Coordination Redis health checks
+
+`kvcm_coordination_redis_healthy_status{host="redis.example",port="6379"}` reports this node's
+latest independent probe of `kvcm.coordination.uri`: `1` for successful connection, required
+authentication, PING and configured database selection; `0` for failure or timeout.
+The legacy `kvcm.distributed_lock.uri` option follows the existing configuration rules.
+Labels expose only the configured host and port, never credentials, database or full URIs.
+
+All four phases (follower, promoting, leader, demoting) publish this metric regardless of lease ownership.
+It reuses the metadata Redis read-only probe on a separate thread and connection. It does not use
+election/business connection pools, acquire business/lifecycle locks, write keys, or invoke lock
+acquisition, renewal or release. A blocked metadata probe cannot block this probe. Election, request
+admission, failure handling and existing metric names/labels are unchanged.
+
+After each probe, the thread waits `max(kvcm.metrics.report_interval_ms, 1000)` milliseconds
+(default 20 seconds). Each cycle opens one connection, sends PING, and optionally AUTH, another PING
+and SELECT, without retries. Connect and each socket operation have a 1-second timeout; DNS resolution
+uses the system resolver and is not bounded by this timeout. This is not a total probe deadline.
+The cost is one extra thread and one short connection per cycle per Redis-coordinated node.
+Non-Redis coordination backends create no probe thread. Shutdown cancels further probes before
+the existing stop/lease-release flow, and joins the outstanding probe afterward.
+
+There is no series before the first result or for memory/file/default coordination backends.
+If coordination initialization prevents HTTP startup, the process cannot expose this metric either.
+Absence does not mean healthy; monitor process/scrape absence separately. A value of 1 does not verify
+Lua/write permissions, lease ownership or service readiness; monitor election state and readiness separately. Unlike metadata Redis health, do not restrict this alert to leaders:
+
+```promql
+kvcm_coordination_redis_healthy_status == 0
+```

@@ -22,7 +22,14 @@ bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "consumer_id", consumer_id_, std::string("online-optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
+    capacity_gb_.clear();
+    ttl_seconds_list_.clear();
     KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mock_cache_layout", mock_cache_layout_, true);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "ttl_seconds_list",
+                                ttl_seconds_list_,
+                                mock_cache_layout_ ? std::vector<int64_t>{} : std::vector<int64_t>{86400});
     return Validate();
 }
 
@@ -31,11 +38,22 @@ void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
     Put(writer, "capacity_gb", capacity_gb_);
+    Put(writer, "mock_cache_layout", mock_cache_layout_);
+    Put(writer, "ttl_seconds_list", ttl_seconds_list_);
 }
 
 bool KvcmEventSubscriptionConfig::Validate() const {
     if (service_discovery_url_.empty() || consumer_id_.empty() || discovery_refresh_interval_ms_ <= 0) {
         return false;
+    }
+    if (ttl_seconds_list_.empty()) {
+        return false;
+    }
+    std::unordered_set<int64_t> ttls;
+    for (auto ttl : ttl_seconds_list_) {
+        if (ttl < 0 || ttl > std::numeric_limits<int64_t>::max() / 1000000000LL || !ttls.insert(ttl).second) {
+            return false;
+        }
     }
     return std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
         return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;

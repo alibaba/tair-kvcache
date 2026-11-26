@@ -5,11 +5,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -30,6 +32,7 @@ namespace kv_cache_manager {
 class RegistryManager;
 class MetaSearcherManager;
 class MetaIndexerManager;
+class MetaIndexer;
 class MetricsRegistry;
 class CacheReclaimer;
 class SchedulePlanExecutor;
@@ -86,6 +89,12 @@ public:
         int64_t global;
     };
 
+    struct StorageReplicaRequirement {
+        DataStorageType storage_type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
+        int32_t min_location_count{0};
+        std::vector<DataStorageType> excluded_storage_types{};
+    };
+
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                  std::shared_ptr<RegistryManager> registry_manager,
                  std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
@@ -112,10 +121,10 @@ public:
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
     [[nodiscard]] std::shared_ptr<MetricsLifecycle> metrics_lifecycle() const { return metrics_lifecycle_; }
 
-    // register a callback invoked after an instance is fully removed;
-    // must be set before serving traffic (not thread-safe for writes)
-    // the callback runs on the RemoveInstance call stack — callees
-    // must not re-enter CacheManager methods
+    // register a callback to invalidate cached per-instance metric collectors;
+    // invoked during RemoveInstance and leader cleanup under the lifecycle lock.
+    // must be set before serving traffic (not thread-safe for writes);
+    // callees must not re-enter CacheManager methods.
     using OnInstanceRemovedFn = std::function<void(const std::string &instance_id)>;
     void SetOnInstanceRemoved(OnInstanceRemovedFn fn) { on_instance_removed_ = std::move(fn); }
 
@@ -128,7 +137,8 @@ public:
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
                                                        const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED);
+                                                       QueryType default_query_type,
+                                                       std::optional<bool> disable_write_session);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -142,6 +152,13 @@ public:
                                                            const TokenIdsVector &tokens,
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
+
+    std::pair<ErrorCode, CacheMetaDetailVec> GetCacheMetaDetail(RequestContext *request_context,
+                                                                const std::string &instance_id,
+                                                                const KeyVector &keys,
+                                                                const TokenIdsVector &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t detail_level /*reserved*/);
 
     std::pair<ErrorCode, CacheLocationViewVecWrapper>
     GetCacheLocation(RequestContext *request_context,
@@ -179,19 +196,46 @@ public:
                                                       const TokenIdsVector &tokens,
                                                       int32_t sw_size);
 
-    std::pair<ErrorCode, StartWriteCacheInfo> StartWriteCache(RequestContext *request_context,
-                                                              const std::string &instance_id,
-                                                              const KeyVector &keys,
-                                                              const TokenIdsVector &tokens,
-                                                              const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds,
-                                                              int32_t min_replica_count = 1);
-    ErrorCode
-    FinishWriteCache(RequestContext *request_context,
-                     const std::string &instance_id,
-                     const std::string &write_session_id,
-                     const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+    std::pair<ErrorCode, StartWriteCacheInfo>
+    StartWriteCache(RequestContext *request_context,
+                    const std::string &instance_id,
+                    const KeyVector &keys,
+                    const TokenIdsVector &tokens,
+                    const std::vector<std::string> &location_spec_group_names,
+                    int64_t write_timeout_seconds,
+                    int32_t min_replica_count = 0,
+                    std::optional<StorageReplicaRequirement> storage_replica_requirement = std::nullopt);
+    struct FinishWriteCacheOptions {
+        std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
+        struct ChecksumBatch {
+            std::string location_spec_name;
+            std::vector<std::string> checksums;
+        };
+        // Each batch is parallel to the compact keys captured by StartWrite.
+        // An empty batch list or individual checksum means no checksum update.
+        // Failed positions and positions whose location
+        // omits that spec are ignored.
+        std::vector<ChecksumBatch> checksum_batches;
+
+        static FinishWriteCacheOptions
+        WithWriteLocationInfo(std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+            FinishWriteCacheOptions options;
+            options.write_location_info_internal = std::move(write_location_info_internal);
+            return options;
+        }
+
+        static FinishWriteCacheOptions WithChecksumBatches(std::vector<ChecksumBatch> checksum_batches) {
+            FinishWriteCacheOptions options;
+            options.checksum_batches = std::move(checksum_batches);
+            return options;
+        }
+    };
+
+    ErrorCode FinishWriteCache(RequestContext *request_context,
+                               const std::string &instance_id,
+                               const std::string &write_session_id,
+                               const BlockMask &success_block_mask,
+                               FinishWriteCacheOptions options = FinishWriteCacheOptions{});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,
@@ -251,6 +295,7 @@ public:
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
+
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
 
@@ -259,6 +304,17 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    class ReportEventProcessor;
+    static ErrorCode ValidateReportEventRequest(const std::string &trace_id,
+                                                const proto::meta::ReportEventRequest &request,
+                                                proto::meta::Status &response_status,
+                                                DataStorageType &requested_type);
+
+    ErrorCode TrimCacheWithIndexer(RequestContext *request_context,
+                                   const std::string &instance_id,
+                                   const std::shared_ptr<MetaIndexer> &meta_indexer,
+                                   bool detached_indexer) const noexcept;
+
     struct EventCleanupCallbackState {
         std::shared_mutex mutex;
         bool accepting = true;
@@ -277,7 +333,9 @@ private:
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask,
                                int32_t min_replica_count,
-                               std::vector<std::string> &new_keys_tiered_targets);
+                               std::vector<std::string> &new_keys_tiered_targets,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -287,13 +345,17 @@ private:
                                              std::vector<std::string_view> &new_location_spec_group_names,
                                              BlockMask &block_mask,
                                              int32_t min_replica_count,
-                                             std::vector<std::string> &new_keys_tiered_targets);
+                                             std::vector<std::string> &new_keys_tiered_targets,
+                                             std::optional<DataStorageType> target_storage_type = std::nullopt,
+                                             const std::vector<DataStorageType> &excluded_storage_types = {});
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
-                               CacheLocationVector &new_locations);
+                               CacheLocationVector &new_locations,
+                               std::optional<DataStorageType> target_storage_type = std::nullopt,
+                               const std::vector<DataStorageType> &excluded_storage_types = {});
     // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
     // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
     // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。
@@ -337,18 +399,18 @@ private:
                            bool &is_create_success);
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
-    std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
-                                                                      const std::string &instance_id,
-                                                                      const KeyVector &keys,
-                                                                      const TokenIdsVector &tokens) const;
+    std::pair<ErrorCode, std::shared_ptr<MetaSearcher>>
+    CheckInputAndGetMetaSearcher(RequestContext *request_context,
+                                 const std::string &instance_id,
+                                 const KeyVector &keys,
+                                 const TokenIdsVector &tokens) const;
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     ErrorCode CheckLocationSpecGroupNames(RequestContext *request_context,
                                           const std::string &instance_id,
                                           size_t key_count,
                                           const std::vector<std::string> &location_spec_group_names);
-    static void FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
-                                       CacheLocationVector &locations);
+    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info, CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
     void CleanupHostLocations(const std::string &instance_id,
@@ -385,8 +447,11 @@ private:
                                                                   const std::string &instance_id,
                                                                   bool allow_unavailable_storages = false) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
-    MetaSearcher::CheckHostCacheLocationFunc
-    GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
+    struct HostCacheQueryCallbacks {
+        MetaSearcher::CheckHostCacheLocationFunc check_location;
+        MetaSearcher::ListHostCacheCandidateHostsFunc list_candidate_hosts;
+    };
+    HostCacheQueryCallbacks GetHostCacheStateQueryCallbacks(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
     void DeactivateEventCleanupCallbacks();
@@ -413,7 +478,7 @@ private:
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
     std::shared_ptr<DataStorageSelector> data_storage_selector_;
-    // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
+    // Shared registry for periodic instance metrics and per-request event samples.
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;
@@ -429,6 +494,14 @@ private:
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态
     std::shared_ptr<EventManager> event_manager_;
+    bool EnqueueOptimizerEvent(const std::string &trace_id,
+                               const std::string &instance_id,
+                               int32_t block_size,
+                               const KeyVector &keys,
+                               int64_t input_token_len,
+                               int64_t timestamp_ns,
+                               const std::vector<std::string> &location_spec_names);
+
     // 无需清理
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
     // EventReportBackend owns a callback that cannot retain CacheManager.
@@ -440,6 +513,8 @@ private:
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理
     OnInstanceRemovedFn on_instance_removed_;
+    // 无需清理 - serialize recovery and cleanup; stop retry before locking.
+    std::mutex recover_run_mutex_;
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};

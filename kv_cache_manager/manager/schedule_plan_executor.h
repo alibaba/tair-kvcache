@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -35,6 +36,7 @@ private:                                                                        
 #endif
 
 class MetaIndexerManager;
+class MetaIndexer;
 class DataStorageManager;
 
 struct CacheMetaDelRequest {
@@ -49,6 +51,10 @@ struct PlanExecuteResult {
     // True only when every failure in this result has already been logged.
     // Callers can retain result metrics without repeating the diagnostics.
     bool error_logged{false};
+    // Sync operations use the safe defaults below.  Native async Copy overrides
+    // them from the backend result.  ErrorCode never authorizes target reuse.
+    bool terminal{true};
+    bool safe_to_reuse_dst{true};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -67,8 +73,9 @@ struct CacheLocationDelRequest {
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
-    // GC physical deletion revalidates against the persistent source of truth
-    // and refreshes candidate keys into the hot cache before CAS.
+    // GC prefilters candidates against the configured primary outside the
+    // shard lock. Cached CAS then validates hot, filling only missing
+    // Recover keys; it never overwrites an existing hot key.
     bool authoritative_read{false};
     // URIs that the submitter has already confirmed absent. Each Backend's
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
@@ -107,6 +114,11 @@ struct CacheLocationCopyRequest {
     std::chrono::microseconds delay{std::chrono::seconds(0)};
 };
 
+struct AsyncCopyExecuteSubmitResult {
+    AsyncCopySubmitResult submit_result;
+    std::future<PlanExecuteResult> future;
+};
+
 // 任务类别同时定义 ready task 的调度优先级。Migration continuation 已经持有活跃
 // reservation/WRITING 目标，必须先于新的 Prepare 收敛；所有 migration 类别共同受
 // 进程级 worker budget 约束。
@@ -143,8 +155,14 @@ public:
     ~SchedulePlanExecutor();
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
+    // RemoveInstance supplies the indexer after extracting it from MetaIndexerManager.
+    std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task, std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
+    AsyncCopyExecuteSubmitResult SubmitAsyncCopy(const CacheLocationCopyRequest &task,
+                                                 const std::string &operation_id,
+                                                 const AsyncCopyOptions &options);
+    ErrorCode RequestCancelAsyncCopy(const std::string &storage_name, const std::string &operation_id);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const EventReportMetadataDelRequest &task);
@@ -166,6 +184,7 @@ private:
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
+        std::shared_ptr<MetaIndexer> indexer;
         bool needs_physical_delete{false};
     };
 
@@ -222,10 +241,13 @@ private:
                             ScheduleTaskClass task_class);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
-    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
+    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task,
+                                                    ScheduleTaskClass task_class,
+                                                    std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
-    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
+                                        const std::shared_ptr<MetaIndexer> &indexer);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

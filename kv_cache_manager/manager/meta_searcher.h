@@ -59,9 +59,8 @@ public:
         // When true, the checker has already parsed the EventReport location
         // id and validated every spec URI while applying query visibility.
         bool has_reporter_identity = false;
-        // Views borrow the immutable CacheLocation id and are consumed while
-        // that location is still held by the current projection; they are
-        // never retained in output.
+        // Views borrow the immutable source held by the current projection
+        // and are never retained in output.
         std::string_view reporter_medium;
         std::string_view reporter_host;
         // Optional request-owned projection of one physical reporter onto one
@@ -71,7 +70,9 @@ public:
         const std::vector<std::string> *logical_hosts = nullptr;
     };
     using CheckHostCacheLocationFunc =
-        std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
+        std::function<bool(const CacheLocationReadView &location, HostCacheLocationInfo &out_info)>;
+    using ListHostCacheCandidateHostsFunc =
+        std::function<std::vector<std::string>(const std::vector<std::string> &medium_filter)>;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -110,7 +111,8 @@ public:
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                 size_t top_k_host_count = 0,
                                 const std::vector<DataStorageType> &backend_types = {},
-                                SelectLocationPolicy *policy = nullptr) const;
+                                SelectLocationPolicy *policy = nullptr,
+                                const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
@@ -120,7 +122,8 @@ public:
                                          const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                          size_t top_k_host_count = 0,
                                          const std::vector<DataStorageType> &backend_types = {},
-                                         SelectLocationPolicy *policy = nullptr) const;
+                                         SelectLocationPolicy *policy = nullptr,
+                                         const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode PrefixMatchWithSwaByHost(RequestContext *request_context,
                                        const KeyVector &keys,
                                        size_t window_blocks,
@@ -131,7 +134,8 @@ public:
                                        const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                        size_t top_k_host_count = 0,
                                        const std::vector<DataStorageType> &backend_types = {},
-                                       SelectLocationPolicy *policy = nullptr) const;
+                                       SelectLocationPolicy *policy = nullptr,
+                                       const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -141,6 +145,11 @@ public:
         // EC_OK 时是可供业务使用的 location id；失败时若非空，仅可作为回滚定位符。
         std::string location_id;
     };
+    ErrorCode BatchGetRawMeta(RequestContext *request_context,
+                              const KeyVector &keys,
+                              CacheLocationMapVector &out_location_maps,
+                              PropertyMapVector &out_properties,
+                              std::vector<ErrorCode> &out_error_codes);
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
@@ -172,6 +181,16 @@ public:
     static size_t ClassifyAddLocationRollback(const KeyVector &keys,
                                               const std::vector<AddLocationResult> &add_results,
                                               AddLocationRollbackPlan &out_plan);
+    class PrevalidatedTotalSize {
+    public:
+        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
+
+    private:
+        friend class CacheManager;
+        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
+
+        std::uint64_t value_ = 0;
+    };
     struct ReplaceLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -179,6 +198,11 @@ public:
         std::vector<LocationSpec> specs;
         InternedLocationId interned_location_id;
         const InternedLocationId *borrowed_interned_location_id = nullptr;
+        std::optional<PrevalidatedTotalSize> prevalidated_total_size;
+
+        [[nodiscard]] size_t SpecCount() const noexcept { return specs.size(); }
+        [[nodiscard]] const LocationSpec &SpecAt(size_t index) const noexcept { return specs[index]; }
+        [[nodiscard]] LocationSpec &MutableSpecAt(size_t index) noexcept { return specs[index]; }
 
         [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
             const auto *interned = ResolvedInternedLocationId();
@@ -192,6 +216,9 @@ public:
                                                                                    : nullptr;
         }
     };
+    std::vector<std::vector<int32_t>> GetWriteBatches(const KeyVector &keys) const;
+    static ErrorCode ValidateReplaceLocationSpecsTask(const ReplaceLocationSpecsTask &task,
+                                                      std::uint64_t &out_total_size);
     // Replaces existing specs or creates the stable location in one metadata
     // read-modify-write operation per batch. Keys and location ids within a
     // key must be unique. Every task requires non-empty, uniquely named specs
@@ -204,16 +231,15 @@ public:
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
-    class PrevalidatedTotalSize {
-    public:
-        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
-
-    private:
-        friend class CacheManager;
-        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
-
-        std::uint64_t value_ = 0;
-    };
+    // The flat form reuses ReportEvent's validated sizes and can consume its
+    // task URIs. Generic tasks keep strict validation and copy/retry semantics,
+    // as in BatchMergeLocationSpecsFlat. Metadata RMW/counting is unchanged.
+    ErrorCode BatchReplaceLocationSpecsFlat(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const std::vector<size_t> &task_offsets,
+                                            std::vector<ReplaceLocationSpecsTask> &flat_tasks,
+                                            std::vector<ErrorCode> &out_per_key_ec,
+                                            AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -293,6 +319,14 @@ public:
                                           std::vector<MergeLocationSpecsTask> &flat_tasks,
                                           std::vector<ErrorCode> &out_per_key_ec,
                                           AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    // Per-call statistics of successfully removed whole locations. count is
+    // used for the batch average/empty check; it is not a cumulative metric.
+    struct DeletedLocationAgeStats {
+        size_t count = 0;
+        int64_t min_us = 0;
+        int64_t max_us = 0;
+        int64_t avg_us = 0;
+    };
     struct DeleteLocationSpecsTask {
         std::string location_id;
         std::vector<std::string> spec_names;
@@ -317,16 +351,25 @@ public:
     // tasks_per_key and marks missing block/location no-ops; an existing
     // location with only missing spec_names is not marked. The optional write
     // lease is acquired once after the metadata read and before the first
-    // mutation.
+    // mutation. Optional age statistics include only successful whole-location
+    // deletions with a valid creation timestamp, never partial-spec/no-op deletes.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
                                        std::vector<std::vector<ErrorCode>> &out_batch_results,
                                        std::vector<std::vector<bool>> *out_missing_targets = nullptr,
-                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr,
+                                       DeletedLocationAgeStats *out_create_age_stats = nullptr);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        struct SpecChecksum {
+            std::string location_spec_name;
+            std::string checksum;
+        };
+        // Optional independently stored spec payload checksums. Unnamed specs
+        // and empty values leave existing checksums untouched.
+        std::vector<SpecChecksum> spec_checksums;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,
@@ -345,15 +388,21 @@ public:
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results,
-                                     bool refresh_cache_from_persistent = false);
+                                     bool fill_missing_cache = false);
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;
     };
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchCADLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results);
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
@@ -393,13 +442,21 @@ private:
                                           size_t top_k_host_count,
                                           const std::vector<DataStorageType> &backend_types,
                                           SelectLocationPolicy *policy,
+                                          const ListHostCacheCandidateHostsFunc *list_candidate_hosts,
                                           char state_category,
                                           size_t window_blocks) const;
-    class MergeLocationSpecsTaskView;
+    template <typename Task>
+    class LocationSpecsTaskView;
+
+    ErrorCode BatchReplaceLocationSpecsImpl(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
+                                            std::vector<ErrorCode> &out_per_key_ec,
+                                            AcquireMetadataWriteLeaseFunc acquire_write_lease);
 
     ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,
                                           const KeyVector &keys,
-                                          MergeLocationSpecsTaskView tasks,
+                                          LocationSpecsTaskView<MergeLocationSpecsTask> tasks,
                                           std::vector<ErrorCode> &out_per_key_ec,
                                           AcquireMetadataWriteLeaseFunc acquire_write_lease);
 

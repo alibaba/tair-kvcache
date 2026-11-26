@@ -22,6 +22,7 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
+        ":service_request_executor",
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
@@ -41,13 +42,23 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
+        "//kv_cache_manager/metrics:redis_health_metrics",
         "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service/grpc_service",
+        "//kv_cache_manager/service/grpc_service:grpc_server_options",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
         "//kv_cache_manager/service/http_service",
         "//kv_cache_manager/service/util:manager_message_proto_util",
+        "//kv_cache_manager/service/util:report_event_body_budget",
         "//kv_cache_manager/service/util:service_call_guard",
     ],
+)
+
+cc_library(
+    name = "service_request_executor",
+    srcs = ["service_request_executor.cc"],
+    hdrs = ["service_request_executor.h"],
+    deps = ["//kv_cache_manager/common"],
 )
 
 cc_library(
@@ -76,7 +87,6 @@ cc_library(
         ":grpc_wrapper",
         ":service_impl_base",
         "//kv_cache_manager/common",
-        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
@@ -155,6 +165,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:node_status_metrics",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/service/util:common",

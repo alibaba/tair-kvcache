@@ -30,7 +30,7 @@ public:
     std::size_t subscriber_queue_size() const { return subscriber_queue_size_; }
 
 private:
-    bool enable_ = false;
+    bool enable_ = true;
     std::size_t queue_size_ = 100000;
     std::size_t max_subscribers_ = 4;
     std::size_t subscriber_queue_size_ = 10000;

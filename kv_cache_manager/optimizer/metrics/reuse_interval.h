@@ -14,6 +14,8 @@ struct ReuseIntervalStats {
     double avg_ns = 0.0;
     uint64_t p95_ns = 0;
     uint64_t p99_ns = 0;
+    uint64_t p995_ns = 0;
+    uint64_t p999_ns = 0;
 };
 
 // Accumulates capacity-independent intervals between two
@@ -34,7 +36,7 @@ private:
     static constexpr std::size_t kBucketCount = kSubBuckets * (1 + 64 - 7);
     static std::size_t BucketIndex(uint64_t interval_ns);
     static uint64_t BucketUpperBound(std::size_t index);
-    uint64_t Percentile(uint64_t percent) const;
+    uint64_t Percentile(uint64_t basis_points) const;
 
     std::array<uint64_t, kBucketCount> buckets_{};
     ReuseIntervalStats window_;

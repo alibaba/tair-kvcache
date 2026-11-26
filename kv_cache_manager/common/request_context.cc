@@ -26,8 +26,11 @@ const RequestContext::JsonFragment &RequestContext::LazyResponseJsonCache::Get()
 }
 
 std::optional<std::string> RequestContext::LazyResponseJsonCache::TakeIfReusable() {
-    Get();
-    if (kind_ != ResponseJsonKind::kFullMessage || !fragment_.valid || fragment_.json.empty()) {
+    if (kind_ != ResponseJsonKind::kFullMessage) {
+        return std::nullopt;
+    }
+    const JsonFragment &fragment = Get();
+    if (!fragment.valid || fragment.json.empty()) {
         return std::nullopt;
     }
     return std::move(fragment_.json);

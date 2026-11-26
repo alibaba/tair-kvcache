@@ -117,6 +117,7 @@ protected:
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("setup-" + group_name);
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name(group_name);
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
         g->add_capacity_gb(capacity_gb);
@@ -172,6 +173,7 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("crud-create");
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name("crud_grp");
         g->add_capacity_gb(2.0);
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -203,6 +205,7 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         proto::optimizer::UpdateInstanceGroupRequest req;
         req.set_trace_id("crud-update");
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name("crud_grp");
         g->add_capacity_gb(4.0);
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
@@ -273,6 +276,7 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithEmptyName) {
     proto::optimizer::CreateInstanceGroupRequest req;
     req.set_trace_id("boundary-empty-name");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("");
     g->add_capacity_gb(1.0);
 
@@ -288,6 +292,7 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithNoCapacity) {
     proto::optimizer::CreateInstanceGroupRequest req;
     req.set_trace_id("boundary-no-cap");
     auto *g = req.mutable_instance_group();
+    g->add_ttl_seconds_list(0);
     g->set_name("no_cap_grp");
     // No capacity_gb set
 
@@ -327,6 +332,7 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithMultipleCapacities) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("boundary-multi-cap");
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name("multi_cap_grp");
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
         g->add_capacity_gb(0.5);
@@ -456,6 +462,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterWithDisabledGroup) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("setup-disabled-grp");
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name("disabled_grp");
         g->add_capacity_gb(1.0);
 
@@ -502,7 +509,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(0, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 
@@ -519,7 +526,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(3, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(3, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 
@@ -536,7 +543,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(1, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(1, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 }
@@ -569,7 +576,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryReturnsUniqueKeys) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(3, tq_resp.capacity_results(0).current_unique_keys());
+        EXPECT_EQ(3, tq_resp.ttl_results(0).capacity_results(0).current_unique_keys());
     }
 
     // Insert some overlapping keys
@@ -585,7 +592,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryReturnsUniqueKeys) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(4, tq_resp.capacity_results(0).current_unique_keys());
+        EXPECT_EQ(4, tq_resp.ttl_results(0).capacity_results(0).current_unique_keys());
     }
 }
 
@@ -819,7 +826,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryIsolationBetweenInstances) {
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(0, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
     }
 }
 
@@ -958,7 +965,7 @@ TEST_F(OnlineOptimizerIntegrationTest, FullLifecycle) {
         proto::optimizer::TraceQueryResponse tq_resp;
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
-        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(0, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
         EXPECT_EQ(5, tq_resp.total_blocks());
     }
 
@@ -973,7 +980,7 @@ TEST_F(OnlineOptimizerIntegrationTest, FullLifecycle) {
         proto::optimizer::TraceQueryResponse tq_resp;
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
-        EXPECT_EQ(5, tq_resp.capacity_results(0).cache_hit_count());
+        EXPECT_EQ(5, tq_resp.ttl_results(0).capacity_results(0).cache_hit_count());
         EXPECT_EQ(5, tq_resp.total_blocks());
     }
 
@@ -1061,6 +1068,7 @@ TEST_F(OnlineOptimizerIntegrationTest, MultiCapacityHitRateTracking) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("setup-multi-cap-hr");
         auto *g = req.mutable_instance_group();
+        g->add_ttl_seconds_list(0);
         g->set_name("multi_cap_hr_grp");
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
         g->add_capacity_gb(0.001); // Very small - will have limited capacity

@@ -51,8 +51,10 @@ private:
     std::string GetCachedScriptSha1(const std::string &cached_sha1) const;
     void UpdateCachedScriptSha1(std::string &cached_sha1, const std::string &new_sha1);
 
+    // Lua 首行的用途标识供 Redis 流量识别，修改脚本实现时保持稳定。
     // Lua脚本：尝试获取锁（原子操作）
     static constexpr const char *LUA_TRY_LOCK = R"(
+        -- kvcm:coordination:try_lock
         local value = ARGV[1]
         local ttl_ms = tonumber(ARGV[2])
         
@@ -77,6 +79,7 @@ private:
 
     // Lua脚本：续约锁（原子操作）
     static constexpr const char *LUA_RENEW_LOCK = R"(
+        -- kvcm:coordination:renew_lock
         local value = ARGV[1]
         local ttl_ms = tonumber(ARGV[2])
         
@@ -106,6 +109,7 @@ private:
 
     // Lua脚本：释放锁（原子操作）
     static constexpr const char *LUA_UNLOCK = R"(
+        -- kvcm:coordination:unlock
         local value = ARGV[1]
         
         -- 检查锁是否存在且值匹配

@@ -347,6 +347,7 @@ public: // Function definitions expected as parameter to ShardedCache
     // The caller must hold an external reference to `handle`.
     // Does NOT trigger eviction even if usage exceeds capacity.
     void AdjustCharge(LRUHandle *handle, ssize_t delta);
+    size_t GetAvailableCapacity() const;
 
     // Although in some platforms the update of size_t is atomic, to make sure
     // GetUsage() and GetPinnedUsage() work correctly under any platform, we'll

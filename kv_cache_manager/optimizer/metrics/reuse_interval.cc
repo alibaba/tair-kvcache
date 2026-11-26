@@ -39,12 +39,13 @@ uint64_t ReuseInterval::BucketUpperBound(std::size_t index) {
     return ((mantissa + 1) << shift) - 1;
 }
 
-uint64_t ReuseInterval::Percentile(uint64_t percent) const {
+uint64_t ReuseInterval::Percentile(uint64_t basis_points) const {
     if (window_.count == 0) {
         return 0;
     }
-    // Nearest rank: ceil(count * percent / 100), without integer overflow.
-    const uint64_t rank = (window_.count / 100) * percent + ((window_.count % 100) * percent + 99) / 100;
+    // Nearest rank: ceil(count * basis_points / 10000), without integer overflow.
+    const uint64_t rank =
+        (window_.count / 10000) * basis_points + ((window_.count % 10000) * basis_points + 9999) / 10000;
     uint64_t cumulative = 0;
     for (std::size_t i = 0; i < buckets_.size(); ++i) {
         cumulative += buckets_[i];
@@ -58,8 +59,10 @@ uint64_t ReuseInterval::Percentile(uint64_t percent) const {
 ReuseIntervalStats ReuseInterval::Snapshot() const {
     auto result = window_;
     result.avg_ns = result.count > 0 ? static_cast<double>(total_ns_ / result.count) : 0.0;
-    result.p95_ns = Percentile(95);
-    result.p99_ns = Percentile(99);
+    result.p95_ns = Percentile(9500);
+    result.p99_ns = Percentile(9900);
+    result.p995_ns = Percentile(9950);
+    result.p999_ns = Percentile(9990);
     return result;
 }
 

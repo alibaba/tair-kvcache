@@ -23,11 +23,12 @@ protected:
                                      bool enable_theoretical_max_cache = false,
                                      int64_t ttl_seconds = 0) {
         OptimizerInstanceGroup group;
+        group.set_ttl_seconds_list({0});
         group.set_name(name);
         group.set_capacity_gb(caps);
         group.set_eviction_policy(eviction_policy);
         group.set_enable_theoretical_max_cache(enable_theoretical_max_cache);
-        group.set_ttl_seconds(ttl_seconds);
+        group.set_ttl_seconds_list({ttl_seconds});
         return group;
     }
 
@@ -212,11 +213,11 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryBasic) {
     std::vector<int64_t> keys = {1, 2, 3, 4, 5};
     TraceQueryResult result;
     EXPECT_EQ(EC_OK, mgr_->TraceQuery("i1", keys, 0, 0, result));
-    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(0, result.ttl_results[0].hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
 
     EXPECT_EQ(EC_OK, mgr_->TraceQuery("i1", keys, 0, 0, result));
-    EXPECT_EQ(5, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(5, result.ttl_results[0].hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
 }
 
@@ -231,7 +232,7 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryPrefixMatch) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 100, 200}, 0, 0, result);
-    EXPECT_EQ(3, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(3, result.ttl_results[0].hit_count_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, TraceQueryNonExistentInstance) {
@@ -260,10 +261,10 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
     // simulator: cache_hit_count uses index 0 (smallest capacity ~6 blocks),
     // prefix match starts at key 0 whose stack distance (99) exceeds the small
     // capacity, so prefix hit = 0.
-    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(0, result.ttl_results[0].hit_count_per_capacity.at(0));
     // Large capacity (index 1) should hit all 100 keys
-    ASSERT_EQ(2, result.hit_count_per_capacity.size());
-    EXPECT_EQ(100, result.hit_count_per_capacity[1]);
+    ASSERT_EQ(2, result.ttl_results[0].hit_count_per_capacity.size());
+    EXPECT_EQ(100, result.ttl_results[0].hit_count_per_capacity[1]);
 }
 
 TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
@@ -275,24 +276,24 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
 
     TraceQueryResult first;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 0, first));
-    EXPECT_EQ((std::vector<int64_t>{0, 0}), first.hit_count_per_capacity);
+    EXPECT_EQ((std::vector<int64_t>{0, 0}), first.ttl_results[0].hit_count_per_capacity);
 
     TraceQueryResult second;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 0, second));
-    EXPECT_EQ((std::vector<int64_t>{2, 3}), second.hit_count_per_capacity);
-    ASSERT_EQ(2, second.hit_rate_per_capacity.size());
-    EXPECT_DOUBLE_EQ(8.0 / 13.0, second.hit_rate_per_capacity[0]);
-    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.hit_rate_per_capacity[1]);
-    EXPECT_EQ(3, second.max_hit_count);
-    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.max_hit_rate);
+    EXPECT_EQ((std::vector<int64_t>{2, 3}), second.ttl_results[0].hit_count_per_capacity);
+    ASSERT_EQ(2, second.ttl_results[0].hit_rate_per_capacity.size());
+    EXPECT_DOUBLE_EQ(8.0 / 13.0, second.ttl_results[0].hit_rate_per_capacity[0]);
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.ttl_results[0].hit_rate_per_capacity[1]);
+    EXPECT_EQ(3, second.ttl_results[0].max_hit_count);
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.ttl_results[0].max_hit_rate);
 
     bool checked_state = false;
     ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
         checked_state = true;
-        EXPECT_NE(nullptr, state.lite_hit);
-        EXPECT_EQ(nullptr, state.indexer);
-        EXPECT_EQ(2, state.total_queries);
-        EXPECT_EQ(26, state.total_input_tokens);
+        EXPECT_NE(nullptr, state.replays[0]->lite_hit);
+        EXPECT_EQ(nullptr, state.replays[0]->indexer);
+        EXPECT_EQ(2, state.replays[0]->total_queries);
+        EXPECT_EQ(26, state.replays[0]->total_input_tokens);
     }));
     EXPECT_TRUE(checked_state);
 
@@ -332,6 +333,7 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionReportsReuseIntervalWindow) {
     ASSERT_EQ(EC_OK, mgr_->TakeReuseIntervalMetrics(metrics));
     ASSERT_EQ(1, metrics.size());
     EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(0, metrics[0].ttl_seconds);
     EXPECT_EQ("g1", metrics[0].instance_group);
     EXPECT_EQ(4, metrics[0].stats.count);
     EXPECT_EQ(4 * kSecond, metrics[0].stats.min_ns);
@@ -359,6 +361,7 @@ TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
     ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
     ASSERT_EQ(1, metrics.size());
     EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(0, metrics[0].ttl_seconds);
     EXPECT_EQ("g1", metrics[0].instance_group);
     EXPECT_TRUE(metrics[0].has_theoretical_max_hit_rate);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, metrics[0].max_hit_rate);
@@ -395,6 +398,7 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     const std::vector<int64_t> expected_blocks = {12, 16, 18, 19, 20, 20};
     for (size_t i = 0; i < metrics.size(); ++i) {
         EXPECT_EQ("i1", metrics[i].instance_id);
+        EXPECT_EQ(0, metrics[i].ttl_seconds);
         EXPECT_EQ("g1", metrics[i].instance_group);
         EXPECT_EQ(expected_targets[i], metrics[i].target_basis_points);
         EXPECT_EQ(expected_blocks[i] * 16384, metrics[i].capacity_bytes);
@@ -468,12 +472,12 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
 
     TraceQueryResult first;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 0, first));
-    EXPECT_EQ(0, first.max_hit_count);
+    EXPECT_EQ(0, first.ttl_results[0].max_hit_count);
     // The immediate re-query is well inside the 60s TTL: plain LRU behavior.
     TraceQueryResult second;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 0, second));
-    EXPECT_EQ(2, second.max_hit_count);
-    EXPECT_EQ(2, second.hit_count_per_capacity.at(0));
+    EXPECT_EQ(2, second.ttl_results[0].max_hit_count);
+    EXPECT_EQ(2, second.ttl_results[0].hit_count_per_capacity.at(0));
 
     // Total-eviction contract: LiteHit has no capacity evictions, so the
     // summary total must always equal the TTL eviction count.
@@ -504,9 +508,9 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryUsesProducerTimeForTtl) {
         TraceQueryResult result;
         ASSERT_EQ(EC_OK, mgr_->TraceQuery(instance_id, {1, 2}, 8, 1000LL * 1000000000, result));
         ASSERT_EQ(EC_OK, mgr_->TraceQuery(instance_id, {1, 2}, 8, 1005LL * 1000000000, result));
-        EXPECT_EQ(2, result.hit_count_per_capacity.at(0));
+        EXPECT_EQ(2, result.ttl_results[0].hit_count_per_capacity.at(0));
         ASSERT_EQ(EC_OK, mgr_->TraceQuery(instance_id, {1, 2}, 8, 1015LL * 1000000000, result));
-        EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+        EXPECT_EQ(0, result.ttl_results[0].hit_count_per_capacity.at(0));
     }
 }
 
@@ -523,7 +527,7 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryFallsBackToArrivalTimeForZeroTimest
     TraceQueryResult result;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 1000LL * 1000000000, result));
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 0, result));
-    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(0, result.ttl_results[0].hit_count_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, TraceQueryRejectsNegativeTimestamp) {
@@ -609,13 +613,13 @@ TEST_F(OnlineOptimizerManagerTest, LruIndexerType) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5}, 0, 0, result);
-    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(0, result.ttl_results[0].hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
-    EXPECT_EQ(5, result.unique_keys_per_capacity.at(0));
+    EXPECT_EQ(5, result.ttl_results[0].unique_keys_per_capacity.at(0));
 
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5}, 0, 0, result);
-    EXPECT_EQ(5, result.hit_count_per_capacity.at(0));
-    EXPECT_EQ(5, result.unique_keys_per_capacity.at(0));
+    EXPECT_EQ(5, result.ttl_results[0].hit_count_per_capacity.at(0));
+    EXPECT_EQ(5, result.ttl_results[0].unique_keys_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, CapacityEvictionLimitsUniqueCount) {
@@ -626,7 +630,7 @@ TEST_F(OnlineOptimizerManagerTest, CapacityEvictionLimitsUniqueCount) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5, 6, 7}, 0, 0, result);
-    EXPECT_LE(result.unique_keys_per_capacity.at(0), 5);
+    EXPECT_LE(result.ttl_results[0].unique_keys_per_capacity.at(0), 5);
 }
 
 TEST_F(OnlineOptimizerManagerTest, LargeCapacityNotTruncatedBySmallCapacity) {
@@ -645,8 +649,8 @@ TEST_F(OnlineOptimizerManagerTest, LargeCapacityNotTruncatedBySmallCapacity) {
     TraceQueryResult result;
     mgr_->TraceQuery("i1", keys, 0, 0, result);
     // Large capacity (index 1) should hit all 100 keys even when a smaller capacity is present.
-    ASSERT_EQ(2, result.hit_count_per_capacity.size());
-    EXPECT_EQ(100, result.hit_count_per_capacity[1]);
+    ASSERT_EQ(2, result.ttl_results[0].hit_count_per_capacity.size());
+    EXPECT_EQ(100, result.ttl_results[0].hit_count_per_capacity[1]);
 }
 
 TEST_F(OnlineOptimizerManagerTest, LruIndexerMaxKeyCountUnlimited) {
@@ -661,11 +665,11 @@ TEST_F(OnlineOptimizerManagerTest, LruIndexerMaxKeyCountUnlimited) {
     }
     TraceQueryResult result;
     mgr_->TraceQuery("i1", keys, 0, 0, result);
-    EXPECT_EQ(200, result.unique_keys_per_capacity.at(0));
+    EXPECT_EQ(200, result.ttl_results[0].unique_keys_per_capacity.at(0));
 
     mgr_->TraceQuery("i1", keys, 0, 0, result);
-    EXPECT_EQ(200, result.hit_count_per_capacity.at(0));
-    EXPECT_EQ(200, result.unique_keys_per_capacity.at(0));
+    EXPECT_EQ(200, result.ttl_results[0].hit_count_per_capacity.at(0));
+    EXPECT_EQ(200, result.ttl_results[0].unique_keys_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, ReRegisterReplacesPrevious) {
@@ -741,6 +745,46 @@ TEST_F(OnlineOptimizerManagerTest, ReRegisterFailurePreservesOldRecord) {
     // Verify in-memory state is still valid (can still TraceQuery)
     TraceQueryResult tr;
     EXPECT_EQ(EC_OK, mgr->TraceQuery("i1", {1, 2, 3}, 0, 0, tr));
+}
+
+TEST_F(OnlineOptimizerManagerTest, MultipleTtlsHaveIndependentReplayWithoutCapacity) {
+    auto group = MakeGroup("g1", {}, "lru", true);
+    group.set_ttl_seconds_list({10, 30});
+    group.set_enable_prefix_hash(true);
+    RegisterInstanceResult registration;
+    ASSERT_EQ(EC_OK, RegisterInstance(MakeInfo("i1", "g1", 4, 0), group, registration));
+    EXPECT_TRUE(registration.estimated_capacity_blocks.empty());
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 100000000000LL, result));
+    ASSERT_EQ(2u, result.ttl_results.size());
+    EXPECT_EQ(0, result.ttl_results[0].max_hit_count);
+    EXPECT_EQ(0, result.ttl_results[1].max_hit_count);
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 115000000000LL, result));
+    EXPECT_EQ(10, result.ttl_results[0].ttl_seconds);
+    EXPECT_EQ(30, result.ttl_results[1].ttl_seconds);
+    EXPECT_EQ(0, result.ttl_results[0].max_hit_count);
+    EXPECT_EQ(2, result.ttl_results[1].max_hit_count);
+    EXPECT_TRUE(result.ttl_results[0].capacity_gb.empty());
+    EXPECT_TRUE(result.ttl_results[1].capacity_gb.empty());
+    // Identical raw second block under a different prefix must not hit.
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {9, 2}, 8, 116000000000LL, result));
+    EXPECT_EQ(0, result.ttl_results[0].max_hit_count);
+    EXPECT_EQ(0, result.ttl_results[1].max_hit_count);
+    std::vector<IntervalMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
+    ASSERT_EQ(2u, metrics.size());
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ(10, metrics[0].ttl_seconds);
+    EXPECT_EQ("i1", metrics[1].instance_id);
+    EXPECT_EQ(30, metrics[1].ttl_seconds);
+    ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("", summaries));
+    ASSERT_EQ(2u, summaries.size());
+    for (const auto &summary : summaries) {
+        EXPECT_EQ("i1", summary.instance_id);
+        EXPECT_EQ(0, summary.total_queries);
+    }
 }
 
 } // namespace kv_cache_manager

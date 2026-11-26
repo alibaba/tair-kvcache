@@ -1,24 +1,30 @@
 #pragma once
 
 #include <atomic>
+#include <autil/Thread.h>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/mpsc_write_queue.h"
+#include "kv_cache_manager/meta/utils.h"
 
 namespace kv_cache_manager {
 
 class MetaAsyncRedisBackend : public MetaStorageBackend {
 public:
     MetaAsyncRedisBackend() = default;
+    explicit MetaAsyncRedisBackend(RedisLocationCodec codec) : codec_(std::move(codec)) {}
     ~MetaAsyncRedisBackend() override;
 
     std::string GetStorageType() noexcept override;
+    size_t GetMemUsage() const noexcept override { return 0; }
+    int64_t GetOldestAccessTime() const noexcept override { return INT64_MAX; }
 
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept override;
@@ -107,6 +113,7 @@ public:
     // ----- MetaData (startup read; bounded async write in memory-primary mode) -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
     // ----- Sync -----
     bool Sync(const KeyTypeVec &keys) noexcept override;
@@ -131,12 +138,16 @@ private:
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);
     int GetQueueIndexForKey(KeyType key) const noexcept;
+    bool ShouldLogReclaimLruWarning(size_t sampled_count,
+                                    size_t missing_lru_count = 0,
+                                    size_t malformed_lru_count = 0) noexcept;
 
     using CmdArgs = std::vector<std::string>;
     void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
 
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
+    virtual autil::ThreadPtr CreateConsumerThread(int queue_id);
 
 private:
     StandardUri storage_uri_;
@@ -144,9 +155,13 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 2000;
+    const RedisLocationCodec codec_;
+    LocationIdInterner id_interner_;
+    LocationSpecNameInterner name_interner_;
 
     // Async config
     int32_t queue_count_ = 8;
+    int32_t open_concurrency_ = 8;
     int64_t max_batch_size_ = 102400;
     int64_t batch_wait_timeout_us_ = 1000000;
     int64_t queue_max_size_ = 102400;
@@ -158,13 +173,21 @@ private:
     // Runtime state
     std::atomic<bool> is_running_{false};
     std::vector<std::unique_ptr<MpscWriteQueue>> queues_;
-    std::vector<std::thread> consumer_threads_;
+    std::vector<autil::ThreadPtr> consumer_threads_;
 
     // Per-consumer RedisClient (each consumer owns one)
     std::vector<std::shared_ptr<RedisClient>> consumer_clients_;
 
     // Read client pool (for concurrent read operations)
     std::shared_ptr<DynamicClientPool<RedisClient>> read_client_pool_;
+
+    // Shared by sampling threads for this instance; missing LRU fields do not consume the warning budget.
+    std::mutex reclaim_lru_warning_mutex_;
+    int64_t next_reclaim_lru_warning_time_us_ = 0;
+    size_t suppressed_reclaim_lru_warning_count_ = 0;
+    size_t suppressed_reclaim_lru_sampled_count_ = 0;
+    size_t suppressed_reclaim_lru_missing_count_ = 0;
+    size_t suppressed_reclaim_lru_malformed_count_ = 0;
 
     // Consumer-thread write stats (atomics, reset on read via CAS)
     std::atomic<int64_t> stats_flush_key_count_{0};

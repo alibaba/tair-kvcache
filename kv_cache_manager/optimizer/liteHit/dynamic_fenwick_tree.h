@@ -23,6 +23,13 @@ public:
     uint64_t PrefixSum(std::size_t index) const;
     std::size_t size() const { return tree_.size() - 1; }
     void Clear();
+    // Reset to count unit markers in O(count), reusing storage unless it is
+    // too small or far above the requested headroom after working-set shrink.
+    void ResetToOnes(std::size_t count, std::size_t reserve_positions = 0);
+    // Destructively turn the Fenwick buffer into inclusive prefix sums in
+    // O(size), without allocating. Index zero is zero. Only ResetToOnes or
+    // Clear may be called afterwards; the returned view expires on reset.
+    const std::vector<int64_t> &MakePrefixSumsInPlace();
     uint64_t memory_usage_bytes() const;
 
 private:

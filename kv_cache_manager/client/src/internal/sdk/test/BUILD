@@ -52,6 +52,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/common:lock_free_thread_pool",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage",
     ],
@@ -80,6 +81,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/common:lock_free_thread_pool",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage",
     ],

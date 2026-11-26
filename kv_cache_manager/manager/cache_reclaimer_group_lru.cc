@@ -91,7 +91,7 @@ bool CacheReclaimer::BuildGroupLruPlan(const RequestContext *request_context,
             continue;
         }
         const auto indexer = meta_indexer_manager_->GetMetaIndexer(info->instance_id());
-        if (!indexer) {
+        if (!indexer || !indexer->SupportsWriteSession()) {
             continue;
         }
         const auto key_count = static_cast<std::uint64_t>(indexer->GetKeyCount());
@@ -313,7 +313,7 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                 }
             }
             const auto indexer = meta_indexer_manager_->GetMetaIndexer(id);
-            if (!indexer) {
+            if (!indexer || !indexer->SupportsWriteSession()) {
                 state.failed = true;
                 continue;
             }
@@ -458,12 +458,13 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
 CacheReclaimer::ReclaimResult
 CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &request_context,
                                      const std::shared_ptr<const InstanceGroup> &instance_group,
-                                     const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                     const InstanceGroupQuota &quota,
                                      const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     ReclaimResult result;
     if (!IsRunning() || IsPaused()) {
         return result;
     }
+    const auto &reclaim_strategy = instance_group->cache_config()->reclaim_strategy();
     const auto policy = reclaim_strategy->reclaim_policy();
     if (policy != ReclaimPolicy::POLICY_UNSPECIFIED && policy != ReclaimPolicy::POLICY_LRU) {
         KVCM_LOG_WARN("group [%s] Group LRU requires an LRU reclaim policy", instance_group->name().c_str());
@@ -472,7 +473,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     const auto delay = reclaim_strategy->delay_before_delete_ms();
     const auto read_water_level = [&]() {
         return GetWaterLevelExceed(
-            request_context.get(), instance_group->name(), instance_group->quota(), reclaim_strategy, instance_infos);
+            request_context.get(), instance_group->name(), quota, reclaim_strategy, instance_infos);
     };
     const auto initial = read_water_level();
     if (!IsTriggerReclaiming(initial)) {

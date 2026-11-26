@@ -41,6 +41,11 @@ public:
     ~MetaStorageBackendManager();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept;
+    // Injected local serves as the sole backend for local, or the hot layer for cached.
+    ErrorCode Init(const std::string &instance_id,
+                   const std::shared_ptr<MetaStorageBackendConfig> &config,
+                   std::unique_ptr<MetaCacheBaseBackend> injected_local,
+                   const SharedLocationSpecName &simple_spec_name) noexcept;
 
     ErrorCode Open() noexcept;
     ErrorCode Close() noexcept;
@@ -77,7 +82,8 @@ public:
     std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept;
+                                                         int32_t &out_reclaimed_count,
+                                                         bool local_primary) noexcept;
     ErrorCode
     TrimPersistentOrphans(RequestContext *request_context, const KeyVector &keys, KeyVector &out_trimmed_keys) noexcept;
 
@@ -103,10 +109,11 @@ public:
     std::vector<ErrorCode> GetLocationsFromPrimary(RequestContext *request_context,
                                                    const KeyVector &keys,
                                                    CacheLocationMapVector &out_location_maps) noexcept;
-    // Refresh complete keys from persistent storage into the hot cache before
-    // a maintenance RMW. The caller must hold the corresponding shard locks.
-    // Caller skips this in running memory-primary mode, under its shard lock.
-    std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
+    // Fill missing keys completely during Recover before an ordinary GC RMW.
+    // Existing hot keys are never overwritten; Running never falls back.
+    // The caller must hold the corresponding shard locks and reread hot after
+    // this call before authorizing a conditional mutation.
+    std::vector<ErrorCode> EnsureCacheForGc(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
@@ -151,6 +158,7 @@ public:
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 
     // ----- Cross-batch APIs (no shard locks) -----
+    // Continuation cursors are opaque and retain their source backend in dual-backend mode.
     ErrorCode ListKeys(RequestContext *request_context,
                        const std::string &cursor,
                        const int64_t limit,
@@ -181,13 +189,22 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+    ErrorCode DeleteMetaData() noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
     bool SyncAll() noexcept;
-    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return memory_primary_ || Sync(keys); }
+    // Capture once under the RMW shard fence for the deletion write order.
+    // Cached maintenance reads always use hot, independently of this route.
+    bool UseLocalPrimaryForMaintenance() const noexcept {
+        return memory_primary_ && GetRecoverState() == RecoverState::kRunning;
+    }
+    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept {
+        return cache_backend_ || Sync(keys);
+    }
     bool IsMemoryPrimary() const noexcept { return memory_primary_; }
+    bool HasCacheBackend() const noexcept { return cache_backend_ != nullptr; }
 
     // A persistent-only backend has no synchronous hot view that can expose an
     // accepted maintenance delete to the next same-key RMW. Conservatively
@@ -200,6 +217,7 @@ public:
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     size_t GetMemUsage() const noexcept;
+    // Current local view, including partial recovery; never queries persistent key counts.
     int64_t GetOldestAccessTime() const noexcept;
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
@@ -225,6 +243,8 @@ private:
                 local_primary ? persistent_backend_.get() : cache_backend_.get(),
                 local_primary};
     }
+    std::vector<ErrorCode>
+    WritePrimary(RequestContext *request_context, BatchMetaData &batch, const WriteRoute &route, bool replace) noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
@@ -233,10 +253,16 @@ private:
                                 // Reports whether every source entry and
                                 // conditional cache write completed safely.
                                 bool *out_success = nullptr) noexcept;
-    // Hydrate missing keys from persistent into cache during Recover. Returns
+    // Fill missing keys from persistent into cache during Recover. Returns
     // false when a backend violates the positional response contract or the
     // full pre-update value cannot be made available safely.
-    bool EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
+    bool EnsureKeyInCache(RequestContext *request_context,
+                          const KeyTypeVec &keys,
+                          std::vector<ErrorCode> *out_results = nullptr) noexcept;
+    // Input contains only whole-key cache misses. Deleted keys remain logical
+    // misses during Recover; after Running no cache miss may fall back at all.
+    void FilterRecoverFallbackKeys(KeyTypeVec &keys, std::vector<size_t> &indices) const noexcept;
+    void RecordRecoverDeletedKeys(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
     // Delete keys that have no remaining location fields. Returns reclaimed count.
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,

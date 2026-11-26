@@ -40,14 +40,16 @@ std::pair<ErrorCode, BatchLocationsView> GetCacheLocationsByBackendForMetrics(Ca
     return {RequestResult(context), BatchLocationsView{}};
 }
 
-std::pair<ErrorCode, StartWriteCacheInfo> StartWriteCacheForMetrics(CacheManager *,
-                                                                    RequestContext *context,
-                                                                    const std::string &,
-                                                                    const KeyVector &,
-                                                                    const CacheManager::TokenIdsVector &,
-                                                                    const std::vector<std::string> &,
-                                                                    int64_t,
-                                                                    int32_t) {
+std::pair<ErrorCode, StartWriteCacheInfo>
+StartWriteCacheForMetrics(CacheManager *,
+                          RequestContext *context,
+                          const std::string &,
+                          const KeyVector &,
+                          const CacheManager::TokenIdsVector &,
+                          const std::vector<std::string> &,
+                          int64_t,
+                          int32_t,
+                          std::optional<CacheManager::StorageReplicaRequirement>) {
     return {RequestResult(context), StartWriteCacheInfo{}};
 }
 
@@ -78,7 +80,8 @@ protected:
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         reporter_ = std::make_shared<LocalMetricsReporter>();
         ASSERT_TRUE(reporter_->Init(cache_manager_, metrics_registry_, ""));
-        service_ = std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr);
+        service_ =
+            std::make_unique<MetaServiceImpl>(cache_manager_, reporter_, nullptr, MetaServiceImpl::AccessLogOptions{});
         service_->DisableLeaderOnlyRequests();
     }
 
@@ -121,6 +124,53 @@ protected:
     std::shared_ptr<CacheManager> cache_manager_;
     std::unique_ptr<MetaServiceImpl> service_;
 };
+
+TEST_F(MetaServiceImplTest, OnlyFullModeMaterializesPayloadBeforeTransport) {
+    for (const bool include_access_log_payload : {false, true}) {
+        MetaServiceImpl service(
+            cache_manager_, reporter_, nullptr, MetaServiceImpl::AccessLogOptions{include_access_log_payload});
+        RequestContext context("payload-mode");
+        proto::meta::GetInstanceInfoRequest request;
+        request.set_trace_id(context.trace_id());
+        proto::meta::GetInstanceInfoResponse response;
+        service.GetInstanceInfo(&context, &request, &response);
+
+        ASSERT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        EXPECT_EQ(include_access_log_payload, context.request_debug_json().valid);
+        EXPECT_EQ(include_access_log_payload, context.response_debug_json_.materialized_);
+    }
+}
+
+TEST_F(MetaServiceImplTest, FullAccessLogOverridesApplyToTheirApi) {
+    const MetaServiceImpl::AccessLogOptions modes[] = {
+        {},
+        {true, false, false},
+        {false, true, false},
+        {false, false, true},
+    };
+    for (const MetaServiceImpl::AccessLogOptions &options : modes) {
+        MetaServiceImpl service(cache_manager_, reporter_, nullptr, options);
+        const bool log_report_event = options.include_payload || options.full_report_event;
+        RequestContext report_context("report-event-log");
+        proto::meta::ReportEventRequest report_request;
+        report_request.set_trace_id(report_context.trace_id());
+        proto::meta::ReportEventResponse report_response;
+        service.ReportEvent(&report_context, &report_request, &report_response);
+        EXPECT_EQ(log_report_event, report_context.request_debug_json().valid);
+        EXPECT_EQ(log_report_event, report_context.response_debug_json().valid);
+        EXPECT_EQ(options.full_report_event, report_context.TakeReusableResponseJson().has_value());
+
+        const bool log_cache_state = options.include_payload || options.full_get_host_cache_state;
+        RequestContext state_context("cache-state-log");
+        proto::meta::GetHostCacheStateRequest state_request;
+        state_request.set_trace_id(state_context.trace_id());
+        proto::meta::GetHostCacheStateResponse state_response;
+        service.GetHostCacheState(&state_context, &state_request, &state_response);
+        EXPECT_EQ(log_cache_state, state_context.request_debug_json().valid);
+        EXPECT_EQ(log_cache_state, state_context.response_debug_json().valid);
+        EXPECT_EQ(options.full_get_host_cache_state, state_context.TakeReusableResponseJson().has_value());
+    }
+}
 
 TEST_F(MetaServiceImplTest, FollowerRejectsReportEventQueryAndWrite) {
     RequestContext query_context("follower-query");
@@ -171,6 +221,60 @@ TEST_F(MetaServiceImplTest, StartWriteCacheErrorMetrics) {
     request.set_instance_id("test-instance");
     request.add_block_keys(1);
     CheckErrorMetrics("StartWriteCache", request, &MetaServiceImpl::StartWriteCache);
+}
+
+TEST_F(MetaServiceImplTest, InvalidStorageReplicaRequirementIsRejectedBeforeInstanceLookup) {
+    service_->EnableLeaderOnlyRequests();
+    RequestContext context("invalid-storage-replica");
+    proto::meta::StartWriteCacheRequest request;
+    request.set_instance_id("not-registered");
+    request.add_block_keys(1);
+    request.set_write_timeout_seconds(60);
+    for (const auto &[type, count] :
+         std::vector<std::pair<int, int>>{{0, 0}, {0, 1}, {3, 0}, {3, -1}, {7, 1}, {8, 1}, {263, 1}}) {
+        auto *requirement = request.mutable_storage_replica_requirement();
+        requirement->set_storage_type(static_cast<proto::meta::StorageType>(type));
+        requirement->set_min_location_count(count);
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+    request.mutable_storage_replica_requirement()->set_storage_type(proto::meta::ST_TAIRMEMPOOL);
+    request.mutable_storage_replica_requirement()->set_min_location_count(1);
+    for (int old_count : {1, 2}) {
+        request.set_min_replica_count(old_count);
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+}
+
+TEST_F(MetaServiceImplTest, InvalidExcludedStorageTypesFailBeforeInstanceLookup) {
+    service_->EnableLeaderOnlyRequests();
+    RequestContext context("invalid-excluded-storage");
+    proto::meta::StartWriteCacheRequest request;
+    request.set_instance_id("not-registered");
+    request.add_block_keys(1);
+    request.set_write_timeout_seconds(60);
+    auto *requirement = request.mutable_storage_replica_requirement();
+    requirement->set_min_location_count(1);
+    for (int value : {0, 263}) {
+        requirement->clear_excluded_storage_types();
+        requirement->add_excluded_storage_types(static_cast<proto::meta::StorageType>(value));
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+    requirement->clear_excluded_storage_types();
+    requirement->add_excluded_storage_types(proto::meta::ST_EVENT_REPORT_L2);
+    // An unknown explicit enum must not disappear during conversion and turn
+    // a conflicting request into a valid exclusion-only request.
+    for (int value : {static_cast<int>(proto::meta::ST_NFS), 263}) {
+        requirement->set_storage_type(static_cast<proto::meta::StorageType>(value));
+        proto::meta::StartWriteCacheResponse response;
+        service_->StartWriteCache(&context, &request, &response);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
 }
 
 TEST_F(MetaServiceImplTest, FinishWriteCacheErrorMetrics) {

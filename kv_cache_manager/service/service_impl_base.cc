@@ -36,6 +36,9 @@ bool ServiceImplBase::CheckAndIncrementRequestCount(bool is_leader_only) {
 void ServiceImplBase::DecrementRequestCount(bool is_leader_only) {
     active_request_count_.fetch_sub(1, std::memory_order_relaxed);
     if (is_leader_only) {
+        // Serialize the final decrement with the drain predicate and its wait
+        // registration, so the completion notification cannot be lost.
+        std::shared_lock<std::shared_mutex> lock(state_mutex_);
         int prev_count = active_leader_only_request_count_.fetch_sub(1, std::memory_order_relaxed);
         if (prev_count == 1) {
             leader_only_request_done_cv_.notify_all();

@@ -53,6 +53,7 @@ OptimizerMetricsReporter::OptimizerMetricsReporter(std::shared_ptr<OnlineOptimiz
 OptimizerMetricsReporter::~OptimizerMetricsReporter() = default;
 
 void OptimizerMetricsReporter::ReportInterval() {
+    std::lock_guard interval_lock(interval_report_mutex_);
     std::vector<InstanceSummary> summaries;
     manager_->ListInstances("", summaries);
     std::vector<IntervalMetricInfo> interval_metrics;
@@ -63,11 +64,23 @@ void OptimizerMetricsReporter::ReportInterval() {
     manager_->TakeReuseIntervalMetrics(reuse_metrics);
 
     for (const auto &summary : summaries) {
-        MetricsTags instance_tags = {{"instance_group", summary.instance_group}, {"instance_id", summary.instance_id}};
+        MetricsTags instance_tags = {{"instance_group", summary.instance_group},
+                                     {"instance_id", summary.instance_id},
+                                     {"ttl", std::to_string(summary.ttl_seconds)}};
 
         metrics_registry_->GetGauge("trace_query_total", instance_tags) = static_cast<double>(summary.total_queries);
         metrics_registry_->GetGauge("trace_query_blocks_total", instance_tags) =
             static_cast<double>(summary.total_blocks_queried);
+        // Token totals are analyzer snapshots, reset together with replay state.
+        // The legacy linear analyzer only maintains block-based statistics.
+        if (summary.linear_step == 0) {
+            metrics_registry_->GetGauge("trace_query_input_tokens_total", instance_tags) =
+                static_cast<double>(summary.total_input_tokens);
+            if (summary.max_hit_rate >= 0) {
+                metrics_registry_->GetGauge("trace_query_max_hit_tokens_total", instance_tags) =
+                    static_cast<double>(summary.total_max_hits) * summary.block_size;
+            }
+        }
         if (summary.max_hit_rate >= 0) {
             metrics_registry_->GetGauge("trace_query_max_hit_rate", instance_tags) = summary.max_hit_rate;
         }
@@ -90,6 +103,10 @@ void OptimizerMetricsReporter::ReportInterval() {
             MetricsTags capacity_tags = instance_tags;
             capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
             metrics_registry_->GetGauge("trace_query_hit_rate", capacity_tags) = capacity.hit_rate;
+            if (summary.linear_step == 0) {
+                metrics_registry_->GetGauge("trace_query_hit_tokens_total", capacity_tags) =
+                    static_cast<double>(capacity.total_hits) * summary.block_size;
+            }
             metrics_registry_->GetGauge("trace_query_capacity_efficiency", capacity_tags) =
                 summary.max_hit_rate > 0 ? capacity.hit_rate / summary.max_hit_rate
                                          : std::numeric_limits<double>::quiet_NaN();
@@ -97,7 +114,9 @@ void OptimizerMetricsReporter::ReportInterval() {
     }
 
     for (const auto &metric : interval_metrics) {
-        MetricsTags interval_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags interval_tags = {{"instance_group", metric.instance_group},
+                                     {"instance_id", metric.instance_id},
+                                     {"ttl", std::to_string(metric.ttl_seconds)}};
         if (metric.has_theoretical_max_hit_rate) {
             metrics_registry_->GetGauge("interval.query_max_hit_rate", interval_tags) = metric.max_hit_rate;
         }
@@ -115,12 +134,15 @@ void OptimizerMetricsReporter::ReportInterval() {
     for (const auto &metric : mrc_metrics) {
         MetricsTags tags = {{"instance_group", metric.instance_group},
                             {"instance_id", metric.instance_id},
+                            {"ttl", std::to_string(metric.ttl_seconds)},
                             {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         metrics_registry_->GetGauge("mrc", tags) = static_cast<double>(metric.capacity_bytes);
     }
 
     for (const auto &metric : reuse_metrics) {
-        MetricsTags tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        MetricsTags tags = {{"instance_group", metric.instance_group},
+                            {"instance_id", metric.instance_id},
+                            {"ttl", std::to_string(metric.ttl_seconds)}};
         const auto &stats = metric.stats;
         const double no_samples = std::numeric_limits<double>::quiet_NaN();
         metrics_registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags) =
@@ -133,6 +155,10 @@ void OptimizerMetricsReporter::ReportInterval() {
             stats.count > 0 ? static_cast<double>(stats.p95_ns) / 1e9 : no_samples;
         metrics_registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags) =
             stats.count > 0 ? static_cast<double>(stats.p99_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p995_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p999_ns) / 1e9 : no_samples;
     }
 
     if (kmonitor_reporter_) {
@@ -195,24 +221,29 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
             ++metrics_registry_->GetCounter("service.error_counter", service_tags);
         }
 
-        if (p->total_blocks() > 0) {
-            for (const auto &capacity : p->per_capacity_hits()) {
-                const double hit_rate = capacity.hit_rate >= 0.0 ? capacity.hit_rate
-                                                                 : static_cast<double>(capacity.hit_count) /
-                                                                       static_cast<double>(p->total_blocks());
-                MetricsTags capacity_tags = query_tags;
-                capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
-                metrics_registry_->GetGauge("query_hit_rate", capacity_tags) = hit_rate;
-                metrics_registry_->GetGauge("query_hit_count", capacity_tags) = static_cast<double>(capacity.hit_count);
-                metrics_registry_->GetGauge("query_capacity_efficiency", capacity_tags) =
-                    p->max_hit_rate() > 0 ? hit_rate / p->max_hit_rate() : std::numeric_limits<double>::quiet_NaN();
-            }
+        for (const auto &ttl : p->ttl_results()) {
+            MetricsTags ttl_tags = query_tags;
+            ttl_tags["ttl"] = std::to_string(ttl.ttl_seconds);
+            if (p->total_blocks() > 0) {
+                for (const auto &capacity : ttl.per_capacity_hits) {
+                    const double hit_rate = capacity.hit_rate >= 0.0 ? capacity.hit_rate
+                                                                     : static_cast<double>(capacity.hit_count) /
+                                                                           static_cast<double>(p->total_blocks());
+                    MetricsTags capacity_tags = ttl_tags;
+                    capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+                    metrics_registry_->GetGauge("query_hit_rate", capacity_tags) = hit_rate;
+                    metrics_registry_->GetGauge("query_hit_count", capacity_tags) =
+                        static_cast<double>(capacity.hit_count);
+                    metrics_registry_->GetGauge("query_capacity_efficiency", capacity_tags) =
+                        ttl.max_hit_rate > 0 ? hit_rate / ttl.max_hit_rate : std::numeric_limits<double>::quiet_NaN();
+                }
 
-            metrics_registry_->GetGauge("query_total_blocks", query_tags) = static_cast<double>(p->total_blocks());
-            if (p->max_hit_count() >= 0) {
-                metrics_registry_->GetGauge("query_max_hit_count", query_tags) =
-                    static_cast<double>(p->max_hit_count());
-                metrics_registry_->GetGauge("query_max_hit_rate", query_tags) = p->max_hit_rate();
+                metrics_registry_->GetGauge("query_total_blocks", ttl_tags) = static_cast<double>(p->total_blocks());
+                if (ttl.max_hit_count >= 0) {
+                    metrics_registry_->GetGauge("query_max_hit_count", ttl_tags) =
+                        static_cast<double>(ttl.max_hit_count);
+                    metrics_registry_->GetGauge("query_max_hit_rate", ttl_tags) = ttl.max_hit_rate;
+                }
             }
         }
     }
@@ -223,6 +254,7 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 }
 
 void OptimizerMetricsReporter::RemoveInstanceMetrics(const std::string &instance_id) {
+    std::lock_guard interval_lock(interval_report_mutex_);
     if (!metrics_registry_) {
         return;
     }

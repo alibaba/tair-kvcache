@@ -3,6 +3,10 @@
 KVCacheManager 在 Admin HTTP 服务端口（默认 6492）上提供了兼容 Prometheus
 的指标抓取端点 `GET /metrics`。
 
+每个存储后端通过 `data_storage.total_capacity_bytes` 上报总字节数，首次取得有效容量前为 -1。按 Group 和存储类型查看 `cache_manager_group_storage.usage_bytes`、`effective_quota` 和 `usage_ratio`，分别为用量、当前有效额度和两者之比。自动额度还提供 `refresh_success` 和 `last_success_time_s`。Group 总额度不限时，总水位用各类型有效额度之和作分母。
+
+Group 和分类型的 quota 水位在分母为零或未知时都上报 `0`，即使已有用量。查看分类型的 `effective_quota` 或总额度不限时的 Group `reference_capacity` 可以区分这两种情况。其中 `0` 表示额度为零，`-1` 表示未知。
+
 ## 快速开始
 
 默认配置下该端点自动启用。将 Prometheus 实例指向 Admin HTTP 端口即可：
@@ -22,9 +26,6 @@ scrape_configs:
 ```promql
 # 服务 QPS（1 分钟速率）
 rate(kvcm_service_query_counter[1m])
-
-# 搜索缓存命中率
-kvcm_meta_indexer_search_cache_hit_ratio
 
 # GetCacheLocation Block 级命中率（5 分钟窗口）
 rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
@@ -162,7 +163,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.query_counter` | counter | 总查询次数 |
 | `service.error_counter` | counter | 总错误次数 |
 | `service.query_rt_us` | gauge | 最近一次查询响应时间（微秒） |
-| `service.request_queue_size` | gauge | 请求队列大小 |
+| `service.request_queue_size` | gauge | 预留指标，当前未采集队列深度 |
+| `grpc.response_counter` | counter | gRPC 响应总数，按 `server`（`meta`/`admin`）、`method`（`Service/Method`）和 `grpc_code`（标准状态码名称）区分，每个 RPC 计一次 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
@@ -172,24 +174,87 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_indexer.get_io_time_us` | gauge | metadata backend 调用区间的墙钟并集；local 模式包含 LRU/锁/复制，不包含并行 projection，也不表示 Redis I/O |
 | `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
-| `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
+| `cache_manager_instance.event_report_location_lifetime_min_us` | gauge | 最近有效 BLOCK_DELETE 批次中，成功删除的 Location 的最短存活时间（微秒） |
+| `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |
+| `cache_manager_instance.event_report_location_lifetime_avg_us` | gauge | 同一批次的平均存活时间（微秒） |
+
+`grpc.response_counter` 统计服务端准备发送的最终 gRPC 状态，包含线程配额耗尽时框架返回的
+`RESOURCE_EXHAUSTED`；该状态也可能来自其他资源不足。主服务与 Admin 共用 gRPC 端口时统一记为
+`server=meta`，业务响应体中的错误仍由 `service.error_counter` 统计。
+`method` 省略 protobuf 包名前缀，例如 `MetaService/GetCacheLocation`；无法在 protobuf 描述中识别的方法统一记为 `unknown`。
 
 ### 周期性指标
 
+Meta 工作池另提供 `service.request_queue_capacity`、`request_queue_length`、
+`request_queue_length_max`、`request_queue_length_avg`、`request_running`，以及
+`service.request_wait_time_us_max/avg`、`service.request_execution_time_us_max/avg`。
+MAX/AVG 按上报窗口计算，队列平均值按时间加权；无样本窗口为 0。
+`service.request_completed`、`request_rejected`、`request_discarded` 是累计计数；
+`service.request_queue_wait_seconds` 是累计 histogram。详见[请求分发指标口径](design/service_request_dispatch.md)。
+Prometheus 指标名将点替换为下划线，并添加配置的前缀。
+
 | 指标 | 类型 | 说明 |
 |---|---|---|
+| `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
+| `role_state` | gauge | 选主生命周期阶段，导出为 `kvcm_role_state`；`state` 标签为 `follower`、`promoting`、`leader`、`demoting`，当前采样阶段为 1，其余为 0 |
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
-| `meta_indexer.total_cache_usage` | gauge | 缓存使用总量（字节） |
+| `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
-| `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
+| `data_storage.storage_usage_ratio` | gauge | 存储使用率，1 表示已满。TairMempool 上报缓存的水位，首次采样前或样本无法计算水位时为 -1。Meta 请求失败时保留最近一次水位。未实现容量查询的后端返回负值时跳过更新。follower 在降级后的下一次上报周期移除该指标。健康状态及可写状态独立上报 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
+| `cache_manager_instance.meta_cache_usage` | gauge | 单实例本地元数据估算内存（LRU charge，字节），标签为 `instance_group`、`instance_id` |
 
-对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
+`cache_manager_instance.meta_cache_usage` 复用 `MetaIndexer::GetMemUsage()`，由现有 Recorder 约每 5 秒采集一次。
+Prometheus 名称为 `kvcm_cache_manager_instance_meta_cache_usage`。local 模式统计该实例的 LRU charge，
+cached 模式统计本地部分，纯 Redis 模式为 0。该口径与 `meta_indexer.total_cache_usage` 一致，
+但两者采样时刻不同，并发写入时不保证瞬时加总相等。charge 不代表 RSS 或容器实际内存，
+不包含完整的固定锁数组、分配器等开销；`byte_size` 则是 KVCache 数据的配额用量。
+
+`is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
+不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。
+
+`role_state` 由独立轻量线程读取 `LeaderElector::GetRoleState()`，周期为
+`kvcm.metrics.report_interval_ms`（默认 20 秒）。不访问网络、不持业务或生命周期锁，
+恢复、清理或普通指标采集阻塞时仍可采样。每轮刷新固定的四条序列，旧阶段归零。
+短于上报/抓取周期的阶段可能采不到；这是当前状态的周期采样，不是状态切换事件记录。
+`is_leader` 保留原有采集路径，两者是独立采样，不是事务性的服务就绪快照。
+`role_state` 直接写入指标注册表，使用 dummy reporter 时也会发布。
+
+晋升期间的输出示例：
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+检测晋升或降级耗时过长，可使用以下表达式，并设置例如 `for: 5m`，按预期恢复/清理耗时调整：
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+筛选同时报告持有租约且处于稳定主节点阶段的节点：
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+该组合不保证请求入口已就绪、所有实例恢复完成或依赖均健康；指标只暴露现有状态机，
+不改变请求准入及选主、恢复、降级行为。
+
+对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
+
+存储卸载时同步移除带有其 unique_name 的所有指标序列，包括健康、可写和容量指标。Local 在途采样发布前校验后端身份，防止卸载后重新注册旧指标；已卸载后端的指标从本地注册表移除，不再用零值占位。follower 尚保留后端时，健康及可写指标继续反映实际状态，容量指标不输出。
+
+KMonitor 已知限制：Local 完成采样后、KMonitor 提交前发生降级、卸载或同名重建时，本轮仍可能提交旧样本（包括旧容量值）。下一轮 Local 采样刷新 collector 和容量输出控制；停止推送不撤回已经发送的数据，下游旧值何时不再影响告警取决于其过期策略和告警窗口。
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。
@@ -213,6 +278,7 @@ KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `grpc.response_qps` | `rate(kvcm_grpc_response_counter[1m])`，保留 `server`、`method`、`grpc_code` 维度 |
 | `event_report.qps` | `rate(kvcm_event_report_request_counter[1m])` |
 | `event_report.error_qps` | `rate(kvcm_event_report_error_counter[1m])` |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
@@ -257,3 +323,60 @@ Prometheus  --GET /metrics-->  AdminServiceHttp
 该端点与 `MetricsReporter` 管线正交。任何 reporter 类型（`kmonitor`、
 `local`、`logging`、`dummy`）都向同一个 `MetricsRegistry` 写入数据，
 Prometheus 端点从中读取。
+
+### 元数据 Redis 主动健康探测
+
+两类 Redis 主动探测默认开启（`kvcm.metrics.redis_health_probe_enabled=true`）。如需关闭，可在启动配置中设置 `kvcm.metrics.redis_health_probe_enabled=false`，重启生效。关闭时不创建探测对象和线程，也不发布这两类 Redis 健康指标；业务和选主连接、普通指标上报不受该开关影响。
+
+
+`kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` 表示 KVCM 到该组元数据 Redis 的最近一次探测结果：
+`1` 为连接、必要的认证、PING 和配置的 DB 选择均成功；`0` 为其中任一步失败或超时。
+该指标覆盖 `redis`、`async_redis`，以及 `cached` 的 Redis 持久层（包括 memory-primary 异步备份），
+即使没有业务请求或 Instance，也会对已加载的 Redis InstanceGroup 发起探测。
+
+探测使用独立线程和连接，按 `kvcm.metrics.report_interval_ms` 周期运行（默认 20 秒，另加探测耗时），
+连接及每次 socket I/O 超时均为 1 秒，不重试、不写入业务数据。相同 URI 的组每轮共享一次探测结果。
+它不会阻塞 `/metrics`、容量采集或占用业务连接池；多 Redis 目标按顺序探测，故障时一轮可能超过配置周期。
+标签包含 `instance_group`、`host` 和 `port`；地址取自配置中的 Redis URI，域名不解析成 IP。
+不暴露完整 URI、认证信息或 query 参数。探测目标包含组的当前配置和已有实例实际初始化时的配置：
+更新组配置不会重连已有实例，因此仍被使用的旧地址和新地址会同时受到监控。
+同一组/host/port 对应多个 DB 或认证配置时，全部探测成功才汇报 1；不再使用的旧地址序列才会移除。
+
+仅 leader 发布该指标。首次探测完成前、既无配置也无运行时 Redis 依赖的组、follower 均不发布；
+最后一个依赖被移除或节点降为 follower 后，旧序列在探测线程下一次检查时移除，不能把缺失解释为健康。
+注册表、索引器或生命周期锁忙时跳过采集/发布，不等待、不将忙误报为故障；网络 I/O 不持有这些锁。
+停机先取消后续探测，原有停服和释放 leader 流程完成后再等待正在进行的探测线程退出。
+本指标不改变请求准入，也不代表 Redis 业务读写权限、容量、数据完整性或所有分片均正常，
+不覆盖 Registry / Coordination Redis。
+
+告警示例（仅适用于预期由 leader 发布的序列；缺失应另设告警）：
+
+```promql
+kvcm_meta_storage_redis_healthy_status == 0
+```
+
+### 选主协调 Redis 健康指标
+
+`kvcm_coordination_redis_healthy_status{host="redis.example",port="6379"}` 表示本节点对
+`kvcm.coordination.uri` 指定 Redis 的最近一次独立探测结果：`1` 为连接、必要的认证、
+PING 和配置的 DB 选择成功，`0` 为失败或超时。旧配置 `kvcm.distributed_lock.uri` 仍按原有规则生效。
+标签仅包含配置的 host 和 port，不暴露凭据、DB 或完整 URI。
+
+该指标在 follower、promoting、leader、demoting 阶段都采集，不依赖是否持锁。
+它复用元数据 Redis 的只读探测实现，但拥有独立线程和连接，不占用选主或业务连接池，
+不调用抢锁、续约、解锁或写入接口，不持业务/生命周期锁；元数据探测阻塞也不会阻塞它。
+原有选主、请求准入、故障处理、元数据指标的名称及标签均不变。
+
+每轮完成后等待 `max(kvcm.metrics.report_interval_ms, 1000)` 毫秒，默认 20 秒。
+每轮新建一个连接并执行 PING，必要时增加 AUTH、再次 PING 和 SELECT；无重试。
+连接和每次 socket I/O 超时为 1 秒，DNS 解析仍受系统 resolver 控制，这不是整轮探测的总超时。
+开销为每个 Redis 协调节点一个线程及每轮一个短连接；不配置 Redis 协调后端时不创建探测线程。
+停机先取消后续探测，完成原有停服/释放 leader 流程后再等待探测退出。
+
+首轮探测完成前、使用 memory/file/默认协调后端时无此序列；进程若因协调后端初始化失败
+而未启动 HTTP 服务，也无法暴露该指标。缺失不能当作健康，应另设进程/采集缺失告警。
+`1` 不证明 Lua 脚本/写权限、租约或服务就绪状态正常；选主状态和服务就绪状态需要独立监控。与元数据指标不同，此告警不要限定 leader：
+
+```promql
+kvcm_coordination_redis_healthy_status == 0
+```

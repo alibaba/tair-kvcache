@@ -278,6 +278,7 @@ bool ParseLocationSpec(const JsonValue &value, proto::meta::LocationSpec *out) {
     }
     bool seen_name = false;
     bool seen_uri = false;
+    bool seen_checksum = false;
     for (const auto &member : value.GetObject()) {
         if (NameIs(member.name, "name")) {
             if (seen_name ||
@@ -291,6 +292,12 @@ bool ParseLocationSpec(const JsonValue &value, proto::meta::LocationSpec *out) {
                 return false;
             }
             seen_uri = true;
+        } else if (NameIs(member.name, "checksum")) {
+            if (seen_checksum ||
+                !SetString(member.value, [out](const char *data, size_t size) { out->set_checksum(data, size); })) {
+                return false;
+            }
+            seen_checksum = true;
         }
     }
     return true;

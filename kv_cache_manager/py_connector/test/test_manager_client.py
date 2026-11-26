@@ -297,6 +297,40 @@ class TestResponseClassification(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             self.client.register_instance({"trace_id": "test"})
 
+    def test_non_json_http_error_preserves_response(self):
+        for check_response in (True, False):
+            with self.subTest(check_response=check_response):
+                response = requests.Response()
+                response.status_code = 502
+                response._content = b"<html>Bad Gateway</html>"
+                self.client.session.post = MagicMock(return_value=response)
+
+                with self.assertRaises(requests.HTTPError) as caught:
+                    self.client.register_instance(
+                        {"trace_id": "test"}, check_response=check_response
+                    )
+
+                self.assertIs(caught.exception.response, response)
+                self.client.session.post.assert_called_once()
+
+    def test_non_json_success_is_protocol_failure(self):
+        for check_response in (True, False):
+            for body in (b"", b"<html>Bad Gateway</html>", b'{"header":'):
+                with self.subTest(check_response=check_response, body=body):
+                    response = requests.Response()
+                    response.status_code = 200
+                    response._content = body
+                    self.client.session.post = MagicMock(return_value=response)
+
+                    with self.assertRaises(KvCacheManagerProtocolError) as caught:
+                        self.client.register_instance(
+                            {"trace_id": "test"}, check_response=check_response
+                        )
+
+                    self.assertIs(caught.exception.response, response)
+                    self.assertIsInstance(caught.exception.__cause__, ValueError)
+                    self.client.session.post.assert_called_once()
+
     def test_malformed_api_envelope_is_protocol_failure(self):
         for payload in ([], {}, {"header": {}}, {"header": {"status": {}}}):
             with self.subTest(payload=payload):
@@ -473,6 +507,65 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
             self.assertTrue(client._refresh_thread.daemon)  # ty: ignore[unresolved-attribute]
         finally:
             client.close()
+
+
+class TestLeaderDiscoveryResponses(unittest.TestCase):
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_malformed_response_preserves_route_and_allows_recovery(self, mock_post):
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+        )
+        self.addCleanup(client.close)
+
+        for payload in (
+            None,
+            [],
+            "unavailable",
+            {},
+            {"header": None},
+            {"header": []},
+            {"header": {"status": None}},
+            {"header": {"status": "OK"}},
+            {"header": {"status": {}}},
+            _ok_response_json({"leader_endpoint": "10.0.0.50:7070"}),
+            _ok_response_json({"leader_endpoint": ["10.0.0.50", 7070]}),
+        ):
+            with self.subTest(payload=payload):
+                mock_post.return_value = _make_mock_response(payload)
+                self.assertFalse(client._refresh_manager_route())
+                self.assertEqual(client.base_url, "http://10.0.0.99:9090")
+
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.50", 7070)
+        )
+        self.assertTrue(client._refresh_manager_route())
+        self.assertEqual(client.base_url, "http://10.0.0.50:7070")
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_malformed_discovery_does_not_mask_not_leader_status(self, mock_post):
+        mock_post.return_value = _make_mock_response(_cluster_info_response())
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+            leader_retry_base_interval_seconds=0,
+        )
+        self.addCleanup(client.close)
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_not_leader_response())
+        )
+        mock_post.return_value = _make_mock_response({"header": None})
+
+        result = client.register_instance({"trace_id": "test"}, check_response=False)
+
+        self.assertEqual(result["header"]["status"]["code"], "SERVER_NOT_LEADER")
+        self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+        client.session.post.assert_called_once()
 
 
 class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):

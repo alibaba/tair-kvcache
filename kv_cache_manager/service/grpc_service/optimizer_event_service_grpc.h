@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 
@@ -22,6 +23,8 @@ public:
 
     void EnableSubscriptions();
     void DisableSubscriptions();
+    // Each accepted synchronous subscription holds a server worker thread.
+    std::size_t MaxSubscribers() const;
 
     grpc::Status GetConfiguration(grpc::ServerContext *context,
                                   const proto::optimizer::KvcmConfigurationRequest *request,

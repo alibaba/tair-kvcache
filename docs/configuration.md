@@ -85,8 +85,56 @@ kvcm.service.admin_rpc_port=6491
 # 指定管控接口的RPC监听端口，如果不指定则和主服务一致
 kvcm.service.admin_http_port=6492
 
-# 指定对外服务IO服务线程数，默认为机器核数
+# 指定 HTTP 服务 IO 线程数，默认为机器核数；不控制 gRPC 线程
 kvcm.service.io_thread_num=2
+
+# 每个 gRPC Server 的同步线程上限（含 poller）。默认 0，自动取 max(2, 硬件并行数)，计算方式参照 HTTP。
+# Manager 开启 optimizer 事件发布时，主 Meta Server 的自动上限额外加上 max_subscribers，
+# 为长期订阅预留线程；独立 Admin Server 不增加。显式设置正数时仍作为总上限，不额外增加。
+# -1 沿用 gRPC 框架默认，不额外设限；显式上限必须 >= 2。
+# Meta/Admin 分端口时各有独立配额，都使用这个值；共用端口时只有一套配额。
+# 不限制 HTTP、Meta 共享业务 worker、独立 CQ 轮询线程、后台任务及 gRPC 其他内部线程。
+# Admin/Debug 等同步 RPC 和 Optimizer 同步流式 RPC 仍占用该配额。
+# 同步 RPC 的线程配额耗尽时可能返回 RESOURCE_EXHAUSTED；异步 Meta 不再因该线程配额被拒绝。
+# Meta 默认使用最多 2048 个等待请求的业务队列；修改后需要重启。
+# 环境变量形式：kvcm_service_grpc_max_threads。
+kvcm.service.grpc_max_threads=0
+
+# 每个 gRPC Server 的内存配额（字节）。0 表示不设置，沿用框架默认。
+# 仅约束 gRPC 纳入配额管理的内存，不是进程 RSS 上限；Meta/Admin 分端口时配额各自独立。
+# 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
+kvcm.service.grpc_memory_quota_bytes=0
+
+# HTTP ReportEvent 在途原始请求体总预算（字节），仅计入请求体达到 8 MiB 的请求。
+# 0 每 200 ms 读取 /proc/meminfo 计算预算，范围为 64 MiB 至 1 GiB。正数使用固定值，上限为 1 GiB。
+# 自动模式从 MemAvailable 扣除 max(512 MiB, MemTotal 的 1%) 后按 8 倍处理开销折算。
+# 无法读取有效样本或超过 1 秒未更新时，自动预算使用 64 MiB。
+# 在 HTTP 收完请求体后、JSON 解析前检查预算。超额返回 SERVICE_BUSY，小于 8 MiB 直接进入正常处理。修改后需要重启。
+# 环境变量形式：kvcm_service_http_report_event_body_budget_bytes。
+kvcm.service.http_report_event_body_budget_bytes=0
+
+# Meta gRPC 默认 2 个轮询线程；必须是正整数。所有轮询线程共享一个 CQ。
+# 承担网络推进、protobuf 请求解析和完成事件处理；不执行业务，不计入 grpc_max_threads。
+# 独立 Admin Server 保留同步框架，不创建这些轮询线程。修改后需要重启。
+# 环境变量形式：kvcm_service_grpc_cq_thread_num。
+kvcm.service.grpc_cq_thread_num=2
+
+# Meta HTTP/gRPC 共享业务池。Admin、健康检查、Debug、Optimizer 保留原执行路径。
+# 正数为显式 worker 数。0 优先沿用正数 grpc_max_threads，否则使用 max(2, hardware_concurrency())。
+# 在 CPU 配额低于宿主机核数的容器上，建议显式设置 worker 数。
+# 环境变量形式：kvcm_service_worker_thread_num。
+kvcm.service.worker_thread_num=0
+
+# 默认最多 2048 个等待请求，不包括正在执行的任务。0 显式不限制，正数满时快速返回 SERVICE_BUSY。
+# gRPC 拒绝仍是 transport OK + 业务 SERVICE_BUSY，不等价于原 RESOURCE_EXHAUSTED。
+# 环境变量形式：kvcm_service_worker_queue_capacity。
+kvcm.service.worker_queue_capacity=2048
+
+# discard_pending（默认）：停止提交，丢弃尚未被 worker 取出的任务并返回 SERVER_NOT_LEADER。
+# drain：停止提交，继续准备并检查已接收任务的业务门禁。两者都等待已领取任务及协议收尾。
+# 关闭队列前先停止 LeaderElector；其后 Leader-only 请求通常返回 SERVER_NOT_LEADER，不执行写入。
+# 环境变量形式：kvcm_service_worker_shutdown_mode。
+kvcm.service.worker_shutdown_mode=discard_pending
 
 # 是否开启DebugService服务，可以通过DebugService直接操作集群内部状态
 kvcm.service.enable_debug_service=false
@@ -144,6 +192,9 @@ kvcm.cache_gc.max_inflight_delete_requests=64
 # 迁移期开关：由常规 GC round 基于 EventReportBackend 当前状态统一回收 metadata；
 # 默认开启，但仍受 kvcm.cache_gc.enabled 总开关控制；总开关关闭时保留 legacy 路径。
 kvcm.cache_gc.event_report_cleanup_enabled=true
+# 是否允许 metadata Recover 期间提交 EventReport 清理；false 时等待该 Instance 恢复完成。
+# 只控制统一 GC 的恢复期准入，不切回 legacy、不影响普通 GC；修改后重启生效。
+kvcm.cache_gc.event_report_cleanup_during_recover_enabled=true
 # 每个 GC tick 最多提交的 EventReport metadata Block key 数；Location 总数仍受 scan_batch_size 限制。
 kvcm.cache_gc.event_report_action_batch_size=256
 
@@ -159,13 +210,17 @@ kvcm.metrics.env_tag_mappings=
 # 若启用的metrics reporter有周期性report任务，指定该任务的唤醒间隔；默认20000
 kvcm.metrics.report_interval_ms
 
+# 是否启用元数据和选主 Redis 主动健康探测，默认true；关闭时不创建两类探测线程
+kvcm.metrics.redis_health_probe_enabled=true
+
 # 是否开启Prometheus metrics端点（GET /metrics），默认true
 kvcm.metrics.enable_prometheus=true
 
 # Prometheus metrics名称前缀，默认kvcm
 kvcm.metrics.prometheus_prefix=kvcm
 
-# Event publisher 配置。log 默认开启；optimizer.enable=true 时，会在现有
+# Event publisher 配置。log 和 optimizer 默认开启；optimizer.enable=false 可禁用。
+# optimizer.enable=true 时仍需活跃订阅者才采集查询事件，会在现有
 # kvcm.service.rpc_port 上注册 OptimizerEventStreamService，不新增监听端口。
 # 每个 publisher 的 queue_size 是它自己的发布队列上限；max_subscribers 是并发订阅数上限，
 # subscriber_queue_size 是每个订阅者的独立缓冲上限；字段省略时使用下列默认值。
@@ -248,6 +303,37 @@ p99、CPU 与 ReportEvent RT。设计、指标含义、测试命令见
 相同 source 迁移到不同 target、不同 source 迁移到相同 target，以及 `hot -> warm -> cold` 级联均可配置；只有
 完全相同的 source/target route 会被拒绝。重复 route 无法明确选择各自的 threshold、method、retention 和 Mark
 timeout，因此不会使用配置数组顺序作为隐式优先级。
+
+### Leader 并行恢复与 Redis 建连
+
+| 参数 | 默认值 | 范围 | 含义 |
+|---|---:|---|---|
+| `kvcm.cache_manager.recover_instance_concurrency` | `8` | `1..64` | 单轮同时恢复的 Instance 数，包含调用线程 |
+| `kvcm.meta_async_redis.open_concurrency` | `8` | `1..64` | 单个 async Redis backend 内 consumer 连接创建的并发数 |
+| `kvcm.redis_client.max_concurrent_connects` | `64` | `1..4096` | 普通 RedisClient 的进程级同时握手上限，包含首次建连、读池懒建及重连 |
+
+这些参数直接读取进程环境变量，超出范围的整数记录告警并回退表中默认值。
+下划线形式分别为 `kvcm_cache_manager_recover_instance_concurrency`、
+`kvcm_meta_async_redis_open_concurrency`、`kvcm_redis_client_max_concurrent_connects`；也可使用同名带点的
+环境变量，带点形式优先；带点形式未设置或无法解析时回退下划线形式，两者均未设置或无法解析时使用
+表中默认值。这三项不经过普通 Server 配置文件或 `--env` 解析。
+普通握手上限在首次普通 RedisClient 握手时固定，应在启动前配置；修改后重启。
+单轮恢复并发在恢复轮次开始时读取，backend 内并发在 `Init` 时读取。
+协调 RedisClient 使用独立的固定 4 个握手许可，不占用普通预算，也不受该参数调整。
+
+例如设置恢复并发 8、backend 内并发 8、普通握手上限 32，会使两层 worker 的真实网络握手合计不超过 32。
+握手许可等待最多该客户端 URI 的 `timeout_ms`，超时沿既有 Redis 重试策略处理；TCP 与各握手命令也使用
+此超时，握手后恢复原有普通命令 I/O 超时设置。排队超时、网络超时和重试分别计时，不是端到端 deadline。
+当前 hiredis 的同步 DNS 解析不受此超时限制，解析期间仍占用握手许可。
+两类许可都在握手尝试返回时释放，不会在连接建成后一直占用。
+主动健康探测直接使用 hiredis 独立连接，不经过 RedisClient，也不占用任一握手预算。
+
+设置两层并发为 `1` 可回退逐 Instance、逐 consumer 建连；两类进程预算仍生效。
+连接数与 `async_queue_count` 不因并行而减少，队列 FIFO、失败回收和服务就绪门禁沿用原语义。
+首轮部分失败后仍沿用后台恢复重试；单个 Instance 的可传播异常不会阻断其他实例，已启动 worker 会被 join。
+Searcher 构造异常后的重试可复用同一 Registry 注册对象、配置和有效直方图边界下已初始化的 Indexer，避免重复建连。
+不会把未初始化 backend 发布给请求；底层既有 `noexcept` 函数内部终止行为不在异常恢复保证范围内。
+详细顺序及故障边界见 [HA 恢复设计](design/ha_leader_elector.md#43-有界并行恢复)。
 
 ### 恢复阶段的 jemalloc arena 轮换（进程环境变量）
 
@@ -334,12 +420,6 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
                     "storage_type": "local",
                     "storage_uri": "",
                     "memory_primary": false # 默认关闭；仅 cached + local + async_redis 可开启
-                },
-                "meta_cache_policy_config": { # 控制 meta indexer数据cache的配置
-                    "type": "LRU",
-                    "capacity": 10000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0
                 }
             }
         },
@@ -350,6 +430,9 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
 ```
 
 `meta_storage_backend_config.memory_primary` 默认 `false`，保持原双写顺序。开启示例：
+
+`local` 元数据后端可在 `storage_uri` 中单独设置 `num_item_mutex_shard_bits`（默认 16，最大 24）；
+它不改变 LRU 的 `num_shard_bits`。锁数量为 `2^num_item_mutex_shard_bits`，每个 local backend 默认约需 3.5 MiB 的固定内存；提高位数会相应增加内存占用。
 
 ```json
 {"storage_type":"cached","storage_uri":"redis://redis-backup:6379/?persistent_type=async_redis&cache_type=local&capacity=4096&async_max_size=102400","memory_primary":true}
@@ -408,12 +491,29 @@ HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_m
 | `timeout` | 分配、删除、同步复制、容量和节点查询 | 必填，示例为 5 秒 |
 | `health_check_timeout` | 健康探测 | 1 秒 |
 
+`allocate_concurrency` 控制 PACE 批量分配的并行度，默认 `0`，表示自动使用可用 CPU 数的两倍，
+通常无需配置。显式正数范围为 `1..64`，自动值不受 `64` 限制；DRAM 和 SSD 均适用。
+后端先合并相同大小的请求，再使用共用线程池分波调用原有 `Create`；例如 20 个 spec 有 3 种大小，
+成功路径只需 3 次 PACE 分配。每波最多提交实际并发度个任务，设为 `1` 即批内串行。
+任一任务失败后不再提交后续波次，仍等待本波所有任务完成，返回已成功的 URI 供原有流程回滚。
+
+分配池大小默认是可用 CPU 数的两倍；Linux 优先读取 affinity/cpuset，否则使用
+`hardware_concurrency()`，无法读取时为 2 个线程。沿用 SDK 的 autil 线程池入队和关闭语义，
+队列容量参数为 64；队列忙时提交可能等待，HTTP `timeout` 不含排队时间。
+原有单次 `Create`、健康检查和非 PACE 后端分配逻辑保持原样。
+
+Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
+`storage.tair_mem_pool.allocate_concurrency` 都允许省略或设置为 `0`，表示自动并发。
+配置序列化保留 `0`，不写入当前机器计算出的并发度。`kvcm_ops` 的 `pace` / `pace_ssd`
+子命令支持 `--allocate_concurrency`，更新时省略该参数会保留已有值，显式 `0` 恢复自动并发。
+
 启用独立 SSD 类型时还需遵守以下配置约束：
 
 - 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有
   `pace` Storage 原地更新为 `pace_ssd`。Storage 类型会写入 CacheLocation 和用量账本，
   服务端会拒绝同名 Storage 的类型变更。
-- Instance Group 的 `quota.quota_config` 必须同时为 `pace` 和 `pace_ssd` 配置正容量。
+- 显式分层时，`pace` 和 `pace_ssd` 可以分别设置分类型额度。
+
   类型水位只遍历这里显式出现的类型；缺少 `pace_ssd` 时不会形成 SSD 类型水位和容量上限，
   缺少迁移源 `pace` 时迁移规则不会触发。
 - SSD 仅作为迁移目标时，不要求放入 `storage_candidates`；迁移规则按
@@ -425,7 +525,27 @@ HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_m
 
 详细升级顺序和回滚限制见 [Breaking Changes](BREAK_CHANGE.md#tairmempool-ssd-独立-storage-type)。
 
+### 按后端容量设置分类型额度
+
+每个存储类型默认按 `capacity`（字节）限额。开启自动额度时显式设置
+`mode: "auto"` 和 `ratio`（大于 0 且不超过 1），例如
+`{"storage_type": "pace_ssd", "mode": "auto", "ratio": 0.5}`。额度等于 Group
+关联的同类型后端总容量乘以该比例。后端需支持容量查询。透明分层取池内 DRAM 和 SSD
+总量的较大值，显式分层分别计算 DRAM 和 SSD。Group 总额度 `quota.capacity=-1`
+关闭总字节限制，各类型额度仍生效。
+
+计算时只计入已注册的关联存储。某个类型没有已注册的关联后端，或其中任一后端尚未取得容量时，
+该类型暂停新分配，并跳过按该类型额度触发的回收。
+取得容量后，刷新失败的后端保留最近的有效值。Admin Get/List 的 `runtime_quota`
+可查看当前有效额度，整对象回写时按 `quota` 更新配置。
+
 ## Logger Config
+
+服务启动时读取环境变量 `kvcm_logger_access_log_payload_mode`，默认 `metadata`，只记录时间、客户端 IP、trace ID、request ID、接口、状态码和耗时。
+设置为 `full` 时记录请求和响应，`ReportEvent` 和 `GetHostCacheState` 默认记录摘要。
+`KVCM_REPORT_EVENT_FULL_ACCESS_LOG=true` 和 `KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG=true` 分别启用对应接口的完整日志，包括全局为 `metadata` 时。
+已有配置文件里的 `kvcm.logger.access_log_payload_mode` 仍可用，环境变量优先。
+HTTP 回包仍使用完整的 protobuf JSON。
 
 ```TEXT
 alog.rootLogger=INFO, rootAppender
@@ -435,8 +555,8 @@ alog.appender.rootAppender=FileAppender
 alog.appender.rootAppender.fileName=logs/kv_cache_manager.log
 alog.appender.rootAppender.layout=PatternLayout
 alog.appender.rootAppender.layout.LogPattern=[%%d] [%%l] [%%p:%%t] %%m
-alog.appender.rootAppender.async_flush=false
-alog.appender.rootAppender.flush=true
+alog.appender.rootAppender.async_flush=true
+alog.appender.rootAppender.flush=false
 alog.appender.rootAppender.compress=false
 
 alog.logger.access=INFO, accessAppender

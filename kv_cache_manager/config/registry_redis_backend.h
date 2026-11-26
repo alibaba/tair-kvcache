@@ -18,6 +18,8 @@ private:
     ErrorCode Load(const std::string &key, std::map<std::string, std::string> &out_value) noexcept override;
     ErrorCode Save(const std::string &key, const std::map<std::string, std::string> &value) noexcept override;
     ErrorCode Delete(const std::string &key) noexcept override;
+    ErrorCode UpsertField(const std::string &key, const std::string &field, const std::string &value) noexcept override;
+    ErrorCode DeleteField(const std::string &key, const std::string &field) noexcept override;
 
 private:
     std::mutex client_mutex_;

@@ -1,6 +1,16 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "EffectiveQuotaTest",
+    srcs = ["effective_quota_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+    ],
+)
+
+cc_test(
     name = "RegistryManagerTest",
     srcs = [
         "registry_manager_test.cc",
@@ -95,6 +105,7 @@ cc_test(
         "//kv_cache_manager/config",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
         "//kv_cache_manager/service/util:manager_message_proto_util",
+        "//kv_cache_manager/service/util:proto_message_json_util",
     ],
 )
 
@@ -196,6 +207,17 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+    ],
+)
+
+cc_test(
+    name = "leader_elector_reconcile_test",
+    srcs = ["leader_elector_reconcile_test.cc"],
+    copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",

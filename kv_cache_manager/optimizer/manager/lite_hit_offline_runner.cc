@@ -135,7 +135,12 @@ bool LiteHitOfflineRunner::Run() {
         // instance group and applies to every instance in it. RegisterInstance
         // already guaranteed the group exists.
         const OptimizerInstanceGroup &group = *groups_by_name.at(instance.instance_group_name());
-        auto lane = std::make_unique<InstanceLane>(static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL);
+        if (group.ttl_seconds_list().size() != 1) {
+            KVCM_LOG_ERROR("Offline facts output requires exactly one TTL per instance group");
+            return false;
+        }
+        auto lane =
+            std::make_unique<InstanceLane>(static_cast<uint64_t>(group.ttl_seconds_list().front()) * 1000000000ULL);
         lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
         lane->block_bytes = static_cast<uint64_t>(register_result.size_full);
         lane->enable_prefix_hash = group.enable_prefix_hash();

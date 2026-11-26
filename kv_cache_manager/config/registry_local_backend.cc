@@ -104,4 +104,28 @@ ErrorCode RegistryLocalBackend::Delete(const std::string &key) noexcept {
     return PersistToPath();
 }
 
+ErrorCode
+RegistryLocalBackend::UpsertField(const std::string &key, const std::string &field, const std::string &value) noexcept {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::map<std::string, std::string> fields;
+    table_.Get(key, fields);
+    fields[field] = value;
+    table_.Upsert(key, std::move(fields));
+    return PersistToPath();
+}
+
+ErrorCode RegistryLocalBackend::DeleteField(const std::string &key, const std::string &field) noexcept {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::map<std::string, std::string> fields;
+    if (!table_.Get(key, fields) || fields.erase(field) == 0) {
+        return PersistToPath();
+    }
+    if (fields.empty()) {
+        table_.Erase(key);
+    } else {
+        table_.Upsert(key, std::move(fields));
+    }
+    return PersistToPath();
+}
+
 } // namespace kv_cache_manager

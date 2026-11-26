@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <unordered_map>
 
-#include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/util/host_registration.h"
@@ -155,12 +155,12 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     std::vector<SdkGroup> groups;
     ec = GroupBySdk(remote_uris, local_buffers, groups);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
 
     // Build task vector for parallel dispatch
@@ -183,12 +183,12 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     std::vector<SdkGroup> groups;
     ec = GroupBySdk(remote_uris, local_buffers, groups);
     if (ec != ER_OK) {
-        return ec;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
     actual_remote_uris->resize(remote_uris.size());
 
@@ -224,7 +224,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
                           group_actual_uris->size(),
                           group.indices.size());
-            return ER_SDKWRITE_ERROR;
+            return ER_SDK_ERROR_BUFFER_SAFE;
         }
         for (size_t j = 0; j < group.indices.size(); ++j) {
             (*actual_remote_uris)[group.indices[j]] = (*group_actual_uris)[j];
@@ -287,7 +287,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     if (wait_task_thread_pool_->isFull()) {
         KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
                       getOpTypeString(op_type).c_str());
-        return ER_THREADPOOL_ERROR;
+        return ER_SDK_ERROR_BUFFER_SAFE;
     }
 
     // Submit all tasks with shared stop flag
@@ -313,30 +313,32 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
                         .count();
                 KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
-                return ER_SDK_TIMEOUT;
+                return ER_SDK_TIMEOUT_BUFFER_SAFE;
             }
             return task();
         };
         futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
-    // 返回 true 表示至少一个 peer 的 completion 仍未知：它没有在 deadline 前完成，
-    // 或者它自己报告了 timeout。caller 必须把这种情况统一暴露为 ER_SDK_TIMEOUT，
-    // 不能用最先观察到的普通错误掩盖仍可能访问 caller buffer 的 peer。
+    // Drain only until the existing deadline. SAFE survives only when every
+    // submitted host returned success, explicit SAFE, or cancellation before I/O.
+    bool all_buffer_safe = true;
     auto drain = [&](size_t from) {
         stop->store(true);
-        bool completion_unknown = false;
+        bool timed_out = false;
         for (size_t j = from; j < futures.size(); ++j) {
             if (futures[j].wait_until(deadline) != std::future_status::ready) {
-                completion_unknown = true;
+                all_buffer_safe = false;
+                timed_out = true;
                 continue;
             }
-            if (futures[j].get() == ER_SDK_TIMEOUT) {
-                completion_unknown = true;
-            }
+            const auto ec = futures[j].get();
+            all_buffer_safe = all_buffer_safe &&
+                              (ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+                               ec == ER_SDK_ERROR_BUFFER_SAFE);
+            timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
         }
-        return completion_unknown;
+        return timed_out;
     };
 
     for (size_t i = 0; i < futures.size(); ++i) {
@@ -360,7 +362,19 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
                           getOpTypeString(op_type).c_str(),
                           static_cast<int>(ec));
-            return drain(i + 1) ? ER_SDK_TIMEOUT : ec;
+            all_buffer_safe = ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+                              ec == ER_SDK_ERROR_BUFFER_SAFE;
+            const bool peer_timed_out = drain(i + 1);
+            if (ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || peer_timed_out) {
+                return all_buffer_safe ? ER_SDK_TIMEOUT_BUFFER_SAFE : ER_SDK_TIMEOUT;
+            }
+            if (all_buffer_safe) {
+                return ER_SDK_ERROR_BUFFER_SAFE;
+            }
+            // A SAFE first error cannot conceal an unknown peer failure.
+            return ec == ER_SDK_ERROR_BUFFER_SAFE || ec == ER_TASK_CANCELLED
+                       ? (op_type == OpType::GET ? ER_SDKREAD_ERROR : ER_SDKWRITE_ERROR)
+                       : ec;
         }
     }
 

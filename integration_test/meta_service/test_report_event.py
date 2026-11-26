@@ -322,7 +322,6 @@ class EventReportFunctionalTest(unittest.TestCase):
                         "mutex_shard_num": 16,
                         "batch_key_size": 16,
                         "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
-                        "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                     },
                 },
                 "event_report_storage_candidates": [
@@ -501,19 +500,19 @@ class EventReportFunctionalTest(unittest.TestCase):
             actual_params = parse_qsl(actual.query, keep_blank_values=True)
             expected_params = parse_qsl(expected.query, keep_blank_values=True)
             versions = [
-                value for key, value in actual_params if key == "s_version"
+                value for key, value in actual_params if key == "s_v"
             ]
             self.assertEqual(
                 len(versions),
                 1,
-                f"Expected exactly one s_version in URI: {actual_uri}",
+                f"Expected exactly one s_v in URI: {actual_uri}",
             )
-            self.assertRegex(versions[0], re.compile(r"^[0-9a-fA-F]{32}$"))
+            self.assertRegex(versions[0], re.compile(r"^[0-9a-f]{8}$"))
             self.assertEqual(
                 sorted(
                     (key, value)
                     for key, value in actual_params
-                    if key != "s_version"
+                    if key != "s_v"
                 ),
                 sorted(expected_params),
                 f"KVCM changed caller URI parameters: {actual_uri}",
@@ -677,7 +676,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
@@ -708,7 +707,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
@@ -747,7 +746,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertFalse(body.get("snapshot_required"))
             self._assert_profile_specs(block_key, profile_name, {"keep_spec": keep_uri}, f"t06_query_{profile_name}")
             self._assert_profile_spec_absent(block_key, profile_name, "drop_spec", f"t06_absent_{profile_name}")
@@ -846,7 +845,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             body = self._report_event(profile_name, host, events, f"t11_{profile_name}")
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
         self._for_each_profile(run)
 
@@ -1121,7 +1120,6 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_keys": [block_key],
             "block_mask": {"offset": 0},
         })
-        # MetaSearchCache may still serve stale entry; not a hard assertion.
 
         # Step 3: heartbeat resumes within grace -> node recovers.
         self._report_event("l2", host, [_ev_heartbeat({})], "t20a_hb")
@@ -1157,7 +1155,6 @@ class EventReportFunctionalTest(unittest.TestCase):
         wait_ms = HEARTBEAT_TIMEOUT_MS + CLEANUP_GRACE_MS + 1500
         time.sleep(wait_ms / 1000.0)
 
-        # Soft check: MetaSearchCache TTL may delay eviction.
         resp = self.client.get_cache_location({
             "trace_id": "t20b_q",
             "instance_id": self.instance_id,

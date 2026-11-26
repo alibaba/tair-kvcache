@@ -53,7 +53,10 @@ TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_
 对象中设置 `"skip_confirmed_missing_backend_delete": true`。默认 `false`，即 GC 对已判定
 不存在的 URI 仍发送 Backend Delete；设为 `true` 才跳过这些 URI 的后端删除。
 
-TairMempool HTTP timeout parameters are described in the [configuration guide](../configuration.md#tairmempool).
+TairMempool 的 `tair_mem_pool.allocate_concurrency` 控制后端批量分配的并行度，默认 `0`，
+省略或 `0` 自动使用可用 CPU 数的两倍；显式正数范围为 `1..64`，自动值不受此上限限制。
+后端合并同尺寸请求后并发调用原有 `Create`；配置保留 `0`，不写入当前机器计算出的值。
+线程池与 HTTP 超时说明见[配置指南](../configuration.md#tairmempool)。
 
 ## Enable Storage
 ```bash
@@ -161,10 +164,6 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "local_path": "/tmp/meta"
-                },
-                "meta_cache_policy_config": {
-                    "capacity": 10000,
-                    "type": "lru"
                 }
             }
         },
@@ -213,12 +212,6 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "storage_uri": ""
-                },
-                "meta_cache_policy_config": {
-                    "type": "LRU",
-                    "capacity": 100000,
-                    "cache_shard_bits": 0,
-                    "high_pri_pool_ratio": 0.0
                 }
             }
         },
@@ -270,10 +263,6 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "redis",
                     "storage_uri": "redis://xxxx:xxxx@r-xxxx.redis.zhangbei.rds.aliyuncs.com:6379"
-                },
-                "meta_cache_policy_config": {
-                    "capacity": 10000,
-                    "type": "lru"
                 }
             }
         },
@@ -329,9 +318,13 @@ curl -g -vvv -X POST http://localhost:6492/api/getCacheMeta \
     "block_mask": {
         "offset": 0
     },
-    "detail_level": 1
+    "detail_level": 1,
+    "include_checksums": true
 }'
 ```
+
+`include_checksums` 默认为 `false`。显式开启后，返回的每个 `location_specs[]` 可携带该 spec 独立的
+`checksum`；非空表示返回了校验值。checksum 为不透明字符串，空字符串或字段省略表示未返回校验值。
 
 ## Remove Cache
 ```bash
@@ -350,6 +343,14 @@ curl -g -vvv -X POST http://localhost:6492/api/removeCache \
 ```
 
 ## Register Instance
+
+`disable_write_session` is an optional boolean. Omitted on a new instance, it defaults to false.
+Set it to true for single-spec EventReport metadata with local storage or cached Redis/async Redis.
+Both modes require `memory_primary=false`. Ordinary write sessions and migration are unsupported.
+RemoveCache/TrimCache delete metadata only.
+The setting is persisted per instance: omission on re-registration preserves it, and an explicit different
+value is rejected. InstanceGroup configuration is unchanged.
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/registerInstance \
   -H "Content-Type: application/json" \

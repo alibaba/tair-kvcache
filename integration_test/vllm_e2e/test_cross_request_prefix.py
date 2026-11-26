@@ -145,7 +145,8 @@ class TestCrossRequestPrefix(unittest.TestCase):
             toks_a = toks_a[:blocks_a * mbs]
             logger.info("A: %d tokens = %d x %d", len(toks_a), blocks_a, mbs)
             completion_token_ids(vllm.base_url(), toks_a, max_tokens=4)
-            wait_for_captures(env.capture_dir, "ref", expected=blocks_a, timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * blocks_a, timeout=180)
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, toks_a,
                 min_blocks=blocks_a), "A was not committed to the manager")

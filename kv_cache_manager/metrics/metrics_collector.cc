@@ -35,6 +35,20 @@ MetricsCollectors::mc_vec_t MetricsCollectors::GetMetricsCollectors() const noex
     return *metrics_collectors_;
 }
 
+DEFINE_METRICS_NAME_(GrpcMetricsCollector, grpc, response_counter);
+
+GrpcMetricsCollector::GrpcMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                           MetricsTags metrics_tags) noexcept
+    : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
+
+bool GrpcMetricsCollector::Init() {
+    if (!metrics_registry_) {
+        return false;
+    }
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, grpc, response_counter, metrics_tags_);
+    return true;
+}
+
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 // service metrics
@@ -92,12 +106,7 @@ DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_query_times);
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_indexer, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_INDEXER(query_key_count);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(get_not_exist_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(query_batch_num);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(search_cache_hit_count);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(search_cache_miss_count);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(search_cache_hit_ratio);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(io_data_size);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(put_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(upsert_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(lock_wait_time_us);
@@ -122,6 +131,23 @@ ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry
 ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry,
                                                  MetricsTags metrics_tags) noexcept
     : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
+
+std::shared_ptr<ServiceMetricsCollector> ServiceMetricsCollector::MakeRequestCollector() const {
+    auto collector = std::make_shared<ServiceMetricsCollector>(*this);
+    collector->registry_query_key_count_metrics_ = registry_query_key_count_metrics_.GetRaw()
+                                                       ? registry_query_key_count_metrics_
+                                                       : METRICS_(meta_indexer, query_key_count);
+    // Keep the registry handles shared while this request owns its key-count sample.
+    collector->METRICS_(meta_indexer, query_key_count) =
+        Gauge(std::make_shared<MetricsValue>(std::in_place_type<GaugeValue>, 0.0));
+    return collector;
+}
+
+void ServiceMetricsCollector::PublishQueryKeyCountSample() {
+    if (registry_query_key_count_metrics_.GetRaw()) {
+        registry_query_key_count_metrics_ = METRICS_(meta_indexer, query_key_count).Get();
+    }
+}
 
 bool ServiceMetricsCollector::Init() {
     if (metrics_registry_ == nullptr) {
@@ -163,12 +189,7 @@ bool ServiceMetricsCollector::Init() {
 
     // meta indexer metrics
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(query_key_count);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(get_not_exist_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(query_batch_num);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(search_cache_hit_count);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(search_cache_miss_count);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(search_cache_hit_ratio);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(io_data_size);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(put_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(upsert_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(lock_wait_time_us);
@@ -220,6 +241,10 @@ EventReportMetricsCollector::EventReportMetricsCollector(const EventReportMetric
     service_error_code_metrics_ = shared_collector.service_error_code_metrics_;
     service_error_counter_metrics_ = shared_collector.service_error_counter_metrics_;
     manager_request_key_count_metrics_ = shared_collector.manager_request_key_count_metrics_;
+    location_lifetime_metrics_tags_ = shared_collector.location_lifetime_metrics_tags_;
+    location_lifetime_min_us_metrics_ = shared_collector.location_lifetime_min_us_metrics_;
+    location_lifetime_max_us_metrics_ = shared_collector.location_lifetime_max_us_metrics_;
+    location_lifetime_avg_us_metrics_ = shared_collector.location_lifetime_avg_us_metrics_;
 }
 
 bool EventReportMetricsCollector::Init() {
@@ -231,7 +256,36 @@ bool EventReportMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(error_code);
     REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(error_counter);
     REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_MANAGER(request_key_count);
+    const auto event_type = metrics_tags_.find("event_type");
+    const auto instance_group = metrics_tags_.find("instance_group");
+    const auto instance_id = metrics_tags_.find("instance_id");
+    if (event_type != metrics_tags_.end() && event_type->second == "block_delete" &&
+        instance_group != metrics_tags_.end() && !instance_group->second.empty() &&
+        instance_id != metrics_tags_.end() && !instance_id->second.empty()) {
+        location_lifetime_metrics_tags_ = {{"instance_group", instance_group->second},
+                                           {"instance_id", instance_id->second}};
+        location_lifetime_min_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_min_us),
+            location_lifetime_metrics_tags_);
+        location_lifetime_max_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_max_us),
+            location_lifetime_metrics_tags_);
+        location_lifetime_avg_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_avg_us),
+            location_lifetime_metrics_tags_);
+    }
     return true;
+}
+
+void EventReportMetricsCollector::UpdateLocationLifetimeMetrics() {
+    if (location_lifetime_sample_) {
+        location_lifetime_min_us_metrics_ = static_cast<double>(location_lifetime_sample_->min_us);
+        location_lifetime_max_us_metrics_ = static_cast<double>(location_lifetime_sample_->max_us);
+        location_lifetime_avg_us_metrics_ = static_cast<double>(location_lifetime_sample_->avg_us);
+    }
 }
 
 /* ------------------ DataStorageMetricsCollector ------------------- */
@@ -281,6 +335,7 @@ bool DataStorageMetricsCollector::Init() {
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(healthy_status);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(writable_status);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(storage_usage_ratio);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(total_capacity_bytes);
 
 DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -290,14 +345,19 @@ DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept
     : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
 
-bool DataStorageIntervalMetricsCollector::Init() {
+bool DataStorageIntervalMetricsCollector::Init() { return Init(true); }
+
+bool DataStorageIntervalMetricsCollector::Init(bool report_storage_usage) {
     if (metrics_registry_ == nullptr) {
         return false;
     }
 
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(healthy_status);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(writable_status);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+    if (report_storage_usage) {
+        REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+        REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(total_capacity_bytes);
+    }
 
     return true;
 }
@@ -310,6 +370,7 @@ bool DataStorageIntervalMetricsCollector::Init() {
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_indexer, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_key_count);
+DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_location_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER_ACC(total_cache_usage);
 
 MetaIndexerAccumulativeMetricsCollector::MetaIndexerAccumulativeMetricsCollector(
@@ -326,6 +387,7 @@ bool MetaIndexerAccumulativeMetricsCollector::Init() {
     }
 
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_key_count);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_location_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER_ACC(total_cache_usage);
 
     return true;
@@ -377,7 +439,11 @@ bool CacheManagerGroupMetricsCollector::Init() {
 }
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      location_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, meta_cache_usage);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
                                       async_queue_max_size);
@@ -400,6 +466,15 @@ DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
                                       async_dropped_metadata_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_min_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_max_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_avg_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -415,7 +490,9 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     }
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, location_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_queue_max_size);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_queue_avg_size);
@@ -424,6 +501,9 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_pipeline_error_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_metadata_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_min_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_max_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_avg_us);
 
     return true;
 }

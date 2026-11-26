@@ -58,13 +58,22 @@ instance_id + storage_type + host_ip_port
 一次 snapshot 是该 reporter 在当前 storage type 下、跨全部 medium 的完整 cache 状态。
 `medium` 是 block 级属性；空 `blocks` 表示该 reporter 当前没有任何 cache。
 
-### 2.3 s_version 同时用于查询栅栏与清理
+### 2.3 s_v 同时用于查询栅栏与清理
 
 KVCM 在 reporter 提供的 URI 上只追加：
 
 ```text
-s_version=<opaque-version>
+s_v=<opaque-version>
 ```
+
+新写入使用 `s_v=<8 位 ASCII 十六进制>`。为兼容原地升级，持久化 metadata 的读取、查询和
+两条 GC 路径也接受 `s_version=<32 位 ASCII 十六进制>`，保留并比较完整 token，不截断或
+转换为新 token。同一个 URI 只能含一个版本字段；重复字段、两种字段同时出现或长度非法均
+按 malformed 处理。Reporter 原始上报 URI 仍禁止携带任一内部版本字段。
+
+兼容格式不改变查询、liveness、snapshot、cleanup lease 和条件删除规则。成功 snapshot 后，
+完全属于旧版本的 location 可由 GC 回收；混有当前或受保护 in-flight spec 的 location 仍保留。
+只发实时增量且节点一直存活的 reporter，未触碰的旧 metadata 仍可能长期存在。
 
 Version 的用途：
 
@@ -135,7 +144,7 @@ Version 只保存在 `EventReportBackend` 内存，不再写入 MetaIndexer，�
 }
 ```
 
-客户端不得携带 `s_version`，由 KVCM 追加。
+客户端不得携带 `s_v`，由 KVCM 追加。
 
 ### 4.2 DELETE
 
@@ -217,7 +226,7 @@ ADD/DELETE：
 3. 获取 delta lease；若 snapshot 正在执行，则最多等待
    `snapshot_delta_drain_timeout_ms` 后返回可重试的 `SNAPSHOT_IN_PROGRESS`；
 4. 如果尚无 committed generation，在锁内生成一个不可复用的 opaque version；
-5. ADD URI 追加该 `s_version`；
+5. ADD URI 追加该 `s_v`；
 6. ADD 按 spec name 合并，DELETE 按 spec name 删除；
 7. 请求完成后释放 lease。
 
@@ -244,7 +253,7 @@ Generation 在获得 delta lease 时建立。参数校验、tombstone 等准入�
 4. `BeginSnapshot` 生成 candidate version，关闭新 delta 入口；
 5. 最多等待 `snapshot_delta_drain_timeout_ms`（默认 10 秒）让已获得 lease 的 delta 完成；
    超时则 abort candidate、重新打开写门并返回可重试的 `SNAPSHOT_IN_PROGRESS`；
-6. 为本次全部 URI 追加 candidate `s_version`；
+6. 为本次全部 URI 追加 candidate `s_v`；
 7. 使用稳定 location id 原地替换完整 specs；
 8. 更新内存 committed generation并打开写门；
 9. 返回新的 `committed_snapshot_version`；
@@ -307,12 +316,12 @@ abort，committed generation 和已有 metadata 都不变。
 3. reporter 必须已注册且 available；
 4. location 至少包含一个 spec；
 5. 每个 URI 必须合法；
-6. URI 如果有 `s_version`，该值必须唯一且格式合法；
+6. URI 如果有 `s_v` 或 `s_version`，只允许其中一个字段出现一次，且值的格式合法；
 7. strict 模式下，location 至少包含一个 committed version。
 
 soft 模式接受：
 
-- 无 `s_version` 的历史 URI；
+- 无版本字段的历史 URI；
 - 旧 generation；
 - 当前 generation；
 - snapshot in-flight generation；

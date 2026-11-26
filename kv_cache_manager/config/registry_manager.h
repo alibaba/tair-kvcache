@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -48,25 +50,42 @@ public:
     ErrorCode UpdateStorage(RequestContext *request_context, const StorageConfig &storage_config, bool force_update);
     std::pair<ErrorCode, std::vector<StorageConfig>> ListStorage(RequestContext *request_context);
 
-    ErrorCode CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group);
-    ErrorCode
-    UpdateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group, int64_t current_version);
+    ErrorCode CreateInstanceGroup(RequestContext *request_context,
+                                  const InstanceGroup &instance_group,
+                                  std::string *validation_error = nullptr);
+    ErrorCode UpdateInstanceGroup(RequestContext *request_context,
+                                  const InstanceGroup &instance_group,
+                                  int64_t current_version,
+                                  std::string *validation_error = nullptr);
     ErrorCode RemoveInstanceGroup(RequestContext *request_context, const std::string &name);
     std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> GetInstanceGroup(RequestContext *request_context,
                                                                                 const std::string &name);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>
     ListInstanceGroup(RequestContext *request_context) const; // list all the instance_groups
+    struct MetricsSnapshot {
+        std::vector<std::shared_ptr<const InstanceGroup>> groups;
+        std::map<std::string, std::string> instance_groups;
+    };
+    // Best-effort, in-memory observation only. Never wait for registry I/O.
+    std::optional<MetricsSnapshot> TryGetMetricsSnapshot() const;
     ErrorCode RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
                                const std::string &instance_id,
                                int32_t block_size,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
-                               const std::vector<LocationSpecGroup> &location_spec_groups = {},
-                               int32_t default_query_type = 0);
+                               const std::vector<LocationSpecGroup> &location_spec_groups,
+                               int32_t default_query_type,
+                               std::optional<bool> disable_write_session);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
+    // Keep a durable deletion intent until cache and persistent metadata have been reclaimed.
+    ErrorCode BeginRemoveInstance(RequestContext *request_context, const std::string &instance_id);
+    ErrorCode CompleteRemoveInstance(const std::string &instance_id);
+    bool IsInstanceRemovalRetired(const std::string &instance_id) const;
+    std::shared_ptr<const InstanceInfo> GetRemovingInstanceInfo(const std::string &instance_id) const;
+    std::vector<std::shared_ptr<const InstanceInfo>> ListRemovingInstanceInfos() const;
     std::shared_ptr<const InstanceInfo> GetInstanceInfo(RequestContext *request_context,
                                                         const std::string &instance_id);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceInfo>>>
@@ -88,14 +107,19 @@ public:
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:
-    ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
-    ErrorCode LoadAndDelete(const std::string &key, const std::string &id);
+    bool ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const;
+    static bool ValidateSimpleInstanceConfig(const InstanceGroup &instance_group,
+                                             const std::vector<LocationSpecInfo> &location_spec_infos,
+                                             std::string &error_message);
+    ErrorCode UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
+    ErrorCode DeleteRegistryField(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);
     // return error count (0 means success)
     size_t RecoverStorageUnsafe();
     size_t RecoverAccountUnsafe();
     size_t RecoverInstanceGroupUnsafe();
     size_t RecoverInstanceInfoUnsafe();
+    bool HasRemovingInstanceInGroupUnsafe(const std::string &instance_group_name) const;
 
 private:
     /***
@@ -116,6 +140,12 @@ private:
     std::unordered_map<std::string, std::shared_ptr<InstanceGroup>> instance_group_configs_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<InstanceInfo>> instance_infos_;
+    struct RemovingInstanceEntry {
+        std::shared_ptr<InstanceInfo> info;
+        bool retired = false;
+    };
+    // 需要清理 - DoRecoverOnce 从持久化删除意图中恢复。
+    std::unordered_map<std::string, RemovingInstanceEntry> removing_instance_infos_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<Account>> accounts_;
     // 无需清理 - 主备切换不改变到registry后端存储的配置

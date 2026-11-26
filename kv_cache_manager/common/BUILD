@@ -2,6 +2,15 @@ load("//bazel:version.bzl", "version_info_cc")
 
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "bounded_parallel",
+    hdrs = ["bounded_parallel.h"],
+    deps = [
+        ":common",
+        "@havenask//aios/autil:thread",
+    ],
+)
+
 version_info_cc(
     name = "build_version",
 )
@@ -211,6 +220,20 @@ cc_library(
 )
 
 cc_library(
+    name = "lock_free_thread_pool",
+    srcs = ["lock_free_thread_pool.cc"],
+    hdrs = ["lock_free_thread_pool.h"],
+    deps = [":logger"] + select({
+        ":client_only_header": [
+            "@havenask//aios/autil:kvcm_client_patch_autil_header",
+        ],
+        "//conditions:default": [
+            "@havenask//aios/autil:lock_free",
+        ],
+    }),
+)
+
+cc_library(
     name = "loop_thread",
     srcs = [
         "loop_thread.cc",
@@ -256,6 +279,7 @@ cc_library(
     ],
     deps = [
         ":common",
+        ":env_util",
         ":standard_uri",
         "@hiredis",
     ],
@@ -347,8 +371,8 @@ cc_library(
         ":logger",
         ":service_discovery",
         ":service_discovery_url",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         ":static_service_discovery",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         "//stub_source/kv_cache_manager/common:vipserver_service_discovery",
     ],
 )

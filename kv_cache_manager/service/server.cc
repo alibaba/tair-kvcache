@@ -1,7 +1,10 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
+#include <system_error>
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -22,17 +25,22 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
+#include "kv_cache_manager/metrics/redis_health_metrics.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/command_line.h"
 #include "kv_cache_manager/service/debug_service_impl.h"
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/service_request_executor.h"
+#include "kv_cache_manager/service/util/report_event_body_budget.h"
 
 namespace kv_cache_manager {
 
@@ -41,8 +49,8 @@ bool Server::Init(const ServerConfig &config) {
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
     // single shared lifecycle handle: producers hold it as a reader
-    // around metric registration; AdminServiceImpl::RemoveInstance and
-    // RemoveInstanceGroup hold it as a writer for the entire removal
+    // around metric registration; CacheManager::RemoveInstance and
+    // AdminServiceImpl group/storage removals hold it as a writer
     metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
 
     config_ = config;
@@ -83,6 +91,8 @@ bool Server::Init(const ServerConfig &config) {
     cache_gc_config.orphan_writing_grace_period_ms = config_.GetCacheGcOrphanWritingGracePeriodMs();
     cache_gc_config.max_inflight_delete_requests = static_cast<size_t>(config_.GetCacheGcMaxInflightDeleteRequests());
     cache_gc_config.event_report_cleanup_enabled = config_.IsCacheGcEventReportCleanupEnabled();
+    cache_gc_config.event_report_cleanup_during_recover_enabled =
+        config_.IsCacheGcEventReportCleanupDuringRecoverEnabled();
     cache_gc_config.event_report_action_batch_size =
         static_cast<size_t>(config_.GetCacheGcEventReportActionBatchSize());
     if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
@@ -113,9 +123,20 @@ bool Server::Init(const ServerConfig &config) {
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
 
-    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_);
-    admin_impl_ = std::make_shared<AdminServiceImpl>(
-        cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
+    const bool include_access_log_payload = config_.IncludeAccessLogPayload();
+    const MetaServiceImpl::AccessLogOptions access_log_options{
+        include_access_log_payload,
+        config_.IsReportEventFullAccessLogEnabled(),
+        config_.IsGetHostCacheStateFullAccessLogEnabled(),
+    };
+    meta_impl_ =
+        std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_, access_log_options);
+    admin_impl_ = std::make_shared<AdminServiceImpl>(cache_manager_,
+                                                     metrics_reporter_,
+                                                     metrics_registry_,
+                                                     registry_manager_,
+                                                     leader_elector_,
+                                                     include_access_log_payload);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -155,12 +176,17 @@ void Server::OnBecomeLeader() {
     cache_manager_->ResumeReclaimer();
     cache_manager_->StartMigrationManager();
 
-    meta_impl_->EnableLeaderOnlyRequests();
-    admin_impl_->EnableLeaderOnlyRequests();
-    if (optimizer_event_service_) {
-        optimizer_event_service_->EnableSubscriptions();
+    if (leader_elector_->RunIfCurrentPromotionValid([this]() {
+            meta_impl_->EnableLeaderOnlyRequests();
+            admin_impl_->EnableLeaderOnlyRequests();
+            if (optimizer_event_service_) {
+                optimizer_event_service_->EnableSubscriptions();
+            }
+        })) {
+        KVCM_LOG_INFO("recover end");
+    } else {
+        KVCM_LOG_INFO("recover finished after leadership was revoked, cleanup required");
     }
-    KVCM_LOG_INFO("recover end");
 }
 
 void Server::OnNoLongerLeader() {
@@ -195,6 +221,40 @@ void Server::OnNoLongerLeader() {
 
 bool Server::Start() {
     KVCM_LOG_INFO("server starting...");
+    const size_t worker_count = config_.ResolveServiceWorkerThreadNum(std::thread::hardware_concurrency());
+    request_executor_ = std::make_shared<ServiceRequestExecutor>();
+    if (!request_executor_->Init(worker_count, config_.GetServiceWorkerQueueCapacity())) {
+        KVCM_LOG_ERROR("init Meta request executor failed");
+        return false;
+    }
+    KVCM_LOG_INFO("Meta request workers=%zu, queue_capacity=%u, shutdown_mode=%s",
+                  worker_count,
+                  config_.GetServiceWorkerQueueCapacity(),
+                  config_.GetServiceWorkerShutdownMode().c_str());
+    const size_t configured_body_budget = config_.GetHttpReportEventBodyBudgetBytes();
+    report_event_body_budget_ = std::make_shared<ReportEventBodyBudget>(configured_body_budget);
+    last_body_budget_report_ = std::chrono::steady_clock::now();
+    KVCM_LOG_INFO("HTTP ReportEvent body budget mode=%s, initial_bytes=%zu",
+                  configured_body_budget == 0 ? "auto" : "fixed",
+                  report_event_body_budget_->Limit());
+    const bool report_kmonitor_qps = config_.metrics_reporter_type() == "kmonitor";
+    if (configured_body_budget == 0 || report_kmonitor_qps) {
+        report_event_body_budget_thread_ = LoopThread::CreateLoopThread(
+            [budget = report_event_body_budget_, reporter = report_kmonitor_qps ? metrics_reporter_ : nullptr]() {
+                budget->Refresh();
+                // A zero update keeps the QPS series visible while there are no rejections.
+                if (reporter) {
+                    reporter->ReportEventBodyBudgetRejections(0);
+                }
+            },
+            ReportEventBodyBudget::kSampleIntervalUs,
+            "report-event-body-budget",
+            true);
+        if (!report_event_body_budget_thread_) {
+            KVCM_LOG_ERROR("init HTTP ReportEvent body budget sampler failed");
+            return false;
+        }
+    }
     if (!StartMetricsReportThread()) {
         KVCM_LOG_ERROR("init metrics reporter failed");
         return false;
@@ -261,7 +321,8 @@ bool Server::StartRpcServer() {
     // grpc::EnableDefaultHealthCheckService(true);
     // grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
+    meta_service_ = std::make_shared<MetaServiceGRpc>(
+        metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
 
@@ -270,6 +331,14 @@ bool Server::StartRpcServer() {
     debug_service_->Init();
 
     grpc::ServerBuilder builder;
+    const int max_threads =
+        ConfigureGrpcServer(builder,
+                            config_.GetServiceGrpcMaxThreads(),
+                            config_.GetServiceGrpcMemoryQuotaBytes(),
+                            "meta",
+                            metrics_registry_,
+                            metrics_reporter_,
+                            optimizer_event_service_ ? optimizer_event_service_->MaxSubscribers() : 0);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (optimizer_event_service_) {
@@ -281,13 +350,24 @@ bool Server::StartRpcServer() {
     if (!use_separate_admin_server && config_.IsEnableDebugService()) {
         builder.RegisterService(debug_service_.get());
     }
+    if (!meta_service_->PrepareCompletionQueue(builder, config_.GetServiceGrpcCqThreadNum())) {
+        KVCM_LOG_ERROR("Failed to start Meta RPC completion queue");
+        return false;
+    }
     auto server = builder.BuildAndStart();
     if (!server) {
         KVCM_LOG_ERROR("Failed to start rpc server");
         return false;
     }
     rpc_server_.reset(server.release());
-    KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
+    meta_service_->StartAccepting();
+    const std::string thread_limit = max_threads == -1 ? "framework_default" : std::to_string(max_threads);
+    KVCM_LOG_INFO(
+        "Server listening on %s success, grpc_max_threads=%s (configured=%d), grpc_memory_quota_bytes=%" PRIu64,
+        server_address.c_str(),
+        thread_limit.c_str(),
+        config_.GetServiceGrpcMaxThreads(),
+        config_.GetServiceGrpcMemoryQuotaBytes());
     if (use_separate_admin_server) {
         return StartSeparateAdminRpcServer();
     }
@@ -298,6 +378,12 @@ bool Server::StartSeparateAdminRpcServer() {
     int32_t rpc_port = config_.GetServiceAdminRpcPort();
     std::string server_address = "0.0.0.0:" + std::to_string(rpc_port);
     grpc::ServerBuilder builder;
+    const int max_threads = ConfigureGrpcServer(builder,
+                                                config_.GetServiceGrpcMaxThreads(),
+                                                config_.GetServiceGrpcMemoryQuotaBytes(),
+                                                "admin",
+                                                metrics_registry_,
+                                                metrics_reporter_);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(admin_service_.get());
     if (config_.IsEnableDebugService()) {
@@ -309,7 +395,13 @@ bool Server::StartSeparateAdminRpcServer() {
         return false;
     }
     admin_rpc_server_.reset(server.release());
-    KVCM_LOG_INFO("Admin Server listening on %s success", server_address.c_str());
+    const std::string thread_limit = max_threads == -1 ? "framework_default" : std::to_string(max_threads);
+    KVCM_LOG_INFO(
+        "Admin Server listening on %s success, grpc_max_threads=%s (configured=%d), grpc_memory_quota_bytes=%" PRIu64,
+        server_address.c_str(),
+        thread_limit.c_str(),
+        config_.GetServiceGrpcMaxThreads(),
+        config_.GetServiceGrpcMemoryQuotaBytes());
     return true;
 }
 
@@ -322,8 +414,14 @@ bool Server::StartHttpServer() {
                                                               : std::thread::hardware_concurrency();
     KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
 
-    meta_http_service_ =
-        std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
+    meta_http_service_ = std::make_shared<MetaServiceHttp>(
+        metrics_registry_,
+        meta_impl_,
+        registry_manager_,
+        request_executor_,
+        metrics_lifecycle_,
+        report_event_body_budget_,
+        [reporter = metrics_reporter_]() { reporter->ReportEventBodyBudgetRejections(1); });
     admin_http_service_ = std::make_shared<AdminServiceHttp>(metrics_registry_,
                                                              admin_impl_,
                                                              config_.enable_prometheus(),
@@ -388,6 +486,15 @@ void Server::CreateMetricsReporter() {
     auto reporter_config = config_.metrics_reporter_config();
     metrics_reporter_ =
         metrics_reporter_factory_->Create(reporter_type, reporter_config, config_.metrics_common_tags());
+    if (metrics_reporter_ && leader_elector_) {
+        // Hold the elector weakly: the metrics loop thread can still run one
+        // last ReportInterval() while the server tears its members down.
+        std::weak_ptr<LeaderElector> weak_leader_elector = leader_elector_;
+        metrics_reporter_->SetLeaderStateProvider([weak_leader_elector]() {
+            auto leader_elector = weak_leader_elector.lock();
+            return leader_elector != nullptr && leader_elector->IsLeader();
+        });
+    }
     KVCM_LOG_INFO("create metrics reporter OK");
 }
 
@@ -420,10 +527,11 @@ void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_
         }
     }
 
-    if (!publishers_config.enable_optimizer_event_publisher()) {
+    const auto &config = publishers_config.optimizer_event_publisher_config();
+    if (!config.enable()) {
+        KVCM_LOG_INFO("optimizer event publisher disabled by configuration");
         return;
     }
-    const auto &config = publishers_config.optimizer_event_publisher_config();
     auto sink = std::make_shared<SubscriptionEventSink>(config);
     auto optimizer_publisher = std::make_shared<OptimizerEventPublisher>(sink, config);
     if (!optimizer_publisher->Init("")) {
@@ -463,6 +571,10 @@ bool Server::CreateLeaderElector() {
                                                       config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+    leader_elector_->SetLeadershipLostHandler([this]() {
+        meta_impl_->DisableLeaderOnlyRequests();
+        admin_impl_->DisableLeaderOnlyRequests();
+    });
 
     // 写入本节点的连接信息到协调后端
     {
@@ -490,18 +602,157 @@ bool Server::StartMetricsReportThread() {
         KVCM_LOG_ERROR("do not have metrics reporter, start report thread failed.");
         return false;
     }
+    std::weak_ptr<LeaderElector> weak_role_elector = leader_elector_;
+    // Phase reporting must remain live while recovery, cleanup or capacity
+    // collection is waiting. GetRoleState only loads an existing atomic.
+    role_state_metrics_thread_ = LoopThread::CreateLoopThread(
+        [registry = metrics_registry_, weak_role_elector]() {
+            if (const auto elector = weak_role_elector.lock()) {
+                NodeStatusMetrics::PublishRoleState(registry, elector->GetRoleState());
+            }
+        },
+        config_.metrics_report_interval_ms() * 1000,
+        "role_state",
+        true);
+    if (leader_elector_) {
+        std::weak_ptr<LeaderElector> weak_storage_elector = leader_elector_;
+        metrics_reporter_->SetStorageUsageProvider([weak_storage_elector]() {
+            const auto elector = weak_storage_elector.lock();
+            return elector && elector->IsLeader();
+        });
+    }
     metrics_report_thread_ = LoopThread::CreateLoopThread(
-        std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
+        [this]() { ReportMetrics(); }, config_.metrics_report_interval_ms() * 1000);
+    if (config_.redis_health_probe_enabled()) {
+        std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
+        redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
+            metrics_registry_, metrics_lifecycle_, registry_manager_, cache_manager_->meta_indexer_manager(),
+            [weak_elector]() {
+                const auto elector = weak_elector.lock();
+                return elector && elector->IsLeader();
+            });
+        redis_health_thread_ = LoopThread::CreateLoopThread([metrics = redis_health_metrics_]() { metrics->Report(); },
+                                                            config_.metrics_report_interval_ms() * 1000,
+                                                            "redis_health",
+                                                            true);
+        coordination_redis_health_metrics_ =
+            std::make_shared<CoordinationRedisHealthMetrics>(metrics_registry_, config_.GetCoordinationUri());
+        if (coordination_redis_health_metrics_->IsEnabled()) {
+            // Neither slow metadata probes nor loss of leadership may suppress this
+            // observation. A minimum interval also bounds load for fast metrics configurations.
+            try {
+                coordination_redis_health_thread_ =
+                    LoopThread::CreateLoopThread([metrics = coordination_redis_health_metrics_]() { metrics->Report(); },
+                                                 std::max<int64_t>(config_.metrics_report_interval_ms(), 1000) * 1000,
+                                                 "coord_redis_health",
+                                                 true);
+            } catch (const std::system_error &error) {
+                // Observability must not prevent the existing service from starting.
+                KVCM_LOG_WARN("cannot start coordination Redis health probe thread: %s", error.what());
+            }
+        }
+    }
     KVCM_LOG_INFO("start metrics reporter success.");
     return true;
 }
 
+void Server::ReportMetrics(bool final_snapshot) {
+    if (metrics_registry_ && report_event_body_budget_) {
+        metrics_registry_->GetGauge("service.report_event_body_budget_bytes") = report_event_body_budget_->Limit();
+        metrics_registry_->GetGauge("service.report_event_body_in_flight_bytes") = report_event_body_budget_->InUse();
+        const uint64_t rejected = report_event_body_budget_->TakeRejected();
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        const std::chrono::steady_clock::duration elapsed =
+            std::max(now - last_body_budget_report_, std::chrono::steady_clock::duration{1});
+        last_body_budget_report_ = now;
+        metrics_registry_->GetGauge("service.report_event_body_budget_rejected") =
+            static_cast<double>(rejected) / std::chrono::duration<double>(elapsed).count();
+    }
+    if (request_executor_) {
+        const auto state = request_executor_->TakeMetricsSnapshot();
+        // Aggregate at most once per reporting interval, outside admission's
+        // hot-path lock. Stop also retains an unconditional final summary.
+        if (!final_snapshot && state.rejected != last_request_rejected_) {
+            KVCM_LOG_WARN("service request submissions rejected: total=%zu, queued=%zu, running=%zu",
+                          state.rejected,
+                          state.queued,
+                          state.running);
+        }
+        if (metrics_registry_) {
+            metrics_registry_->GetGauge("service.request_queue_length") = state.queued;
+            metrics_registry_->GetGauge("service.request_queue_length_max") = state.queue_length_max;
+            metrics_registry_->GetGauge("service.request_queue_length_avg") = state.queue_length_avg;
+            metrics_registry_->GetGauge("service.request_queue_capacity") = config_.GetServiceWorkerQueueCapacity();
+            metrics_registry_->GetGauge("service.request_wait_time_us_max") = state.wait_time.max_us;
+            metrics_registry_->GetGauge("service.request_wait_time_us_avg") = state.wait_time.AvgUs();
+            metrics_registry_->GetGauge("service.request_execution_time_us_max") = state.execution_time.max_us;
+            metrics_registry_->GetGauge("service.request_execution_time_us_avg") = state.execution_time.AvgUs();
+            metrics_registry_->GetCounter("service.request_completed") += state.execution_time.count;
+            metrics_registry_->GetGauge("service.request_running") = state.running;
+            metrics_registry_->GetCounter("service.request_rejected") += state.rejected - last_request_rejected_;
+            metrics_registry_->GetCounter("service.request_discarded") += state.discarded - last_request_discarded_;
+            last_request_rejected_ = state.rejected;
+            last_request_discarded_ = state.discarded;
+
+            // Publish cumulative histogram buckets from one consistent snapshot.
+            // The existing exporter stores sums in microseconds and emits seconds.
+            const std::string family = "service.request_queue_wait_seconds";
+            metrics_registry_->RegisterHistogramFamily(family);
+            for (const auto *suffix : {"_bucket", "_sum", "_count"}) {
+                metrics_registry_->MapMetricToFamily(family + suffix, family);
+            }
+            uint64_t cumulative_delta = 0;
+            for (std::size_t i = 0; i < state.queue_wait.buckets.size(); ++i) {
+                cumulative_delta += state.queue_wait.buckets[i] - last_queue_wait_.buckets[i];
+                const auto &bounds = ServiceRequestExecutor::kQueueWaitBoundsUs;
+                const auto le = i < bounds.size() ? std::to_string(static_cast<double>(bounds[i]) / 1e6) : "+Inf";
+                metrics_registry_->GetCounter(family + "_bucket", {{"le", le}}) += cumulative_delta;
+            }
+            metrics_registry_->GetCounter(family + "_sum") += state.queue_wait.sum_us - last_queue_wait_.sum_us;
+            metrics_registry_->GetCounter(family + "_count") += state.queue_wait.count - last_queue_wait_.count;
+            last_queue_wait_ = state.queue_wait;
+        }
+        if (final_snapshot) {
+            KVCM_LOG_INFO("service request executor stopped: queued=%zu, running=%zu, rejected=%zu, discarded=%zu",
+                          state.queued,
+                          state.running,
+                          state.rejected,
+                          state.discarded);
+        }
+    }
+    if (metrics_reporter_) {
+        metrics_reporter_->ReportInterval();
+    }
+}
+
 void Server::Stop() {
-    if (stop_) {
+    if (stop_.exchange(true)) {
         return;
     }
-    stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (redis_health_thread_) {
+        redis_health_metrics_->RequestStop();
+    }
+    if (coordination_redis_health_metrics_) {
+        coordination_redis_health_metrics_->RequestStop();
+    }
+    // Revoke Leader readiness before closing the business queue. During the
+    // potentially slow cleanup, requests must still reach the original
+    // SERVER_NOT_LEADER gate and GetClusterInfo must remain callable.
+    if (leader_elector_) {
+        leader_elector_->Stop();
+    }
+    if (request_executor_) {
+        request_executor_->CloseAdmission(config_.GetServiceWorkerShutdownMode() == "drain"
+                                              ? ServiceRequestExecutor::ShutdownMode::kDrain
+                                              : ServiceRequestExecutor::ShutdownMode::kDiscardPending);
+    }
+    if (report_event_body_budget_thread_) {
+        report_event_body_budget_thread_->Stop();
+    }
+    if (meta_service_) {
+        meta_service_->StopAccepting();
+    }
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }
@@ -512,6 +763,15 @@ void Server::Stop() {
         admin_rpc_server_->Shutdown();
     }
     KVCM_LOG_INFO("rpc server stopped.");
+    // Workers and both network executors must stay alive until accepted requests
+    // have finished handing their results back to the transport.
+    if (request_executor_) {
+        request_executor_->Drain();
+    }
+    if (meta_service_) {
+        meta_service_->WaitForCalls();
+        meta_service_->ShutdownCompletionQueueAndJoin();
+    }
     if (meta_http_service_) {
         meta_http_service_->Stop();
     }
@@ -523,10 +783,25 @@ void Server::Stop() {
         debug_http_service_->Stop();
         KVCM_LOG_INFO("debug http server stopped.");
     }
+    if (role_state_metrics_thread_) {
+        role_state_metrics_thread_->Stop();
+    }
+    if (request_executor_) {
+        request_executor_->Join();
+    }
     if (metrics_report_thread_) {
         metrics_report_thread_->Stop();
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
+    if (redis_health_thread_) {
+        redis_health_thread_->Stop();
+    }
+    if (coordination_redis_health_thread_) {
+        coordination_redis_health_thread_->Stop();
+    }
+    // Discard/rejection counts can change after the last periodic sample.
+    // Join the report thread before sampling once more to avoid double counting.
+    ReportMetrics(true);
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }

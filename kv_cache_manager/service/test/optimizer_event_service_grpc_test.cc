@@ -3,6 +3,7 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,8 +23,10 @@
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
+#include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 
 using namespace ::testing;
@@ -46,6 +49,8 @@ bool WaitUntil(Predicate predicate, int timeout_ms = 2000) {
 
 std::shared_ptr<CacheGetEvent> MakeGetEvent() {
     auto event = std::make_shared<CacheGetEvent>("instance-a");
+    event->set_capture_epoch(1);
+    event->set_optimizer_observation(true);
     event->SetEventTriggerTime();
     event->set_trace_id("trace-grpc-e2e");
     event->SetAddtionalArgs(
@@ -67,6 +72,7 @@ std::string EncodeTokenIdsLe64(const std::vector<int64_t> &token_ids) {
 
 class CaptureEventPublisher : public EventPublisher {
 public:
+    uint64_t CaptureEpoch() const override { return 1; }
     bool Init(const std::string & /*config*/) override { return true; }
     bool Publish(const std::shared_ptr<BaseEvent> &event) override {
         events.push_back(event);
@@ -125,7 +131,7 @@ protected:
 
     void SetServingState(RoleState role_state, bool recover_complete) {
         leader_elector_->role_state_ = role_state;
-        leader_elector_->is_transitioning_ = false;
+        leader_elector_->lock_acquired_ = role_state == RoleState::LEADER;
         registry_manager_->recover_complete_ = recover_complete;
         if (role_state == RoleState::LEADER && recover_complete) {
             service_->EnableSubscriptions();
@@ -165,6 +171,47 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableOnFollower) {
     EXPECT_EQ(0u, sink_->SubscriberCount());
 }
 
+TEST_F(OptimizerEventServiceGRpcTest, TestAutomaticQuotaPreservesUnaryCapacityWithAllSubscriptionsActive) {
+    // Rebuild with the automatic quota for a two-thread host, independent of
+    // the machine running this test. The one allowed subscription fills its budget.
+    server_->Shutdown();
+    server_.reset();
+    service_ = std::make_unique<OptimizerEventServiceGRpc>(sink_, registry_manager_, leader_elector_, cache_manager_);
+    SetServingState(RoleState::LEADER, true);
+    auto reporter = std::make_shared<LocalMetricsReporter>();
+    ASSERT_TRUE(reporter->Init(cache_manager_, metrics_registry_, ""));
+    const auto thread_limit = ResolveGrpcMaxThreads(0, 2, service_->MaxSubscribers());
+    ASSERT_EQ(3, thread_limit);
+    grpc::ServerBuilder builder;
+    ConfigureGrpcServer(builder, thread_limit, 0, "meta", metrics_registry_, reporter, service_->MaxSubscribers());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
+    builder.RegisterService(service_.get());
+    server_ = builder.BuildAndStart();
+    ASSERT_NE(nullptr, server_);
+    stub_ = proto::optimizer::OptimizerEventStreamService::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(port_), grpc::InsecureChannelCredentials()));
+
+    grpc::ClientContext subscription_context;
+    subscription_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
+    subscription_request.set_consumer_id("optimizer");
+    auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
+    ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == service_->MaxSubscribers(); }));
+
+    grpc::ClientContext configuration_context;
+    configuration_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    proto::optimizer::KvcmConfigurationRequest configuration_request;
+    proto::optimizer::KvcmConfigurationResponse configuration_response;
+    EXPECT_TRUE(stub_->GetConfiguration(&configuration_context, configuration_request, &configuration_response).ok());
+    EXPECT_EQ(proto::optimizer::OK, configuration_response.header().status().code());
+    EXPECT_EQ(service_->MaxSubscribers(), sink_->SubscriberCount());
+
+    subscription_context.TryCancel();
+    proto::optimizer::TraceQueryRequest event;
+    EXPECT_FALSE(reader->Read(&event));
+    EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
+}
+
 TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableWhileLeaderIsRecovering) {
     SetServingState(RoleState::LEADER, false);
 
@@ -175,6 +222,31 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableWhileLeaderIsRecover
     EXPECT_EQ(proto::optimizer::SERVICE_NOT_READY, configuration_response.header().status().code());
 
     grpc::ClientContext subscription_context;
+    proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
+    auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
+    proto::optimizer::TraceQueryRequest event;
+    EXPECT_FALSE(reader->Read(&event));
+    EXPECT_EQ(grpc::StatusCode::UNAVAILABLE, reader->Finish().error_code());
+    EXPECT_EQ(0u, sink_->SubscriberCount());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestLeaseLossRejectsNewRequestsBeforeCleanupChangesRole) {
+    // The role and subscription flag still describe the old serving state.
+    // Losing the lease must make it unavailable before cleanup starts.
+    leader_elector_->lock_acquired_ = false;
+    ASSERT_EQ(RoleState::LEADER, leader_elector_->GetRoleState());
+    ASSERT_TRUE(sink_->accepting_subscriptions());
+    ASSERT_FALSE(leader_elector_->IsStableState());
+
+    grpc::ClientContext configuration_context;
+    configuration_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    proto::optimizer::KvcmConfigurationRequest configuration_request;
+    proto::optimizer::KvcmConfigurationResponse configuration_response;
+    ASSERT_TRUE(stub_->GetConfiguration(&configuration_context, configuration_request, &configuration_response).ok());
+    EXPECT_EQ(proto::optimizer::SERVICE_NOT_READY, configuration_response.header().status().code());
+
+    grpc::ClientContext subscription_context;
+    subscription_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
     proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
     auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
     proto::optimizer::TraceQueryRequest event;
@@ -202,7 +274,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestDemotionClosesStreamAndReenableAccepts
     request.set_consumer_id("second-optimizer");
     auto second_reader = stub_->SubscribeEvents(&second_context, request);
     ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == 1; }));
-    ASSERT_TRUE(publisher_->Publish(MakeGetEvent()));
+    auto source = MakeGetEvent();
+    source->set_capture_epoch(sink_->CaptureEpoch());
+    ASSERT_TRUE(publisher_->Publish(source));
     EXPECT_TRUE(second_reader->Read(&event));
     second_context.TryCancel();
     EXPECT_FALSE(second_reader->Read(&event));
@@ -250,7 +324,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
                                                   2,
                                                   {LocationSpecInfo("tp0", 128)},
                                                   ModelDeployment(),
-                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+                                                  {LocationSpecGroup("full_cache", {"tp0"})},
+                                                  0,
+                                                  std::nullopt));
     ASSERT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
     grpc::ClientContext subscription_context;
@@ -279,6 +355,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     ASSERT_TRUE(reader->Read(&received));
     EXPECT_EQ("reported-trace", received.trace_id());
     EXPECT_EQ("report-instance", received.instance_id());
+    EXPECT_EQ(2, received.block_size());
     EXPECT_EQ(2, received.block_keys_size());
     EXPECT_EQ(5, received.input_token_len());
     EXPECT_EQ(123456789000, received.timestamp_ns());
@@ -286,14 +363,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
               std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
     EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
-    ASSERT_EQ(1u, capture_publisher_->events.size());
-    auto broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.front());
-    ASSERT_NE(nullptr, broadcast_event);
-    EXPECT_EQ("reported-trace", broadcast_event->trace_id());
-    EXPECT_EQ("report-instance", broadcast_event->event_source());
-    EXPECT_EQ(5, broadcast_event->input_token_len());
-    EXPECT_EQ(123456789, broadcast_event->event_trigger_time_us());
-    EXPECT_EQ((std::vector<std::string>{"tp0"}), broadcast_event->location_spec_names());
+    EXPECT_TRUE(capture_publisher_->events.empty());
 
     grpc::ClientContext raw_report_context;
     proto::optimizer::TraceQueryRequest raw_request;
@@ -307,13 +377,11 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     proto::optimizer::TraceQueryRequest raw_received;
     ASSERT_TRUE(reader->Read(&raw_received));
     EXPECT_EQ("reported-raw-trace", raw_received.trace_id());
+    EXPECT_EQ(2, raw_received.block_size());
     EXPECT_EQ(std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()),
               std::vector<int64_t>(raw_received.block_keys().begin(), raw_received.block_keys().end()));
     EXPECT_EQ(5, raw_received.input_token_len());
-    ASSERT_EQ(2u, capture_publisher_->events.size());
-    auto raw_broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.back());
-    ASSERT_NE(nullptr, raw_broadcast_event);
-    EXPECT_EQ("reported-raw-trace", raw_broadcast_event->trace_id());
+    EXPECT_TRUE(capture_publisher_->events.empty());
 
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));
@@ -374,7 +442,9 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReturnsInstanceConfigurationSnapshot) 
                                                   16,
                                                   {LocationSpecInfo("tp0", 128)},
                                                   ModelDeployment(),
-                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+                                                  {LocationSpecGroup("full_cache", {"tp0"})},
+                                                  0,
+                                                  std::nullopt));
 
     grpc::ClientContext context;
     proto::optimizer::KvcmConfigurationRequest request;

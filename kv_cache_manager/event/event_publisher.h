@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,9 @@ namespace kv_cache_manager {
 class EventPublisher {
 public:
     virtual ~EventPublisher() = default;
+
+    // Zero means this publisher has no active replay consumer.
+    virtual uint64_t CaptureEpoch() const { return 0; }
 
     /**
      * @brief 初始化事件发布器

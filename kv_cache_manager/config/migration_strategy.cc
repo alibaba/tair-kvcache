@@ -123,16 +123,59 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 copy_max_concurrency_,
                                 MigrationConfig::kDefaultCopyMaxConcurrency);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "async_copy_max_concurrency",
+                                async_copy_max_concurrency_,
+                                MigrationConfig::kDefaultAsyncCopyMaxConcurrency);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
                                 "mark_clear_policy",
                                 mark_clear_policy_,
                                 MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "copy_execution_mode", copy_execution_mode_, MigrationCopyExecutionMode::SYNC);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_max_inflight_bytes",
+                                copy_max_inflight_bytes_,
+                                MigrationConfig::kDefaultCopyMaxInflightBytes);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_operation_deadline_ms",
+                                copy_operation_deadline_ms_,
+                                MigrationConfig::kDefaultCopyOperationDeadlineMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_poll_initial_interval_ms",
+                                copy_poll_initial_interval_ms_,
+                                MigrationConfig::kDefaultCopyPollInitialIntervalMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_poll_max_interval_ms",
+                                copy_poll_max_interval_ms_,
+                                MigrationConfig::kDefaultCopyPollMaxIntervalMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_connect_timeout_ms",
+                                copy_connect_timeout_ms_,
+                                MigrationConfig::kDefaultCopyConnectTimeoutMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_submit_timeout_ms",
+                                copy_submit_timeout_ms_,
+                                MigrationConfig::kDefaultCopySubmitTimeoutMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_query_timeout_ms",
+                                copy_query_timeout_ms_,
+                                MigrationConfig::kDefaultCopyQueryTimeoutMs);
     KVCM_JSON_GET_MACRO(rapid_value, "strategies", strategies_);
     return true;
 }
 
 void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "copy_max_concurrency", copy_max_concurrency_);
+    Put(writer, "async_copy_max_concurrency", async_copy_max_concurrency_);
     Put(writer, "mark_clear_policy", mark_clear_policy_);
+    Put(writer, "copy_execution_mode", copy_execution_mode_);
+    Put(writer, "copy_max_inflight_bytes", copy_max_inflight_bytes_);
+    Put(writer, "copy_operation_deadline_ms", copy_operation_deadline_ms_);
+    Put(writer, "copy_poll_initial_interval_ms", copy_poll_initial_interval_ms_);
+    Put(writer, "copy_poll_max_interval_ms", copy_poll_max_interval_ms_);
+    Put(writer, "copy_connect_timeout_ms", copy_connect_timeout_ms_);
+    Put(writer, "copy_submit_timeout_ms", copy_submit_timeout_ms_);
+    Put(writer, "copy_query_timeout_ms", copy_query_timeout_ms_);
     Put(writer, "strategies", strategies_);
 }
 
@@ -144,10 +187,41 @@ bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const 
         valid = false;
         local_invalid_fields += "{copy_max_concurrency}";
     }
+    if (async_copy_max_concurrency_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{async_copy_max_concurrency}";
+    }
     if (mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS &&
         mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED) {
         valid = false;
         local_invalid_fields += "{mark_clear_policy}";
+    }
+    if (copy_execution_mode_ != MigrationCopyExecutionMode::SYNC &&
+        copy_execution_mode_ != MigrationCopyExecutionMode::ASYNC_REQUIRED) {
+        valid = false;
+        local_invalid_fields += "{copy_execution_mode}";
+    }
+    if (copy_operation_deadline_ms_ <= 0 || copy_poll_initial_interval_ms_ <= 0 ||
+        copy_poll_max_interval_ms_ < copy_poll_initial_interval_ms_ ||
+        copy_poll_max_interval_ms_ >= copy_operation_deadline_ms_) {
+        valid = false;
+        local_invalid_fields += "{copy_async_timing}";
+    }
+    if (copy_connect_timeout_ms_ <= 0 || copy_submit_timeout_ms_ < copy_connect_timeout_ms_ ||
+        copy_query_timeout_ms_ < copy_connect_timeout_ms_ ||
+        copy_submit_timeout_ms_ >= copy_operation_deadline_ms_ ||
+        copy_query_timeout_ms_ >= copy_operation_deadline_ms_ ||
+        copy_submit_timeout_ms_ >
+            copy_operation_deadline_ms_ / MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline ||
+        copy_query_timeout_ms_ >
+            copy_operation_deadline_ms_ / MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline) {
+        valid = false;
+        local_invalid_fields += "{copy_async_http_timing}";
+    }
+    if (copy_execution_mode_ == MigrationCopyExecutionMode::ASYNC_REQUIRED &&
+        copy_max_inflight_bytes_ == 0) {
+        valid = false;
+        local_invalid_fields += "{copy_async_limits}";
     }
     for (const auto &strategy : strategies_) {
         if (strategy == nullptr) {

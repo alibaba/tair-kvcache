@@ -1,0 +1,60 @@
+--- src/core/lib/surface/server.cc
++++ src/core/lib/surface/server.cc
+@@ -1441,29 +1441,35 @@
+       rm = &rc->data.registered.method->matcher;
+       break;
+   }
+-  if (gpr_locked_mpscq_push(&rm->requests_per_cq[cq_idx], &rc->request_link)) {
+-    /* this was the first queued request: we need to lock and start
+-       matching calls */
++  // Match older pending RPCs before making this receive visible to new
++  // arrivals. Otherwise their fast path can repeatedly steal the receive
++  // while the pending RPCs wait until their deadlines expire.
++  gpr_mu_lock(&server->mu_call);
++  while (!gpr_atm_acq_load(&server->shutdown_flag) &&
++         (calld = rm->pending_head) != nullptr) {
++    rm->pending_head = calld->pending_next;
++    gpr_mu_unlock(&server->mu_call);
++    if (gpr_atm_full_cas(&calld->state, PENDING, ACTIVATED)) {
++      publish_call(server, calld, cq_idx, rc);
++      return GRPC_CALL_OK;
++    }
++    // Keep the receive while discarding an already-cancelled pending RPC.
++    GRPC_CLOSURE_INIT(
++        &calld->kill_zombie_closure, kill_zombie,
++        grpc_call_stack_element(grpc_call_get_call_stack(calld->call), 0),
++        grpc_schedule_on_exec_ctx);
++    GRPC_CLOSURE_SCHED(&calld->kill_zombie_closure, GRPC_ERROR_NONE);
+     gpr_mu_lock(&server->mu_call);
+-    while ((calld = rm->pending_head) != nullptr) {
+-      rc = reinterpret_cast<requested_call*>(
+-          gpr_locked_mpscq_pop(&rm->requests_per_cq[cq_idx]));
+-      if (rc == nullptr) break;
+-      rm->pending_head = calld->pending_next;
+-      gpr_mu_unlock(&server->mu_call);
+-      if (!gpr_atm_full_cas(&calld->state, PENDING, ACTIVATED)) {
+-        // Zombied Call
+-        GRPC_CLOSURE_INIT(
+-            &calld->kill_zombie_closure, kill_zombie,
+-            grpc_call_stack_element(grpc_call_get_call_stack(calld->call), 0),
+-            grpc_schedule_on_exec_ctx);
+-        GRPC_CLOSURE_SCHED(&calld->kill_zombie_closure, GRPC_ERROR_NONE);
+-      } else {
+-        publish_call(server, calld, cq_idx, rc);
+-      }
+-      gpr_mu_lock(&server->mu_call);
+-    }
+-    gpr_mu_unlock(&server->mu_call);
++  }
++  // Shutdown drains the pending and receive queues under this same lock.
++  const bool shutdown = gpr_atm_acq_load(&server->shutdown_flag);
++  if (!shutdown) {
++    gpr_locked_mpscq_push(&rm->requests_per_cq[cq_idx], &rc->request_link);
++  }
++  gpr_mu_unlock(&server->mu_call);
++  if (shutdown) {
++    fail_call(server, cq_idx, rc,
++              GRPC_ERROR_CREATE_FROM_STATIC_STRING("Server Shutdown"));
+   }
+   return GRPC_CALL_OK;
+ }

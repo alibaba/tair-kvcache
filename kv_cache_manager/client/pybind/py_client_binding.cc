@@ -89,6 +89,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_MANAGERCLIENT_INIT_ERROR", kvcm::ClientErrorCode::ER_MANAGERCLIENT_INIT_ERROR)
         .value("ER_CLIENT_NOT_EXISTS", kvcm::ClientErrorCode::ER_CLIENT_NOT_EXISTS)
         .value("ER_SERVICE_NO_STATUS", kvcm::ClientErrorCode::ER_SERVICE_NO_STATUS)
+        .value("ER_SERVICE_BUSY", kvcm::ClientErrorCode::ER_SERVICE_BUSY)
         .value("ER_SERVICE_INTERNAL_ERROR", kvcm::ClientErrorCode::ER_SERVICE_INTERNAL_ERROR)
         .value("ER_SERVICE_UNSUPPORTED", kvcm::ClientErrorCode::ER_SERVICE_UNSUPPORTED)
         .value("ER_SERVICE_INVALID_ARGUMENT", kvcm::ClientErrorCode::ER_SERVICE_INVALID_ARGUMENT)
@@ -113,6 +114,8 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_CUDA_STREAM_DESTROY_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_DESTROY_ERROR)
         .value("ER_CUDA_HOST_REGISTER_ERROR", kvcm::ClientErrorCode::ER_CUDA_HOST_REGISTER_ERROR)
         .value("ER_TASK_CANCELLED", kvcm::ClientErrorCode::ER_TASK_CANCELLED)
+        .value("ER_SDK_TIMEOUT_BUFFER_SAFE", kvcm::ClientErrorCode::ER_SDK_TIMEOUT_BUFFER_SAFE)
+        .value("ER_SDK_ERROR_BUFFER_SAFE", kvcm::ClientErrorCode::ER_SDK_ERROR_BUFFER_SAFE)
         .finalize();
 
     py::native_enum<kvcm::MemoryType>(module, "MemoryType", "enum.Enum")

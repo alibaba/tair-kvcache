@@ -41,6 +41,21 @@ TEST_F(MetricsCollectorTest, EventReportMetricsTest) {
     EXPECT_DOUBLE_EQ(10., GET(collector, service, error_code));
 }
 
+TEST_F(MetricsCollectorTest, EventReportLifetimeRequiresDeleteEventAndInstanceTags) {
+    for (const MetricsTags tags :
+         {MetricsTags{{"event_type", "block_delete"}},
+          MetricsTags{{"instance_group", "group_a"}, {"instance_id", "instance_a"}, {"event_type", "block_add"}}}) {
+        EventReportMetricsCollector collector(metrics_registry_, tags);
+        ASSERT_TRUE(collector.Init());
+        collector.SetLocationLifetimeSample({10, 30, 20});
+        EXPECT_FALSE(collector.GetLocationLifetimeSample());
+        EXPECT_TRUE(collector.GetLocationLifetimeMetricsTags().empty());
+        EXPECT_NO_THROW(collector.UpdateLocationLifetimeMetrics());
+    }
+    EXPECT_EQ(nullptr,
+              metrics_registry_->GetMetricsData("cache_manager_instance.event_report_location_lifetime_avg_us"));
+}
+
 // Test MetaIndexer metrics functionality
 TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
@@ -51,12 +66,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
 
     // Test initial state
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_key_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, get_not_exist_key_count), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_batch_num), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_miss_count), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 0.);
@@ -71,12 +81,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
 
     // Test value setting
     SET_METRICS_(p, meta_indexer, query_key_count, 100.);
-    SET_METRICS_(p, meta_indexer, get_not_exist_key_count, 1.);
     SET_METRICS_(p, meta_indexer, query_batch_num, 10.);
-    SET_METRICS_(p, meta_indexer, search_cache_hit_count, 50.);
-    SET_METRICS_(p, meta_indexer, search_cache_miss_count, 50.);
-    SET_METRICS_(p, meta_indexer, search_cache_hit_ratio, 50.);
-    SET_METRICS_(p, meta_indexer, io_data_size, 2048.);
     SET_METRICS_(p, meta_indexer, put_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, upsert_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, lock_wait_time_us, 200.);
@@ -90,12 +95,7 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     SET_METRICS_(p, meta_indexer, read_modify_write_delete_key_count, 10.);
 
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_key_count), 100.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, get_not_exist_key_count), 1.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, query_batch_num), 10.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_count), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_miss_count), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 50.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 2048.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 200.);
@@ -315,6 +315,15 @@ TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, data_storage, writable_status), 1.);
 }
 
+TEST_F(MetricsCollectorTest, HealthOnlyCollectorDoesNotRegisterCapacity) {
+    DataStorageIntervalMetricsCollector collector(metrics_registry_, {{"unique_name", "follower_store"}});
+    ASSERT_TRUE(collector.Init(false));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio"));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("data_storage.total_capacity_bytes"));
+    EXPECT_NE(nullptr, metrics_registry_->GetMetricsData("data_storage.healthy_status"));
+    EXPECT_NE(nullptr, metrics_registry_->GetMetricsData("data_storage.writable_status"));
+}
+
 TEST_F(MetricsCollectorTest, MetaIndexerAccumulativeMetricsCollectorTest) {
     metrics_collector_ = std::make_shared<MetaIndexerAccumulativeMetricsCollector>(metrics_registry_);
     metrics_collector_->Init();
@@ -486,4 +495,41 @@ TEST_F(MetricsCollectorTest, ChronoScopeAsymmetricConcurrentTest) {
         double val = GET(p, meta_searcher, indexer_get_time_us);
         EXPECT_GE(val, static_cast<double>(kLongSleepUs - 500));
     }
+}
+
+TEST_F(MetricsCollectorTest, RequestQueryKeyCountsRemainPrivateDuringConcurrentPublication) {
+    ServiceMetricsCollector shared(metrics_registry_);
+    ASSERT_TRUE(shared.Init());
+    SET_METRICS_(&shared, meta_indexer, query_key_count, 3600000.);
+    const size_t metric_count = metrics_registry_->GetSize();
+    constexpr int kWorkers = 4;
+    constexpr int kRequests = 100;
+    std::atomic<int> ready{0};
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < kWorkers; ++i) {
+        workers.emplace_back([&, i]() {
+            std::shared_ptr<ServiceMetricsCollector> request = shared.MakeRequestCollector();
+            if (request->get_meta_indexer_query_key_count_metrics() != 0.) {
+                ++mismatches;
+            }
+            ++ready;
+            while (ready.load() != kWorkers) {
+                std::this_thread::yield();
+            }
+            const double expected = i == 0 ? 0. : static_cast<double>(i * 100);
+            for (int j = 0; j < kRequests; ++j) {
+                SET_METRICS_(request, meta_indexer, query_key_count, expected);
+                request->PublishQueryKeyCountSample();
+                if (request->get_meta_indexer_query_key_count_metrics() != expected) {
+                    ++mismatches;
+                }
+            }
+        });
+    }
+    for (std::thread &worker : workers) {
+        worker.join();
+    }
+    EXPECT_EQ(0, mismatches.load());
+    EXPECT_EQ(metric_count, metrics_registry_->GetSize());
 }

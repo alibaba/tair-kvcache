@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
+#include "kv_cache_manager/common/bounded_parallel.h"
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
@@ -37,6 +41,10 @@ std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC
 
 std::shared_ptr<RedisClient> MetaAsyncRedisBackend::CreateRedisClient() const {
     return std::make_shared<RedisClient>(storage_uri_);
+}
+
+autil::ThreadPtr MetaAsyncRedisBackend::CreateConsumerThread(int queue_id) {
+    return autil::Thread::createThread([this, queue_id] { ConsumerLoop(queue_id); }, "kvcm_consumer");
 }
 
 ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
@@ -75,6 +83,15 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
     parse_config_param("async_enqueue_timeout_ms", enqueue_timeout_ms_);
     parse_config_param("async_sync_timeout_ms", sync_timeout_ms_);
     parse_config_param("async_drain_ms", drain_timeout_ms_);
+    constexpr int32_t kDefaultOpenConcurrency = 8;
+    open_concurrency_ =
+        EnvUtil::GetEnv("kvcm.meta_async_redis.open_concurrency",
+                        EnvUtil::GetEnv("kvcm_meta_async_redis_open_concurrency", kDefaultOpenConcurrency));
+    if (open_concurrency_ <= 0 || open_concurrency_ > 64) {
+        KVCM_LOG_WARN(
+            "invalid async Redis open concurrency[%d], using default[%d]", open_concurrency_, kDefaultOpenConcurrency);
+        open_concurrency_ = kDefaultOpenConcurrency;
+    }
 
     constexpr int32_t kMaxQueueCount = 2048;
     if (queue_count_ <= 0 || queue_count_ > kMaxQueueCount || max_batch_size_ <= 0 || batch_wait_timeout_us_ <= 0 ||
@@ -108,68 +125,101 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaAsyncRedisBackend::Open() noexcept {
-    consumer_clients_.resize(queue_count_);
-    for (int i = 0; i < queue_count_; ++i) {
-        auto client = CreateRedisClient();
-        if (!client || !client->Open()) {
-            KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%d], instance[%s]",
-                           i,
+    if (is_running_.load(std::memory_order_acquire)) {
+        return EC_OK;
+    }
+    try {
+        consumer_clients_.resize(queue_count_);
+        const auto open_ec = RunBoundedParallel(queue_count_, open_concurrency_, [this](size_t i) {
+            auto client = CreateRedisClient();
+            if (!client || !client->Open()) {
+                KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%zu], instance[%s]",
+                               i,
+                               instance_id_.c_str());
+                return EC_ERROR;
+            }
+            // Preallocated slots let workers publish their own clients without locking.
+            consumer_clients_[i] = std::move(client);
+            return EC_OK;
+        });
+        if (open_ec != EC_OK) {
+            KVCM_LOG_ERROR("async redis backend open failed during consumer connection startup, instance[%s], "
+                           "open concurrency[%d], ec[%d]",
+                           instance_id_.c_str(),
+                           open_concurrency_,
+                           open_ec);
+            CleanupResources();
+            return EC_ERROR;
+        }
+
+        constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
+        constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
+        int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
+        int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
+        int64_t tmp_client_max_pool_size = 0;
+        storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
+        if (tmp_client_max_pool_size > 0) {
+            client_max_pool_size = tmp_client_max_pool_size;
+        }
+        int64_t tmp_client_min_pool_size = 0;
+        storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
+        if (tmp_client_min_pool_size > 0) {
+            client_min_pool_size = tmp_client_min_pool_size;
+        }
+        read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
+            [this]() -> std::shared_ptr<RedisClient> {
+                auto client = this->CreateRedisClient();
+                if (!client || !client->Open()) {
+                    return nullptr;
+                }
+                return client;
+            },
+            client_min_pool_size,
+            client_max_pool_size);
+        if (!read_client_pool_->Initialize()) {
+            KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
                            instance_id_.c_str());
             CleanupResources();
             return EC_ERROR;
         }
-        consumer_clients_[i] = std::move(client);
-    }
 
-    constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
-    constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
-    int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
-    int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
-    int64_t tmp_client_max_pool_size = 0;
-    storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
-    if (tmp_client_max_pool_size > 0) {
-        client_max_pool_size = tmp_client_max_pool_size;
-    }
-    int64_t tmp_client_min_pool_size = 0;
-    storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
-    if (tmp_client_min_pool_size > 0) {
-        client_min_pool_size = tmp_client_min_pool_size;
-    }
-    read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
-        [this]() -> std::shared_ptr<RedisClient> {
-            auto client = this->CreateRedisClient();
-            if (!client || !client->Open()) {
-                return nullptr;
+        queues_.resize(queue_count_);
+        for (int i = 0; i < queue_count_; ++i) {
+            queues_[i] = std::make_unique<MpscWriteQueue>();
+        }
+        consumer_threads_.reserve(queue_count_);
+        is_running_.store(true, std::memory_order_release);
+        for (int i = 0; i < queue_count_; ++i) {
+            auto consumer = CreateConsumerThread(i);
+            if (!consumer) {
+                KVCM_LOG_ERROR(
+                    "async redis backend consumer startup failed, instance[%s], consumer[%d]", instance_id_.c_str(), i);
+                [[maybe_unused]] const auto ec = Close();
+                return EC_ERROR;
             }
-            return client;
-        },
-        client_min_pool_size,
-        client_max_pool_size);
-    if (!read_client_pool_->Initialize()) {
-        KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
-                       instance_id_.c_str());
+            consumer_threads_.push_back(std::move(consumer));
+        }
+
+        KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
+                      "read client pool size min[%d], max[%d], open concurrency[%d]",
+                      instance_id_.c_str(),
+                      queue_count_,
+                      client_min_pool_size,
+                      client_max_pool_size,
+                      open_concurrency_);
+        return EC_OK;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("async redis backend open threw, instance[%s], error[%s]", instance_id_.c_str(), e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("async redis backend open threw, instance[%s]", instance_id_.c_str());
+    }
+    // Consumers must stop before their queues and clients can be released.
+    if (is_running_.load(std::memory_order_acquire)) {
+        [[maybe_unused]] const auto ec = Close();
+    } else {
         CleanupResources();
-        return EC_ERROR;
     }
-
-    queues_.resize(queue_count_);
-    for (int i = 0; i < queue_count_; ++i) {
-        queues_[i] = std::make_unique<MpscWriteQueue>();
-    }
-
-    is_running_.store(true, std::memory_order_release);
-    consumer_threads_.reserve(queue_count_);
-    for (int i = 0; i < queue_count_; ++i) {
-        consumer_threads_.emplace_back(&MetaAsyncRedisBackend::ConsumerLoop, this, i);
-    }
-
-    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
-                  "read client pool size min[%d], max[%d]",
-                  instance_id_.c_str(),
-                  queue_count_,
-                  client_min_pool_size,
-                  client_max_pool_size);
-    return EC_OK;
+    return EC_ERROR;
 }
 
 ErrorCode MetaAsyncRedisBackend::Close() noexcept {
@@ -184,9 +234,7 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
     }
 
     for (auto &t : consumer_threads_) {
-        if (t.joinable()) {
-            t.join();
-        }
+        t->join();
     }
     consumer_threads_.clear();
 
@@ -413,7 +461,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i]);
+        ErrorCode ec = codec_.DeserializeFieldMap(
+            field_maps[i], out_locations[i], &out_properties[i], &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("async redis get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -445,7 +494,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *reque
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i]);
+        ErrorCode ec =
+            codec_.DeserializeFieldMap(field_maps[i], out_locations[i], nullptr, &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR(
                 "async redis get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
@@ -503,7 +553,8 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
                 continue;
             }
             auto location = std::make_shared<CacheLocation>();
-            if (!location->FromJsonString(it->second)) {
+            if (!codec_.DeserializeLocation(
+                    location_ids[i][j], it->second, &id_interner_, &name_interner_, *location)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }
@@ -716,32 +767,91 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
 
     out_candidates.reserve(keys.size());
     if (!require_read_success && !all_properties_available) {
-        KVCM_INTERVAL_LOG_WARN(10,
-                               "async redis sample reclaim candidate properties unavailable, use zero lru time, "
-                               "instance[%s]",
-                               instance_id_.c_str());
+        // EC_NOENT also means that the optional LRU field is absent. Preserve
+        // the batch-wide fallback without treating that expected case as a read failure.
+        const bool read_failed = property_results.size() != keys.size() || properties.size() != keys.size() ||
+                                 std::any_of(property_results.begin(), property_results.end(), [](ErrorCode ec) {
+                                     return ec != EC_OK && ec != EC_NOENT;
+                                 });
+        if (read_failed && ShouldLogReclaimLruWarning(keys.size())) {
+            KVCM_LOG_WARN("async redis sample reclaim candidate properties unavailable, use zero lru time, "
+                          "instance[%s], sampled[%zu], warn_interval_s[30]",
+                          instance_id_.c_str(),
+                          keys.size());
+        }
         for (const KeyType key : keys) {
             out_candidates.push_back({key, 0});
         }
         return EC_OK;
     }
 
+    size_t missing_lru_count = 0;
+    size_t malformed_lru_count = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         // A missing LRU field maps to EC_NOENT, just like a missing key.
         // Keep the candidate at time zero; later Location reads exclude keys
         // that actually disappeared, without an additional existence query.
         int64_t last_access_time_us = 0;
         const auto it = properties[i].find(PROPERTY_LRU_TIME);
-        if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
-            KVCM_INTERVAL_LOG_WARN(10,
-                                   "async redis sample reclaim candidate has missing or malformed lru time, "
-                                   "instance[%s]",
-                                   instance_id_.c_str());
+        if (it == properties[i].end()) {
+            // Redis need not persist the in-memory LRU timestamp.
+            ++missing_lru_count;
+        } else if (!StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+            ++malformed_lru_count;
             last_access_time_us = 0;
         }
         out_candidates.push_back({keys[i], last_access_time_us});
     }
+    if (malformed_lru_count > 0 && ShouldLogReclaimLruWarning(keys.size(), missing_lru_count, malformed_lru_count)) {
+        KVCM_LOG_WARN("async redis sample reclaim candidates have malformed lru time, use zero for invalid timestamps, "
+                      "instance[%s], sampled[%zu], missing[%zu], malformed[%zu], warn_interval_s[30]",
+                      instance_id_.c_str(),
+                      keys.size(),
+                      missing_lru_count,
+                      malformed_lru_count);
+    }
     return EC_OK;
+}
+
+// KVCM_PERIOD_LOG_WARN shares its warning budget across all instances.
+bool MetaAsyncRedisBackend::ShouldLogReclaimLruWarning(size_t sampled_count,
+                                                       size_t missing_lru_count,
+                                                       size_t malformed_lru_count) noexcept {
+    if (!LoggerBroker::IsLevelEnable(Logger::LEVEL_WARN)) {
+        return false;
+    }
+    constexpr int64_t kWarningPeriodUs = 30 * 1000 * 1000;
+    size_t suppressed_warnings = 0;
+    size_t suppressed_sampled = 0;
+    size_t suppressed_missing = 0;
+    size_t suppressed_malformed = 0;
+    {
+        std::lock_guard<std::mutex> lock(reclaim_lru_warning_mutex_);
+        const int64_t now_us = TimestampUtil::GetSteadyTimeUs();
+        if (now_us < next_reclaim_lru_warning_time_us_) {
+            ++suppressed_reclaim_lru_warning_count_;
+            suppressed_reclaim_lru_sampled_count_ += sampled_count;
+            suppressed_reclaim_lru_missing_count_ += missing_lru_count;
+            suppressed_reclaim_lru_malformed_count_ += malformed_lru_count;
+            return false;
+        }
+        next_reclaim_lru_warning_time_us_ = now_us + kWarningPeriodUs;
+        suppressed_warnings = std::exchange(suppressed_reclaim_lru_warning_count_, 0);
+        suppressed_sampled = std::exchange(suppressed_reclaim_lru_sampled_count_, 0);
+        suppressed_missing = std::exchange(suppressed_reclaim_lru_missing_count_, 0);
+        suppressed_malformed = std::exchange(suppressed_reclaim_lru_malformed_count_, 0);
+    }
+    if (suppressed_warnings > 0) {
+        KVCM_LOG_WARN("async redis reclaim LRU warnings suppressed, instance[%s], warn_interval_s[30], "
+                      "suppressed_warnings[%zu], suppressed_sampled[%zu], suppressed_missing[%zu], "
+                      "suppressed_malformed[%zu]",
+                      instance_id_.c_str(),
+                      suppressed_warnings,
+                      suppressed_sampled,
+                      suppressed_missing,
+                      suppressed_malformed);
+    }
+    return true;
 }
 
 ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
@@ -784,6 +894,18 @@ ErrorCode MetaAsyncRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
         out_field_map = std::move(maps[0]);
     }
     return error_codes[0];
+}
+
+ErrorCode MetaAsyncRedisBackend::DeleteMetaData() noexcept {
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        return EC_TIMEOUT;
+    }
+    const auto results = handle->Delete({metadata_key_});
+    if (results.size() != 1) {
+        return EC_ERROR;
+    }
+    return results[0] == EC_NOENT ? EC_OK : results[0];
 }
 
 // ==================== Sync ====================
@@ -879,7 +1001,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
 
     if (!op.field_maps.empty()) {
         for (size_t i = 0; i < op.keys.size(); ++i) {
-            op.field_maps[i] = SerializeToFieldMap(op.locations[i], std::move(op.field_maps[i]));
+            op.field_maps[i] = codec_.SerializeToFieldMap(op.locations[i], std::move(op.field_maps[i]));
         }
     }
 

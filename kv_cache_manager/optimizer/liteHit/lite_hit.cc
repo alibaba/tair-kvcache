@@ -161,66 +161,56 @@ void LiteHit::MaybeCompactPositions() {
     // Markers below the TTL watermark are a miss for every capacity forever,
     // so compaction drops them together with their table entries; the state
     // afterwards is bounded by the alive working set again.
-    std::vector<std::pair<std::size_t, int64_t>> ordered_positions;
-    ordered_positions.reserve(active_positions);
-    for (auto it = last_positions_.begin(); it != last_positions_.end();) {
-        if (it->second.position < dead_below_position_) {
-            it = last_positions_.erase(it);
-        } else {
-            ordered_positions.emplace_back(it->second.position, it->first);
-            ++it;
+    {
+        // Prefix sums give the rank of each surviving marker directly. Reuse
+        // the old Fenwick buffer instead of collecting and sorting keys.
+        const auto &prefix_counts = fenwick_.MakePrefixSumsInPlace();
+        const int64_t dead_count = dead_below_position_ > 0 ? prefix_counts[dead_below_position_ - 1] : 0;
+        for (auto it = last_positions_.begin(); it != last_positions_.end();) {
+            if (it->second.position < dead_below_position_) {
+                it = last_positions_.erase(it);
+            } else {
+                it->second.position = static_cast<std::size_t>(prefix_counts[it->second.position] - dead_count);
+                ++it;
+            }
+        }
+
+        // The bucket array never shrinks on erase and would otherwise stay at
+        // the historical peak. Shrink only when it is far above the surviving
+        // set (with headroom) so oscillating working sets do not rehash back and
+        // forth.
+        if (last_positions_.bucket_count() > 4 * (last_positions_.size() + 1)) {
+            last_positions_.rehash(2 * last_positions_.size());
+        }
+
+        // Old position boundary S maps to (surviving markers below S) + 1; the
+        // mapping is monotone, so epoch starts and the watermark keep their
+        // order and semantics.
+        for (PositionEpoch &epoch : position_epochs_) {
+            epoch.start_position = static_cast<std::size_t>(prefix_counts[epoch.start_position - 1] - dead_count) + 1;
+        }
+        // Equal remapped starts prove there is no alive marker between the two
+        // epochs, so the earlier one governs an empty range and can be dropped
+        // without changing any future liveness answer. Keeping the last epoch per
+        // start bounds the deque by the alive working set (hot keys otherwise
+        // accumulate one empty epoch per request until the TTL elapses).
+        std::size_t deduped_size = 0;
+        for (const PositionEpoch &epoch : position_epochs_) {
+            if (deduped_size > 0 && position_epochs_[deduped_size - 1].start_position == epoch.start_position) {
+                position_epochs_[deduped_size - 1].timestamp_ns = epoch.timestamp_ns;
+            } else {
+                position_epochs_[deduped_size++] = epoch;
+            }
+        }
+        position_epochs_.resize(deduped_size);
+        if (dead_below_position_ > 0) {
+            // All markers below the watermark were removed above.
+            dead_below_position_ = 1;
         }
     }
-    std::sort(ordered_positions.begin(), ordered_positions.end());
-
-    // The bucket array never shrinks on erase and would otherwise stay at
-    // the historical peak. Shrink only when it is far above the surviving
-    // set (with headroom) so oscillating working sets do not rehash back and
-    // forth.
-    if (last_positions_.bucket_count() > 4 * (last_positions_.size() + 1)) {
-        last_positions_.rehash(2 * last_positions_.size());
-    }
-
-    // Old position boundary S maps to (surviving markers below S) + 1; the
-    // mapping is monotone, so epoch starts and the watermark keep their
-    // order and semantics.
-    const auto remap_boundary = [&ordered_positions](std::size_t old_position) -> std::size_t {
-        const auto it = std::lower_bound(
-            ordered_positions.begin(),
-            ordered_positions.end(),
-            old_position,
-            [](const std::pair<std::size_t, int64_t> &entry, std::size_t value) { return entry.first < value; });
-        return static_cast<std::size_t>(it - ordered_positions.begin()) + 1;
-    };
-    for (PositionEpoch &epoch : position_epochs_) {
-        epoch.start_position = remap_boundary(epoch.start_position);
-    }
-    // Equal remapped starts prove there is no alive marker between the two
-    // epochs, so the earlier one governs an empty range and can be dropped
-    // without changing any future liveness answer. Keeping the last epoch per
-    // start bounds the deque by the alive working set (hot keys otherwise
-    // accumulate one empty epoch per request until the TTL elapses).
-    std::size_t deduped_size = 0;
-    for (const PositionEpoch &epoch : position_epochs_) {
-        if (deduped_size > 0 && position_epochs_[deduped_size - 1].start_position == epoch.start_position) {
-            position_epochs_[deduped_size - 1].timestamp_ns = epoch.timestamp_ns;
-        } else {
-            position_epochs_[deduped_size++] = epoch;
-        }
-    }
-    position_epochs_.resize(deduped_size);
-    if (dead_below_position_ > 0) {
-        dead_below_position_ = remap_boundary(dead_below_position_);
-    }
-
-    DynamicFenwickTree compacted_fenwick;
-    for (const auto &[_, block_key] : ordered_positions) {
-        compacted_fenwick.AppendZero();
-        const std::size_t compacted_position = compacted_fenwick.size();
-        compacted_fenwick.Add(compacted_position, 1);
-        last_positions_[block_key].position = compacted_position;
-    }
-    fenwick_ = std::move(compacted_fenwick);
+    // Leave room through the next compaction threshold for a stable working
+    // set, rather than immediately reallocating on the next request.
+    fenwick_.ResetToOnes(active_positions, 2 * active_positions + kCompactionSlackPositions + 1);
 }
 
 uint64_t LiteHit::ReuseDistance(std::size_t previous_position) const {

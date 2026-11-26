@@ -80,6 +80,25 @@ TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime)
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestDeleteMetadataPreservesCacheKeys) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("delete_metadata", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{"property", "value"}}}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->PutMetaData({{"__key_count__", "1"}}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->DeleteMetaData());
+    FieldMap metadata;
+    EXPECT_EQ(EC_NOENT, meta_storage_backend_->GetMetaData(metadata));
+    AssertExists(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+    ConstructMetaStorageBackend();
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("delete_metadata", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    EXPECT_EQ(EC_NOENT, meta_storage_backend_->GetMetaData(metadata));
+    AssertExists(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
+}
+
 TEST_F(MetaDummyBackendTest, TestSimple) {
     ASSERT_EQ(META_DUMMY_BACKEND_TYPE_STR, meta_storage_backend_->GetStorageType());
 
@@ -397,7 +416,7 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     };
     const auto lru_times_before = snapshot_lru_times();
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates, false));
     ASSERT_EQ(2, candidates.size());
     for (const auto &candidate : candidates) {
         ASSERT_TRUE(lru_times_before.count(candidate.key) > 0);
@@ -424,7 +443,7 @@ TEST_F(MetaDummyBackendTest, TestSampleReclaimCandidatesDegradesMalformedTimesta
         3, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "-9223372036854775809"; }));
 
     ReclaimCandidateVector candidates;
-    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates));
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates, false));
     ASSERT_EQ(3, candidates.size());
     for (const auto &candidate : candidates) {
         EXPECT_EQ(0, candidate.last_access_time_us) << candidate.key;

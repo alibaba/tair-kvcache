@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,7 +29,6 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/migration_strategy.h"
@@ -94,6 +95,12 @@ public:
     TypedTestBackend(std::shared_ptr<MetricsRegistry> metrics_registry, DataStorageType type)
         : DataStorageBackend(std::move(metrics_registry)), type_(type) {}
 
+    StorageCapacitySnapshot GetStorageCapacity() const override {
+        ++capacity_reads;
+        return snapshot;
+    }
+    mutable std::atomic<int> capacity_reads{0};
+    StorageCapacitySnapshot snapshot;
     DataStorageType GetType() override { return type_; }
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &trace_id) const override {
@@ -189,18 +196,12 @@ std::shared_ptr<InstanceGroup> InstanceGroupFactory() {
     meta_storage_backend_config->SetStorageType("local");
     meta_storage_backend_config->SetStorageUri("file:///tmp/meta_storage");
 
-    // create meta cache policy config
-    const auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(10000);
-    meta_cache_policy_config->SetType("LRU");
-
     // create meta indexer config
     const auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(1000000);
     meta_indexer_config->SetMutexShardNum(16);
     meta_indexer_config->SetBatchKeySize(16);
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
 
     // create cache config
     const auto cache_config = std::make_shared<CacheConfig>();
@@ -456,8 +457,8 @@ void MetaIndexer_PersistMetaData_stub(void *obj) noexcept {}
 // the dummy meta_searcher that the meta_searcher_manager would return
 std::shared_ptr<MetaSearcher> dummy_meta_searcher;
 
-MetaSearcher *MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::string &i) {
-    return dummy_meta_searcher.get();
+std::shared_ptr<MetaSearcher> MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::string &i) {
+    return dummy_meta_searcher;
 }
 
 /* ---------------- MetaSearcher_BatchGetLocation_stub ---------------- */
@@ -1061,9 +1062,8 @@ public:
         return result;
     }
 
-    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
-                                                KeyType rejected_prefix = 0,
-                                                bool event_report_prefix = false) {
+    MetaLocalBackend *
+    UseRealLocalReclaimBackend(const std::string &id, KeyType rejected_prefix = 0, bool event_report_prefix = false) {
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         auto &indexer = meta_indexers_by_instance.at(id);
@@ -2017,7 +2017,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         max_key_count = 32;
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
+        ins_group->quota_.set_capacity(-1);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
                                                          ins_group->name(),
@@ -2040,21 +2040,21 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         // instance 0 storage usage = 1024, key count = 0, max key count = 32
         // instance 1 storage usage = 1024, key count = 0, max key count = 32
         // group quota capacity set to -1
-        // A negative capacity has the same zero-capacity semantics.
+        // Unlimited group bytes leave the independent key and type limits active.
 
         key_count = 0;
         max_key_count = 32;
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
+        ins_group->quota_.set_capacity(-1);
         cache_reclaimer_->job_state_flag_ = true;
         auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
-        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
     }
 }
 
@@ -2247,6 +2247,74 @@ TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevel
     EXPECT_FALSE(water_level->GetGeneralWaterLevelExceed());
     EXPECT_TRUE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
     EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+}
+
+TEST_F(CacheReclaimerTest, UnlimitedBytesStillEnforcesTypeAndKeyWaterLevels) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 2000);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, 10);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(-1);
+    group->quota_.set_quota_config({QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL),
+                                    QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)});
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+    auto water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                       group->name(),
+                                                       cache_reclaimer_->GetReclaimQuota(*group),
+                                                       group->cache_config()->reclaim_strategy(),
+                                                       instance_infos);
+    ASSERT_NE(nullptr, water);
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(water->GetGroupKeysWaterLevelExceed());
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_FALSE(water->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    key_count = 100;
+    water = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                  group->name(),
+                                                  cache_reclaimer_->GetReclaimQuota(*group),
+                                                  group->cache_config()->reclaim_strategy(),
+                                                  instance_infos);
+    EXPECT_TRUE(water->GetGroupKeysWaterLevelExceed());
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+}
+
+TEST_F(CacheReclaimerTest, UnknownAutoQuotaSkipsEvictionAndLastKnownQuotaEnforcesIt) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    dummy_meta_indexer->SetStorageUsageByType(type, 2000);
+    auto group = InstanceGroupFactory();
+    group->set_storage_candidates({"dram"});
+    QuotaConfig automatic(0, type);
+    automatic.set_mode("auto");
+    automatic.set_ratio(1.0);
+    group->set_quota(InstanceGroupQuota(-1, {automatic}));
+    rm_->instance_group_configs_[group->name()] = group;
+    rm_->data_storage_manager_ = dsm_;
+    auto dram_backend = std::make_shared<TypedTestBackend>(mr_, type);
+    dsm_->storage_map_["dram"] = dram_backend;
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+    auto check = [&]() {
+        return cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     group->name(),
+                                                     cache_reclaimer_->GetReclaimQuota(*group),
+                                                     group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    };
+    auto water = check();
+    ASSERT_NE(nullptr, water);
+    EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water));
+    dram_backend->snapshot = {100, 1000, EC_ERROR};
+    water = check();
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
+    dram_backend->snapshot = {100, 1001, EC_OK};
+    water = check();
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
+    EXPECT_FALSE(water->GetGroupBytesWaterLevelExceed());
+    dram_backend->snapshot.capacity = 0;
+    water = check();
+    EXPECT_TRUE(water->GetWaterLevelExceedByType(type));
 }
 
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
@@ -3511,7 +3579,9 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) { promise->set_exception(std::current_exception()); }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -4899,6 +4969,27 @@ TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsResetWhenAcceptedBatchHasNoVali
     EXPECT_EQ(4, GroupLruSubmittedBlocks().size());
 }
 
+TEST_F(CacheReclaimerTest, CapacityChangeTakesEffectOnNextGroupRound) {
+    const auto group = SetUpGroupLruScenario();
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    const auto backend = std::make_shared<TypedTestBackend>(mr_, type);
+    backend->snapshot = {100, 1000, EC_OK};
+    dsm_->storage_map_["pool"] = backend;
+    rm_->data_storage_manager_ = dsm_;
+    group->set_storage_candidates({"pool"});
+    QuotaConfig automatic(0, type);
+    automatic.set_mode("auto");
+    automatic.set_ratio(1.0);
+    group->set_quota(InstanceGroupQuota(-1, {automatic}));
+
+    spe_submit_accepted_callback = [backend](const CacheLocationDelRequest &) { backend->snapshot.capacity = 100000; };
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_GT(SubmittedDelRequestCount(), 1);
+    EXPECT_EQ(1, backend->capacity_reads.load());
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).water_level_exceeded);
+    EXPECT_EQ(2, backend->capacity_reads.load());
+}
+
 TEST_F(CacheReclaimerTest, TestGroupLruStopsImmediatelyOnAcceptedCredit) {
     const auto group = SetUpGroupLruScenario();
     AddMetaIndexerForInstance("a", 50, 32);
@@ -5245,9 +5336,7 @@ TEST_F(CacheReclaimerTest, TestGroupLruReusesKeepBothColdReplicaProtection) {
     };
     // Exercise the eviction path only; migration scheduling has separate coverage.
     EXPECT_TRUE(
-        cache_reclaimer_
-            ->TryReclaimOnGroupLru(request_context_, group, group->cache_config()->reclaim_strategy(), instance_infos)
-            .made_progress);
+        cache_reclaimer_->TryReclaimOnGroupLru(request_context_, group, group->quota(), instance_infos).made_progress);
     const auto requests = SubmittedDelRequestsSnapshot();
     ASSERT_FALSE(requests.empty());
     ASSERT_EQ(1, requests[0].block_keys.front());
@@ -6430,7 +6519,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 }
 
 TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudgets) {
-    auto indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
+    std::shared_ptr<MetaIndexer> indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
     ASSERT_NE(nullptr, indexer);
     indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
     indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();
@@ -6904,6 +6993,60 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     EXPECT_TRUE(out[3].empty()) << "preparing copy target should be protected before location id is bound";
 }
 
+TEST_F(CacheReclaimerTest, TestFilterLocIDAllowsSourceAndAbandonedCopyTargetWithoutActiveTask) {
+    const auto ins_info = InstanceInfoFactory();
+    const int64_t source_create_time = 123;
+    auto source = std::make_shared<CacheLocation>(
+        "persistent_source",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot/persistent_source")});
+    source->set_create_time(source_create_time);
+    auto target = std::make_shared<CacheLocation>(
+        "persistent_target",
+        CacheLocationStatus::CLS_WRITING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/persistent_target")});
+
+    CacheLocationMap loc_map;
+    loc_map.emplace(source->id(), source);
+    loc_map.emplace(target->id(), target);
+    batch_get_loc_out_maps = {loc_map};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGroupBytesWaterLevelExceed(true);
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    // Without a write-session manager, ordinary WRITING eligibility cannot
+    // be established. Removing CopyGuard must not weaken that existing rule.
+    EXPECT_EQ((std::vector<std::string>{"persistent_source"}), out[0]);
+
+    auto write_location_manager = std::make_shared<WriteLocationManager>();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
+    ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_EQ((std::set<std::string>{"persistent_source", "persistent_target"}),
+              (std::set<std::string>(out[0].begin(), out[0].end())));
+}
+
 /* -------- keep_both 分层淘汰优先级（多副本保冷弃热）stub + test -------- */
 namespace {
 std::shared_ptr<const InstanceGroup> g_cold_ig;
@@ -7252,6 +7395,43 @@ std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
     return std::vector<ErrorCode>(requests.size(), ErrorCode::EC_OK);
 }
 
+namespace {
+std::vector<MigrationManager::MigrationRequest> limited_copy_accepted_reqs;
+std::vector<ErrorCode> limited_copy_results;
+
+// This dispatch fixture stubs metadata and does not exercise actual backend
+// submission. Model the BatchSubmit group gate separately from its candidate
+// input; the real gate/byte-credit path is covered in MigrationManagerTest.
+std::vector<ErrorCode> MigrationManager_BatchSubmitWithGroupLimit_stub(
+    void *obj,
+    const std::string &trace_id,
+    std::vector<MigrationManager::MigrationRequest> requests,
+    MigrationManager::CopyConcurrencyLimit copy_limit,
+    bool lifecycle_lock_held) {
+    MigrationManager_BatchSubmit_stub(obj, trace_id, requests, copy_limit, lifecycle_lock_held);
+    auto *manager = static_cast<MigrationManager *>(obj);
+    const auto active = manager->ActiveTaskCountForGroup(copy_limit.instance_group_name);
+    auto available = copy_limit.enabled()
+                         ? (copy_limit.max_concurrency > active ? copy_limit.max_concurrency - active : 0)
+                         : SIZE_MAX;
+    limited_copy_accepted_reqs.clear();
+    limited_copy_results.assign(requests.size(), EC_OUT_OF_LIMIT);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (copy_limit.enabled() && requests[i].instance_group_name != copy_limit.instance_group_name) {
+            limited_copy_results[i] = EC_BADARGS;
+            continue;
+        }
+        if (available == 0) {
+            continue;
+        }
+        limited_copy_results[i] = EC_OK;
+        limited_copy_accepted_reqs.push_back(requests[i]);
+        --available;
+    }
+    return limited_copy_results;
+}
+} // namespace
+
 ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
                                                    const std::string &instance_id,
                                                    const std::vector<std::int64_t> &block_keys,
@@ -7290,7 +7470,7 @@ MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, 
 }
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
-    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmitWithGroupLimit_stub);
     stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
 
     cache_reclaimer_->job_state_flag_ = true; // 让 IsRunning() 为真，无需启动 cron 线程
@@ -7303,6 +7483,8 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
         config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
         config->set_migration_copy_max_concurrency(static_cast<int64_t>(copy_limit));
+        // Async Prepare does not imply ASYNC_REQUIRED Copy: use the SYNC limit.
+        config->set_migration_async_copy_max_concurrency(static_cast<int64_t>(copy_limit + 16));
         config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
         instance_group->set_cache_config(config);
         EnableAsyncMigration(instance_group, ins_info);
@@ -7355,9 +7537,16 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        // 3 个合格候选，预算 2 -> 只提交 2 个
-        ASSERT_EQ(2u, captured_copy_reqs.size());
-        for (const auto &req : captured_copy_reqs) {
+        // 候选不能按 slot 数提前截断；全部 3 项交给 BatchSubmit 的 group
+        // 硬准入，只有 2 项成功，第三项明确返回 EC_OUT_OF_LIMIT。
+        ASSERT_EQ(3u, captured_copy_reqs.size());
+        ASSERT_FALSE(captured_copy_limits.empty());
+        ASSERT_TRUE(captured_copy_limits.back().enabled());
+        ASSERT_EQ(ins_info->instance_group_name(), captured_copy_limits.back().instance_group_name);
+        ASSERT_EQ(2u, captured_copy_limits.back().max_concurrency);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OUT_OF_LIMIT}), limited_copy_results);
+        ASSERT_EQ(2u, limited_copy_accepted_reqs.size());
+        for (const auto &req : limited_copy_accepted_reqs) {
             ASSERT_TRUE(req.block_key == 20 || req.block_key == 21 || req.block_key == 22);
             ASSERT_EQ("hot_01", req.src_storage_name);
         }
@@ -7381,7 +7570,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_EQ("cold_01", captured_mark_target);
     }
 
-    // ---- 场景 D：copy + mark 互斥分发，copy 优先；copy 槽位外才 mark ----
+    // ---- 场景 D：copy + mark 互斥分发，copy 优先；硬准入拒绝的候选回落 mark ----
     {
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
@@ -7394,10 +7583,17 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        ASSERT_EQ(2u, captured_copy_reqs.size());
+        ASSERT_EQ(3u, captured_copy_reqs.size());
+        ASSERT_FALSE(captured_copy_limits.empty());
+        ASSERT_TRUE(captured_copy_limits.back().enabled());
+        ASSERT_EQ(ins_info->instance_group_name(), captured_copy_limits.back().instance_group_name);
+        ASSERT_EQ(2u, captured_copy_limits.back().max_concurrency);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OUT_OF_LIMIT}), limited_copy_results);
+        ASSERT_EQ(2u, limited_copy_accepted_reqs.size());
         ASSERT_EQ(1u, captured_mark_keys.size());
+        ASSERT_EQ(22, captured_mark_keys.front());
         std::vector<std::int64_t> copied_keys;
-        for (const auto &req : captured_copy_reqs) {
+        for (const auto &req : limited_copy_accepted_reqs) {
             copied_keys.push_back(req.block_key);
             ASSERT_FALSE(VecContains(captured_mark_keys, req.block_key));
         }
@@ -7897,16 +8093,17 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
         started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
     }
 
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {first_instance});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, instance_group->quota(), {first_instance});
     const auto pending_after_first_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
 
     sample_reclaim_call_counter = 0;
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {second_instance, third_instance});
+    cache_reclaimer_->TryMigrateOnGroup(
+        request_context_, instance_group, instance_group->quota(), {second_instance, third_instance});
     const auto pending_after_second_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_on_second_tick = sample_reclaim_call_counter;
 
     sample_reclaim_call_counter = 0;
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {third_instance});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, instance_group->quota(), {third_instance});
     const auto pending_after_full_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_when_full = sample_reclaim_call_counter;
 
@@ -7980,7 +8177,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_copy_limits.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {ins_info});
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
@@ -8045,7 +8242,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsBelowThreshold) {
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_mark_keys.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {InstanceInfoFactory()});
 
     ASSERT_TRUE(captured_copy_reqs.empty());
     ASSERT_TRUE(captured_copy_req_batches.empty());
@@ -8098,7 +8295,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsWhenNoCapacity) {
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_mark_keys.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {InstanceInfoFactory()});
 
     ASSERT_TRUE(captured_copy_reqs.empty());
     ASSERT_TRUE(captured_copy_req_batches.empty());
@@ -8150,7 +8347,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
 
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, ins_group->quota(), {ins_info});
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);

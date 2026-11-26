@@ -24,7 +24,7 @@ public:
     const std::string &eviction_policy() const { return eviction_policy_; }
     bool shared_group_quota() const { return shared_group_quota_; }
     bool enable_theoretical_max_cache() const { return enable_theoretical_max_cache_; }
-    int64_t ttl_seconds() const { return ttl_seconds_; }
+    const std::vector<int64_t> &ttl_seconds_list() const { return ttl_seconds_list_; }
     // When true, incoming block keys of every instance in this group are
     // per-block raw hashes and are converted to rolling prefix-chained keys
     // before analysis. Key shape follows the model deployment, so it lives at
@@ -39,7 +39,7 @@ public:
     void set_eviction_policy(const std::string &v) { eviction_policy_ = v; }
     void set_shared_group_quota(bool v) { shared_group_quota_ = v; }
     void set_enable_theoretical_max_cache(bool v) { enable_theoretical_max_cache_ = v; }
-    void set_ttl_seconds(int64_t v) { ttl_seconds_ = v; }
+    void set_ttl_seconds_list(const std::vector<int64_t> &v) { ttl_seconds_list_ = v; }
     void set_enable_prefix_hash(bool v) { enable_prefix_hash_ = v; }
 
 private:
@@ -50,7 +50,7 @@ private:
     std::string eviction_policy_ = "lru";
     bool shared_group_quota_ = false;
     bool enable_theoretical_max_cache_ = false;
-    int64_t ttl_seconds_ = 0;
+    std::vector<int64_t> ttl_seconds_list_;
     bool enable_prefix_hash_ = false;
 };
 

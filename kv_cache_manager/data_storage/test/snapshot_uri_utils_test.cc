@@ -11,16 +11,17 @@ namespace kv_cache_manager {
 class SnapshotUriUtilsTest : public ::testing::Test {};
 
 TEST_F(SnapshotUriUtilsTest, SnapshotVersionTokenUsesStrictAsciiHex) {
-    EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123456789abcdefABCDEF0123456789"));
-    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123456789abcdefABCDEF012345678g"));
+    EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123ABcd"));
+    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123ABcg"));
     EXPECT_FALSE(
-        SnapshotUriUtils::IsValidSnapshotVersionToken(std::string("0123456789abcdefABCDEF01234567") + "\xc3\xa9"));
-    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123456789abcdefABCDEF012345678"));
+        SnapshotUriUtils::IsValidSnapshotVersionToken(std::string("0123ABc") + "\xc3\xa9"));
+    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123ABc"));
+    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("0123456789abcdef0123456789abcdef"));
 }
 
 TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityReturnsBorrowedVersion) {
-    constexpr std::string_view token = "0123456789abcdefABCDEF0123456789";
-    const std::string uri = "event_report://10.0.0.1:8080/mem?rank=0&s_version=" + std::string(token) + "&size=4096";
+    constexpr std::string_view token = "0123ABcd";
+    const std::string uri = "event_report://10.0.0.1:8080/mem?rank=0&s_v=" + std::string(token) + "&size=4096";
 
     std::string_view version;
     ASSERT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version));
@@ -37,7 +38,7 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsLegacyAndUnre
         "event_report://user:secret@host:8080/mem",
         "event_report://host/path:with:colon?callback=http://peer:9000/path",
         "event_report://10.0.0.1:8080/mem?rank=0&size=4096",
-        "event_report://10.0.0.1:8080/mem?xs_version=ignored&s_version_suffix=ignored",
+        "event_report://10.0.0.1:8080/mem?xs_v=ignored&s_v_suffix=ignored",
         "event_report://10.0.0.1:8080/mem?&rank=0&&",
     };
 
@@ -74,31 +75,79 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityRejectsMalformedUri)
 }
 
 TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityRejectsInvalidOrDuplicateVersion) {
-    constexpr const char *token = "0123456789abcdef0123456789abcdef";
+    constexpr const char *token = "01234567";
+    const std::string legacy_token = "0123456789abcdef0123456789ABCDEF";
     const std::vector<std::string> uris = {
+        "event_report://host/mem?s_v",
+        "event_report://host/mem?s_v=",
+        "event_report://host/mem?s_v=0123456",
+        "event_report://host/mem?s_v=012345678",
+        "event_report://host/mem?s_v=0123456g",
+        std::string("event_report://host/mem?s_v=") + token + "&s_v=" + token,
+        std::string("event_report://host/mem?s_v=") + token + "&s_v",
+        std::string("event_report://host/mem?s_v&rank=0&s_v=") + token,
+        std::string("event_report://host/mem?s_version=") + token,
+        std::string("event_report://host/mem?s_v=") + token + "&s_version=" + token,
         "event_report://host/mem?s_version",
         "event_report://host/mem?s_version=",
-        "event_report://host/mem?s_version=0123456789abcdef0123456789abcde",
-        "event_report://host/mem?s_version=0123456789abcdef0123456789abcdef0",
-        "event_report://host/mem?s_version=0123456789abcdef0123456789abcdeg",
-        std::string("event_report://host/mem?s_version=") + token + "&s_version=" + token,
-        std::string("event_report://host/mem?s_version=") + token + "&s_version",
-        std::string("event_report://host/mem?s_version&rank=0&s_version=") + token,
+        "event_report://host/mem?s_version=" + std::string(31, 'a'),
+        "event_report://host/mem?s_version=" + std::string(33, 'a'),
+        "event_report://host/mem?s_version=" + std::string(31, 'a') + "g",
+        "event_report://host/mem?s_version=" + std::string(30, 'a') + "\xc3\xa9",
+        "event_report://host/mem?s_v=" + legacy_token,
+        "event_report://host/mem?s_version=" + legacy_token + "&s_version=" + legacy_token,
+        "event_report://host/mem?s_version=" + legacy_token + "&s_version",
+        "event_report://host/mem?s_version&rank=0&s_version=" + legacy_token,
+        "event_report://host/mem?s_version=" + legacy_token + "&s_v=" + token,
+        std::string("event_report://host/mem?s_v=") + token + "&s_version=" + legacy_token,
     };
 
     for (const auto &uri : uris) {
         std::string_view version = "must be cleared";
         EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version)) << uri;
+        EXPECT_TRUE(version.empty()) << uri;
+        EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version, true)) << uri;
+        EXPECT_TRUE(version.empty()) << uri;
+        SnapshotUriInfo info;
+        info.version = "must be cleared";
+        EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(uri, info)) << uri;
+        EXPECT_TRUE(info.version.empty()) << uri;
     }
 }
 
+TEST_F(SnapshotUriUtilsTest, OldVersionFieldIsReadableButRejectedForWrite) {
+    constexpr const char *token = "01234567";
+    const std::string legacy_token = "0123456789abcdef0123456789ABCDEF";
+    const std::string raw_uri = "event_report://host/mem?s_version=" + legacy_token;
+    SnapshotUriInfo info;
+    ASSERT_TRUE(SnapshotUriUtils::ParseSnapshotUriInfo(raw_uri, info));
+    EXPECT_EQ(legacy_token, info.version);
+    ASSERT_TRUE(SnapshotUriUtils::ParseSnapshotUriInfo(DataStorageUri(raw_uri), info));
+    EXPECT_EQ(legacy_token, info.version);
+    std::string_view version;
+    ASSERT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(raw_uri, version));
+    EXPECT_EQ(legacy_token, version);
+    EXPECT_EQ(raw_uri.data() + raw_uri.find(legacy_token), version.data());
+    std::string output;
+    EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, token, output));
+    EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(DataStorageUri(raw_uri), token, output));
+    CanonicalSnapshotUriAppendInfo append_info;
+    EXPECT_FALSE(SnapshotUriUtils::ParseCanonicalUriForSnapshotAppend(raw_uri, append_info));
+    EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri("event_report://host/mem", legacy_token, output));
+
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri("event_report://host/mem", token, output));
+    EXPECT_EQ(std::string("event_report://host/mem?s_v=") + token, output);
+    const DataStorageUri mixed(raw_uri + "&s_v=" + token);
+    EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(mixed, info));
+}
+
 TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsVersionAtParamBoundaries) {
-    constexpr const char *token = "abcdef0123456789abcdef0123456789";
+    constexpr const char *token = "abcdef01";
     const std::vector<std::string> uris = {
-        std::string("event_report://host/mem?s_version=") + token,
-        std::string("event_report://host/mem?&s_version=") + token,
-        std::string("event_report://host/mem?rank=0&s_version=") + token + "&",
-        std::string("event_report://host/mem?rank=0&s_version=") + token + "&size=1",
+        std::string("event_report://host/mem?s_v=") + token,
+        std::string("event_report://host/mem?&s_v=") + token,
+        std::string("event_report://host/mem?rank=0&s_v=") + token + "&",
+        std::string("event_report://host/mem?rank=0&s_v=") + token + "&size=1",
     };
 
     for (const auto &uri : uris) {
@@ -111,17 +160,33 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsVersionAtPara
     }
 }
 
+TEST_F(SnapshotUriUtilsTest, LegacyVersionPreservesAllDigitsAtParamBoundaries) {
+    const std::string token = "abcdef0123456789ABCDEF0123456789";
+    for (const auto &query : {"s_version=" + token,
+                              "&s_version=" + token,
+                              "rank=0&s_version=" + token + "&",
+                              "rank=0&s_version=" + token + "&size=1"}) {
+        const std::string uri = "event_report://host/mem?" + query;
+        std::string_view version;
+        ASSERT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version, true));
+        EXPECT_EQ(token, version);
+        SnapshotUriInfo info;
+        ASSERT_TRUE(SnapshotUriUtils::ParseSnapshotUriInfo(uri, info));
+        EXPECT_EQ(token, info.version);
+    }
+}
+
 TEST_F(SnapshotUriUtilsTest, PrevalidatedStructureStillRejectsProtocolQueryAndBadVersionMetadata) {
     std::string_view version = "must be cleared";
     EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility("event?bad_report://host/mem", version, true));
     EXPECT_TRUE(version.empty());
 
     EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility(
-        "event_report://host/mem?s_version=not-a-version", version, true));
+        "event_report://host/mem?s_v=not-a-version", version, true));
 }
 
 TEST_F(SnapshotUriUtilsTest, AddSnapshotVersionRejectsInvalidPortWithoutCanonicalizingItAway) {
-    constexpr const char *token = "0123456789abcdef0123456789abcdef";
+    constexpr const char *token = "01234567";
     for (const char *invalid_uri : {
              "event_report://physical-cache:not-a-port/mem?size=1",
              "event_report://physical-cache:-1/mem?size=1",
@@ -134,7 +199,7 @@ TEST_F(SnapshotUriUtilsTest, AddSnapshotVersionRejectsInvalidPortWithoutCanonica
 }
 
 TEST_F(SnapshotUriUtilsTest, CanonicalSnapshotAppendMatchesStandardUriWithoutAllocatingParseState) {
-    constexpr const char *token = "0123456789abcdef0123456789abcdef";
+    constexpr const char *token = "01234567";
     const std::vector<std::pair<std::string, std::uint64_t>> cases = {
         {"event_report://host/mem", 0},
         {"event_report://user@host:8080/mem?a=1&size=4096&z=last", 4096},
@@ -175,7 +240,7 @@ TEST_F(SnapshotUriUtilsTest, CanonicalSnapshotAppendDefersNoncanonicalUrisToStan
         "event_report://host/mem?size",
         "event_report://host/mem?z=1&a=2",
         "event_report://host/mem?a=1&a=2",
-        "event_report://host/mem?s_version=0123456789abcdef0123456789abcdef",
+        "event_report://host/mem?s_v=01234567",
         "event_report://host?query=before/path",
     };
     for (const auto &uri : noncanonical_uris) {

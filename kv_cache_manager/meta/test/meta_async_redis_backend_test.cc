@@ -1,10 +1,18 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
+#include <dlfcn.h>
+#include <functional>
+#include <future>
 #include <mutex>
+#include <new>
+#include <pthread.h>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_base.h"
@@ -15,12 +23,33 @@
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "stub.h"
 
 namespace kv_cache_manager {
 
 class MockMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
 public:
     MOCK_METHOD(std::shared_ptr<RedisClient>, CreateRedisClient, (), (const));
+
+    autil::ThreadPtr CreateConsumerThread(int queue_id) override {
+        return consumer_thread_factory ? consumer_thread_factory(queue_id)
+                                       : MetaAsyncRedisBackend::CreateConsumerThread(queue_id);
+    }
+    std::function<autil::ThreadPtr(int)> consumer_thread_factory;
+};
+
+class TrackingOpenRedisClient : public RedisClient {
+public:
+    TrackingOpenRedisClient(std::function<bool()> open, std::atomic<int> &destroyed)
+        : RedisClient(StandardUri{}), open_(std::move(open)), destroyed_(destroyed) {}
+    ~TrackingOpenRedisClient() override { ++destroyed_; }
+
+protected:
+    bool Reconnect() override { return open_(); }
+
+private:
+    std::function<bool()> open_;
+    std::atomic<int> &destroyed_;
 };
 
 class TrackingCacheLocation : public CacheLocation {
@@ -49,6 +78,7 @@ public:
                                          const KeyTypeVec &,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override {
+        std::lock_guard<std::mutex> lock(properties_mutex);
         requested_fields = field_names;
         out_properties = properties;
         return property_results;
@@ -59,6 +89,7 @@ public:
     std::vector<ErrorCode> property_results;
     PropertyMapVector properties;
     std::vector<std::string> requested_fields;
+    std::mutex properties_mutex;
 };
 
 class MetaAsyncRedisBackendTest : public MetaStorageBackendTestBase, public RedisTestBase, public TESTBASE {
@@ -160,6 +191,15 @@ TEST_F(MetaAsyncRedisBackendTest, TestInitParams) {
     ASSERT_EQ(2000, backend_->drain_timeout_ms_);
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestOpenConcurrencyEnvironmentAliasAndDottedPriority) {
+    ScopedEnv alias("kvcm_meta_async_redis_open_concurrency", "3");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    EXPECT_EQ(3, backend_->open_concurrency_);
+    ScopedEnv dotted("kvcm.meta_async_redis.open_concurrency", "2");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    EXPECT_EQ(2, backend_->open_concurrency_);
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesUsesReadOnlyTimestampQuery) {
     ScriptedReclaimMetaAsyncRedisBackend backend;
     backend.sampled_keys = {1, 2};
@@ -193,6 +233,247 @@ TEST_F(MetaAsyncRedisBackendTest, TestGroupLruStrictCandidateReadsPreserveLegacy
     AssertReclaimCandidateReadModes<MetaAsyncRedisBackend>();
 }
 
+class MetaAsyncRedisReclaimLoggingTest : public MetaAsyncRedisBackendTest {
+public:
+    void SetUp() override {
+        MetaAsyncRedisBackendTest::SetUp();
+        previous_log_level_ = LoggerBroker::base_log_level_;
+        console_env_ = std::make_unique<ScopedEnv>("KVCM_LOG_TO_CONSOLE", "1");
+        LoggerBroker::DestroyLogger();
+        ASSERT_TRUE(LoggerBroker::InitLogger(""));
+        LoggerBroker::SetLogLevel(Logger::LEVEL_WARN);
+    }
+
+    void TearDown() override {
+        MetaAsyncRedisBackendTest::TearDown();
+        LoggerBroker::DestroyLogger();
+        console_env_.reset();
+        LoggerBroker::InitLogger("");
+        LoggerBroker::SetLogLevel(previous_log_level_);
+    }
+
+private:
+    uint32_t previous_log_level_ = Logger::LEVEL_DEBUG;
+    std::unique_ptr<ScopedEnv> console_env_;
+};
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, MissingLruFieldsAreExpectedInBothReadModes) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.properties = {{{PROPERTY_LRU_TIME, "101"}}, {}};
+
+    testing::internal::CaptureStdout();
+    for (const bool strict : {false, true}) {
+        for (const ErrorCode missing_ec : {EC_OK, EC_NOENT}) {
+            backend.property_results = {EC_OK, missing_ec};
+            ReclaimCandidateVector candidates;
+            EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates, strict));
+            EXPECT_EQ(2, candidates.size());
+            if (candidates.size() == 2) {
+                EXPECT_EQ(1, candidates[0].key);
+                EXPECT_EQ(strict || missing_ec == EC_OK ? 101 : 0, candidates[0].last_access_time_us);
+                EXPECT_EQ(2, candidates[1].key);
+                EXPECT_EQ(0, candidates[1].last_access_time_us);
+            }
+        }
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_TRUE(logs.empty()) << logs;
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, MalformedLruWarningsAreBatchedAndThrottledPerInstance) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    ASSERT_EQ(EC_OK, backend.Init("reclaim_lru_first", config_));
+    for (KeyType key = 1; key <= 1000; ++key) {
+        backend.sampled_keys.push_back(key);
+    }
+    backend.property_results.assign(1000, EC_OK);
+    backend.properties.assign(1000, {{PROPERTY_LRU_TIME, "malformed"}});
+    backend.properties[0] = {{PROPERTY_LRU_TIME, "101"}};
+    backend.properties[1].clear();
+
+    ScriptedReclaimMetaAsyncRedisBackend other;
+    ASSERT_EQ(EC_OK, other.Init("reclaim_lru_second", config_));
+    other.sampled_keys = {1};
+    other.property_results = {EC_OK};
+    other.properties = {{{PROPERTY_LRU_TIME, "malformed"}}};
+
+    ReclaimCandidateVector candidates;
+    const int64_t sample_start_us = TimestampUtil::GetSteadyTimeUs();
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 1000, candidates, i % 2 == 0));
+    }
+    const std::string first_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(first_logs.begin(), first_logs.end(), '\n')) << first_logs;
+    EXPECT_THAT(first_logs, HasSubstr("instance[reclaim_lru_first], sampled[1000], missing[1], malformed[998]"));
+    EXPECT_THAT(first_logs, HasSubstr("warn_interval_s[30]"));
+    ASSERT_EQ(1000, candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EXPECT_EQ(i + 1, candidates[i].key);
+        EXPECT_EQ(i == 0 ? 101 : 0, candidates[i].last_access_time_us);
+    }
+
+    const int64_t next_warning_us = backend.next_reclaim_lru_warning_time_us_;
+    EXPECT_GE(next_warning_us, sample_start_us + 30 * 1000 * 1000);
+    EXPECT_LE(next_warning_us, TimestampUtil::GetSteadyTimeUs() + 30 * 1000 * 1000);
+    // Advance the warning deadline without sleeping for a full period.
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 1000, candidates));
+    EXPECT_EQ(EC_OK, other.SampleReclaimCandidates(nullptr, 1, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(3, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_first], warn_interval_s[30], suppressed_warnings[19], "
+                          "suppressed_sampled[19000], suppressed_missing[19], suppressed_malformed[18962]"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_first], sampled[1000], missing[1], malformed[998], "
+                          "warn_interval_s[30]"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_second], sampled[1], missing[0], malformed[1], "
+                          "warn_interval_s[30]"));
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, ReadFailureWarningsAreThrottledAndKeepFallback) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.property_results = {EC_NOENT, EC_TIMEOUT};
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "202"}}};
+    ReclaimCandidateVector candidates;
+
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
+    EXPECT_THAT(logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(logs, HasSubstr("warn_interval_s[30]"));
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(0, candidates[0].last_access_time_us);
+    EXPECT_EQ(0, candidates[1].last_access_time_us);
+    EXPECT_EQ(EC_TIMEOUT, backend.SampleReclaimCandidates(nullptr, 2, candidates, true));
+    EXPECT_TRUE(candidates.empty());
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("warn_interval_s[30], suppressed_warnings[19], suppressed_sampled[38], "
+                          "suppressed_missing[0], suppressed_malformed[0]"));
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, WarningKindsShareSuppressedCount) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_TIMEOUT);
+    backend.properties.resize(3);
+    ReclaimCandidateVector candidates;
+
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+    for (const bool strict : {false, true}) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates, strict));
+    }
+    // Count the actual sample size across warning kinds, not the requested count.
+    backend.sampled_keys = {4, 5};
+    backend.property_results.assign(2, EC_TIMEOUT);
+    backend.properties.assign(2, {});
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 10, candidates));
+    EXPECT_EQ(2, candidates.size());
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_NOENT);
+    backend.properties.assign(3, {});
+    for (const bool strict : {false, true}) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates, strict));
+    }
+    std::string logs = testing::internal::GetCapturedStdout();
+    LoggerBroker::SetLogLevel(Logger::LEVEL_ERROR);
+    testing::internal::CaptureStdout();
+    backend.property_results.assign(3, EC_TIMEOUT);
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    logs += testing::internal::GetCapturedStdout();
+    LoggerBroker::SetLogLevel(Logger::LEVEL_WARN);
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    logs += testing::internal::GetCapturedStdout();
+    EXPECT_EQ(3, std::count(logs.begin(), logs.end(), '\n')) << logs;
+    EXPECT_THAT(logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(logs,
+                HasSubstr("warn_interval_s[30], suppressed_warnings[3], suppressed_sampled[8], "
+                          "suppressed_missing[2], suppressed_malformed[4]"));
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs, HasSubstr("malformed lru time"));
+    EXPECT_THAT(later_logs, HasSubstr("sampled[3], missing[1], malformed[2], warn_interval_s[30]"));
+    EXPECT_EQ(std::string::npos, later_logs.find("suppressed_warnings"));
+
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string reset_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(reset_logs.begin(), reset_logs.end(), '\n')) << reset_logs;
+    EXPECT_THAT(reset_logs,
+                HasSubstr("suppressed_warnings[1], suppressed_sampled[3], suppressed_missing[1], "
+                          "suppressed_malformed[2]"));
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, ConcurrentSamplingSharesWarningBudget) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+    std::atomic<int> successful_samples{0};
+    std::vector<std::thread> workers;
+
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 16; ++i) {
+        workers.emplace_back([&]() {
+            for (int j = 0; j < 100; ++j) {
+                ReclaimCandidateVector candidates;
+                if (backend.SampleReclaimCandidates(nullptr, 3, candidates) == EC_OK && candidates.size() == 3 &&
+                    candidates[0].key == 1 && candidates[2].key == 3 &&
+                    std::all_of(candidates.begin(), candidates.end(), [](const auto &candidate) {
+                        return candidate.last_access_time_us == 0;
+                    })) {
+                    ++successful_samples;
+                }
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1600, successful_samples.load());
+    EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    ReclaimCandidateVector candidates;
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs,
+                HasSubstr("suppressed_warnings[1599], suppressed_sampled[4797], suppressed_missing[1599], "
+                          "suppressed_malformed[3198]"));
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=0&async_max_batch=64");
     ASSERT_EQ(EC_BADARGS, backend_->Init("test_instance", config_));
@@ -219,15 +500,252 @@ TEST_F(MetaAsyncRedisBackendTest, TestOpenAndClose) {
     ASSERT_TRUE(backend_->read_client_pool_ == nullptr);
 }
 
-TEST_F(MetaAsyncRedisBackendTest, TestOpenFailsOnClientCreation) {
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillOnce(Invoke([]() {
-        StandardUri empty_uri;
-        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        EXPECT_CALL(*mock, Reconnect()).WillRepeatedly(Return(false));
-        return mock;
+TEST_F(MetaAsyncRedisBackendTest, TestOpenOverlapsConnectionsWithinConfiguredBound) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "2");
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=6");
+    ASSERT_EQ(EC_OK, backend_->Init("parallel_instance", config_));
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool release = false;
+    size_t active = 0;
+    size_t peak = 0;
+    size_t calls = 0;
+    std::atomic<int> destroyed{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        return std::make_shared<TrackingOpenRedisClient>(
+            [&] {
+                std::unique_lock<std::mutex> lock(mutex);
+                ++active;
+                ++calls;
+                peak = std::max(peak, active);
+                changed.notify_all();
+                const bool released = changed.wait_for(lock, std::chrono::seconds(5), [&] { return release; });
+                --active;
+                return released;
+            },
+            destroyed);
     }));
-    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
-    ASSERT_EQ(EC_ERROR, backend_->Open());
+    ErrorCode result = EC_UNKNOWN;
+    std::thread opener([&] { result = backend_->Open(); });
+    bool overlapped = false;
+    bool premature_ready = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        overlapped = changed.wait_for(lock, std::chrono::seconds(5), [&] { return active == 2; });
+        premature_ready = backend_->is_running_.load();
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(overlapped);
+    EXPECT_FALSE(premature_ready);
+    EXPECT_EQ(EC_OK, result);
+    EXPECT_EQ(2, peak);
+    EXPECT_EQ(6, calls);
+    EXPECT_EQ(6, backend_->consumer_threads_.size());
+    EXPECT_EQ(EC_OK, backend_->Close());
+    EXPECT_EQ(6, destroyed.load());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestFailedOpenWaitsForSiblingThenCleansAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "2");
+    ASSERT_EQ(EC_OK, backend_->Init("failure_instance", config_));
+    std::mutex mutex;
+    std::condition_variable changed;
+    int entered = 0;
+    bool failure = false;
+    bool release = false;
+    std::atomic<int> created{0};
+    std::atomic<int> destroyed{0};
+    std::atomic<bool> returned{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        const int id = created.fetch_add(1);
+        return std::make_shared<TrackingOpenRedisClient>(
+            [&, id] {
+                std::unique_lock<std::mutex> lock(mutex);
+                ++entered;
+                changed.notify_all();
+                if (id == 0) {
+                    changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered == 2; });
+                    failure = true;
+                    changed.notify_all();
+                    return false;
+                }
+                return changed.wait_for(lock, std::chrono::seconds(5), [&] { return release; });
+            },
+            destroyed);
+    }));
+    ErrorCode result = EC_UNKNOWN;
+    std::thread opener([&] {
+        result = backend_->Open();
+        returned.store(true);
+    });
+    bool saw_failure = false;
+    bool premature_return = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        saw_failure = changed.wait_for(lock, std::chrono::seconds(5), [&] { return failure; });
+        premature_return = returned.load();
+        EXPECT_FALSE(backend_->is_running_.load());
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(saw_failure);
+    EXPECT_FALSE(premature_return);
+    EXPECT_EQ(EC_ERROR, result);
+    EXPECT_EQ(2, created.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    Mock::VerifyAndClearExpectations(backend_.get());
+    SetupMockRedisClients();
+    EXPECT_EQ(EC_OK, backend_->Open());
+    EXPECT_TRUE(backend_->is_running_.load());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestReadPoolFailureCleansSuccessfulConsumerConnections) {
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=2&client_min_pool_size=1");
+    ASSERT_EQ(EC_OK, backend_->Init("read_pool_failure_instance", config_));
+    std::atomic<int> created{0};
+    std::atomic<int> destroyed{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() -> std::shared_ptr<RedisClient> {
+        if (created.fetch_add(1) == 2) {
+            return nullptr;
+        }
+        return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+    }));
+    EXPECT_EQ(EC_ERROR, backend_->Open());
+    EXPECT_EQ(3, created.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    Mock::VerifyAndClearExpectations(backend_.get());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadStartupFailureCleansResourcesAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    SetupMockRedisClients();
+    ASSERT_EQ(EC_OK, backend_->Init("thread_start_failure_instance", config_));
+    static size_t thread_starts = 0;
+    thread_starts = 0;
+    auto create_thread = reinterpret_cast<decltype(&pthread_create)>(dlsym(RTLD_NEXT, "pthread_create"));
+    ASSERT_NE(nullptr, create_thread);
+    {
+        Stub stub;
+        stub.set(
+            create_thread, +[](pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) {
+                ++thread_starts;
+                return EAGAIN;
+            });
+        EXPECT_EQ(EC_ERROR, backend_->Open());
+    }
+    EXPECT_EQ(1, thread_starts);
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    EXPECT_EQ(EC_OK, backend_->Open());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestClientFactoryExceptionsCleanResourcesAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    config_->SetStorageUri("redis://host:6379/?async_queue_count=2&client_min_pool_size=1");
+    for (int fail_at : {0, 2}) {
+        ASSERT_EQ(EC_OK, backend_->Init("client_factory_exception_instance", config_));
+        std::atomic<int> created{0};
+        std::atomic<int> destroyed{0};
+        EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() -> std::shared_ptr<RedisClient> {
+            if (created.fetch_add(1) == fail_at) {
+                if (fail_at == 0) {
+                    throw std::runtime_error("injected consumer client failure");
+                }
+                throw std::bad_alloc(); // Read pool startup, outside RunBoundedParallel.
+            }
+            return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+        }));
+        EXPECT_EQ(EC_ERROR, backend_->Open());
+        EXPECT_EQ(fail_at + 1, created.load());
+        EXPECT_EQ(fail_at, destroyed.load());
+        EXPECT_FALSE(backend_->is_running_.load());
+        EXPECT_TRUE(backend_->consumer_clients_.empty());
+        EXPECT_TRUE(backend_->consumer_threads_.empty());
+        EXPECT_TRUE(backend_->queues_.empty());
+        EXPECT_EQ(nullptr, backend_->read_client_pool_);
+        Mock::VerifyAndClearExpectations(backend_.get());
+        SetupMockRedisClients();
+        EXPECT_EQ(EC_OK, backend_->Open());
+        EXPECT_EQ(EC_OK, backend_->Close());
+        Mock::VerifyAndClearExpectations(backend_.get());
+    }
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConsumerThreadExceptionJoinsBeforeCleanupAndCanRetry) {
+    ScopedEnv concurrency("kvcm.meta_async_redis.open_concurrency", "1");
+    ASSERT_EQ(EC_OK, backend_->Init("consumer_thread_exception_instance", config_));
+    std::atomic<int> destroyed{0};
+    std::atomic<int> exited{0};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        return std::make_shared<TrackingOpenRedisClient>([] { return true; }, destroyed);
+    }));
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool started = false;
+    bool failed = false;
+    bool release = false;
+    backend_->consumer_thread_factory = [&](int queue_id) -> autil::ThreadPtr {
+        if (queue_id == 0) {
+            return autil::Thread::createThread(
+                [&] {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    started = true;
+                    changed.notify_all();
+                    changed.wait(lock, [&] { return release; });
+                    ++exited;
+                },
+                "kvcm_test");
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] { return started || release; });
+        failed = true;
+        changed.notify_all();
+        throw std::runtime_error("injected consumer thread failure");
+    };
+    std::promise<ErrorCode> completion;
+    auto result = completion.get_future();
+    std::thread opener([&] { completion.set_value(backend_->Open()); });
+    bool saw_failure = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        saw_failure = changed.wait_for(lock, std::chrono::seconds(5), [&] { return failed; });
+    }
+    const auto status = result.wait_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(0, destroyed.load());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+        changed.notify_all();
+    }
+    opener.join();
+    EXPECT_TRUE(saw_failure);
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(EC_ERROR, result.get());
+    EXPECT_EQ(1, exited.load());
+    EXPECT_EQ(2, destroyed.load());
+    EXPECT_FALSE(backend_->is_running_.load());
+    EXPECT_TRUE(backend_->consumer_clients_.empty());
+    EXPECT_TRUE(backend_->consumer_threads_.empty());
+    EXPECT_TRUE(backend_->queues_.empty());
+    EXPECT_EQ(nullptr, backend_->read_client_pool_);
+    backend_->consumer_thread_factory = nullptr;
+    Mock::VerifyAndClearExpectations(backend_.get());
+    SetupMockRedisClients();
+    EXPECT_EQ(EC_OK, backend_->Open());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestDoubleClose) {
@@ -1342,6 +1860,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryHealthySyncAndMetadata) {
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {7}, {{}}, {{{"p", "v"}}}));
     ASSERT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "1"}}));
     EXPECT_TRUE(backend_->Sync({7}));
+    EXPECT_TRUE(backend_->SyncAll());
+    EXPECT_EQ(EC_OK, backend_->DeleteMetaData());
     ASSERT_EQ(EC_OK, backend_->Close());
     auto stats = backend_->GetAsyncWriteStats();
     EXPECT_EQ(1, stats.flush_key_count);

@@ -24,21 +24,25 @@ std::shared_ptr<EventManager> MakeEventManager() {
 
 void EnableOptimizerPublisher(Server *server) {
     server->config_.event_publishers_configs_ =
-        R"({"optimizer":{"enable":true,"queue_size":123,"max_subscribers":2,"subscriber_queue_size":4096}})";
+        R"({"optimizer":{"queue_size":123,"max_subscribers":2,"subscriber_queue_size":4096}})";
 }
 
 } // namespace
 
 class ServerEventPublisherTest : public TESTBASE {};
 
-TEST_F(ServerEventPublisherTest, TestOptimizerPublisherIsAbsentByDefault) {
+TEST_F(ServerEventPublisherTest, TestOptimizerPublisherIsRegisteredByDefault) {
     Server server;
     auto event_manager = MakeEventManager();
     server.RegisterEventPublishers(event_manager);
 
     EXPECT_TRUE(event_manager->HasPublisher("log_event_publisher"));
-    EXPECT_FALSE(event_manager->HasPublisher("optimizer_event_publisher"));
-    EXPECT_EQ(nullptr, server.optimizer_event_service_);
+    EXPECT_TRUE(event_manager->HasPublisher("optimizer_event_publisher"));
+    EXPECT_NE(nullptr, server.optimizer_event_service_);
+    auto publisher =
+        std::dynamic_pointer_cast<OptimizerEventPublisher>(event_manager->GetPublisher("optimizer_event_publisher"));
+    ASSERT_NE(nullptr, publisher);
+    EXPECT_EQ(0u, publisher->CaptureEpoch());
     event_manager->Stop();
 }
 
@@ -57,7 +61,19 @@ TEST_F(ServerEventPublisherTest, TestConfiguredOptimizerPublisherIsRegistered) {
     ASSERT_NE(nullptr, sink);
     EXPECT_EQ(2u, sink->config_.max_subscribers());
     EXPECT_EQ(4096u, sink->config_.subscriber_queue_size());
-    EXPECT_NE(nullptr, server.optimizer_event_service_);
+    ASSERT_NE(nullptr, server.optimizer_event_service_);
+    EXPECT_EQ(2u, server.optimizer_event_service_->MaxSubscribers());
+    event_manager->Stop();
+}
+
+TEST_F(ServerEventPublisherTest, TestOptimizerPublisherCanBeDisabled) {
+    Server server;
+    server.config_.event_publishers_configs_ = R"({"optimizer":{"enable":false}})";
+    auto event_manager = MakeEventManager();
+    server.RegisterEventPublishers(event_manager);
+    EXPECT_TRUE(event_manager->HasPublisher("log_event_publisher"));
+    EXPECT_FALSE(event_manager->HasPublisher("optimizer_event_publisher"));
+    EXPECT_EQ(nullptr, server.optimizer_event_service_);
     event_manager->Stop();
 }
 
@@ -68,7 +84,7 @@ TEST_F(ServerEventPublisherTest, TestLogPublisherCanBeDisabled) {
     server.RegisterEventPublishers(event_manager);
 
     EXPECT_FALSE(event_manager->HasPublisher("log_event_publisher"));
-    EXPECT_FALSE(event_manager->HasPublisher("optimizer_event_publisher"));
+    EXPECT_TRUE(event_manager->HasPublisher("optimizer_event_publisher"));
     event_manager->Stop();
 }
 

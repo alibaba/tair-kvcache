@@ -21,6 +21,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
         ASSERT_EQ(2, config.GetSchedulePlanExecutorThreadCount());
+        ASSERT_EQ(0, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(0u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_EQ(1u, config.GetSchedulePlanMigrationWorkerBudget());
         ASSERT_EQ(4u, config.GetMetaQueryWorkerCount());
         ASSERT_EQ(256u, config.GetMetaQueryParallelThreshold());
@@ -38,6 +40,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_EQ(64, config.GetCacheGcMaxInflightDeleteRequests());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+        ASSERT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
         ASSERT_EQ(256, config.GetCacheGcEventReportActionBatchSize());
     }
     // config_file not exist
@@ -57,6 +60,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(6381, config.GetServiceRpcPort());
         ASSERT_EQ(6382, config.GetServiceHttpPort());
         ASSERT_EQ(2, config.GetServiceIoThreadNum());
+        ASSERT_EQ(16, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(134217728u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_TRUE(config.IsEnableDebugService());
     }
     // from environ
@@ -84,6 +89,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         environ.insert({"kvcm.service.rpc_port", "7381"});
         ScopedEnv env("kvcm.service.http_port", "7382");
         environ.insert({"kvcm.service.io_thread_num", "4"});
+        environ.insert({"kvcm.service.grpc_max_threads", "32"});
+        environ.insert({"kvcm.service.grpc_memory_quota_bytes", "268435456"});
         environ.insert({"kvcm.logger.log_level", "3"});
         ASSERT_TRUE(config.Parse(config_file, environ));
         ASSERT_TRUE(config.Check());
@@ -91,8 +98,203 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(7381, config.GetServiceRpcPort());
         ASSERT_EQ(7382, config.GetServiceHttpPort());
         ASSERT_EQ(4, config.GetServiceIoThreadNum());
+        ASSERT_EQ(32, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(268435456u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
+    }
+}
+
+TEST_F(ServerConfigTest, AccessLogPayloadModeDefaultsToMetadata) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "full"}}));
+    EXPECT_TRUE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "metadata"}}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+    EXPECT_FALSE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "unknown"}}));
+}
+
+TEST_F(ServerConfigTest, AccessLogPayloadModeEnvironmentOverride) {
+    ServerConfig config;
+    {
+        const ScopedEnv env("kvcm_logger_access_log_payload_mode", "full");
+        ASSERT_TRUE(config.Parse("", {{"kvcm.logger.access_log_payload_mode", "metadata"}}));
+        EXPECT_TRUE(config.IncludeAccessLogPayload());
+    }
+
+    const std::string config_file = GetPrivateTestDataPath() + "server_config_simple.conf";
+    ASSERT_TRUE(config.Parse(config_file, {}));
+    EXPECT_TRUE(config.IncludeAccessLogPayload());
+
+    const ScopedEnv env("kvcm_logger_access_log_payload_mode", "metadata");
+    ASSERT_TRUE(config.Parse(config_file, {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+}
+
+TEST_F(ServerConfigTest, LegacyFullAccessLogEnvironmentVariables) {
+    ServerConfig config;
+    {
+        const ScopedEnv env("KVCM_REPORT_EVENT_FULL_ACCESS_LOG", "true");
+        ASSERT_TRUE(config.Parse("", {}));
+        EXPECT_FALSE(config.IncludeAccessLogPayload());
+        EXPECT_TRUE(config.IsReportEventFullAccessLogEnabled());
+        EXPECT_FALSE(config.IsGetHostCacheStateFullAccessLogEnabled());
+    }
+
+    const ScopedEnv env("KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG", "true");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IncludeAccessLogPayload());
+    EXPECT_FALSE(config.IsReportEventFullAccessLogEnabled());
+    EXPECT_TRUE(config.IsGetHostCacheStateFullAccessLogEnabled());
+}
+
+TEST_F(ServerConfigTest, GrpcMaxThreadsValidation) {
+    for (const std::string value : {"-1", "0", "2", "64", "2147483647"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_max_threads", value}}));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(std::stoi(value), config.GetServiceGrpcMaxThreads());
+    }
+    for (const std::string value :
+         {"", "-2", "-2147483649", "2junk", "abc", "2147483648", "4294967296", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_max_threads", value}}));
+    }
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_max_threads", "1"}}));
+    EXPECT_FALSE(config.Check());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0, config.GetServiceGrpcMaxThreads());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMaxThreadsEnvironmentOverride) {
+    ScopedEnv env("kvcm_service_grpc_max_threads", "8");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse(GetPrivateTestDataPath() + "server_config_simple.conf",
+                             {{"kvcm.service.grpc_max_threads", "32"}}));
+    EXPECT_EQ(8, config.GetServiceGrpcMaxThreads());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMemoryQuotaValidation) {
+    for (const std::string value : {"0", "1", "134217728", "4294967296", "9223372036854775807"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", value}}));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(std::stoull(value), config.GetServiceGrpcMemoryQuotaBytes());
+    }
+    for (const std::string value : {"",
+                                    "-1",
+                                    "-18446744073709551615",
+                                    "+1",
+                                    "1junk",
+                                    "128MiB",
+                                    "1.5",
+                                    "abc",
+                                    "9223372036854775808",
+                                    "18446744073709551615",
+                                    "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", value}}));
+    }
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", "134217728"}}));
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceGrpcMemoryQuotaBytes());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMemoryQuotaEnvironmentOverride) {
+    ScopedEnv env("kvcm_service_grpc_memory_quota_bytes", "67108864");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse(GetPrivateTestDataPath() + "server_config_simple.conf",
+                             {{"kvcm.service.grpc_memory_quota_bytes", "268435456"}}));
+    EXPECT_EQ(67108864u, config.GetServiceGrpcMemoryQuotaBytes());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, HttpReportEventBodyBudgetValidation) {
+    const std::string key = "kvcm.service.http_report_event_body_budget_bytes";
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetHttpReportEventBodyBudgetBytes());
+    ASSERT_TRUE(config.Parse("", {{key, "1073741824"}}));
+    EXPECT_EQ(1073741824u, config.GetHttpReportEventBodyBudgetBytes());
+    for (const char *value : {"", "-1", "+1", "1GiB", "1073741825", "4294967296"}) {
+        SCOPED_TRACE(value);
+        EXPECT_FALSE(config.Parse("", {{key, value}}));
+    }
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetHttpReportEventBodyBudgetBytes());
+    ScopedEnv env("kvcm_service_http_report_event_body_budget_bytes", "268435456");
+    ASSERT_TRUE(config.Parse("", {{key, "134217728"}}));
+    EXPECT_EQ(268435456u, config.GetHttpReportEventBodyBudgetBytes());
+}
+
+TEST_F(ServerConfigTest, GrpcCompletionQueueThreads) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(2u, config.GetServiceGrpcCqThreadNum());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_cq_thread_num", "4"}}));
+    EXPECT_EQ(4u, config.GetServiceGrpcCqThreadNum());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(2u, config.GetServiceGrpcCqThreadNum());
+    for (const auto *value : {"0", "-1", "12x", "", "4294967296"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_cq_thread_num", value}}));
+    }
+    ScopedEnv env("kvcm_service_grpc_cq_thread_num", "3");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(3u, config.GetServiceGrpcCqThreadNum());
+}
+
+TEST_F(ServerConfigTest, ServiceRequestExecutorConfig) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(64u, config.ResolveServiceWorkerThreadNum(64));
+    EXPECT_EQ(2u, config.ResolveServiceWorkerThreadNum(0));
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_max_threads", "8"}}));
+    EXPECT_EQ(8u, config.ResolveServiceWorkerThreadNum(64));
+    EXPECT_EQ(2048u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("discard_pending", config.GetServiceWorkerShutdownMode());
+    ASSERT_TRUE(config.Parse("",
+                             {{"kvcm.service.worker_thread_num", "32"},
+                              {"kvcm.service.grpc_max_threads", "8"},
+                              {"kvcm.service.worker_queue_capacity", "1000"},
+                              {"kvcm.service.worker_shutdown_mode", "drain"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ(32u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(32u, config.ResolveServiceWorkerThreadNum(64));
+    EXPECT_EQ(1000u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("drain", config.GetServiceWorkerShutdownMode());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(2048u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("discard_pending", config.GetServiceWorkerShutdownMode());
+    for (const auto *key : {"kvcm.service.worker_thread_num", "kvcm.service.worker_queue_capacity"}) {
+        for (const auto *value : {"-1", "12x", "", "4294967296"}) {
+            EXPECT_FALSE(config.Parse("", {{key, value}})) << key << "=" << value;
+        }
+    }
+    EXPECT_FALSE(config.Parse("", {{"kvcm.service.worker_shutdown_mode", "unknown"}}));
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.worker_queue_capacity", "0"}}));
+    EXPECT_EQ(0u, config.GetServiceWorkerQueueCapacity());
+    {
+        ScopedEnv capacity("kvcm_service_worker_queue_capacity", "37");
+        ASSERT_TRUE(config.Parse("", {{"kvcm.service.worker_queue_capacity", "9"}}));
+        EXPECT_EQ(37u, config.GetServiceWorkerQueueCapacity());
     }
 }
 
@@ -434,6 +636,28 @@ TEST_F(ServerConfigTest, TestMalformedNumericEnvironmentValueReturnsParseError) 
     EXPECT_FALSE(config.Parse("", environ));
 }
 
+TEST_F(ServerConfigTest, TestEventReportCleanupDuringRecoverConfig) {
+    ServerConfig config;
+    const std::string setting = "kvcm.cache_gc.event_report_cleanup_during_recover_enabled";
+    ASSERT_TRUE(config.Parse("", {{setting, "false"}}));
+    ASSERT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    EXPECT_TRUE(config.IsCacheGcEnabled());
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+
+    ASSERT_TRUE(config.Parse("", {{setting, "true"}}));
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    EXPECT_FALSE(config.Parse("", {{setting, "invalid"}}));
+
+    {
+        ScopedEnv env("kvcm_cache_gc_event_report_cleanup_during_recover_enabled", "false");
+        ASSERT_TRUE(config.Parse("", {}));
+        EXPECT_FALSE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    }
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+}
+
 TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {
     // 仅设置下划线版本，验证 fallback 生效
     {
@@ -455,5 +679,20 @@ TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
         ASSERT_EQ("redis://dotted-wins", config.GetRegistryStorageUri());
+    }
+}
+
+TEST_F(ServerConfigTest, RedisHealthProbeSwitch) {
+    ServerConfig config;
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "true"}}));
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "false"}}));
+    EXPECT_FALSE(config.redis_health_probe_enabled());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", "false"}}));
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.redis_health_probe_enabled());
+    for (const auto &invalid : {"", "1", "TRUE", "invalid"}) {
+        EXPECT_FALSE(config.Parse("", {{"kvcm.metrics.redis_health_probe_enabled", invalid}}));
     }
 }

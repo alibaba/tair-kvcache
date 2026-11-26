@@ -8,9 +8,12 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/meta/types.h"
 
@@ -96,6 +99,107 @@ public:
     // Best-effort Delete; swallow NOENT so repeated runs against the same
     // redis instance stay idempotent even when a previous run aborted midway.
     static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) { mgr.Delete(nullptr, keys); }
+
+    void WriteSimpleLocation(MetaIndexer &indexer, const KeyVector &keys, const CacheLocationConstPtr &location) {
+        const auto replace = [&location](const std::vector<ErrorCode> &,
+                                         const LocationIdVector &,
+                                         size_t,
+                                         CacheLocationVector &locations,
+                                         PropertyMap &) {
+            locations.front() = location;
+            return LocationModifierResult{MA_OK, {EC_OK}};
+        };
+        const MetaIndexer::LocationResult result =
+            indexer.ReadModifyWriteTargetLocations(request_context_.get(), keys, {{location->id()}}, replace);
+        ASSERT_EQ(EC_OK, result.ec);
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), result.per_location_error_codes);
+    }
+
+    void CheckSimpleCompactRoundTrip(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                     const std::string &instance) {
+        const KeyVector keys{42001};
+        const std::vector<LocationSpecInfo> specs{LocationSpecInfo("tp0", 4096)};
+        auto info = std::make_shared<InstanceInfo>(
+            "", "group", instance, 1024, specs, ModelDeployment{}, std::vector<LocationSpecGroup>{}, 0);
+        auto index_config = std::make_shared<MetaIndexerConfig>(100, 1, 100, config);
+        auto legacy = std::make_shared<CacheLocation>(
+            "kvs#event_report_l1p5#hbm#127.0.0.1:10",
+            CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "event_report://127.0.0.1:10/hbm?s_v=11111111&size=4096")});
+        auto compact = std::make_shared<CacheLocation>(
+            "kvs#event_report_l2#mem#127.0.0.1:11",
+            CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "event_report://127.0.0.1:11/mem?s_v=22222222&size=8192")});
+        legacy->set_create_time(9876543210LL);
+        compact->set_create_time(0x01000200030004LL);
+
+        MetaStorageBackendManager cleanup;
+        ASSERT_EQ(EC_OK, cleanup.Init(instance, MakeSingleConfig()));
+        ASSERT_EQ(EC_OK, cleanup.Open());
+        Cleanup(cleanup, keys);
+        ErrorCode metadata_ec = cleanup.DeleteMetaData();
+        ASSERT_TRUE(metadata_ec == EC_OK || metadata_ec == EC_NOENT);
+
+        const std::string legacy_field = PROPERTY_LOCATION_PREFIX + legacy->id();
+        {
+            MetaIndexer legacy_writer(info);
+            ASSERT_EQ(EC_OK, legacy_writer.Init(instance, index_config));
+            ASSERT_NO_FATAL_FAILURE(WaitRunning(*legacy_writer.backend_manager_));
+            ASSERT_NO_FATAL_FAILURE(WriteSimpleLocation(legacy_writer, keys, legacy));
+            ASSERT_TRUE(legacy_writer.SyncAll());
+            PropertyMapVector fields;
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), cleanup.GetProperties(nullptr, keys, {legacy_field}, fields));
+            EXPECT_EQ(legacy->ToJsonString(), fields.front().at(legacy_field));
+        }
+        info->set_disable_write_session(true);
+        {
+            MetaIndexer writer(info);
+            ASSERT_EQ(EC_OK, writer.Init(instance, index_config));
+            ASSERT_NO_FATAL_FAILURE(WaitRunning(*writer.backend_manager_));
+            ASSERT_EQ(1u, writer.GetKeyCount());
+            ASSERT_EQ(1u, writer.GetLocationCount());
+            ASSERT_NO_FATAL_FAILURE(WriteSimpleLocation(writer, keys, compact));
+            ASSERT_TRUE(writer.SyncAll());
+
+            MetaStorageBackend &redis = *writer.backend_manager_->persistent_backend_;
+            const std::string compact_field = PROPERTY_LOCATION_PREFIX + compact->id();
+            PropertyMapVector fields;
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      redis.GetProperties(nullptr, keys, {legacy_field, compact_field}, fields));
+            EXPECT_EQ(legacy->ToJsonString(), fields[0].at(legacy_field));
+            const std::string &compact_value = fields[0].at(compact_field);
+            EXPECT_EQ(std::string("\0KV\1\4\0\3\0\2\0\1\0", 12) + compact->location_specs()[0].uri(), compact_value);
+
+            LocationsPerKey read;
+            ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK, EC_NOENT}}),
+                      redis.GetLocations(nullptr, keys, {{legacy->id(), compact->id(), "missing"}}, read));
+            ASSERT_NE(nullptr, read[0][0]);
+            ASSERT_NE(nullptr, read[0][1]);
+            EXPECT_EQ(legacy->ToJsonString(), read[0][0]->ToJsonString());
+            EXPECT_EQ(compact->ToJsonString(), read[0][1]->ToJsonString());
+        }
+        {
+            MetaIndexer reader(info);
+            ASSERT_EQ(EC_OK, reader.Init(instance, index_config));
+            ASSERT_NO_FATAL_FAILURE(WaitRunning(*reader.backend_manager_));
+            EXPECT_EQ(1u, reader.GetKeyCount());
+            EXPECT_EQ(2u, reader.GetLocationCount());
+
+            CacheLocationMapVector read;
+            const MetaIndexer::Result result = reader.GetLocations(request_context_.get(), keys, read);
+            ASSERT_EQ(EC_OK, result.ec);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), result.error_codes);
+            ASSERT_EQ(2u, read[0].size());
+            EXPECT_EQ(legacy->ToJsonString(), read[0].at(legacy->id())->ToJsonString());
+            EXPECT_EQ(compact->ToJsonString(), read[0].at(compact->id())->ToJsonString());
+        }
+        Cleanup(cleanup, keys);
+        EXPECT_EQ(EC_OK, cleanup.DeleteMetaData());
+    }
 
     // ---- Reusable test bodies (parameterised by config + instance + keys) ----
 
@@ -372,7 +476,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     WaitRunning(mgr);
 
     // Force Recover so Delete writes a tombstone and Upsert runs
-    // EnsureKeyInLocal before the conditional write.
+    // EnsureKeyInCache before the conditional write.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {40042};
@@ -398,8 +502,8 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
-    // Key 40007 lives only in redis: Upsert under Recover must hydrate
-    // it into local via EnsureKeyInLocal before the conditional write, so the
+    // Key 40007 lives only in Redis: Upsert under Recover must fill the cache
+    // via EnsureKeyInCache before the conditional write, so the
     // subsequent Get observes the upsert.
     KeyVector k7 = {40007};
     Cleanup(mgr, k7);
@@ -426,6 +530,11 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
 TEST_F(MetaStorageBackendManagerRealRedisTest, TestDualBackendPutAndGet) {
     DoDualPutAndGetTest(MakeDualConfig(), "inst_redis_dual", 10001);
     DoDualPutAndGetTest(MakeAsyncDualConfig(), "inst_async_dual", 80001);
+}
+
+TEST_F(MetaStorageBackendManagerRealRedisTest, TestSimpleCompactLocationsRoundTrip) {
+    ASSERT_NO_FATAL_FAILURE(CheckSimpleCompactRoundTrip(MakeDualConfig(), "inst_simple_compact_redis"));
+    ASSERT_NO_FATAL_FAILURE(CheckSimpleCompactRoundTrip(MakeAsyncDualConfig(), "inst_simple_compact_async"));
 }
 
 // --- Running phase: reads stay local-only, no redis fallback -----------------

@@ -1,15 +1,55 @@
+#include <optional>
+
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/config/registry_local_backend.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+class FaultInjectRegistryLocalBackend : public RegistryLocalBackend {
+public:
+    explicit FaultInjectRegistryLocalBackend(std::string instance_id) : instance_id_(std::move(instance_id)) {}
+
+    ErrorCode
+    UpsertField(const std::string &key, const std::string &field, const std::string &value) noexcept override {
+        if (fail_next_marker_upsert && key == "instance" && field == instance_id_ &&
+            value == instance_id_ + ":retired") {
+            fail_next_marker_upsert = false;
+            return EC_ERROR;
+        }
+        if (fail_next_info_upsert && key == instance_id_ && field == instance_id_) {
+            fail_next_info_upsert = false;
+            return EC_ERROR;
+        }
+        return RegistryLocalBackend::UpsertField(key, field, value);
+    }
+
+    ErrorCode DeleteField(const std::string &key, const std::string &field) noexcept override {
+        const ErrorCode ec = RegistryLocalBackend::DeleteField(key, field);
+        if (lose_index_delete_reply && ec == EC_OK && key == "instance" && field == instance_id_) {
+            lose_index_delete_reply = false;
+            return EC_ERROR;
+        }
+        return ec;
+    }
+
+    bool fail_next_info_upsert = false;
+    bool fail_next_marker_upsert = false;
+    bool lose_index_delete_reply = false;
+
+private:
+    std::string instance_id_;
+};
 
 class RegistryManagerLocalBackendTest : public TESTBASE {
 public:
@@ -68,7 +108,7 @@ void RegistryManagerLocalBackendTest::RegisterInstance(const std::string &instan
     LocationSpecInfo info;
     ModelDeployment model_deployment;
     auto ec = registry_manager_->RegisterInstance(
-        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment);
+        request_context_.get(), instance_group, instance_id, 1024, {info}, model_deployment, {}, 0, std::nullopt);
     ASSERT_EQ(EC_OK, ec);
 }
 
@@ -87,6 +127,163 @@ TEST_F(RegistryManagerLocalBackendTest, TestInit) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_file1";
     std::string uri = "local://" + local_path + "?cluster_name=test";
     ASSERT_TRUE(InitRegistryManager(uri));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRemovingInstanceIntentSurvivesRecover) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_removing_instance_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "__kvcm_internal_removing_instance_registry__");
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RemoveInstance(
+                  request_context_.get(), "group1", "__kvcm_internal_removing_instance_registry__"));
+    RegisterInstance("group1", "instance1");
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("instance1", fields.at("instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("__kvcm_internal_removing_instance_registry__", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance1", fields));
+    InstanceInfo deleting;
+    ASSERT_TRUE(deleting.FromJsonString(fields.at("instance1")));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, deleting.state());
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("instance1", fields.at("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_NE(EC_OK, registry_manager_->RemoveInstanceGroup(request_context_.get(), "group1"));
+    auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context_.get(), "group1");
+    ASSERT_EQ(EC_OK, group_ec);
+    auto updated_group = *group;
+    updated_group.set_version(group->version() + 1);
+    EXPECT_NE(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
+    EXPECT_NE(EC_OK,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "group1",
+                                                  "instance1",
+                                                  1024,
+                                                  {LocationSpecInfo{}},
+                                                  ModelDeployment{},
+                                                  {},
+                                                  0,
+                                                  std::nullopt));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance1", fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance", fields));
+    RegisterInstance("group1", "instance1");
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRetiredInstanceRecordRecovery) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_retired_instance_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "retired_with_info");
+    RegisterInstance("group1", "retired_without_info");
+    RegisterInstance("group1", "serving_instance");
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "retired_with_info"));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "retired_without_info"));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->storage_->UpsertField("instance", "retired_with_info", "retired_with_info:retired"));
+    ASSERT_EQ(
+        EC_OK,
+        registry_manager_->storage_->UpsertField("instance", "retired_without_info", "retired_without_info:retired"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("retired_without_info", "retired_without_info"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    std::map<std::string, std::string> fields;
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("retired_with_info", fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("retired_without_info", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ(0, fields.count("retired_with_info"));
+    EXPECT_EQ(0, fields.count("retired_without_info"));
+    EXPECT_EQ(1, fields.count("serving_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("retired_with_info"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("retired_without_info"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestAmbiguousFinalIndexDeleteDoesNotRecreateInstanceInfo) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_ambiguous_final_index_delete";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    const std::string instance_id = "instance1";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", instance_id);
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>(instance_id);
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    auto *fault_backend = backend.get();
+    backend->fail_next_info_upsert = true;
+    backend->lose_index_delete_reply = true;
+    registry_manager_->storage_ = std::move(backend);
+
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load(instance_id, fields));
+    InstanceInfo deleting;
+    ASSERT_TRUE(deleting.FromJsonString(fields.at(instance_id)));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, deleting.state());
+    fault_backend->fail_next_info_upsert = true;
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_ERROR, registry_manager_->CompleteRemoveInstance(instance_id));
+
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+
+    ASSERT_TRUE(InitRegistryManager(uri)); // Simulate a restart before the next CompleteRemoveInstance.
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo(instance_id));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+    RegisterInstance("group1", instance_id);
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRetiredRemovalPhaseSurvivesRegistryRecoveryRetry) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_retired_removal_phase";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    const std::string instance_id = "instance1";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", instance_id);
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>(instance_id);
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    backend->fail_next_marker_upsert = true;
+    registry_manager_->storage_ = std::move(backend);
+    EXPECT_EQ(EC_ERROR, registry_manager_->CompleteRemoveInstance(instance_id));
+    EXPECT_TRUE(registry_manager_->IsInstanceRemovalRetired(instance_id));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_TRUE(registry_manager_->IsInstanceRemovalRetired(instance_id));
+    EXPECT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance(instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo(instance_id));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestMalformedDeletingRecordDoesNotHideServingInstances) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_malformed_deleting_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "healthy_instance");
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("instance", "broken_instance", "broken_instance"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("broken_instance", "broken_instance", "invalid_json"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_NE(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "healthy_instance"));
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestStorageManagement) {
@@ -176,17 +373,14 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         current_spec->set_media_type(current_media_type);
         // This open-source test uses an NFS backend as a configured-backend holder because the
         // open-source TairMempool backend is intentionally non-functional.
-        backend->config_ =
-            StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
+        backend->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
 
         auto requested_spec = std::make_shared<TairMemPoolStorageSpec>(*current_spec);
         requested_spec->set_media_type(requested_media_type);
-        StorageConfig requested_config(
-            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
+        StorageConfig requested_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
         ASSERT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), requested_config, true));
 
-        const auto unchanged_backend =
-            registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
+        const auto unchanged_backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
         ASSERT_EQ(backend, unchanged_backend);
         const auto unchanged_spec =
             std::dynamic_pointer_cast<TairMemPoolStorageSpec>(unchanged_backend->GetStorageConfig().storage_spec());
@@ -194,10 +388,8 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         ASSERT_EQ(current_media_type, unchanged_spec->media_type());
     };
 
-    verify_media_type_change_rejected(
-        "pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
-    verify_media_type_change_rejected(
-        "pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
+    verify_media_type_change_rejected("pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
+    verify_media_type_change_rejected("pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupManagement) {
@@ -252,6 +444,115 @@ TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupManagement) {
     ASSERT_EQ(1, instance_groups_after_remove.size());
 }
 
+TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupUpdateValidatesExistingSimpleInstances) {
+    const std::string uri =
+        "local://" + GetPrivateTestRuntimeDataPath() + "_simple_group_update?cluster_name=simple_group_update";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("simple");
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "simple",
+                                                  "simple_instance",
+                                                  1024,
+                                                  {LocationSpecInfo("spec", 4096)},
+                                                  {},
+                                                  {},
+                                                  0,
+                                                  true));
+    const std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> original =
+        registry_manager_->GetInstanceGroup(request_context_.get(), "simple");
+    ASSERT_EQ(EC_OK, original.first);
+    const std::string original_json = original.second->ToJsonString();
+    const std::vector<std::string> invalid_backends{
+        R"({"storage_type":"local","memory_primary":true})",
+        R"({"storage_type":"redis"})",
+        R"({"storage_type":"cached","storage_uri":""})",
+        R"({"storage_type":"cached","storage_uri":"redis://127.0.0.1:6379?persistent_type=dummy&cache_type=local"})",
+        R"({"storage_type":"cached","storage_uri":"redis://127.0.0.1:6379?persistent_type=async_redis&cache_type=redis"})"};
+    for (const std::string &backend_json : invalid_backends) {
+        SCOPED_TRACE(backend_json);
+        InstanceGroup updated;
+        ASSERT_TRUE(updated.FromJsonString(original_json));
+        updated.set_version(1);
+        updated.set_user_data("must not be saved");
+        const std::shared_ptr<MetaStorageBackendConfig> backend =
+            updated.cache_config()->meta_indexer_config()->GetMetaStorageBackendConfig();
+        ASSERT_TRUE(backend->FromJsonString(backend_json));
+        EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated, 0));
+        const std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> unchanged =
+            registry_manager_->GetInstanceGroup(request_context_.get(), "simple");
+        ASSERT_EQ(EC_OK, unchanged.first);
+        EXPECT_EQ(original_json, unchanged.second->ToJsonString());
+    }
+    EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("simple_instance"));
+
+    InstanceGroup zero_batch;
+    ASSERT_TRUE(zero_batch.FromJsonString(original_json));
+    zero_batch.set_version(1);
+    zero_batch.cache_config()->meta_indexer_config()->SetBatchKeySize(0);
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateInstanceGroup(request_context_.get(), zero_batch, 0));
+    zero_batch.set_name("zero_batch");
+    zero_batch.set_version(0);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(request_context_.get(), zero_batch));
+    EXPECT_EQ(EC_BADARGS,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "zero_batch",
+                                                  "rejected_simple",
+                                                  1024,
+                                                  {LocationSpecInfo("spec", 4096)},
+                                                  {},
+                                                  {},
+                                                  0,
+                                                  true));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "rejected_simple"));
+    EXPECT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "zero_batch",
+                                                  "accepted_ordinary",
+                                                  1024,
+                                                  {LocationSpecInfo("spec", 4096)},
+                                                  {},
+                                                  {},
+                                                  0,
+                                                  false));
+
+    ASSERT_TRUE(InitRegistryManager(uri));
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecover());
+    const std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> recovered =
+        registry_manager_->GetInstanceGroup(request_context_.get(), "simple");
+    ASSERT_EQ(EC_OK, recovered.first);
+    EXPECT_EQ(original_json, recovered.second->ToJsonString());
+
+    InstanceGroup valid;
+    ASSERT_TRUE(valid.FromJsonString(original_json));
+    valid.set_version(1);
+    valid.set_user_data("valid update");
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), valid, 0));
+    const std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> accepted =
+        registry_manager_->GetInstanceGroup(request_context_.get(), "simple");
+    ASSERT_EQ(EC_OK, accepted.first);
+    EXPECT_EQ(1, accepted.second->version());
+    EXPECT_EQ("valid update", accepted.second->user_data());
+
+    CreateInstanceGroup("ordinary");
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "ordinary",
+                                                  "ordinary_instance",
+                                                  1024,
+                                                  {LocationSpecInfo("spec", 4096)},
+                                                  {},
+                                                  {},
+                                                  0,
+                                                  false));
+    InstanceGroup ordinary;
+    ASSERT_TRUE(ordinary.FromJsonString(original_json));
+    ordinary.set_name("ordinary");
+    ordinary.set_version(1);
+    ordinary.cache_config()->meta_indexer_config()->GetMetaStorageBackendConfig()->SetMemoryPrimary(true);
+    EXPECT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), ordinary, 0));
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestInstanceRegistration) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_instance_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";
@@ -304,9 +605,10 @@ TEST_F(RegistryManagerLocalBackendTest, DuplicateInstanceCannotMoveToAnotherGrou
 
     LocationSpecInfo info;
     ModelDeployment model_deployment;
-    EXPECT_EQ(EC_DUPLICATE_ENTITY,
-              registry_manager_->RegisterInstance(
-                  request_context_.get(), "group2", "shared_instance", 1024, {info}, model_deployment));
+    EXPECT_EQ(
+        EC_DUPLICATE_ENTITY,
+        registry_manager_->RegisterInstance(
+            request_context_.get(), "group2", "shared_instance", 1024, {info}, model_deployment, {}, 0, std::nullopt));
     const auto existing = registry_manager_->GetInstanceInfo(request_context_.get(), "shared_instance");
     ASSERT_NE(nullptr, existing);
     EXPECT_EQ("group1", existing->instance_group_name());
@@ -617,6 +919,105 @@ TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOnceIdempotent) {
     }
 }
 
+TEST_F(RegistryManagerLocalBackendTest, PartialRecoveryRetriesPreserveRegistrationAndUpdatedGroup) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_registration_identity";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("account", "broken", "invalid_json"));
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    const auto registration = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, registration);
+    EXPECT_FALSE(registry_manager_->IsRecoverComplete());
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    // Recovery retries fill missing entries; runtime configuration updates remain authoritative.
+    const auto group = registry_manager_->GetInstanceGroupConfig("group1");
+    ASSERT_NE(nullptr, group);
+    auto updated_group = *group;
+    updated_group.set_version(group->version() + 1);
+    updated_group.set_user_data("updated while recovery is incomplete");
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
+    const auto current_group = registry_manager_->GetInstanceGroupConfig("group1");
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(current_group, registry_manager_->GetInstanceGroupConfig("group1"));
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("account", "broken"));
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_TRUE(registry_manager_->IsRecoverComplete());
+    EXPECT_EQ(registration, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, RecoveryRetryPreservesFailedRemovalIntentWithoutRevivingServingRecord) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_pending_identity";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>("instance1");
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    backend->fail_next_info_upsert = true;
+    registry_manager_->storage_ = std::move(backend);
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    const auto pending = registry_manager_->GetRemovingInstanceInfo("instance1");
+    ASSERT_NE(nullptr, pending);
+    EXPECT_EQ(InstanceInfo::State::kDeleting, pending->state());
+    // The durable record is still serving because persisting the intent failed.
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance1", fields));
+    InstanceInfo durable;
+    ASSERT_TRUE(durable.FromJsonString(fields.at("instance1")));
+    ASSERT_EQ(InstanceInfo::State::kServing, durable.state());
+
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(pending, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    EXPECT_EQ(EC_ERROR,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "group1",
+                                                  "instance1",
+                                                  1024,
+                                                  {LocationSpecInfo{}},
+                                                  ModelDeployment{},
+                                                  {},
+                                                  0,
+                                                  std::nullopt));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, CleanupAndReregistrationCreateNewRegistrationIdentities) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_recover_new_registration_identity";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+    const auto original = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, original);
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    const auto reloaded = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, reloaded);
+    EXPECT_NE(original, reloaded);
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(reloaded, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    RegisterInstance("group1", "instance1");
+    const auto reregistered = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, reregistered);
+    EXPECT_NE(reloaded, reregistered);
+    // Register/remove and recovery serialize on the registry mutex, including background retries.
+    EXPECT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(reregistered, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOncePartialFailure) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_partial_fail_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";
@@ -751,6 +1152,43 @@ TEST_F(RegistryManagerLocalBackendTest, TestRecoverRetryLoopLifecycle) {
         rm->StartRecoverRetryLoop();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         rm.reset(); // destructor -> DoCleanup -> StopRecoverRetryLoop
+    }
+}
+
+TEST_F(RegistryManagerLocalBackendTest, DisableWriteSessionForOneSpecEnv) {
+    ASSERT_TRUE(InitRegistryManager("local://?cluster_name=one_spec_env"));
+    CreateInstanceGroup("group");
+    const std::vector<LocationSpecInfo> one{LocationSpecInfo("spec", 4096)};
+    const std::vector<LocationSpecInfo> many{LocationSpecInfo("spec", 4096), LocationSpecInfo("other", 4096)};
+    {
+        ScopedEnv env("kvcm.disable_write_session_for_one_spec", "false");
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "default", 1024, one, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "default")->disable_write_session());
+    }
+    {
+        ScopedEnv env("kvcm.disable_write_session_for_one_spec", "true");
+        for (const std::optional<bool> requested :
+             {std::optional<bool>{}, std::optional<bool>{false}, std::optional<bool>{true}}) {
+            const std::string id = requested.has_value() ? (*requested ? "explicit_true" : "explicit_false") : "auto";
+            ASSERT_EQ(EC_OK,
+                      registry_manager_->RegisterInstance(
+                          request_context_.get(), "group", id, 1024, one, {}, {}, 0, requested));
+            EXPECT_EQ(requested.value_or(true),
+                      registry_manager_->GetInstanceInfo(request_context_.get(), id)->disable_write_session());
+            ASSERT_EQ(EC_OK,
+                      registry_manager_->RegisterInstance(
+                          request_context_.get(), "group", id, 1024, one, {}, {}, 0, requested));
+        }
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "many", 1024, many, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "many")->disable_write_session());
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->RegisterInstance(
+                      request_context_.get(), "group", "default", 1024, one, {}, {}, 0, std::nullopt));
+        ASSERT_FALSE(registry_manager_->GetInstanceInfo(request_context_.get(), "default")->disable_write_session());
     }
 }
 

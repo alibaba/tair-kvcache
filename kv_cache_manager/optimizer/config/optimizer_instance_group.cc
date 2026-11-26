@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <limits>
+#include <unordered_set>
 
 namespace kv_cache_manager {
 
@@ -18,7 +19,7 @@ bool OptimizerInstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value)
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "eviction_policy", eviction_policy_, std::string("lru"));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "shared_group_quota", shared_group_quota_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_theoretical_max_cache", enable_theoretical_max_cache_, false);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "ttl_seconds", ttl_seconds_, int64_t(0));
+    KVCM_JSON_GET_MACRO(rapid_value, "ttl_seconds_list", ttl_seconds_list_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_prefix_hash", enable_prefix_hash_, false);
     SortCapacities();
     return true;
@@ -32,7 +33,7 @@ void OptimizerInstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "eviction_policy", eviction_policy_);
     Put(writer, "shared_group_quota", shared_group_quota_);
     Put(writer, "enable_theoretical_max_cache", enable_theoretical_max_cache_);
-    Put(writer, "ttl_seconds", ttl_seconds_);
+    Put(writer, "ttl_seconds_list", ttl_seconds_list_);
     Put(writer, "enable_prefix_hash", enable_prefix_hash_);
 }
 
@@ -42,10 +43,6 @@ bool OptimizerInstanceGroup::ValidateRequiredFields(std::string &invalid_fields)
     if (name_.empty()) {
         valid = false;
         local_invalid_fields += "{name}";
-    }
-    if (capacity_gb_.empty()) {
-        valid = false;
-        local_invalid_fields += "{capacity_gb}";
     }
     for (double cap : capacity_gb_) {
         if (!std::isfinite(cap) || cap <= 0.0) {
@@ -63,9 +60,20 @@ bool OptimizerInstanceGroup::ValidateRequiredFields(std::string &invalid_fields)
         valid = false;
         local_invalid_fields += "{eviction_policy}";
     }
-    if (ttl_seconds_ < 0) {
+    std::unordered_set<int64_t> ttls;
+    if (ttl_seconds_list_.empty()) {
         valid = false;
-        local_invalid_fields += "{ttl_seconds}";
+        local_invalid_fields += "{ttl_seconds_list}";
+    }
+    for (int64_t ttl : ttl_seconds_list_) {
+        if (ttl < 0 || ttl > std::numeric_limits<int64_t>::max() / 1000000000LL || !ttls.insert(ttl).second) {
+            valid = false;
+            local_invalid_fields += "{ttl_seconds_list: invalid or duplicate value}";
+        }
+    }
+    if (capacity_gb_.empty() && !enable_theoretical_max_cache_) {
+        valid = false;
+        local_invalid_fields += "{no analysis requested}";
     }
     if (!valid) {
         invalid_fields += "{OptimizerInstanceGroup: " + local_invalid_fields + "}";

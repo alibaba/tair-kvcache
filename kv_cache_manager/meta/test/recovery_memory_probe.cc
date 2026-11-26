@@ -56,7 +56,7 @@ FieldMap Payload(int generation) {
     location->set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     location->set_spec_size(1);
     location->set_location_specs({LocationSpec("default", std::string(120, 'u') + char('0' + generation))});
-    return SerializeToFieldMap({{location->id(), location}}, {{"property", std::string(48, 'p')}});
+    return RedisLocationCodec{}.SerializeToFieldMap({{location->id(), location}}, {{"property", std::string(48, 'p')}});
 }
 
 // Generate SCAN/Get responses on demand, but use the production deserializer.
@@ -87,7 +87,8 @@ public:
         properties.resize(keys.size());
         std::vector<ErrorCode> results;
         for (size_t i = 0; i < keys.size(); ++i) {
-            results.push_back(DeserializeFieldMap(payload, locations[i], properties[i]));
+            results.push_back(
+                RedisLocationCodec{}.DeserializeFieldMap(payload, locations[i], &properties[i], nullptr, nullptr));
         }
         return results;
     }
@@ -160,7 +161,8 @@ void Update(MetaStorageBackendManager &manager, int generation) {
                 batch.batch_keys.push_back(key);
                 batch.batch_locations.emplace_back();
                 batch.batch_properties.emplace_back();
-                Require(DeserializeFieldMap(payload, batch.batch_locations.back(), batch.batch_properties.back()) ==
+                Require(RedisLocationCodec{}.DeserializeFieldMap(
+                            payload, batch.batch_locations.back(), &batch.batch_properties.back(), nullptr, nullptr) ==
                             EC_OK,
                         "deserialize update");
                 if (batch.batch_keys.size() == kBatch) {

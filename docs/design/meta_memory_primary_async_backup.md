@@ -2,13 +2,15 @@
 
 状态：**已实现并完成单元回归**。2026-09-16 修订，基于提交 `aac9d4dc` 及当前工作区实现。本文描述当前目标行为；真实 Redis 故障压测、完整 ASan/TSan 与生产吞吐验证仍按 10.2 执行，不能由单元测试结果替代。
 
+2026-10-29 补充：[Recover 期间允许 EventReport GC 清理](event_report_gc_during_recover.md) 更新了本文恢复期的 maintenance 与 tombstone 回源语义。
+
 ## 1. 结论与适用边界
 
 保留 `MetaStorageBackendConfig.memory_primary`，默认 `false`，保持原模式。开启后，普通写按恢复状态选择顺序：**Recover 保持原有 persistent-first，Running 才切换为 local-first**：
 
 ```text
 启动/Leader 接管：Open Redis + 恢复辅助计数 → Init 完成、可服务；后台 Recover 继续回填
-Recover 阶段：保留缺失 key 回源、写前补齐与 tombstone；普通写 Redis → 条件写 local
+Recover 阶段：普通缺失 key 回源/写前补齐；tombstoned hot miss 按不存在处理；普通写 Redis → 条件写 local
 Running 阶段：普通读只读 local；普通写 local → 条件备份 Redis
 Running 写结果：local 成功、Redis 失败 → 返回成功，不回退 local；local 失败 → 不提交该项备份
 物理删除准入：shard lock 内 local CAS/提交备份 → 锁外 Sync → 调度物理删除
@@ -45,10 +47,11 @@ V1 仅支持 `cached + local + async_redis`。复用现有双 backend、MetaInde
 | 位置 | 修订后的处理 |
 |---|---|
 | Redis Open、Recover、GetMetaData | 保留 Redis 依赖及原恢复来源，不改为 local no-op 或懒建连 |
-| Recover 期间的 EnsureKeyInCache、回填、tombstone | 完整保留原机制和 persistent-first 普通写，不增加前台读过滤 |
+| Recover 期间的 EnsureKeyInCache、回填、tombstone | 保留 persistent-first 普通写；hot miss 命中现有 tombstone 时跳过 Redis 回源和补齐，允许在线新建 |
 | Running 普通 Get/Exists/List/采样 | 复用现有 cache-only 分支，不重复添加模式判断 |
-| maintenance 权威读、回填与双层比较 | 新模式以 local 为准，不以落后的 Redis 值覆盖 local |
-| maintenance 读前 Sync | 新模式不需要为了读取 local 而等待 Redis |
+| EventReport maintenance 校验 | 两种 cached 模式在 Recover/Running 均只校验 hot 目标及 ID；缺失跳过，不回源 |
+| 普通 GC 目标校验与补齐 | 已有 hot K 不覆盖；Recover 缺 K 经 tombstone 过滤后完整补齐；Running 缺失跳过，详见恢复期 GC 设计 4.4 |
+| EventReport maintenance 读前 Sync | cached 模式不执行；无 hot 的 single-backend 保持原行为 |
 | 物理删除、回滚前 Sync | 对齐原提交，在 shard lock 外调用真实 Sync，依赖现有 RedisClient 重试 |
 | 运行时 PutMetaData | 改走已有 consumer 的有界异步提交，避免辅助计数持久化继续阻塞热路径 |
 
@@ -118,8 +121,9 @@ std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
 |---|---|---|---|
 | 普通写入顺序 | Redis → 条件写 local | Redis → 条件写 local | local → 尽力备份 Redis |
 | 返回值 | 保留 persistent 失败，也反映 local 写入失败 | 与原模式相同 | 返回 local 结果，不合并备份错误 |
-| 普通查询首选 | local | local 缺失时回源 Redis | local |
-| maintenance 权威来源 | persistent，保留现有双层保护 | 沿用恢复期延期和读取语义 | local |
+| 普通查询首选 | local | local；仅非 tombstoned 缺失 key 回源 Redis | local |
+| cached EventReport maintenance 校验来源 | local；缺失跳过 | local；缺失跳过；整 key 删除登记 tombstone | local；缺失跳过 |
+| cached EventReport maintenance 写入顺序 | persistent-first | persistent-first | local-primary |
 | 启动恢复方向 | Redis → local | Redis → local | 已完成 |
 | 物理删除前 Sync | Redis | Redis | Redis |
 | 内存统计与 LRU | local | local | local |
@@ -140,9 +144,9 @@ WriteRoute GetWriteRoute(bool local_primary) noexcept {
 }
 ```
 
-普通写调用点传入 `memory_primary_ && recover_state_ == RecoverState::kRunning`；maintenance 根据自身前置条件传入 `memory_primary_`。即使恢复状态在调用中途切换，同一次操作也按已经捕获的 route 完成。
+普通写调用点传入 `memory_primary_ && recover_state_ == RecoverState::kRunning`；maintenance 在 shard lock 内按相同条件捕获一次写路由，删除按该 route 完成。cached EventReport 的 no-touch 读取和整 key 判定固定使用 hot，不执行读前 Sync，不与写路由的 `local_primary` 绑定。即使恢复状态在调用中途切换，同一次操作仍按已经捕获的写 route 完成，Recover 不因读取 hot 而切换成 local-first 写。
 
-单 backend 的 Secondary 为 nullptr。初始化已保证新模式有 local + async Redis，访问器不重新校验 URI、组合或指针关系，也不 dynamic_cast。RecoverState 继续用于回源、tombstone 生命周期及原 maintenance 延期规则，不能机械删除全部阶段判断。
+单 backend 的 Secondary 为 nullptr。初始化已保证新模式有 local + async Redis，访问器不重新校验 URI、组合或指针关系，也不 dynamic_cast。RecoverState 继续用于回源、tombstone 生命周期及 maintenance 准入与路由，不能机械删除全部阶段判断。
 
 Open、Recover、GetMetaData 和 Sync 仍直接访问 `persistent_backend_`；内存/LRU 统计仍直接访问 `cache_backend_`，不临时改成员指针或将主次角色反复切换。
 
@@ -283,9 +287,9 @@ Running 阶段任一容量满了只停止接收备份，不停止 local 写入�
 
 `MetaIndexerManager` 和 `MetaSearcherManager` 恢复原创建/查找/清理流程，不增加 initializing 表、条件变量或 cleanup epoch。原 Init 内短期 Redis Open/GetMetaData 仍处于既有锁范围；全量恢复在线程中执行，不在全局表锁内等待扫描完成。锁外初始化可作为独立优化，不与本配置绑定。
 
-新模式 Recover 的普通写完整沿用 persistent-first：Redis 主写未接受时不修改 local，成功项才条件写 local。Upsert/部分删除仍复用 `EnsureKeyInCache` 补齐未恢复 key 的旧字段；后台 SCAN/Get 继续通过 `PutIfAbsent` 回填；整 key 删除继续用既有 `deleted_keys_` 防止迟到回填复活。普通读沿用 Recover 回源，不增加 `BlockedRecoverFallbacks` 或逐 API 过滤；并发读可能短暂看到旧数据，符合既定的最终一致性要求。
+新模式 Recover 的普通写仍沿用 persistent-first：Redis 主写未接受时不修改 local，成功项才条件写 local。普通缺失 key 继续回源并由 `EnsureKeyInCache` 补齐；hot 整 key 缺失且命中 `deleted_keys_` 时，RMW 读取按 `EC_NOENT` 处理、Ensure 跳过补齐，允许业务直接新建，不等待 Redis DEL 消费。hot 命中时优先使用 hot，新写不清除 tombstone。后台 SCAN/Get 仍通过 `PutIfAbsent` 和该集合阻止旧值回填；不新增删除集合或业务侧 Sync。
 
-恢复线程完成最后一批回填后，以 release store 发布 Running；每次普通写只捕获一次阶段，因此跨越切换点的在途 Recover 写仍按 persistent-first 完成，之后的新写才使用 local-first。这样无需为前台回源新增 tombstone 判定、dirty-key 表或阶段切换协议。
+恢复线程完成最后一批回填后，以 release store 发布 Running；每次普通写只捕获一次阶段，因此跨越切换点的在途 Recover 写仍按 persistent-first 完成，之后的新写才使用 local-first。回源过滤在已有 `deleted_keys_mutex_` 下同时检查阶段与 tombstone，Running 后不再回源；不新增 dirty-key 表或阶段切换协议。
 
 不更改原恢复协议，不给 Recover 添加第二种降级状态，不保证 Redis 故障时未恢复 key 可写。Recover 中 Redis 已接受而 local 因容量不足失败属于 local 容量配置错误，沿原错误和 Reconcile 链路处理；需要扩容，不能把该状态当作可持续降级运行。未完整恢复时不得将 RecoverState 标成 Running。
 
@@ -293,14 +297,14 @@ Running 阶段任一容量满了只停止接收备份，不停止 local 写入�
 
 ### 7.2 普通读取与 maintenance
 
-Running 后普通 Get/Exists/List/采样沿用现有 cache-only 路径，local 缺失不回源；两种模式 Recover 期间均保留原回源、EnsureKeyInCache 和后台 tombstone。Recover 的枚举仍不是一致性快照，不据此推断已恢复完整索引。
+Running 后普通 Get/Exists/List/采样沿用现有 cache-only 路径，local 缺失不回源；两种模式 Recover 期间的普通回源和 EnsureKeyInCache 均过滤 tombstoned hot miss。Recover 的枚举仍不是一致性快照，不据此推断已恢复完整索引。
 
 maintenance 的差异集中在 manager：
 
-- `GetLocationsFromPrimary` 在新模式始终读 local；原模式仍读 persistent。Recover 时尚未回填的 key 可以暂不纳入 maintenance 候选，不为了维护读取落后备份来覆盖 local。
+- 普通 GC 前置筛选使用的 `GetLocationsFromPrimary` 在新模式始终读 local，原模式仍读 persistent；它不决定 cached EventReport maintenance 的读取来源。Recover 时尚未回填的 key 可以暂不纳入 EventReport 候选，不为了该清理入口读取落后备份来覆盖 local。
 - 新模式全量 location 读取必须 no-touch；可在 cache 层补窄接口，复用 local 已有 `GetForOneKeyForMaintenance`，不为所有 backend 新建一套主备 API。
-- 保留原 `refresh_cache_from_persistent` 参数和 `RefreshCacheFromPersistent` 命名；RMW 在 shard lock 内对新模式整体跳过覆盖式刷新，不只跳过 Running，不产生无意义的成功结果数组。旧模式继续原刷新流程；普通部分写需要的缺失 key 补齐见 7.1，不能用覆盖式 refresh 替代。
-- 新模式 `GetLocationsForMaintenance` 只依据 local，跳过为读取 persistent 权威视图而设置的读前 Sync；`DeleteLocationsForMaintenance` 继续保留原 Recover 删除延期，Running 共享候选分组、精确值 CAS、no-touch 删除及空 key 回收，不比较迟到备份。该延期不阻断普通写删。
+- 普通 GC 使用锁内目标校验与按需补齐：两种 cached 模式均不覆盖已有 hot K；Recover 缺 K 时经 `deleted_keys_` 过滤后完整 `PutIfAbsent`，再读取实际 hot 值校验；Running 缺 K 或目标时直接跳过，不回源、不新增锁内 Sync。恢复结束后也不覆盖已有 K，不主动补齐 Redis-only key。具体设计要求见[恢复期 GC 设计 4.4](event_report_gc_during_recover.md#44-普通-gc目标校验与按需补齐)；在线写前补齐仍按 7.1。
+- cached EventReport maintenance 在 Recover/Running 均只 no-touch 校验 hot 目标与 Location ID，缺 K 或目标直接跳过，不回源、不做双层比较或读前 Sync。hot 仅剩本次已通过校验的目标时直接整 key 删除，否则保留非目标 sibling；Recover 的写路由仍 persistent-first，并接入整 key tombstone，Running 按配置写。完整 expected-value、token/lease 与原 shard 锁保留，普通 GC 不覆盖已有 hot 的规则必须配套执行。
 - Running 的 metadata-only 回收可继续执行；涉及物理数据删除的任务仍须通过第 8 节的锁外 `Sync`，不能把两者统称为“Redis 故障时 GC 全部可用”。
 
 ## 8. 对齐原物理删除 Sync
@@ -329,12 +333,12 @@ MetaIndexer 继续在构造 upsert map 的现有遍历中记录实际写入 `DEL
 
 | 调用目的 | 新模式处理 |
 |---|---|
-| maintenance 读前等待旧写，以便读取 persistent 权威视图 | 读 local 已受 shard lock 保护，可跳过 Redis 等待 |
+| EventReport maintenance 读前等待旧写 | cached Recover/Running 均读取 hot，不执行读前 Sync；single async Redis 读取唯一后端前保留原 Sync |
 | maintenance 删除后的 local 可见性 | 沿用 RequiresMaintenancePostDeleteSync 的已有 cached 判断，无需另加相同判断 |
 | executor 允许物理删除 | 新旧模式均保留 executor 原位置的锁外真实 Sync |
 | 删除写失败后允许释放 URI | 失败项不进入实际删除任务，不释放 URI，也不增加额外补偿 |
 
-不再增加原稿的通用 `SyncForServing` 并替换全部调用。读前策略收敛为 manager 的 `SyncBeforeMaintenanceRead(keys)` 薄入口：旧模式委托原 Sync，新模式因 maintenance 读 local 而跳过；它不暴露给物理删除流程。
+maintenance 读前策略按是否有 hot 副本区分：cached 路径直接校验 hot，single-backend 委托原 Sync；不得用本批次的写路由决定是否等待。single async Redis 的删后 barrier 仍在释放 shard 锁前完成；executor 物理删除前的锁外 Sync 不受此调整影响。
 
 ### 8.3 Reconcile 恢复原链路，不为容量配置错误增加补偿
 
@@ -402,13 +406,14 @@ Redis 重新连通不会自动补齐丢写。需要恢复精确备份或关闭�
 | queue / async Redis | Recover 无条件主写使用 WaitAndReserve；Running 条件备份的 TryReserve 不超限、超大 item 拒绝、满队列立即失败；key 预留在 payload 构造前完成并在出队时释放；metadata 使用同一 key 容量准入，Sync barrier 使用零容量 `PushBarrier`；非预期异常 fail-fast |
 | 顺序与生命周期 | 同 key Put→Upsert→Delete→重建顺序；无额外全局锁；Close 不出现悬空引用/泄漏；drain 有界且丢弃可见 |
 | Open / Recover | Open/辅助计数失败保持 Init 失败；后台回填期间可读写；Recover Redis 主写失败时 local 不提交并保留原反压；切入 Running 后新调用改为 local-first；恢复失败不进入 Running；原 Manager 创建回归 |
-| Recover 并发 | 暂停 Redis 主写并在回调中切换 Running，验证在途调用仍完成 persistent-first；保留 PutIfAbsent、EnsureKeyInCache 和后台 tombstone；不增加前台读过滤 |
-| maintenance | local no-touch 权威读和精确 CAS、空 key 回收；旧 Redis 值不覆盖 local；metadata-only 操作不因 Redis 等待阻塞 |
+| Recover 并发 | 暂停 Redis 主写并切换 Running，验证在途调用仍完成 persistent-first；验证 tombstoned hot miss 的读取、Ensure、在线重建和 key count，不增加业务侧 Sync |
+| EventReport maintenance | 两种 cached 模式在 Recover/Running 均只校验 hot 且无读前/删后 Sync；hot 新值拒绝旧候选、缺失不回源；整 key tombstone、hot sibling 分组和批次固定写路由生效；single async Redis 原 barrier 保留 |
+| 普通 GC 目标校验与补齐 | 两种模式下已有 hot K 均不覆盖；Recover 缺 K 经 tombstone 过滤后完整补齐并重读校验；Running 缺失跳过且不新增 Sync；恢复切换与 EventReport 异步删除交错时旧值不复活 |
 | 物理删除 Sync | CAS 在 shard lock 内完成；`DELETING` 普通准入失败时按配置强制入队或返回 Secondary 错误；验证只强制失败严格项、开关关闭和部分批次；真实 Sync 在 executor 锁外执行且失败时不调度物理删除；验证 barrier 顺序和超时行为，不把它声明为逐写入确认 |
 | 回滚 | Recover 复用原 persistent-first 和 Reconcile；Running 的 local 失败新增不产生 Put 备份；Reconcile 不为缺失新 ID 增加专属 HDEL/Sync 分支；实际删到引用仍需锁外 Sync |
 | 辅助元数据与恢复 | 启动读 Redis 计数；运行时 PutMetaData 不同步访问 Redis；容量限制、序列化、失败可见；测试普通更新/逻辑删除回退和计数偏差的已声明边界 |
 | 隔离与发布 | 不同 Instance 数据与恢复互不串用；校准只改目标前缀；停止旧 writer 后再接管；旧程序/工具不能在开启状态下接管或改写配置 |
-| 原模式回归 | 默认/false 时 persistent-first、条件 cache 写、Recover、Sync、辅助 metadata、pure local 快路径和原队列策略不变 |
+| 原模式回归 | 默认/false 时 persistent-first、条件 cache 写、Sync、辅助 metadata、pure local 快路径和原队列策略继续回归；恢复期 GC 按本次补充验证 |
 
 使用 fake client/latch 控制竞态，不靠长 sleep 判断。真实 Redis 测试覆盖停服、限速、断连和恢复，持续故障超过队列填满时间；并发/Lifetime 用例在可用环境补跑 ASan/TSan。
 
@@ -429,7 +434,7 @@ memory-primary 的主要收益来自消除普通备份入队在 shard lock 内�
 | meta_storage_backend.h / meta_cache_base_backend.h | 提升四个通用条件写与 maintenance 条件删除接口，保留 cache 专属接口；不让 Redis 继承 cache |
 | meta_async_redis_backend.h / .cc | 条件写重载及原入队分组筛选；构造 payload 前预留 key 容量；复用原 consumer/统计 |
 | meta_local_backend.h / .cc | 尽量只调整继承/重载可见性；原条件写、no-touch 和容量逻辑不变 |
-| meta_storage_backend_manager.h / .cc | 用唯一的 GetWriteRoute(bool) 统一主次 Backend 选择；普通写只在 Running 选择 local primary，maintenance 显式传入自身策略；删除 BackupSuccessful；仅实际进入 `DELETING` 的 Upsert 要求 Secondary 准入，普通准入失败时按配置强制提交或返回错误；保留原恢复链路及准确的 local 计时 |
+| meta_storage_backend_manager.h / .cc | 用唯一的 GetWriteRoute(bool) 统一写入主次 Backend 选择；普通写只在 Running 选择 local primary，maintenance 固定本批次写路由而 cached EventReport 读取独立使用 hot；删除 BackupSuccessful；仅实际进入 `DELETING` 的 Upsert 要求 Secondary 准入，普通准入失败时按配置强制提交或返回错误；保留原恢复链路及准确的 local 计时 |
 | meta_indexer.cc / manager 相关调用点 | 恢复原 `MetaIndexer::Sync` 和 executor 锁外调用；保留原分片锁、计数和 Manager 生命周期 |
 | meta_searcher.cc / 相关测试 | 撤销 memory-primary 专属 Reconcile 补偿及通用持久化确认参数，复用原调用链；保留批次整体失败的回滚与物理删除 Sync |
 

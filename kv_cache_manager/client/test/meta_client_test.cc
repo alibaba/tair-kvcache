@@ -119,7 +119,8 @@ public:
                  const TokenIdsVector &tokens,
                  const std::vector<std::string> &location_spec_group_names,
                  int64_t write_timeout_seconds,
-                 int32_t min_replica_count),
+                 int32_t min_replica_count,
+                 std::optional<StorageReplicaRequirement> storage_replica_requirement),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,
@@ -178,6 +179,64 @@ TEST_F(MetaClientTest, TestCreateSimple) {
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
     auto ec = client->Init(client_config_, init_params_);
     ASSERT_EQ(ec, ER_OK);
+}
+
+TEST_F(MetaClientTest, TestStartWriteStorageReplicaRequirement) {
+    using ::testing::_;
+    auto mock_stub = new MockStub();
+    auto client = std::make_unique<MetaClientImpl>();
+    client->stub_.reset(mock_stub);
+    EXPECT_CALL(*mock_stub, AddConnection("127.0.0.1:8080", _)).WillOnce(::testing::Return(ER_OK));
+    EXPECT_CALL(*mock_stub, RegisterInstance(_, _, _, _, _, _, _, _))
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{}"))));
+    ASSERT_EQ(ER_OK, client->Init(client_config_, init_params_));
+    EXPECT_CALL(*mock_stub,
+                StartWriteCache("target-write",
+                                "test_instance",
+                                _,
+                                _,
+                                _,
+                                60,
+                                0,
+                                ::testing::Truly([](const std::optional<StorageReplicaRequirement> &requirement) {
+                                    return requirement && requirement->storage_type == StorageType::ST_TAIRMEMPOOL &&
+                                           requirement->min_location_count == 2;
+                                })))
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, WriteLocation{})));
+    EXPECT_EQ(
+        ER_OK,
+        client
+            ->StartWrite("target-write", {42}, {}, {}, 60, 0, StorageReplicaRequirement{StorageType::ST_TAIRMEMPOOL, 2})
+            .first);
+    EXPECT_CALL(*mock_stub,
+                StartWriteCache("exclude-write",
+                                "test_instance",
+                                _,
+                                _,
+                                _,
+                                60,
+                                0,
+                                ::testing::Truly([](const std::optional<StorageReplicaRequirement> &requirement) {
+                                    return requirement && requirement->storage_type == StorageType::ST_UNSPECIFIED &&
+                                           requirement->min_location_count == 1 &&
+                                           requirement->excluded_storage_types ==
+                                               std::vector<StorageType>{StorageType::ST_EVENT_REPORT_L1P5,
+                                                                        StorageType::ST_EVENT_REPORT_L2};
+                                })))
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, WriteLocation{})));
+    EXPECT_EQ(ER_OK,
+              client
+                  ->StartWrite(
+                      "exclude-write",
+                      {42},
+                      {},
+                      {},
+                      60,
+                      0,
+                      StorageReplicaRequirement{StorageType::ST_UNSPECIFIED,
+                                                1,
+                                                {StorageType::ST_EVENT_REPORT_L1P5, StorageType::ST_EVENT_REPORT_L2}})
+                  .first);
 }
 
 TEST_F(MetaClientTest, TestCreateWithLeaderMode) {

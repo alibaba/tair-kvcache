@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -27,6 +28,9 @@ public:
     void RemoveInstanceMetrics(const std::string &instance_id);
 
 private:
+    // Prevent an in-flight interval snapshot from restoring metrics after instance removal.
+    std::mutex interval_report_mutex_;
+
     std::shared_ptr<OnlineOptimizerManager> manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<OptimizerKmonitorMetricsReporter> kmonitor_reporter_;

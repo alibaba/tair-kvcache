@@ -30,6 +30,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -409,7 +410,9 @@ void CacheReclaimer::RecordPendingLimitReject(const std::string &instance_group,
             MetricsTags{{"instance_group", instance_group}, {"storage_type", storage_type_scope}}) += 1;
     } catch (const std::exception &e) {
         KVCM_LOG_WARN("record tagged pending-limit metric failed: %s", e.what());
-    } catch (...) { KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception");
+    }
 }
 
 void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {
@@ -826,6 +829,10 @@ void CacheReclaimer::SetSleepIntervalMs(const RequestContext *request_context,
     LOG_WITH_TRACE(DEBUG, "set sleep interval to [%u] ms", sleep_interval_ms);
 }
 
+InstanceGroupQuota CacheReclaimer::GetReclaimQuota(const InstanceGroup &group) const {
+    return ResolveEffectiveQuota(group, registry_manager_->data_storage_manager().get()).ForReclaim();
+}
+
 std::shared_ptr<CacheReclaimer::WaterLevelExceed>
 CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
                                     const std::string &ins_gr,
@@ -917,7 +924,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     // must not suppress the other dimension's water-level check.
 
     // 2.2.1. trigger_strategy:used_percent for instance group quota capacity
-    if (effective_group_bytes > 0) {
+    if (effective_group_bytes > 0 && instance_group_quota.capacity() != -1) {
         if (instance_group_quota.capacity() <= 0) {
             // proceed as group quota capacity is 0
             LOG_WITH_GR(DEBUG,
@@ -1207,8 +1214,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
     const std::string &ins_gr = instance_info->instance_group_name();
 
     const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-    if (meta_indexer == nullptr) {
-        LOG_WITH_ID(WARN, "meta indexer is nullptr");
+    if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
+        LOG_WITH_ID(WARN, "meta indexer is nullptr or does not support write sessions");
         return false;
     }
 
@@ -1229,7 +1236,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
         if (cancelled->load(std::memory_order_relaxed) || (bounded_waves && (!IsRunning() || IsPaused()))) {
             return ErrorCode::EC_ERROR;
         }
-        if (const auto ec = meta_indexer->SampleReclaimCandidates(request_context.get(), sampling_sz, candidates);
+        if (const auto ec =
+                meta_indexer->SampleReclaimCandidates(request_context.get(), sampling_sz, candidates, false);
             ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "reclaim candidate sampling failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
@@ -1821,7 +1829,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         }
         // Yield keys with no deletable locations so later samples can reach
         // other cold candidates, regardless of the rejected location types.
-        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
+            indexer && indexer->SupportsWriteSession() && !rejected_keys.empty()) {
             METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
         }
     }
@@ -1836,6 +1845,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
 void CacheReclaimer::TryMigrateOnGroup(
     const std::shared_ptr<RequestContext> &request_context,
     const std::shared_ptr<const InstanceGroup> &instance_group,
+    const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         return;
@@ -1864,14 +1874,13 @@ void CacheReclaimer::TryMigrateOnGroup(
         return;
     }
 
-    const auto &quota = instance_group->quota();
     struct CachedMigrationBatch {
         bool built = false;
         bool ok = false;
         std::vector<std::int64_t> batch;
     };
     std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
-    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const auto configured_copy_concurrency = cache_config->effective_migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
     // active Copy 与已排队/运行的异步 Prepare 一起用于提前剪枝，避免慢 Create 期间每轮 cron
@@ -1940,6 +1949,14 @@ void CacheReclaimer::TryMigrateOnGroup(
                     available_copy_slots);
 
         for (const auto &instance_info : instance_infos) {
+            if (!instance_info) {
+                continue;
+            }
+            const std::shared_ptr<MetaIndexer> eligible_indexer =
+                meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+            if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
+                continue;
+            }
             if (instance_info == nullptr) {
                 continue;
             }
@@ -2200,20 +2217,26 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept {
     const auto data = std::make_shared<GroupUsageData>();
     for (const auto &instance_info : instance_infos) {
-        if (instance_info == nullptr) {
-            LOG_WITH_TRACE(WARN, "instance is nullptr");
+        if (!instance_info) {
+            continue;
+        }
+        const std::shared_ptr<MetaIndexer> eligible_indexer =
+            meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+        if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
             continue;
         }
 
         const std::string &ins_id = instance_info->instance_id();
         const std::string &ins_gr = instance_info->instance_group_name();
         const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-        if (meta_indexer == nullptr) {
-            LOG_WITH_ID(WARN, "meta indexer is nullptr");
+        if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
+            LOG_WITH_ID(WARN, "meta indexer is nullptr or does not support write sessions");
             continue;
         }
 
-        meta_indexer->PersistMetaData();
+        // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+        // here: persistence does not refresh these values, and durability is already covered by
+        // CacheManagerMetricsRecorder::RecorderLoop, which persists every instance every 5 seconds.
         const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
 
@@ -2458,7 +2481,7 @@ bool CacheReclaimer::BuildFairReclaimPlan(const RequestContext *request_context,
         const std::string &ins_id = instance_info->instance_id();
         const std::string &ins_gr = instance_info->instance_group_name();
         const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
-        if (meta_indexer == nullptr) {
+        if (meta_indexer == nullptr || !meta_indexer->SupportsWriteSession()) {
             LOG_WITH_ID(WARN, "skip instance without meta indexer when building fair reclaim plan");
             continue;
         }
@@ -2742,17 +2765,18 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         return result;
     }
 
+    const auto quota = GetReclaimQuota(*instance_group);
     const auto budget_policy = reclaim_strategy->instance_reclaim_budget_policy();
     if (budget_policy == InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
         fair_rotation_by_group_.erase(ins_gr);
         group_lru_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupLegacy(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupLegacy(request_context, instance_group, quota, instance_infos);
     } else if (budget_policy == InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL) {
         group_lru_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupFair(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupFair(request_context, instance_group, quota, instance_infos);
     } else if (budget_policy == InstanceReclaimBudgetPolicy::GROUP_LRU) {
         fair_rotation_by_group_.erase(ins_gr);
-        result = TryReclaimOnGroupLru(request_context, instance_group, reclaim_strategy, instance_infos);
+        result = TryReclaimOnGroupLru(request_context, instance_group, quota, instance_infos);
     } else {
         LOG_WITH_GR(ERROR, "invalid instance reclaim mode [%d], skip reclaim", static_cast<int>(budget_policy));
     }
@@ -2763,7 +2787,7 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
     // admission; it does not wait for physical deletion. Migration still runs independently
     // when its lower watermark is reached before the reclaim threshold.
     if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
-        TryMigrateOnGroup(request_context, instance_group, instance_infos);
+        TryMigrateOnGroup(request_context, instance_group, quota, instance_infos);
     }
 
     return result;
@@ -2772,15 +2796,24 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
 CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
     const std::shared_ptr<RequestContext> &request_context,
     const std::shared_ptr<const InstanceGroup> &instance_group,
-    const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+    const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     ReclaimResult result;
+    const auto &reclaim_strategy = instance_group->cache_config()->reclaim_strategy();
     const std::string &ins_gr = instance_group->name();
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
     for (const auto &instance_info : instance_infos) {
+        if (!instance_info) {
+            continue;
+        }
+        const std::shared_ptr<MetaIndexer> eligible_indexer =
+            meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+        if (!eligible_indexer || !eligible_indexer->SupportsWriteSession()) {
+            continue;
+        }
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-        const auto water_level_exceed = GetWaterLevelExceed(
-            request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);
+        const auto water_level_exceed =
+            GetWaterLevelExceed(request_context.get(), ins_gr, quota, reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         if (!IsTriggerReclaiming(water_level_exceed)) {
@@ -2818,9 +2851,10 @@ CacheReclaimer::ReclaimResult CacheReclaimer::TryReclaimOnGroupLegacy(
 CacheReclaimer::ReclaimResult
 CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &request_context,
                                       const std::shared_ptr<const InstanceGroup> &instance_group,
-                                      const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                      const InstanceGroupQuota &quota,
                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     ReclaimResult result;
+    const auto &reclaim_strategy = instance_group->cache_config()->reclaim_strategy();
     const std::string &ins_gr = instance_group->name();
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
     METRICS_(cache_reclaimer, fair_effective_instance_count) = 0;
@@ -2830,8 +2864,7 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
 
     const auto read_water_level = [&]() {
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-        auto water_level = GetWaterLevelExceed(
-            request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);
+        auto water_level = GetWaterLevelExceed(request_context.get(), ins_gr, quota, reclaim_strategy, instance_infos);
         METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
         return water_level;

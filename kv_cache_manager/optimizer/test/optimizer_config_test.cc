@@ -18,20 +18,22 @@ TEST_F(OptimizerInstanceGroupTest, DefaultValues) {
     EXPECT_EQ("lru", group.eviction_policy());
     EXPECT_FALSE(group.shared_group_quota());
     EXPECT_FALSE(group.enable_theoretical_max_cache());
-    EXPECT_EQ(0, group.ttl_seconds());
+    EXPECT_TRUE(group.ttl_seconds_list().empty());
 }
 
 TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({40.0, 80.0, 120.0});
-    group.set_ttl_seconds(3600);
+    group.set_ttl_seconds_list({3600});
     group.set_shared_group_quota(true);
     group.set_enable_theoretical_max_cache(true);
 
     std::string json = group.ToJsonString();
 
     OptimizerInstanceGroup group2;
+    group2.set_ttl_seconds_list({0});
     ASSERT_TRUE(group2.FromJsonString(json));
     EXPECT_EQ("g1", group2.name());
     EXPECT_EQ(3, group2.capacity_gb().size());
@@ -39,13 +41,14 @@ TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     EXPECT_DOUBLE_EQ(80.0, group2.capacity_gb()[1]);
     EXPECT_DOUBLE_EQ(120.0, group2.capacity_gb()[2]);
     EXPECT_EQ("lru", group2.eviction_policy());
-    EXPECT_EQ(3600, group2.ttl_seconds());
+    EXPECT_EQ(3600, group2.ttl_seconds_list().front());
     EXPECT_TRUE(group2.shared_group_quota());
     EXPECT_TRUE(group2.enable_theoretical_max_cache());
 }
 
 TEST_F(OptimizerInstanceGroupTest, ValidateEmptyName) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_capacity_gb({1.0});
     std::string fields;
     EXPECT_FALSE(group.ValidateRequiredFields(fields));
@@ -54,14 +57,22 @@ TEST_F(OptimizerInstanceGroupTest, ValidateEmptyName) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateNoCapacity) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({3600, 86400});
     group.set_name("g1");
+    group.set_enable_theoretical_max_cache(true);
     std::string fields;
-    EXPECT_FALSE(group.ValidateRequiredFields(fields));
-    EXPECT_NE(std::string::npos, fields.find("capacity_gb"));
+    EXPECT_TRUE(group.ValidateRequiredFields(fields));
+    for (const auto &ttls : std::vector<std::vector<int64_t>>{{}, {1, 1}, {-1}, {INT64_MAX}}) {
+        group.set_ttl_seconds_list(ttls);
+        fields.clear();
+        EXPECT_FALSE(group.ValidateRequiredFields(fields));
+        EXPECT_NE(std::string::npos, fields.find("ttl_seconds_list"));
+    }
 }
 
 TEST_F(OptimizerInstanceGroupTest, ValidateWithCapacity) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({1.0});
     std::string fields;
@@ -70,6 +81,7 @@ TEST_F(OptimizerInstanceGroupTest, ValidateWithCapacity) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateCapacityTooLargeFails) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({static_cast<double>(std::numeric_limits<int64_t>::max())});
     std::string fields;
@@ -79,6 +91,7 @@ TEST_F(OptimizerInstanceGroupTest, ValidateCapacityTooLargeFails) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateInvalidEvictionPolicyType) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({1.0});
     group.set_eviction_policy("unknown");
@@ -89,9 +102,10 @@ TEST_F(OptimizerInstanceGroupTest, ValidateInvalidEvictionPolicyType) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateNegativeTtlSeconds) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({1.0});
-    group.set_ttl_seconds(-1);
+    group.set_ttl_seconds_list({-1});
     std::string fields;
     EXPECT_FALSE(group.ValidateRequiredFields(fields));
     EXPECT_NE(std::string::npos, fields.find("ttl_seconds"));
@@ -99,6 +113,7 @@ TEST_F(OptimizerInstanceGroupTest, ValidateNegativeTtlSeconds) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateZeroTtlDisablesTtl) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({1.0});
     std::string fields;
@@ -107,9 +122,10 @@ TEST_F(OptimizerInstanceGroupTest, ValidateZeroTtlDisablesTtl) {
 
 TEST_F(OptimizerInstanceGroupTest, ValidateTtlWithPositiveTtlSeconds) {
     OptimizerInstanceGroup group;
+    group.set_ttl_seconds_list({0});
     group.set_name("g1");
     group.set_capacity_gb({1.0});
-    group.set_ttl_seconds(10);
+    group.set_ttl_seconds_list({10});
     std::string fields;
     EXPECT_TRUE(group.ValidateRequiredFields(fields));
 }

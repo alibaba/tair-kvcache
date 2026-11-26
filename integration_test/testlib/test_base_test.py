@@ -1,10 +1,53 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from integration_test.testlib.module_base import ModuleBase
 from integration_test.testlib.test_base import TestBase
+
+
+class ModuleBaseProcessTest(unittest.TestCase):
+    def setUp(self):
+        self.harness = ModuleBase()
+
+    def _start_process(self, code, *args):
+        process = subprocess.Popen([sys.executable, "-c", code, *args])
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def test_wait_exit_ignores_pid_digits_in_another_process_command(self):
+        exited = self._start_process("pass")
+        exited.wait(timeout=5)
+        other = self._start_process("import time; time.sleep(60)", str(exited.pid))
+
+        self.harness._wait_exit("python", exited.pid, timeout=0.1)
+
+        self.assertIsNone(other.poll())
+
+    def test_wait_exit_accepts_an_unreaped_zombie(self):
+        exited = self._start_process("pass")
+        os.waitid(os.P_PID, exited.pid, os.WEXITED | os.WNOWAIT)
+
+        self.harness._wait_exit("python", exited.pid, timeout=0.1)
+
+        self.assertEqual(0, exited.wait(timeout=5))
+
+    def test_wait_exit_reports_a_live_process_without_killing_it(self):
+        process = self._start_process("import time; time.sleep(60)")
+
+        with self.assertRaisesRegex(TimeoutError, f"python .*pid={process.pid}.*did not exit"):
+            self.harness._wait_exit("python", process.pid, timeout=0.05)
+
+        self.assertIsNone(process.poll())
 
 
 class TestBaseWorkdirTest(unittest.TestCase):

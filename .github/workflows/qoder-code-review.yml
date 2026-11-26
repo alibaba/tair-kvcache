@@ -18,9 +18,9 @@ on:
         description: "Runner type"
         type: choice
         options:
-          - ubuntu-latest
           - aliyun-ecs-x64
-        default: ubuntu-latest
+          - ubuntu-latest
+        default: aliyun-ecs-x64
 
 jobs:
   qoder-review:
@@ -72,7 +72,7 @@ jobs:
             core.setOutput('number', String(normalized));
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Keep the privileged workflow workspace on trusted base-branch code.
           # The PR diff is read through GitHub MCP in the Qoder review step.
@@ -106,9 +106,10 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
+          package-manager-cache: false
 
       - name: Prepare Qoder MCP config
         shell: bash
@@ -148,7 +149,7 @@ jobs:
         env:
           HOME: ${{ runner.temp }}/qoder-home
         with:
-          qodercli_version: '1.0.39'
+          qodercli_version: '1.1.76'
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review ${{ github.repository }} ${{ steps.pr-info.outputs.number }}

@@ -7,21 +7,27 @@ from ..common.common_args import *
 class StorageQuota(JsonData):
     def __init__(self,
                  s_type: str,
-                 capacity: int):
+                 capacity: int = 0,
+                 mode: str = "fixed",
+                 ratio: float = None):
         self._type = s_type
         self._capacity = capacity
+        self._mode = mode
+        self._ratio = ratio
         self.check()
 
     def to_json_data(self) -> dict:
-        return {
-            "storage_type": self._type,
-            "capacity": self._capacity
-        }
+        if self._mode == "auto":
+            return {"storage_type": self._type, "mode": "auto", "ratio": self._ratio}
+        return {"storage_type": self._type, "capacity": self._capacity}
 
     def check(self) -> bool:
         _type = self._type.upper()
         supported_types = [
             "ST_3FS",
+            "ST_VCNS_3FS",
+            "ST_MOONCAKE",
+            "ST_DUMMY",
             "ST_TAIRMEMPOOL",
             "ST_TAIRMEMPOOL_SSD",
             "ST_NFS",
@@ -32,17 +38,18 @@ class StorageQuota(JsonData):
             raise RuntimeError(
                 f"storage type {self._type} invalid, support {'|'.join(supported_types)}")
         self._type = _type
-        if self._capacity <= 0:
-            raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")
+        if self._mode not in ("fixed", "auto"):
+            raise RuntimeError("StorageQuota mode must be fixed or auto")
+        if self._mode == "auto" and (type(self._ratio) not in (int, float) or not 0 < self._ratio <= 1):
+            raise RuntimeError("StorageQuota ratio must be in (0, 1]")
         return True
 
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("storage_type", json_data, str):
             s_type = json_data["storage_type"]
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        return cls(s_type, capacity)
+        capacity = int(json_data.get("capacity", 0))
+        return cls(s_type, capacity, json_data.get("mode") or "fixed", json_data.get("ratio"))
 
 
 def split_storage_quotas_value(value: str):
@@ -50,10 +57,20 @@ def split_storage_quotas_value(value: str):
     result = []
     for storage_quota_str in storage_quota_strs:
         storage_quota_str_split = split_strs(storage_quota_str)
-        if len(storage_quota_str_split) != 2:
+        if len(storage_quota_str_split) not in (2, 3):
             raise argparse.ArgumentTypeError(f"Invalid storage_quota format: expected 'type,capacity', got '{value}'")
-        s_type, capacity_str = storage_quota_str_split
-        result.append(StorageQuota(s_type, int(capacity_str)))
+        s_type, capacity_str = storage_quota_str_split[:2]
+        if capacity_str == "auto":
+            if len(storage_quota_str_split) != 3:
+                raise argparse.ArgumentTypeError("auto quota expects type,auto,ratio")
+            result.append(StorageQuota(s_type, mode="auto", ratio=float(storage_quota_str_split[2])))
+        else:
+            if len(storage_quota_str_split) != 2:
+                raise argparse.ArgumentTypeError("fixed quota expects type,capacity")
+            capacity = int(capacity_str)
+            if capacity < 0:
+                raise argparse.ArgumentTypeError("fixed storage quota capacity must be non-negative")
+            result.append(StorageQuota(s_type, capacity))
     return result
 
 
@@ -75,21 +92,16 @@ class InstanceGroupQuota(JsonData):
         }
 
     def check(self) -> bool:
-        if self._capacity <= 0:
-            raise RuntimeError(f"InstanceGroupQuota capacity {self._capacity} <= 0")
+        if self._capacity < -1:
+            raise RuntimeError("InstanceGroupQuota capacity must be >= -1")
         for storage_qouta in self._storage_qoutas:
             storage_qouta.check()
         return True
 
     @classmethod
     def from_json_data(cls, json_data: dict):
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        if JsonData.expect_exist("quota_config", json_data, list):
-            storage_qouta_objs = json_data["quota_config"]
-            storage_qoutas = []
-            for storage_quota_obj in storage_qouta_objs:
-                storage_qoutas.append(StorageQuota.from_json_data(storage_quota_obj))
+        capacity = int(json_data.get("capacity", 0))
+        storage_qoutas = [StorageQuota.from_json_data(item) for item in json_data.get("quota_config", [])]
         return cls(capacity, storage_qoutas)
 
 
@@ -253,57 +265,18 @@ def meta_storage_backend_config_value(value: str):
         f"'type,uri,true|false,true|false', got '{value}'")
 
 
-class MetaCachePolicyConfig(JsonData):
-    def __init__(self,
-                 capacity: int = 10 * 1024,  # MB
-                 m_type: str = "LRU",
-                 cache_shard_bits: int = 6,
-                 high_pri_pool_ratio: float = 0.0):
-        self._capacity = capacity
-        self._type = m_type
-        self._cache_shard_bits = cache_shard_bits
-        self._high_pri_pool_ratio = high_pri_pool_ratio
-        self.check()
-
-    def to_json_data(self) -> dict:
-        return {
-            "capacity": self._capacity,
-            "type": self._type,
-            "cache_shard_bits": self._cache_shard_bits,
-            "high_pri_pool_ratio": self._high_pri_pool_ratio
-        }
-
-    def check(self) -> bool:
-        _type = self._type.upper()
-        if _type != "LRU":
-            raise RuntimeError(f"MetaCachePolicyConfig type {_type} invalid, only support LRU now")
-        self._type = _type
-
-    @classmethod
-    def from_json_data(cls, json_data: dict):
-        if JsonData.expect_exist("capacity", json_data, (str, int)):
-            capacity = int(json_data["capacity"])
-        if JsonData.expect_exist("type", json_data, str):
-            m_type = json_data["type"]
-        if JsonData.expect_exist("cache_shard_bits", json_data, (str, int)):
-            cache_shard_bits = int(json_data["cache_shard_bits"])
-        if JsonData.expect_exist("high_pri_pool_ratio", json_data, (float, int)):
-            high_pri_pool_ratio = json_data["high_pri_pool_ratio"]
-        return cls(capacity, m_type, cache_shard_bits, high_pri_pool_ratio)
-
-
 class MetaIndexerConfig(JsonData):
     def __init__(self,
                  max_key_count: int = 1 * 1000 * 1000 * 1000,
                  mutex_shard_num: int = 512,
                  batch_key_size: int = 128,
-                 meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig(),
-                 meta_cache_policy_config: MetaCachePolicyConfig = MetaCachePolicyConfig()):
+                 meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig()):
         self._max_key_count = max_key_count
         self._mutex_shard_num = mutex_shard_num
         self._batch_key_size = batch_key_size
         self._meta_storage_backend_config = meta_storage_backend_config
-        self._meta_cache_policy_config = meta_cache_policy_config
+        self._legacy_search_cache_capacity = 10 * 1024
+        self._legacy_search_cache_shard_bits = 6
         self.check()
 
     def to_json_data(self) -> dict:
@@ -312,12 +285,16 @@ class MetaIndexerConfig(JsonData):
             "mutex_shard_num": self._mutex_shard_num,
             "batch_key_size": self._batch_key_size,
             "meta_storage_backend_config": self._meta_storage_backend_config.to_json_data(),
-            "meta_cache_policy_config": self._meta_cache_policy_config.to_json_data()
+            "meta_cache_policy_config": {
+                "type": "LRU",
+                "capacity": self._legacy_search_cache_capacity,
+                "cache_shard_bits": self._legacy_search_cache_shard_bits,
+                "high_pri_pool_ratio": 0.0,
+            }
         }
 
     def check(self) -> bool:
         self._meta_storage_backend_config.check()
-        self._meta_cache_policy_config.check()
 
     @classmethod
     def from_json_data(cls, json_data: dict):
@@ -330,14 +307,15 @@ class MetaIndexerConfig(JsonData):
         if JsonData.expect_exist("meta_storage_backend_config", json_data, dict):
             meta_storage_backend_config = MetaStorageBackendConfig.from_json_data(
                 json_data["meta_storage_backend_config"])
-        if JsonData.expect_exist("meta_cache_policy_config", json_data, dict):
-            meta_cache_policy_config = MetaCachePolicyConfig.from_json_data(json_data["meta_cache_policy_config"])
-        return cls(
+        config = cls(
             max_key_count,
             mutex_shard_num,
             batch_key_size,
-            meta_storage_backend_config,
-            meta_cache_policy_config)
+            meta_storage_backend_config)
+        legacy = json_data.get("meta_cache_policy_config") or {}
+        config._legacy_search_cache_capacity = int(legacy.get("capacity", config._legacy_search_cache_capacity))
+        config._legacy_search_cache_shard_bits = int(legacy.get("cache_shard_bits", config._legacy_search_cache_shard_bits))
+        return config
 
 
 class CacheConfig(JsonData):
@@ -550,7 +528,7 @@ def parse_instance_group_args(is_create: bool):
         "-q",
         type=int,
         default=30000000000 if is_create else argparse.SUPPRESS,
-        help="quota_capacity(bytes), eg. 30000000000"
+        help="Group byte limit in bytes (-1 disables the total byte limit)"
     )
 
     parser.add_argument(
@@ -568,7 +546,7 @@ def parse_instance_group_args(is_create: bool):
                 10000000000)] if is_create else argparse.SUPPRESS,
         help=(
             "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
-            "ST_TAIRMEMPOOL,10000000000;ST_TAIRMEMPOOL_SSD,10000000000"))
+            "ST_TAIRMEMPOOL,auto,0.5;ST_TAIRMEMPOOL_SSD,auto,0.8."))
 
     parser.add_argument(
         "--reclaim_policy",
@@ -637,14 +615,14 @@ def parse_instance_group_args(is_create: bool):
         "--search_cache_capacity",
         type=int,
         default=10 * 1024 if is_create else argparse.SUPPRESS,  # 10 * 1024 MB
-        help="search_cache_capacity(MB)"
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
     )
 
     parser.add_argument(
         "--search_cache_shard_bits",
         type=int,
         default=6 if is_create else argparse.SUPPRESS,
-        help="search_cache_shard_bits"
+        help="Deprecated; retained in configuration for compatibility, search cache is disabled"
     )
 
     parser.add_argument(

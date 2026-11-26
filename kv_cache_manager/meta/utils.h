@@ -31,11 +31,28 @@ inline int32_t GetShardIndex(KeyType key, size_t shard_mask) noexcept {
     return GetShardIndex(key, shard_mask, kDefaultMetaShardHashSeed);
 }
 
-FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties);
+class RedisLocationCodec {
+public:
+    RedisLocationCodec() = default;
+    explicit RedisLocationCodec(SharedLocationSpecName simple_spec_name);
 
-ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties);
+    FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties) const;
+    ErrorCode DeserializeFieldMap(const FieldMap &field_map,
+                                  CacheLocationMap &out_locations,
+                                  PropertyMap *out_properties,
+                                  LocationIdInterner *id_interner,
+                                  LocationSpecNameInterner *name_interner) const;
+    bool DeserializeLocation(const LocationId &id,
+                             const std::string &value,
+                             LocationIdInterner *id_interner,
+                             LocationSpecNameInterner *name_interner,
+                             CacheLocation &out_location) const;
 
-ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations);
+private:
+    bool SerializeCompactLocation(const LocationId &id, const CacheLocation &location, std::string &out_value) const;
+
+    SharedLocationSpecName simple_spec_name_;
+};
 
 void ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids);
 

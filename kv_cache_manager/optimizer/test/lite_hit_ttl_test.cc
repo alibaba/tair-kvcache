@@ -179,6 +179,35 @@ TEST_F(LiteHitTtlTest, CompactionCollapsesEmptyEpochs) {
     EXPECT_TRUE(core.ProcessRequest({7}, 10001 + 1000000000).hit_curve.empty());
 }
 
+TEST_F(LiteHitTtlTest, CompactionPreservesDistinctEpochDeadlinesAndEmptyState) {
+    LiteHit core(10000);
+    for (int64_t t = 0; t < 6000; ++t) {
+        core.ProcessRequest({7}, t);
+    }
+    core.ProcessRequest({8}, 6000);
+    core.ProcessRequest({9}, 6001);
+    // Force another compaction without refreshing the three distinct epochs.
+    for (int i = 0; i < 5000; ++i) {
+        core.fenwick_.AppendZero();
+    }
+    core.MaybeCompactPositions();
+    ASSERT_EQ(3u, core.fenwick_.size());
+    core.AdvanceTime(15999);
+    EXPECT_EQ(2u, core.current_unique_blocks());
+    core.AdvanceTime(16000);
+    EXPECT_EQ(1u, core.current_unique_blocks());
+    core.AdvanceTime(16001);
+    EXPECT_EQ(0u, core.current_unique_blocks());
+    for (int i = 0; i < 5000; ++i) {
+        core.fenwick_.AppendZero();
+    }
+    core.MaybeCompactPositions();
+    EXPECT_EQ(0u, core.fenwick_.size());
+    EXPECT_TRUE(core.last_positions_.empty());
+    EXPECT_TRUE(core.ProcessRequest({7}, 16002).hit_curve.empty());
+    EXPECT_EQ(1u, core.current_unique_blocks());
+}
+
 TEST_F(LiteHitTtlTest, AdvanceTimeRefreshesUniqueCount) {
     LiteHit core(1000);
     core.ProcessRequest({1, 2}, 0);

@@ -137,7 +137,7 @@ def verify(args, client, checks):
     )
     checks.assertEqual(accepted["header"]["status"]["code"], "OK")
     active_version = accepted["committed_snapshot_version"]
-    checks.assertEqual(len(active_version), 32)
+    checks.assertEqual(len(active_version), 8)
     # A generation-creating delta is accepted immediately, but its own
     # response keeps snapshot_required=true so a snapshot-capable caller sees
     # that the request arrived without a current-process generation. The next

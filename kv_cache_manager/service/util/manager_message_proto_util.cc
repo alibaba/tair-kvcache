@@ -50,6 +50,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
         tair_mem_pool->set_health_check_timeout(tair_mem_pool_storage.health_check_timeout());
+        tair_mem_pool->set_allocate_concurrency(tair_mem_pool_storage.allocate_concurrency());
         tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
         tair_mem_pool->set_media_type(tair_mem_pool_storage.media_type());
         tair_mem_pool->set_skip_confirmed_missing_backend_delete(
@@ -131,6 +132,7 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         if (proto_storage_config->tair_mem_pool().health_check_timeout() != 0) {
             spec.set_health_check_timeout(proto_storage_config->tair_mem_pool().health_check_timeout());
         }
+        spec.set_allocate_concurrency(proto_storage_config->tair_mem_pool().allocate_concurrency());
         spec.set_service_discovery_url(proto_storage_config->tair_mem_pool().service_discovery_url());
         spec.set_skip_confirmed_missing_backend_delete(
             proto_storage_config->tair_mem_pool().skip_confirmed_missing_backend_delete());
@@ -252,22 +254,37 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
                 origin_meta_storage_backend_config->GetForceDeletingAsyncEnqueue());
         }
 
-        // 转换meta_cache_policy_config
-        auto origin_meta_cache_policy_config = origin_meta_indexer_config->GetMetaCachePolicyConfig();
-        if (cache_config_info.meta_indexer_config()->GetMetaCachePolicyConfig()) {
-            auto *meta_cache_policy_config = meta_indexer_config->mutable_meta_cache_policy_config();
-            meta_cache_policy_config->set_capacity(origin_meta_cache_policy_config->GetCapacity());
-            meta_cache_policy_config->set_type(origin_meta_cache_policy_config->GetCachePolicyType());
-            meta_cache_policy_config->set_cache_shard_bits(origin_meta_cache_policy_config->GetCacheShardBits());
-            meta_cache_policy_config->set_high_pri_pool_ratio(origin_meta_cache_policy_config->GetHighPriPoolRatio());
-        }
+        // Preserve only the values compared by legacy bootstrap; search cache remains disabled.
+        proto::admin::MetaCachePolicyConfig *legacy_policy = meta_indexer_config->mutable_meta_cache_policy_config();
+        legacy_policy->set_type("LRU");
+        legacy_policy->set_capacity(origin_meta_indexer_config->GetLegacySearchCacheCapacity());
+        legacy_policy->set_cache_shard_bits(origin_meta_indexer_config->GetLegacySearchCacheShardBits());
+        legacy_policy->set_high_pri_pool_ratio(0.0);
     }
 
     // 转换migration_config
     auto *migration_config = proto_cache_config->mutable_migration_config();
     migration_config->mutable_copy_max_concurrency()->set_value(cache_config_info.migration_copy_max_concurrency());
+    migration_config->mutable_async_copy_max_concurrency()->set_value(
+        cache_config_info.migration_async_copy_max_concurrency());
     migration_config->set_mark_clear_policy(
         static_cast<proto::admin::MigrationMarkClearPolicy>(cache_config_info.migration_mark_clear_policy()));
+    migration_config->set_copy_execution_mode(
+        static_cast<proto::admin::MigrationCopyExecutionMode>(cache_config_info.migration_copy_execution_mode()));
+    migration_config->mutable_copy_max_inflight_bytes()->set_value(
+        cache_config_info.migration_copy_max_inflight_bytes());
+    migration_config->mutable_copy_operation_deadline_ms()->set_value(
+        cache_config_info.migration_copy_operation_deadline_ms());
+    migration_config->mutable_copy_poll_initial_interval_ms()->set_value(
+        cache_config_info.migration_copy_poll_initial_interval_ms());
+    migration_config->mutable_copy_poll_max_interval_ms()->set_value(
+        cache_config_info.migration_copy_poll_max_interval_ms());
+    migration_config->mutable_copy_connect_timeout_ms()->set_value(
+        cache_config_info.migration_copy_connect_timeout_ms());
+    migration_config->mutable_copy_submit_timeout_ms()->set_value(
+        cache_config_info.migration_copy_submit_timeout_ms());
+    migration_config->mutable_copy_query_timeout_ms()->set_value(
+        cache_config_info.migration_copy_query_timeout_ms());
     for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
         if (migration_strategy == nullptr) {
             continue;
@@ -321,8 +338,42 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     } else {
         cache_config_info.set_migration_copy_max_concurrency(CacheConfig::kDefaultMigrationCopyMaxConcurrency);
     }
+    cache_config_info.set_migration_async_copy_max_concurrency(
+        proto_migration_config.has_async_copy_max_concurrency()
+            ? proto_migration_config.async_copy_max_concurrency().value()
+            : MigrationConfig::kDefaultAsyncCopyMaxConcurrency);
     cache_config_info.set_migration_mark_clear_policy(
         static_cast<MigrationMarkClearPolicy>(proto_migration_config.mark_clear_policy()));
+    cache_config_info.set_migration_copy_execution_mode(
+        static_cast<MigrationCopyExecutionMode>(proto_migration_config.copy_execution_mode()));
+    cache_config_info.set_migration_copy_max_inflight_bytes(
+        proto_migration_config.has_copy_max_inflight_bytes()
+            ? proto_migration_config.copy_max_inflight_bytes().value()
+            : MigrationConfig::kDefaultCopyMaxInflightBytes);
+    cache_config_info.set_migration_copy_operation_deadline_ms(
+        proto_migration_config.has_copy_operation_deadline_ms()
+            ? proto_migration_config.copy_operation_deadline_ms().value()
+            : MigrationConfig::kDefaultCopyOperationDeadlineMs);
+    cache_config_info.set_migration_copy_poll_initial_interval_ms(
+        proto_migration_config.has_copy_poll_initial_interval_ms()
+            ? proto_migration_config.copy_poll_initial_interval_ms().value()
+            : MigrationConfig::kDefaultCopyPollInitialIntervalMs);
+    cache_config_info.set_migration_copy_poll_max_interval_ms(
+        proto_migration_config.has_copy_poll_max_interval_ms()
+            ? proto_migration_config.copy_poll_max_interval_ms().value()
+            : MigrationConfig::kDefaultCopyPollMaxIntervalMs);
+    cache_config_info.set_migration_copy_connect_timeout_ms(
+        proto_migration_config.has_copy_connect_timeout_ms()
+            ? proto_migration_config.copy_connect_timeout_ms().value()
+            : MigrationConfig::kDefaultCopyConnectTimeoutMs);
+    cache_config_info.set_migration_copy_submit_timeout_ms(
+        proto_migration_config.has_copy_submit_timeout_ms()
+            ? proto_migration_config.copy_submit_timeout_ms().value()
+            : MigrationConfig::kDefaultCopySubmitTimeoutMs);
+    cache_config_info.set_migration_copy_query_timeout_ms(
+        proto_migration_config.has_copy_query_timeout_ms()
+            ? proto_migration_config.copy_query_timeout_ms().value()
+            : MigrationConfig::kDefaultCopyQueryTimeoutMs);
 
     // 转换meta_indexer_config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
@@ -347,15 +398,11 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     }
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
 
-    // 转换meta_cache_policy_config（仅当 proto 中实际配置了时才填充）
-    const auto &proto_cache_policy = proto_cache_config->meta_indexer_config().meta_cache_policy_config();
-    if (!proto_cache_policy.type().empty()) {
-        auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-        meta_cache_policy_config->SetCapacity(proto_cache_policy.capacity());
-        meta_cache_policy_config->SetType(proto_cache_policy.type());
-        meta_cache_policy_config->SetCacheShardBits(proto_cache_policy.cache_shard_bits());
-        meta_cache_policy_config->SetHighPriPoolRatio(proto_cache_policy.high_pri_pool_ratio());
-        meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    if (proto_cache_config->meta_indexer_config().has_meta_cache_policy_config()) {
+        const proto::admin::MetaCachePolicyConfig &legacy =
+            proto_cache_config->meta_indexer_config().meta_cache_policy_config();
+        meta_indexer_config->SetLegacySearchCacheCapacity(legacy.capacity());
+        meta_indexer_config->SetLegacySearchCacheShardBits(legacy.cache_shard_bits());
     }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
@@ -402,6 +449,10 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
         auto *proto_quota_config = quota->add_quota_config();
         proto_quota_config->set_storage_type(static_cast<proto::admin::StorageType>(quota_config.storage_spec()));
         proto_quota_config->set_capacity(quota_config.capacity());
+        if (quota_config.automatic()) {
+            proto_quota_config->set_mode(quota_config.mode());
+            proto_quota_config->set_ratio(quota_config.ratio());
+        }
     }
 
     // 处理cache_config
@@ -439,6 +490,8 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
         DataStorageTypeFromProto(storage_type, data_storage_type);
         quota_config.set_storage_type(data_storage_type);
         quota_config.set_capacity(proto_quota_config.capacity());
+        quota_config.set_mode(proto_quota_config.mode().empty() ? "fixed" : proto_quota_config.mode());
+        quota_config.set_ratio(proto_quota_config.ratio());
         quota_configs.push_back(quota_config);
     }
     quota.set_quota_config(quota_configs);

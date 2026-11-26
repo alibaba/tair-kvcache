@@ -270,7 +270,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0, 2.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0, 2.0],
             }
         }
         resp = self._client.create_instance_group(create_req)
@@ -296,7 +296,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         })
         # Update
@@ -305,7 +305,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [2.0, 4.0],
+                "ttl_seconds_list": [0], "capacity_gb": [2.0, 4.0],
             }
         })
         self.assertEqual(resp["header"]["status"]["code"], "OK")
@@ -327,7 +327,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         })
         # Remove
@@ -352,7 +352,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         })
 
@@ -369,7 +369,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": "",
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         }, check_response=False)
         self.assertNotEqual(resp["header"]["status"]["code"], "OK")
@@ -393,7 +393,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [capacity_gb],
+                "ttl_seconds_list": [0], "capacity_gb": [capacity_gb],
             }
         })
         reg_resp = self._client.register_instance({
@@ -436,7 +436,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         })
         resp = self._client.register_instance({
@@ -456,7 +456,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_group": {
                 "name": group_name,
                 "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
-                "capacity_gb": [1.0],
+                "ttl_seconds_list": [0], "capacity_gb": [1.0],
             }
         })
         resp = self._client.register_instance({
@@ -541,7 +541,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [100, 200, 300],
         })
         self.assertEqual(resp1["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp1["capacity_results"][0]["cache_hit_count"]), 0)
+        self.assertEqual(int(resp1["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 0)
         self.assertEqual(int(resp1["total_blocks"]), 3)
 
         # Second query - same keys, all hit
@@ -551,7 +551,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [100, 200, 300],
         })
         self.assertEqual(resp2["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp2["capacity_results"][0]["cache_hit_count"]), 3)
+        self.assertEqual(int(resp2["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 3)
         self.assertEqual(int(resp2["total_blocks"]), 3)
 
     def test_trace_query_mixed(self):
@@ -574,7 +574,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [1, 4, 5],
         })
         self.assertEqual(resp["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp["capacity_results"][0]["cache_hit_count"]), 1)
+        self.assertEqual(int(resp["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 1)
         self.assertEqual(int(resp["total_blocks"]), 3)
 
     def test_trace_query_nonexistent_instance(self):
@@ -597,7 +597,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [10, 20, 30],
         })
-        self.assertEqual(int(resp["capacity_results"][0]["current_unique_keys"]), 3)
+        self.assertEqual(int(resp["ttl_results"][0]["capacity_results"][0]["current_unique_keys"]), 3)
 
         # Add overlapping keys
         resp = self._client.trace_query({
@@ -605,7 +605,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [20, 30, 40],
         })
-        self.assertEqual(int(resp["capacity_results"][0]["current_unique_keys"]), 4)
+        self.assertEqual(int(resp["ttl_results"][0]["capacity_results"][0]["current_unique_keys"]), 4)
 
     # --- ResetStats Tests ---
 
@@ -672,7 +672,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_b,
             "block_keys": [1000, 2000],
         })
-        self.assertEqual(int(resp["capacity_results"][0]["cache_hit_count"]), 0)
+        self.assertEqual(int(resp["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 0)
 
     def test_list_instances_filter_by_group(self):
         """ListInstances should filter by group."""
@@ -718,7 +718,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [1, 2, 3, 4, 5],
         })
-        self.assertEqual(int(tq1["capacity_results"][0]["cache_hit_count"]), 0)
+        self.assertEqual(int(tq1["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 0)
         self.assertEqual(int(tq1["total_blocks"]), 5)
 
         # 3. TraceQuery (hit)
@@ -727,7 +727,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [1, 2, 3, 4, 5],
         })
-        self.assertEqual(int(tq2["capacity_results"][0]["cache_hit_count"]), 5)
+        self.assertEqual(int(tq2["ttl_results"][0]["capacity_results"][0]["cache_hit_count"]), 5)
 
         # 4. List and verify stats
         list_resp = self._client.list_instances({

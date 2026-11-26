@@ -1,5 +1,6 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -14,6 +15,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -237,9 +239,11 @@ DataStorageSelector::Select(RequestContext const *request_context,
 
 void DataStorageSelector::DoCleanup() {}
 
-DataStorageSelectResult
-DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
-                                                        const std::string &instance_group) const noexcept {
+DataStorageSelectResult DataStorageSelector::SelectCacheWriteDataStorageBackend(
+    RequestContext *request_context,
+    const std::string &instance_group,
+    std::optional<DataStorageType> target_type,
+    const std::vector<DataStorageType> &excluded_storage_types) const noexcept {
     SPAN_TRACER(request_context);
     DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
     if (!request_context) {
@@ -286,7 +290,7 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     }
 
     // evaluate the total used byte size of this group
-    const auto quota = ig->quota();
+    const auto quota = ResolveEffectiveQuota(*ig, data_storage_manager.get()).ForAdmission();
     const auto [ec1, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (ec1 != ErrorCode::EC_OK) {
         PREFIX_LOG(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec1));
@@ -294,7 +298,8 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
         return result;
     }
     const std::size_t group_used_byte_size = CalcGroupUsedSize(request_context, instance_infos);
-    if (quota.capacity() < 0 || group_used_byte_size >= static_cast<std::size_t>(quota.capacity())) {
+    if (quota.capacity() != -1 &&
+        (quota.capacity() < 0 || group_used_byte_size >= static_cast<std::size_t>(quota.capacity()))) {
         PREFIX_LOG(WARN,
                    "instance group: [%s], quota capacity: [%" PRId64 "], has been reached or exceeded: [%zu]",
                    instance_group.c_str(),
@@ -334,9 +339,23 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     // 0. calculate the candidate list
     std::vector<std::shared_ptr<DataStorageBackend>> candidates;
     GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_table, candidates);
+    if (target_type || !excluded_storage_types.empty()) {
+        candidates.erase(std::remove_if(candidates.begin(),
+                                        candidates.end(),
+                                        [&](const auto &backend) {
+                                            // VCNS shares the HF3FS protocol type, but has its own configured identity.
+                                            const auto type = backend->GetStorageConfig().type();
+                                            return (target_type && type != *target_type) ||
+                                                   std::find(excluded_storage_types.begin(),
+                                                             excluded_storage_types.end(),
+                                                             type) != excluded_storage_types.end();
+                                        }),
+                         candidates.end());
+    }
 
     // 1. select backend according to the specified preference
-    const auto chosen_backend = Select(request_context, candidates, preference);
+    const auto chosen_backend = target_type ? (candidates.empty() ? nullptr : candidates.front())
+                                            : Select(request_context, candidates, preference);
 
     if (chosen_backend == nullptr) {
         PREFIX_LOG(WARN, "unable to select a data storage backend, instance group: %s", instance_group.c_str());
@@ -388,7 +407,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     using UsageArray = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
     UsageArray usage_by_type{};
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> quota_type_needed{};
-    const auto &quota = group->quota();
+    const auto quota = ResolveEffectiveQuota(*group, data_storage_manager.get()).ForAdmission();
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
         if (type_idx < quota_type_needed.size()) {
@@ -427,7 +446,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     const bool group_quota_exceeded =
-        quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity());
+        quota.capacity() != -1 &&
+        (quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity()));
     std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> type_quota_exceeded{};
     for (const auto &storage_quota : quota.quota_config()) {
         const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
@@ -496,7 +516,8 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
             continue;
         }
 
-        meta_indexer->PersistMetaData();
+        // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+        // from this admission path: persistence does not refresh these values and may add backend I/O.
         group_used_byte_size += meta_indexer->GetStorageUsage();
     }
 
@@ -525,13 +546,18 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
                 PREFIX_LOG(WARN, "meta indexer is nullptr");
                 continue;
             }
-            meta_indexer->PersistMetaData();
+            // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+            // from this admission path: persistence does not refresh these values and may add backend I/O.
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
             total_sz += sz;
         }
 
-        if (storage_quota.capacity() <= total_sz) {
-            out_storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
+        if (storage_quota.capacity() < 0 || static_cast<std::uint64_t>(storage_quota.capacity()) <= total_sz) {
+            out_storage_quota_avail_table.SetStorageQuotaAvailByType(ToBaseType(type), false);
+            if (ToBaseType(type) == DataStorageType::DATA_STORAGE_TYPE_HF3FS) {
+                out_storage_quota_avail_table.SetStorageQuotaAvailByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS,
+                                                                         false);
+            }
         }
     }
 }

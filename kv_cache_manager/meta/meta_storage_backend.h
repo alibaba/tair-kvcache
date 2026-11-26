@@ -32,6 +32,14 @@ public:
 
     virtual std::string GetStorageType() noexcept = 0;
 
+    // Metadata memory accounted for in this process; remote storage contributes zero.
+    virtual size_t GetMemUsage() const noexcept = 0;
+
+    // Resident local metadata keys; backends without a local index contribute zero.
+
+    // Oldest access timestamp in microseconds; INT64_MAX if unavailable or empty.
+    virtual int64_t GetOldestAccessTime() const noexcept = 0;
+
     // 初始化后端。必须在 Open() 之前调用。
     // @param instance_id  实例标识，用于 key 前缀隔离
     // @param config       后端配置（含 storage_uri 等）
@@ -551,6 +559,9 @@ public:
     // @param field_maps [out] 读到的元数据
     // @return EC_OK 成功；EC_NOENT 无元数据；EC_ERROR 读取失败
     virtual ErrorCode GetMetaData(FieldMap &field_maps) noexcept = 0;
+
+    // Delete the per-instance metadata record. Missing metadata is success.
+    virtual ErrorCode DeleteMetaData() noexcept = 0;
 
     // Synchronously flush pending writes for the given keys.
     // Returns true if all writes persisted successfully, false on failure/timeout.

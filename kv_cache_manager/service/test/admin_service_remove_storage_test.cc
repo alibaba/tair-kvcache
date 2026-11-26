@@ -1,5 +1,8 @@
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -10,8 +13,10 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
+#include "stub.h"
 
 using namespace kv_cache_manager;
 
@@ -19,14 +24,17 @@ class AdminServiceRemoveStorageTest : public TESTBASE {
 public:
     void SetUp() override {
         metrics_registry_ = std::make_shared<MetricsRegistry>();
-        auto rm_registry = std::make_shared<MetricsRegistry>();
-        registry_manager_ = std::make_shared<RegistryManager>("local://", rm_registry);
+        registry_manager_ = std::make_shared<RegistryManager>("local://", metrics_registry_);
         registry_manager_->Init();
 
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
 
-        admin_service_ =
-            std::make_unique<AdminServiceImpl>(cache_manager_, nullptr, metrics_registry_, registry_manager_, nullptr);
+        admin_service_ = std::make_unique<AdminServiceImpl>(cache_manager_,
+                                                            nullptr,
+                                                            metrics_registry_,
+                                                            registry_manager_,
+                                                            nullptr,
+                                                            /*include_access_log_payload=*/false);
         admin_service_->EnableLeaderOnlyRequests();
     }
 
@@ -53,7 +61,7 @@ TEST_F(AdminServiceRemoveStorageTest, PurgesUniqueNameTaggedMetrics) {
     metrics_registry_->GetGauge("data_storage.healthy_status", {{"unique_name", "store1"}, {"type", "DUMMY"}});
     metrics_registry_->GetGauge("data_storage.storage_usage_ratio", {{"unique_name", "store1"}, {"type", "DUMMY"}});
     metrics_registry_->GetCounter("m1", {{"instance_id", "other"}});
-    ASSERT_EQ(3, metrics_registry_->GetSize());
+    ASSERT_GT(metrics_registry_->GetSize(), 1u);
 
     RequestContext rc("test-trace");
     proto::admin::RemoveStorageRequest request;
@@ -83,6 +91,53 @@ TEST_F(AdminServiceRemoveStorageTest, RemoveNonexistentStorageReturnsError) {
     ASSERT_EQ(proto::admin::INTERNAL_ERROR, response.header().status().code());
 }
 
+TEST_F(AdminServiceRemoveStorageTest, WaitsForInstanceRemovalBeforeClosingStorage) {
+    SeedStorage("store1");
+    std::unique_lock<std::shared_mutex> removal_guard(cache_manager_->metrics_lifecycle()->removal_mut_);
+    std::atomic<bool> started{false};
+    auto remove_future = std::async(std::launch::async, [&] {
+        RequestContext context("remove_storage_during_instance_removal");
+        proto::admin::RemoveStorageRequest request;
+        request.set_storage_unique_name("store1");
+        proto::admin::CommonResponse response;
+        started.store(true, std::memory_order_release);
+        admin_service_->RemoveStorage(&context, &request, &response);
+        return response.header().status().code();
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto status = remove_future.wait_for(std::chrono::milliseconds(50));
+    removal_guard.unlock();
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(proto::admin::OK, remove_future.get());
+}
+
+TEST_F(AdminServiceRemoveStorageTest, UpdateStorageWaitsForInstanceRemoval) {
+    SeedStorage("store1");
+    std::unique_lock<std::shared_mutex> removal_guard(cache_manager_->metrics_lifecycle()->removal_mut_);
+    std::atomic<bool> started{false};
+    auto update_future = std::async(std::launch::async, [&] {
+        RequestContext context("update_storage_during_instance_removal");
+        proto::admin::UpdateStorageRequest request;
+        auto *storage = request.mutable_storage();
+        storage->set_global_unique_name("store1");
+        storage->mutable_dummy()->set_root_path("/tmp/test_store1");
+        storage->mutable_dummy()->set_key_count_per_file(1);
+        proto::admin::CommonResponse response;
+        started.store(true, std::memory_order_release);
+        admin_service_->UpdateStorage(&context, &request, &response);
+        return response.header().status().code();
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto status = update_future.wait_for(std::chrono::milliseconds(50));
+    removal_guard.unlock();
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(proto::admin::OK, update_future.get());
+}
+
 TEST_F(AdminServiceRemoveStorageTest, PurgesOnlyTargetedStorageMetrics) {
     SeedStorage("store1");
     SeedStorage("store2");
@@ -91,7 +146,17 @@ TEST_F(AdminServiceRemoveStorageTest, PurgesOnlyTargetedStorageMetrics) {
     metrics_registry_->GetGauge("data_storage.healthy_status", {{"unique_name", "store1"}, {"type", "DUMMY"}});
     metrics_registry_->GetGauge("data_storage.storage_usage_ratio", {{"unique_name", "store1"}, {"type", "DUMMY"}});
     metrics_registry_->GetGauge("data_storage.healthy_status", {{"unique_name", "store2"}, {"type", "DUMMY"}});
-    ASSERT_EQ(3, metrics_registry_->GetSize());
+    // The shared production registry also contains the backend's own metrics.
+    std::vector<MetricsRegistry::metrics_tuple_t> before;
+    metrics_registry_->GetAllMetrics(before);
+    size_t keeper_count = 0;
+    for (const auto &[name, tags, value] : before) {
+        const auto storage = tags.find("unique_name");
+        if (storage != tags.end() && storage->second == "store2") {
+            ++keeper_count;
+        }
+    }
+    ASSERT_GT(keeper_count, 0u);
 
     RequestContext rc("test-trace");
     proto::admin::RemoveStorageRequest request;
@@ -102,12 +167,13 @@ TEST_F(AdminServiceRemoveStorageTest, PurgesOnlyTargetedStorageMetrics) {
     ASSERT_EQ(proto::admin::OK, response.header().status().code());
 
     // only store2 metrics remain
-    ASSERT_EQ(1, metrics_registry_->GetSize());
+    ASSERT_EQ(keeper_count, metrics_registry_->GetSize());
     std::vector<MetricsRegistry::metrics_tuple_t> all;
     metrics_registry_->GetAllMetrics(all);
-    ASSERT_EQ(1, all.size());
-    auto &[name, tags, _] = all[0];
-    ASSERT_EQ("store2", tags.at("unique_name"));
+    ASSERT_EQ(keeper_count, all.size());
+    for (const auto &[name, tags, value] : all) {
+        ASSERT_EQ("store2", tags.at("unique_name"));
+    }
 }
 
 // race ReportInterval (reader: shared lifecycle lock) against
@@ -183,4 +249,39 @@ TEST_F(AdminServiceRemoveStorageTest, ConcurrentReportIntervalAndRemoveStorageIs
         }
     }
     ASSERT_TRUE(keeper_seen);
+}
+
+TEST_F(AdminServiceRemoveStorageTest, DoesNotPurgeReplacementMetricsAfterStorageRemovalReturns) {
+    SeedStorage("reused_store");
+    const MetricsTags tags{{"unique_name", "reused_store"}, {"type", "dummy"}};
+    metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags) = 1.0;
+    const auto previous = registry_manager_->data_storage_manager()->GetDataStorageBackend("reused_store");
+
+    // Model a concurrent AddStorage completing after the storage lock is
+    // released but before the Admin success path resumes. Use real unload
+    // and registration so the old lifetime is actually removed.
+    Stub stub;
+    auto remove_and_replace = +[](RegistryManager *manager, RequestContext *context, const std::string &name) {
+        const auto config = manager->data_storage_manager()->GetDataStorageBackend(name)->GetStorageConfig();
+        auto ec = manager->data_storage_manager()->UnRegisterStorage(name);
+        if (ec != EC_OK) {
+            return ec;
+        }
+        ec = manager->AddStorage(context, config);
+        if (ec == EC_OK) {
+            manager->metrics_registry_->GetGauge("data_storage.storage_usage_ratio",
+                                                {{"unique_name", name}, {"type", "dummy"}}) = 0.25;
+        }
+        return ec;
+    };
+    stub.set(&RegistryManager::RemoveStorage, remove_and_replace);
+    RequestContext context("remove-and-recreate");
+    proto::admin::RemoveStorageRequest request;
+    request.set_storage_unique_name("reused_store");
+    proto::admin::CommonResponse response;
+    admin_service_->RemoveStorage(&context, &request, &response);
+
+    ASSERT_EQ(proto::admin::OK, response.header().status().code());
+    EXPECT_NE(previous, registry_manager_->data_storage_manager()->GetDataStorageBackend("reused_store"));
+    EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
 }

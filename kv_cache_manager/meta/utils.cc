@@ -1,50 +1,133 @@
 #include "kv_cache_manager/meta/utils.h"
 
+#include <cstring>
+#include <string_view>
+#include <utility>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 
 namespace kv_cache_manager {
 
-FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties) {
+namespace {
+
+// Compact v1 stores a 4-byte header, a little-endian int64 timestamp and the raw URI.
+constexpr std::string_view kCompactLocationHeader{"\0KV\1", 4};
+constexpr size_t kCompactLocationUriOffset = kCompactLocationHeader.size() + sizeof(int64_t);
+
+bool ParseEventReportStorageType(std::string_view id, DataStorageType &out_type) {
+    std::string_view storage_type;
+    std::string_view medium;
+    std::string_view host;
+    if (!SnapshotUriUtils::ParseEventReportLocationIdView(id, storage_type, medium, host)) {
+        return false;
+    }
+    out_type = storage_type == "event_report_l1p5" ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5
+                                                   : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    return true;
+}
+
+} // namespace
+
+RedisLocationCodec::RedisLocationCodec(SharedLocationSpecName simple_spec_name)
+    : simple_spec_name_(std::move(simple_spec_name)) {}
+
+bool RedisLocationCodec::SerializeCompactLocation(const LocationId &id,
+                                                  const CacheLocation &location,
+                                                  std::string &out_value) const {
+    const std::vector<LocationSpec> &specs = location.location_specs();
+    if (location.status() != CLS_SERVING || location.spec_size() != 1 || specs.size() != 1 || location.id() != id) {
+        return false;
+    }
+    const LocationSpec &spec = specs.front();
+    DataStorageType type;
+    if (spec.name() != *simple_spec_name_ || spec.uri().empty() || spec.has_checksum() ||
+        !ParseEventReportStorageType(id, type) || type != location.type()) {
+        return false;
+    }
+
+    const uint64_t timestamp = static_cast<uint64_t>(location.create_time());
+    out_value.assign(kCompactLocationHeader);
+    out_value.resize(kCompactLocationUriOffset);
+    unsigned char *bytes = reinterpret_cast<unsigned char *>(out_value.data() + kCompactLocationHeader.size());
+    for (size_t i = 0; i < sizeof(timestamp); ++i) {
+        bytes[i] = static_cast<unsigned char>(timestamp >> (8 * i));
+    }
+    out_value.append(spec.uri());
+    return true;
+}
+
+FieldMap RedisLocationCodec::SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties) const {
     for (const auto &[loc_id, loc_ptr] : locations) {
         auto [it, inserted] = properties.try_emplace(PROPERTY_LOCATION_PREFIX + loc_id);
-        if (inserted && loc_ptr) {
+        if (inserted && loc_ptr && !(simple_spec_name_ && SerializeCompactLocation(loc_id, *loc_ptr, it->second))) {
             it->second = loc_ptr->ToJsonString();
         }
     }
     return properties;
 }
 
-ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties) {
-    for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
-            std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
-            auto location = std::make_shared<CacheLocation>();
-            if (field_value.empty()) {
-                location->set_id(loc_id);
-            } else if (!location->FromJsonString(field_value)) {
-                return EC_CORRUPTION;
-            }
-            out_locations[loc_id] = std::move(location);
-        } else {
-            out_properties[field_name] = field_value;
-        }
+bool RedisLocationCodec::DeserializeLocation(const LocationId &id,
+                                             const std::string &value,
+                                             LocationIdInterner *id_interner,
+                                             LocationSpecNameInterner *name_interner,
+                                             CacheLocation &out_location) const {
+    if (value.empty()) {
+        out_location.set_id(id);
+        return true;
     }
-    return EC_OK;
+    if (value.front() != kCompactLocationHeader.front()) {
+        return id_interner ? out_location.FromJsonStringInterned(value, *id_interner, name_interner)
+                           : out_location.FromJsonString(value);
+    }
+
+    DataStorageType type;
+    if (!simple_spec_name_ || value.size() <= kCompactLocationUriOffset ||
+        value.compare(0, kCompactLocationHeader.size(), kCompactLocationHeader) != 0 ||
+        !ParseEventReportStorageType(id, type)) {
+        return false;
+    }
+
+    const unsigned char *bytes = reinterpret_cast<const unsigned char *>(value.data() + kCompactLocationHeader.size());
+    uint64_t timestamp = 0;
+    for (size_t i = 0; i < sizeof(timestamp); ++i) {
+        timestamp |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    }
+    int64_t create_time;
+    std::memcpy(&create_time, &timestamp, sizeof(create_time));
+    if (id_interner) {
+        bool retained = false;
+        InternedLocationId interned_id = id_interner->Intern(id, &retained);
+        out_location.set_id(std::move(interned_id), retained);
+    } else {
+        out_location.set_id(id);
+    }
+    out_location.set_status(CLS_SERVING);
+    out_location.set_type(type);
+    out_location.set_spec_size(1);
+    out_location.set_create_time(create_time);
+    out_location.push_location_spec(LocationSpec(simple_spec_name_, value.substr(kCompactLocationUriOffset)));
+    return true;
 }
 
-ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
+ErrorCode RedisLocationCodec::DeserializeFieldMap(const FieldMap &field_map,
+                                                  CacheLocationMap &out_locations,
+                                                  PropertyMap *out_properties,
+                                                  LocationIdInterner *id_interner,
+                                                  LocationSpecNameInterner *name_interner) const {
     for (const auto &[field_name, field_value] : field_map) {
         if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) != 0) {
+            if (out_properties) {
+                (*out_properties)[field_name] = field_value;
+            }
             continue;
         }
-        std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
+        const std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
         auto location = std::make_shared<CacheLocation>();
-        if (field_value.empty()) {
-            location->set_id(loc_id);
-        } else if (!location->FromJsonString(field_value)) {
+        if (!DeserializeLocation(loc_id, field_value, id_interner, name_interner, *location)) {
             return EC_CORRUPTION;
         }
         out_locations[loc_id] = std::move(location);

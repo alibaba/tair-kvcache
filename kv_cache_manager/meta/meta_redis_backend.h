@@ -4,10 +4,12 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <utility>
 
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/utils.h"
 
 namespace kv_cache_manager {
 
@@ -20,9 +22,12 @@ namespace kv_cache_manager {
 class MetaRedisBackend : public MetaStorageBackend {
 public:
     MetaRedisBackend() = default;
+    explicit MetaRedisBackend(RedisLocationCodec codec) : codec_(std::move(codec)) {}
     ~MetaRedisBackend() override;
 
     std::string GetStorageType() noexcept override;
+    size_t GetMemUsage() const noexcept override { return 0; }
+    int64_t GetOldestAccessTime() const noexcept override { return INT64_MAX; }
 
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept override;
@@ -89,6 +94,7 @@ public:
     // ----- Metadata APIs -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
 private:
     // virtual for test
@@ -101,5 +107,8 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 1000;
+    const RedisLocationCodec codec_;
+    LocationIdInterner id_interner_;
+    LocationSpecNameInterner name_interner_;
 };
 } // namespace kv_cache_manager

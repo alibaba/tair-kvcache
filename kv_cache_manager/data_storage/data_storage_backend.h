@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
@@ -12,6 +15,89 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+struct StorageCapacitySnapshot {
+    // -1 is unknown; a successful zero is authoritative.
+    int64_t capacity = -1;
+    int64_t last_success_time_s = 0;
+    ErrorCode refresh_code = EC_ERROR;
+    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+
+    bool HasKnownCapacity() const { return capacity >= 0 && (refresh_code == EC_OK || last_success_time_s > 0); }
+};
+
+struct DataStorageCreateRequest {
+    std::vector<std::string> keys;
+    size_t size_per_key;
+};
+
+using DataStorageCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
+using DataStorageBatchCreateResult = std::vector<DataStorageCreateResult>;
+
+enum class AsyncCopyOutcome : int32_t {
+    kSuccess = 0,
+    kFailed = 1,
+    kCancelled = 2,
+    kUnknown = 3,
+};
+
+// `error` is diagnostic only. A successful Copy requires terminal + safe.
+// Failure/unknown cleanup uses ordinary Delete; an async-capable backend must
+// reject deletion while Copy still owns the allocation, without reusing it.
+// A timeout never proves that the remote operation has drained.
+struct AsyncCopyItemResult {
+    AsyncCopyOutcome outcome = AsyncCopyOutcome::kUnknown;
+    ErrorCode error = EC_UNKNOWN;
+    bool terminal = false;
+    bool safe_to_reuse_dst = false;
+    std::string backend_task_id;
+    std::string detail;
+};
+
+struct AsyncCopyBatchResult {
+    ErrorCode status = EC_UNKNOWN;
+    std::vector<AsyncCopyItemResult> items;
+    std::string detail;
+
+    bool AllSucceeded() const {
+        return !items.empty() && std::all_of(items.begin(), items.end(), [](const auto &item) {
+            return item.terminal && item.safe_to_reuse_dst && item.outcome == AsyncCopyOutcome::kSuccess;
+        });
+    }
+    bool AllTerminalAndSafe() const {
+        return !items.empty() && std::all_of(items.begin(), items.end(), [](const auto &item) {
+            return item.terminal && item.safe_to_reuse_dst;
+        });
+    }
+};
+
+struct AsyncCopyOptions {
+    static constexpr int64_t kMinHttpTimeoutWindowsPerDeadline = 16;
+
+    int64_t operation_deadline_ms = 10 * 60 * 1000;
+    int64_t initial_poll_interval_ms = 20;
+    int64_t max_poll_interval_ms = 1000;
+    // Per-request control-plane budgets.  They are deliberately independent
+    // from the end-to-end operation deadline: an HTTP timeout never proves
+    // that a remote Copy task is terminal or that its destination is safe.
+    int64_t connect_timeout_ms = 1000;
+    int64_t submit_timeout_ms = 3000;
+    int64_t query_timeout_ms = 3000;
+};
+
+using AsyncCopyCompletion = std::function<void(AsyncCopyBatchResult)>;
+
+struct AsyncCopySubmitResult {
+    ErrorCode status = EC_UNIMPLEMENTED;
+    // Acknowledges local coordinator handoff, not remote Copy completion.
+    bool accepted = false;
+    // Kept for backends that cannot make local handoff atomic.  Native PACE
+    // asynchronous copy always returns false here because no POST happens
+    // before the handoff result is returned.
+    bool acceptance_unknown = false;
+    std::string operation_id;
+    std::string detail;
+};
 
 class DataStorageBackend {
 public:
@@ -27,6 +113,17 @@ public:
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
+    // Static backend capability, independent of startup, health, or refresh results.
+    virtual bool SupportsStorageCapacity() const { return false; }
+    // Read a cached observation of total bytes for GetType(), never free bytes.
+    // Must perform no network/disk I/O and never wait for a background refresh.
+    // Backends own refresh scheduling and retain the last successful capacity
+    // and timestamps on errors. Before the first success return unknown, not zero.
+    virtual StorageCapacitySnapshot GetStorageCapacity() const {
+        StorageCapacitySnapshot snapshot;
+        snapshot.refresh_code = EC_UNIMPLEMENTED;
+        return snapshot;
+    }
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
     virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }
@@ -65,6 +162,31 @@ public:
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
                                                                      std::function<void()> cb) = 0;
+    // Preserve request/key order. The default keeps spec boundaries and stops
+    // after the first failed Create; unexecuted requests have empty results.
+    // Keep returned allocations, including malformed responses, for caller rollback.
+    // cb runs once on the calling thread after all backend work has completed.
+    virtual DataStorageBatchCreateResult CreateBatch(const std::vector<DataStorageCreateRequest> &requests,
+                                                     const std::string &trace_id,
+                                                     std::function<void()> cb) {
+        DataStorageBatchCreateResult results(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto &request = requests[i];
+            if (request.keys.empty()) {
+                continue;
+            }
+            auto &result = results[i];
+            result = Create(request.keys, request.size_per_key, trace_id, nullptr);
+            if (result.size() != request.keys.size() ||
+                std::any_of(result.begin(), result.end(), [](const auto &item) { return item.first != EC_OK; })) {
+                break;
+            }
+        }
+        if (cb) {
+            cb();
+        }
+        return results;
+    }
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;
@@ -88,6 +210,39 @@ public:
                                         const std::vector<DataStorageUri> &dst_uris,
                                         const std::string &trace_id) {
         return std::vector<ErrorCode>(src_uris.size(), EC_UNIMPLEMENTED);
+    }
+
+    // Opt-in also requires Copy/Delete allocation safety: Delete must return a
+    // retryable failure while a Copy may still access that allocation, retaining
+    // the allocation and preventing reuse. This applies after caller timeout,
+    // cancellation and manager restart; Copy task persistence is not provided.
+    virtual bool SupportsAsyncCopy() const { return false; }
+
+    // Native asynchronous copy.  A successful return means the backend owns
+    // the completion callback and will invoke it exactly once.  A rejected
+    // request has no remote side effect unless acceptance_unknown is true.
+    virtual AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &src_uris,
+                                            const std::vector<DataStorageUri> &dst_uris,
+                                            const std::string &operation_id,
+                                            const std::string &trace_id,
+                                            const AsyncCopyOptions &options,
+                                            AsyncCopyCompletion completion) {
+        (void)dst_uris;
+        (void)operation_id;
+        (void)trace_id;
+        (void)options;
+        (void)completion;
+        AsyncCopySubmitResult result;
+        result.status = src_uris.empty() ? EC_BADARGS : EC_UNIMPLEMENTED;
+        result.detail = "backend does not support asynchronous copy";
+        return result;
+    }
+
+    // Best-effort request only.  EC_OK means the coordinator accepted the
+    // cancellation intent, not that PACE proved the target drained.
+    virtual ErrorCode RequestCancelAsyncCopy(const std::string &operation_id) {
+        (void)operation_id;
+        return EC_UNIMPLEMENTED;
     }
 
 protected:

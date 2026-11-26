@@ -3,12 +3,17 @@
 #include <memory>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/account.h"
+#include "kv_cache_manager/config/effective_quota.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -19,6 +24,7 @@ namespace kv_cache_manager {
 static constexpr const char *kRegistryStorageKey = "storage";
 static constexpr const char *kRegistryGroupKey = "instance_group";
 static constexpr const char *kRegistryInstanceKey = "instance";
+static constexpr const char *kRegistryRetiredSuffix = ":retired";
 static constexpr const char *kRegistryAccountKey = "account";
 
 #define PREFIX_LOG_I(LEVEL, format, args...)                                                                           \
@@ -127,6 +133,28 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
 
 RegistryManager::~RegistryManager() { DoCleanup(); }
 
+bool RegistryManager::ValidateAutomaticQuota(const InstanceGroup &group, std::string &invalid_fields) const {
+    const auto manager = data_storage_manager();
+    if (!manager) {
+        return true; // Missing backends remain unknown during recovery.
+    }
+    const auto associated = GetQuotaStorageNames(group);
+    for (const auto &quota : group.quota().quota_config()) {
+        if (!quota.automatic()) {
+            continue;
+        }
+        const auto type = ToBaseType(quota.storage_spec());
+        for (const auto &name : associated) {
+            const auto backend = manager->GetDataStorageBackend(name);
+            if (backend && ToBaseType(backend->GetType()) == type && !backend->SupportsStorageCapacity()) {
+                invalid_fields += "{quota: storage '" + name + "' does not support automatic capacity; use fixed quota}";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
     storage_ = RegistryStorageBackendFactory::CreateAndInitStorageBackend(registry_storage_uri_);
@@ -142,8 +170,8 @@ bool RegistryManager::Init() {
 ErrorCode RegistryManager::AddStorage(RequestContext *request_context, const StorageConfig &storage_config) {
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
-    auto ec = LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and save storage failed");
+    auto ec = UpsertRegistryField(kRegistryStorageKey, global_unique_name, &storage_config);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "upsert storage failed");
     ec = data_storage_manager_->RegisterStorage(request_context, global_unique_name, storage_config);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "add storage failed");
     PREFIX_LOG_S(INFO, "add storage OK");
@@ -172,8 +200,8 @@ ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const
 
 ErrorCode RegistryManager::RemoveStorage(RequestContext *request_context, const std::string &global_unique_name) {
     const auto &trace_id = request_context->request_id();
-    auto ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed");
+    auto ec = DeleteRegistryField(kRegistryStorageKey, global_unique_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "delete storage failed");
     ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "remove storage failed");
     PREFIX_LOG_S(INFO, "remove storage OK");
@@ -227,16 +255,26 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
     return {EC_OK, storages};
 }
 
-ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
+ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context,
+                                               const InstanceGroup &instance_group,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_EXIST, "create instance group failed: instance group already existed");
     }
     // save to storage backend
-    auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+    auto ec = UpsertRegistryField(kRegistryGroupKey, instance_group_name, &instance_group);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "upsert instance group failed");
     instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
     PREFIX_LOG_G(INFO, "create instance group OK");
     return EC_OK;
@@ -244,13 +282,25 @@ ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, 
 
 ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                const InstanceGroup &instance_group,
-                                               int64_t current_version) {
+                                               int64_t current_version,
+                                               std::string *validation_error) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::string invalid_fields;
+    if (!ValidateAutomaticQuota(instance_group, invalid_fields)) {
+        if (validation_error) {
+            *validation_error += invalid_fields;
+        }
+        PREFIX_LOG_G(WARN, "%s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "update instance group failed: instance group not found");
+    }
+    if (HasRemovingInstanceInGroupUnsafe(instance_group_name)) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_ERROR, "update instance group failed: instance removal pending");
     }
     if (current_version != iter->second->version() || instance_group.version() <= iter->second->version()) {
         // TODO: 定义错误码
@@ -262,9 +312,25 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                        instance_group.version(),
                                        iter->second->version());
     }
+    for (const std::pair<const std::string, std::shared_ptr<InstanceInfo>> &entry : instance_infos_) {
+        const std::shared_ptr<InstanceInfo> &info = entry.second;
+        if (info->instance_group_name() != instance_group_name || !info->disable_write_session()) {
+            continue;
+        }
+        std::string error_message;
+        if (!ValidateSimpleInstanceConfig(instance_group, info->location_spec_infos(), error_message)) {
+            request_context->error_tracer()->AddErrorMsg("update instance group failed: instance '" + entry.first +
+                                                         "': " + error_message);
+            PREFIX_LOG_G(WARN,
+                         "update instance group failed: simple instance [%s]: %s",
+                         entry.first.c_str(),
+                         error_message.c_str());
+            return EC_BADARGS;
+        }
+    }
     // save to storage backend
-    auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+    auto ec = UpsertRegistryField(kRegistryGroupKey, instance_group_name, &instance_group);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "upsert instance group failed");
     instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
     PREFIX_LOG_G(INFO, "update instance group OK");
     return EC_OK;
@@ -278,9 +344,12 @@ ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "remove instance group failed: instance group not found");
     }
+    if (HasRemovingInstanceInGroupUnsafe(instance_group_name)) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_ERROR, "remove instance group failed: instance removal pending");
+    }
     // delete from storage backend
-    auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and delete instance group failed");
+    auto ec = DeleteRegistryField(kRegistryGroupKey, instance_group_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "delete instance group failed");
     instance_group_configs_.erase(iter);
     PREFIX_LOG_G(INFO, "remove instance group OK");
     return EC_OK;
@@ -296,6 +365,46 @@ RegistryManager::ListInstanceGroup(RequestContext *request_context) const {
     return std::make_pair(ErrorCode::EC_OK, instance_groups);
 }
 
+bool RegistryManager::ValidateSimpleInstanceConfig(const InstanceGroup &instance_group,
+                                                   const std::vector<LocationSpecInfo> &location_spec_infos,
+                                                   std::string &error_message) {
+    const std::shared_ptr<const CacheConfig> cache_config = instance_group.cache_config();
+    const std::shared_ptr<MetaIndexerConfig> meta_config = cache_config ? cache_config->meta_indexer_config() : nullptr;
+    const std::shared_ptr<MetaStorageBackendConfig> backend_config =
+        meta_config ? meta_config->GetMetaStorageBackendConfig() : nullptr;
+    if (location_spec_infos.size() != 1 || location_spec_infos.front().name().empty() || !backend_config ||
+        backend_config->GetMemoryPrimary()) {
+        error_message = "simple metadata requires one named spec and memory_primary=false";
+        return false;
+    }
+    if (meta_config->GetBatchKeySize() == 0) {
+        error_message = "simple metadata requires nonzero batch_key_size";
+        return false;
+    }
+    const std::string &storage_type = backend_config->GetStorageType();
+    if (storage_type != "local" && storage_type != "cached") {
+        error_message = "simple metadata requires local or cached storage";
+        return false;
+    }
+    const bool cached = storage_type == "cached";
+    const std::string &storage_uri = backend_config->GetStorageUri();
+    StandardUri uri;
+    if ((cached || !storage_uri.empty()) && (!uri.Parse(storage_uri) || !uri.Valid())) {
+        error_message = "simple metadata has an invalid storage URI";
+        return false;
+    }
+    if (cached) {
+        const std::string persistent_type = uri.GetParam("persistent_type");
+        const std::string cache_type = uri.GetParam("cache_type");
+        if ((!persistent_type.empty() && persistent_type != "redis" && persistent_type != "async_redis") ||
+            (!cache_type.empty() && cache_type != "local")) {
+            error_message = "simple cached metadata requires Redis/async Redis and local cache";
+            return false;
+        }
+    }
+    return true;
+}
+
 ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             const std::string &instance_group,
                                             const std::string &instance_id,
@@ -303,9 +412,14 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             const std::vector<LocationSpecInfo> &location_spec_infos,
                                             const ModelDeployment &model_deployment,
                                             const std::vector<LocationSpecGroup> &location_spec_groups,
-                                            int32_t default_query_type) {
+                                            int32_t default_query_type,
+                                            std::optional<bool> disable_write_session) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (removing_instance_infos_.count(instance_id) != 0) {
+        request_context->error_tracer()->AddErrorMsg("register instance failed: instance removal pending");
+        return EC_ERROR;
+    }
     auto instance_group_iter = instance_group_configs_.find(instance_group);
     if (instance_group_iter == instance_group_configs_.end()) {
         request_context->error_tracer()->AddErrorMsg("register instance failed: instance group '" + instance_group +
@@ -318,6 +432,9 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
         const auto &existing = it->second;
         auto mismatched = existing->MismatchFields(
             block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
+        if (disable_write_session.has_value() && existing->disable_write_session() != *disable_write_session) {
+            mismatched.emplace_back("disable_write_session");
+        }
         if (existing->instance_group_name() != instance_group) {
             mismatched.insert(mismatched.begin(), "instance_group_name");
         }
@@ -341,20 +458,29 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         model_deployment,
                                                         location_spec_groups,
                                                         default_query_type);
-    // save the instance info to storage backend in such a way that one key corresponds to one instance
-    auto ec = LoadAndSave(instance_id, instance_id, instance_info.get());
+    const bool simple = disable_write_session.value_or(
+        location_spec_infos.size() == 1 && EnvUtil::GetEnv<bool>("kvcm.disable_write_session_for_one_spec", false));
+    if (simple) {
+        std::string error_message;
+        if (!ValidateSimpleInstanceConfig(*instance_group_iter->second, location_spec_infos, error_message)) {
+            request_context->error_tracer()->AddErrorMsg(error_message);
+            return EC_BADARGS;
+        }
+    }
+    instance_info->set_disable_write_session(simple);
+    // Keep the full info out of the shared instance index.
+    auto ec = UpsertRegistryField(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {
         request_context->error_tracer()->AddErrorMsg(
             "register instance failed: failed to persist instance info to storage backend");
     }
-    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and save instance info failed");
-    // save the instance_id as value to instance key for recover
-    ec = LoadAndSave(kRegistryInstanceKey, instance_id, nullptr);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "save instance info failed");
+    ec = UpsertRegistryField(kRegistryInstanceKey, instance_id, nullptr);
     if (ec != EC_OK) {
         request_context->error_tracer()->AddErrorMsg(
             "register instance failed: failed to persist instance id to storage backend");
     }
-    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and save instance id failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "save instance id failed");
     // TODO: add quota_group_name
     instance_infos_[instance_id] = instance_info;
     PREFIX_LOG_I(INFO, "register instance OK");
@@ -366,20 +492,95 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
                                           const std::string &instance_id) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (instance_infos_.find(instance_id) == instance_infos_.end()) {
+    const auto active = instance_infos_.find(instance_id);
+    if (active == instance_infos_.end()) {
         // TODO: 添加错误码
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(
             WARN, EC_NOENT, "remove instance failed: instance not found, group: %s", instance_group.c_str());
     }
     // first, delete instance id from instance key
-    auto ec = LoadAndDelete(kRegistryInstanceKey, instance_id);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance info failed");
-    // second, delete instance info
-    ec = LoadAndDelete(instance_id, instance_id);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance id failed");
+    auto ec = DeleteRegistryField(kRegistryInstanceKey, instance_id);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "delete instance id failed");
+    ec = DeleteRegistryField(instance_id, instance_id);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "delete instance info failed");
     instance_infos_.erase(instance_id);
     PREFIX_LOG_I(INFO, "remove instance OK");
     return EC_OK;
+}
+
+ErrorCode RegistryManager::BeginRemoveInstance(RequestContext * /*request_context*/, const std::string &instance_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto pending = removing_instance_infos_.find(instance_id);
+    if (pending == removing_instance_infos_.end()) {
+        const auto active = instance_infos_.find(instance_id);
+        if (active == instance_infos_.end()) {
+            return EC_NOENT;
+        }
+        auto removing_info = std::make_shared<InstanceInfo>(*active->second);
+        removing_info->set_state(InstanceInfo::State::kDeleting);
+        removing_instance_infos_[instance_id] = {std::move(removing_info)};
+        instance_infos_.erase(active);
+        pending = removing_instance_infos_.find(instance_id);
+    }
+    if (pending->second.retired) {
+        return EC_OK;
+    }
+    return UpsertRegistryField(instance_id, instance_id, pending->second.info.get());
+}
+
+ErrorCode RegistryManager::CompleteRemoveInstance(const std::string &instance_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    const auto pending = removing_instance_infos_.find(instance_id);
+    if (pending == removing_instance_infos_.end()) {
+        return EC_NOENT;
+    }
+    pending->second.retired = true;
+    // Keep a small terminal marker until both registry records are gone.
+    ErrorCode ec = storage_->UpsertField(kRegistryInstanceKey, instance_id, instance_id + kRegistryRetiredSuffix);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    ec = DeleteRegistryField(instance_id, instance_id);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    ec = DeleteRegistryField(kRegistryInstanceKey, instance_id);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    removing_instance_infos_.erase(instance_id);
+    return EC_OK;
+}
+
+bool RegistryManager::IsInstanceRemovalRetired(const std::string &instance_id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto pending = removing_instance_infos_.find(instance_id);
+    return pending != removing_instance_infos_.end() && pending->second.retired;
+}
+
+std::shared_ptr<const InstanceInfo> RegistryManager::GetRemovingInstanceInfo(const std::string &instance_id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto it = removing_instance_infos_.find(instance_id);
+    return it == removing_instance_infos_.end() ? nullptr : it->second.info;
+}
+
+std::vector<std::shared_ptr<const InstanceInfo>> RegistryManager::ListRemovingInstanceInfos() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::vector<std::shared_ptr<const InstanceInfo>> result;
+    result.reserve(removing_instance_infos_.size());
+    for (const auto &[id, entry] : removing_instance_infos_) {
+        result.push_back(entry.info);
+    }
+    return result;
+}
+
+bool RegistryManager::HasRemovingInstanceInGroupUnsafe(const std::string &instance_group_name) const {
+    for (const auto &[id, entry] : removing_instance_infos_) {
+        if (entry.info->instance_group_name() == instance_group_name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>>
@@ -428,8 +629,8 @@ ErrorCode RegistryManager::AddAccount(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_EXIST, "add account failed: account already existed");
     }
     std::shared_ptr<Account> account = std::make_shared<Account>(user_name, password, role);
-    auto ec = LoadAndSave(kRegistryAccountKey, user_name, account.get());
-    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and save account failed");
+    auto ec = UpsertRegistryField(kRegistryAccountKey, user_name, account.get());
+    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "upsert account failed");
     accounts_[user_name] = account;
     PREFIX_LOG_A(INFO, "add account OK");
     return EC_OK;
@@ -441,8 +642,8 @@ ErrorCode RegistryManager::DeleteAccount(RequestContext *request_context, const 
     if (accounts_.find(user_name) == accounts_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_NOENT, "delete account failed: account not found");
     }
-    auto ec = LoadAndDelete(kRegistryAccountKey, user_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and delete account failed");
+    auto ec = DeleteRegistryField(kRegistryAccountKey, user_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "delete account failed");
     accounts_.erase(user_name);
     PREFIX_LOG_A(INFO, "delete account OK");
     return EC_OK;
@@ -487,42 +688,20 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
-ErrorCode RegistryManager::LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
-    std::map<std::string, std::string> value_map;
-    auto ec = storage_->Load(key, value_map);
-    // maybe value_map is empty
-    if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("Load %s from storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
-        return ec;
-    }
-    if (jsonizable) {
-        value_map[id] = jsonizable->ToJsonString();
-    } else {
-        value_map[id] = id;
-    }
-    ec = storage_->Save(key, value_map);
+ErrorCode
+RegistryManager::UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
+    const ErrorCode ec = storage_->UpsertField(key, id, jsonizable ? jsonizable->ToJsonString() : id);
     if (ec != EC_OK) {
-        KVCM_LOG_ERROR("Save %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
+        KVCM_LOG_ERROR("Upsert %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
         return ec;
     }
     return EC_OK;
 }
 
-ErrorCode RegistryManager::LoadAndDelete(const std::string &key, const std::string &id) {
-    std::map<std::string, std::string> value_map;
-    auto ec = storage_->Load(key, value_map);
-    if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("Load %s from storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
-        return ec;
-    }
-    value_map.erase(id);
-    if (value_map.empty()) {
-        ec = storage_->Delete(key);
-    } else {
-        ec = storage_->Save(key, value_map);
-    }
+ErrorCode RegistryManager::DeleteRegistryField(const std::string &key, const std::string &id) {
+    const ErrorCode ec = storage_->DeleteField(key, id);
     if (ec != EC_OK) {
-        KVCM_LOG_ERROR("Save %s to storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
+        KVCM_LOG_ERROR("Delete field in %s from storage backend failed, id[%s], ec[%d]", key.c_str(), id.c_str(), ec);
         return ec;
     }
     return EC_OK;
@@ -536,7 +715,7 @@ ErrorCode RegistryManager::UpdateStorageAvailableStatus(const std::string &globa
     }
     auto storage_config = storage_backend->GetStorageConfig();
     storage_config.set_is_available(is_available); // for recover
-    return LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
+    return UpsertRegistryField(kRegistryStorageKey, global_unique_name, &storage_config);
 }
 
 size_t RegistryManager::RecoverStorageUnsafe() {
@@ -642,23 +821,49 @@ size_t RegistryManager::RecoverInstanceInfoUnsafe() {
         return 1;
     }
     for (const auto &[id, val] : value_map) {
-        if (instance_infos_.find(id) != instance_infos_.end()) {
+        // Recovery is incremental: runtime registration/removal owns any already-loaded id.
+        // Preserve its object identity and pending-removal phase across partial-recovery retries.
+        // DoRecoverOnce and the mutation APIs serialize on mutex_; DoCleanup enables a full reload.
+        if (instance_infos_.count(id) != 0 || removing_instance_infos_.count(id) != 0) {
+            continue;
+        }
+        if (val == id + kRegistryRetiredSuffix) {
+            ec = DeleteRegistryField(id, id);
+            if (ec == EC_OK) {
+                ec = DeleteRegistryField(kRegistryInstanceKey, id);
+            }
+            if (ec != EC_OK) {
+                ++error_count;
+            }
+            continue;
+        }
+        if (val != id) {
+            KVCM_LOG_WARN("invalid registry instance entry, skip. instance id[%s]", id.c_str());
+            ++error_count;
             continue;
         }
         std::map<std::string, std::string> instance_map;
         ec = storage_->Load(id, instance_map);
-        if (ec != EC_OK) {
+        auto instance_info = std::make_shared<InstanceInfo>();
+        if (ec != EC_OK || !instance_info->FromJsonString(instance_map[id])) {
             KVCM_LOG_WARN("load registry instance info failed, skip. instance id[%s]", id.c_str());
             ++error_count;
             continue;
         }
-        auto instance_info = std::make_shared<InstanceInfo>();
-        if (!instance_info->FromJsonString(instance_map[id])) {
-            KVCM_LOG_WARN("instance info from json string failed, skip. json string[%s]", instance_map[id].c_str());
+        if (instance_info->instance_id() != id) {
+            KVCM_LOG_WARN("instance info id mismatch, skip. instance id[%s]", id.c_str());
             ++error_count;
             continue;
         }
-        instance_infos_[id] = instance_info;
+        if (instance_info->state() == InstanceInfo::State::kDeleting) {
+            auto &pending = removing_instance_infos_[id];
+            if (!pending.info) {
+                pending.info = std::move(instance_info);
+            }
+            instance_infos_.erase(id);
+        } else if (removing_instance_infos_.count(id) == 0) {
+            instance_infos_[id] = std::move(instance_info);
+        }
     }
     return error_count;
 }
@@ -673,11 +878,12 @@ ErrorCode RegistryManager::DoRecoverOnce() {
     error_count += RecoverInstanceInfoUnsafe();
 
     KVCM_LOG_INFO("registry manager do recover once done, error_count[%lu], account num[%lu], "
-                  "instance group num[%lu], instance info num[%lu]",
+                  "instance group num[%lu], instance info num[%lu], removing instance info num[%lu]",
                   error_count,
                   accounts_.size(),
                   instance_group_configs_.size(),
-                  instance_infos_.size());
+                  instance_infos_.size(),
+                  removing_instance_infos_.size());
     if (error_count == 0) {
         recover_complete_.store(true);
     }
@@ -739,6 +945,7 @@ ErrorCode RegistryManager::DoCleanup() {
     // clear config and infos
     instance_group_configs_.clear();
     instance_infos_.clear();
+    removing_instance_infos_.clear();
     accounts_.clear();
 
     KVCM_LOG_INFO("registry manager cleanup completed");
@@ -752,6 +959,21 @@ std::string RegistryManager::GetInstanceGroupName(const std::string &instance_id
         return it->second->instance_group_name();
     }
     return "";
+}
+
+std::optional<RegistryManager::MetricsSnapshot> RegistryManager::TryGetMetricsSnapshot() const {
+    std::shared_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    MetricsSnapshot snapshot;
+    for (const auto &[name, group] : instance_group_configs_) {
+        snapshot.groups.push_back(group);
+    }
+    for (const auto &[id, info] : instance_infos_) {
+        snapshot.instance_groups.emplace(id, info->instance_group_name());
+    }
+    return snapshot;
 }
 
 } // namespace kv_cache_manager

@@ -51,11 +51,19 @@ OptimizerManager (core coordinator)
     HitAnalysis (result analysis)
 ```
 
+### 在线服务健康检查
+
+Optimizer 在自身 `http_port` 上提供 `GET /api/healthy`，返回 HTTP 200、
+`Content-Type: application/json` 和 `{"status":"OK"}`。平台健康探针应使用
+Optimizer 实际监听的 HTTP 端口及该路径，不使用 KVCM 的 Admin 端口。
+这是轻量存活检查，只表示 HTTP 服务可响应，不代表 KVCM 已连接、回放已追平或监控上报成功；
+无需配置订阅，也不依赖 `enable_prometheus`，探测不会发起上游 RPC 或修改回放状态。
+
 ### 在线订阅 KVCM 事件
 
 `online_optimizer_server_main` 可以主动发现 KVCM，并通过 KVCM 现有的 Meta gRPC 端口订阅缓存读取事件。KVCM 不需要知道 Optimizer 地址，也不新增事件端口；Optimizer 是 gRPC 客户端，调用 `OptimizerEventStreamService.SubscribeEvents`，KVCM 通过 response stream 写入 `TraceQueryRequest`。
 
-KVCM 侧先在原有 server 配置中启用 optimizer publisher：
+KVCM 的 optimizer publisher 默认开启，无需额外启用配置；可设置 `optimizer.enable=false` 禁用。开启只允许订阅，实际采集仍需要活跃订阅者。以下为默认值：
 
 ```properties
 kvcm.event.event_publishers_configs={"log":{"enable":true,"queue_size":10000},"optimizer":{"enable":true,"queue_size":100000,"max_subscribers":4,"subscriber_queue_size":10000}}
@@ -69,32 +77,69 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
         {
             "service_discovery_url": "static://127.0.0.1:6381",
             "consumer_id": "online-optimizer",
-            "discovery_refresh_interval_ms": 5000
+            "discovery_refresh_interval_ms": 5000,
+            "mock_cache_layout": true,
+            "capacity_gb": [],
+            "ttl_seconds_list": [3600, 21600, 86400]
         },
         {
             "service_discovery_url": "vipserver://another-kvcm",
             "consumer_id": "online-optimizer",
-            "discovery_refresh_interval_ms": 5000
+            "discovery_refresh_interval_ms": 5000,
+            "mock_cache_layout": true,
+            "capacity_gb": [],
+            "ttl_seconds_list": [3600, 21600, 86400]
         }
     ]
 }
 ```
 
-空数组表示不订阅 KVCM。每个数组元素对应一个独立 KVCM 部署；`service_discovery_url` 指向该 KVCM 的 `kvcm.service.rpc_port`，支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`），同一个 URL 不能重复配置。每个 KVCM 的发现结果只作为 seed：Optimizer 周期调用任一健康 seed 的 `MetaService.GetClusterInfo` 获取当前 Leader，并且只向该 Leader 维持一条 `SubscribeEvents` stream。某个 KVCM 切主后，它自己的下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流和切主不影响其他 KVCM 的订阅。
+空数组表示不订阅 KVCM。每个数组元素对应一个独立 KVCM 部署；`service_discovery_url` 支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`），同一个 URL 不能重复配置。发现结果只用于获取健康 seed 的 IP：Optimizer 忽略注册中心返回的端口，统一连接 `IP:6381` 调用 `MetaService.GetClusterInfo`，因此 seed 的 Meta gRPC 必须监听 `6381`，注册中心仍可发布 HTTP 端口（例如 `6382`），不需要改动 KVCM 的服务注册。拿到当前 Leader 后，配置同步和 `SubscribeEvents` 使用响应中的 `leader_endpoint.host` 与 `meta_rpc_port`，不再覆盖该端口，并且每个 KVCM 只维持一条 stream。某个 KVCM 切主后，它自己的下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流和切主不影响其他 KVCM 的订阅。
 
 部署时也可以通过 `kvcm_optimizer.kvcm_event_subscriptions`（或下划线形式 `kvcm_optimizer_kvcm_event_subscriptions`）传入完整 JSON 数组，不需要为每个 KVCM 增加独立配置文件。
 
-`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知 `instance_id` 时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。当前同步只添加新配置，不删除或热更新已经存在的 Optimizer 配置。
+`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知实例事件时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。同名 Group 配置冲突仍会终止本轮同步；单个实例配置无效、注册失败或所属 Group 冲突则单独记录并跳过，不阻断其他实例同步或 Leader 订阅迁移，也不按旧配置继续处理该冲突实例的事件。每次周期同步重新校验，配置恢复后可继续处理。
 
-自动注册采用能从 KVCM 配置直接确定的口径：Instance Group 的 quota byte 数转换成一个 GiB 容量点，使用当前 Optimizer 支持的 LRU，并开启 prefix hash；Instance 按 full-only 注册，优先合并名称以 `full` / `FULL` 开头的 location spec group，没有时使用全部 spec。当前在线 indexer 不支持 shared group quota，因此同组各 Instance 分别按完整 Group quota 模拟。KVCM 没有 `linear_step` 等 Optimizer 专属参数，因此这里不猜测 linear/mamba 周期。
+订阅事件保留 KVCM 原始 `instance_id`，并携带采集时的正整数 `block_size`。Optimizer 自动注册和事件回放统一使用分析 ID `<原 instance_id>_bs<block_size>`，例如 `foo_bs128`，不根据当前配置猜测事件的 block size。新版本未注册时丢弃事件并请求配置刷新，不补回；block size 缺失或非法的订阅事件直接拒绝。block size 切换成功后，清理该订阅先前版本的分析状态和指标，新版本从冷状态开始；旧版本迟到事件不会写入新状态。Group 迁移不自动处理。直接调用 TraceQuery API 时传注册后的分析 ID，block size 仍由该实例的注册配置确定。
 
-每个 KVCM 订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，并且只唤醒对应 KVCM 的配置刷新；配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，旧客户端未设置时间戳时仍回退到 Optimizer 本机墙钟。
+订阅始终发现并注册 KVCM 的 Group / Instance，block size 始终取 KVCM 实例配置。`mock_cache_layout=true`（默认）时，TTL 和容量列表使用 optimizer 订阅配置，每 block 字节数 mock 为 1，不解释源 spec，也不继承 KVCM quota；容量列表允许为空，此时只分析各 TTL 下的无限容量理论命中。按 full-attention 回放并开启 prefix hash，不再计算 block hash。
 
-在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+`mock_cache_layout=false` 时容量取 KVCM Group quota，TTL 使用订阅项的 `ttl_seconds_list`，未填写时默认 `[86400]`；单个 spec group 按 full-attention 使用，没有 group 时将全部 spec 组成 full group，不使用订阅项的容量列表。当前尚未约定可可靠识别 FA / Mamba 等缓存角色的 spec 映射协议，因此真实布局路径不支持多组 spec，跳过这类实例；mock 路径也不模拟混合缓存布局。真实布局路径暂不支持动态 quota 更新：同名 Group 的 quota 变化会导致配置同步失败，阻止新增实例同步，并可能阻止订阅切换到新 Leader。这是已知限制，不影响默认 mock 模式对源 quota 变化的处理。
 
-在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_min_seconds`、`trace_query_reuse_interval_max_seconds` 、`trace_query_reuse_interval_avg_seconds`、`trace_query_reuse_interval_p95_seconds` 和 `trace_query_reuse_interval_p99_seconds`，单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。p95/p99 采用 nearest-rank（ceil(N×p)）口径，使用固定 58 KiB/Instance 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
+在线 Group 使用必填的 `ttl_seconds_list`，每项是非负秒数，0 表示不限制时间；空列表、重复、负数和纳秒换算溢出均拒绝。每个分析 Instance 持有各 TTL 独立回放状态，共享一次输入归一化和 prefix hash。TraceQuery 返回 `ttl_results`，每项包含 TTL 与对应结果；ListInstances 每 TTL 一行，保留分析 ID 并携带 TTL。分析指标保留分析 `instance_id`（如 `foo_bs128`），新增独立 `ttl` tag，值为十进制秒数（如 `86400`，`0` 表示无限 TTL）；service QPS/TPM/RT/错误指标不带 `ttl`，按分析 ID（如 `foo_bs128`）计数一次，不按 TTL 重复计数。空容量不生成容量命中率，理论命中率、MRC 等照常输出；mock 字节数模式下的 MRC 字节值基于占位字节数，不能用于实际容量规划。旧 Group 单 TTL 字段不再接受。
+
+KVCM 默认在启动时注册 optimizer 订阅服务；设置 `optimizer.enable=false` 则不注册 publisher 和订阅服务。开启但没有订阅者时直接跳过，不创建查询事件；存在订阅者时，在有效 GetHostCacheState 请求中将原始 block keys 和 trace_id 直接送入已有 optimizer 有界队列，时间为 KVCM 到达时间；不发同步 RPC、不等待分析结果，上报失败不改变查询返回。队列满或队列锁竞争时丢弃分析样本，不等待网络发送。最后一个订阅者离开后停止采集，旧订阅批次的排队事件不会发送给重新连接的订阅者。普通缓存读取不再重复进入该 optimizer publisher。没有 input length 时按完整 block 数乘注册 block size 计数，不额外读取 token。独立 Optimizer 仍通过原有 SubscribeEvents 接收事件。
+
+每个 KVCM 订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，唤醒对应 KVCM 的配置刷新；配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，直接调用 TraceQuery 的 timestamp_ns 为 0 时使用 Optimizer 接收时间。
+
+在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id`、`ttl` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+
+在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_{min,max,avg,p95,p99,p995,p999}_seconds`，单位为秒，标签为 `instance_group`、`instance_id`、`ttl`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。P95/P99/P99.5/P99.9 采用 nearest-rank（ceil(N×p)）口径，每份 TTL 回放使用固定 58 KiB 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
 
 当前仅 LiteHit full-attention 路径提供原生 reuse interval 统计；旧 linear indexer 不上报这些指标，也不再使用旧 hit-age 分桶作为兼容数据源。
+
+#### Prometheus / KMON 指标对应
+
+所有按 TTL 独立回放的指标（逐请求/周期/累计命中、MRC、reuse interval 和状态估计）均带 `ttl` tag，单位为秒；服务指标不带此 tag。大盘按不带 TTL 后缀的 `instance_id` 筛选，回放曲线按 `ttl` 分组并在图例中显示。PromQL 的聚合和向量匹配也需保留 `ttl`，避免把不同回放状态合并。升级后需同步移除大盘的 `-ttl-*s` 后缀筛选；不双写旧后缀指标，历史数据仍保留原标签。查询事件日志的 source 后缀不属于 metrics，本次保持不变。
+
+两种后端共用一次回放快照和一次窗口提取，不分别清空窗口。下表省略服务名前缀；Prometheus 会将指标名中的 `.` 转成 `_`，KMON 保留 `.`。KMON 的服务名前缀由环境变量 `kmonitorServiceName` 配置，不能直接照搬 Prometheus 前缀。
+
+| 口径 | Prometheus | KMON | 使用方式 |
+|---|---|---|---|
+| 请求吞吐 | `service.query_counter` counter | `service.qps` QPS | Prometheus 取 rate；KMON 已是请求/秒 |
+| 输入吞吐 | `service.input_tokens_total` counter | `service.input_tokens_qps` QPS | Prometheus rate × 60；KMON × 60，得到 TPM |
+| 错误吞吐 | `service.error_counter` counter | `service.error_qps` QPS | 同请求吞吐，不按 TTL 重复计数 |
+| 处理耗时 | `service.query_rt_us_sum` / `service.query_counter` 的增量比 | `service.query_rt_us` GAUGE 的请求样本均值 | 单位微秒；跨实例应按请求量加权，而不是平均各实例均值 |
+| 错误码 | `service.error_code` | `service.error_code` | 请求样本，不把错误码平均值当错误率 |
+| 逐请求分析 | `query_{hit_rate,hit_count,total_blocks,max_hit_count,max_hit_rate,capacity_efficiency}` | `query.{同名后缀}` | instance_id + ttl，容量相关项另带 capacity_gb |
+| 周期命中 | `interval.query_{hit_rate,max_hit_rate,capacity_efficiency}` | 同名 | 两边同一上报窗口，直接展示比例 |
+| 累计回放和状态 | `trace_query_*` | `trace.query_*` | 两边相同累计快照、token 命中率、内存/工作集/驱逐统计 |
+| 复用时间 | `trace_query_reuse_interval_*_seconds` | `trace.query_reuse_interval_*_seconds` | min/max/avg/P95/P99/P99.5/P99.9；空窗口不补零、不延用旧样本 |
+| MRC | `mrc` | `mrc` | 同一窗口、同一 target_hit_rate_percent、单位 byte |
+
+累计 token 快照包括 `trace_query_input_tokens_total`、`trace_query_max_hit_tokens_total` 和带 `capacity_gb` 的 `trace_query_hit_tokens_total`。只在 full-attention 回放上输出，后两项由命中完整 block 数乘 block size 得到；输入 token 数包含尾部不足一块的 token。理论分析关闭时不输出理论命中量；容量列表为空时不输出容量命中量。它们是随 ResetStats / 重建实例清零的 gauge，不是永久递增 counter。计算选定时间段的加权命中率需对每条序列分别处理重置、取得命中 token 与输入 token 增量，再分别求和相除，不能平均命中率样本，也不能将不同 TTL 的分母混加。KMON 对累计 gauge 的降采样也不等同于 Prometheus counter 的 rate，查询端必须按累计快照语义处理。
+
+不输出 Capacity Estimate / retrospective capacity history 指标；这不影响现有 MRC 和已配置容量下的命中率。
 
 ### Eviction Policies
 

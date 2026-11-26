@@ -112,6 +112,9 @@ message TairMemPoolStorageSpec {
     // GC 是否跳过已判定不存在的 URI 的后端删除；默认 false，仍发送 Delete/Free。
     bool skip_confirmed_missing_backend_delete = 7;
     int32 health_check_timeout = 8; // /v1/api/healthy 的单次 HTTP 超时，单位秒，默认1s。
+    // 单次 PACE CreateBatch 的分配并发上限；0/未提供自动使用可用 CPU 数的两倍。
+    // 显式正数范围1..64；自动值不受此上限限制。Registry JSON 采用相同语义。
+    int32 allocate_concurrency = 9;
 }
 
 message NfsStorageSpec {
@@ -204,11 +207,29 @@ enum InstanceReclaimBudgetPolicy {
 message QuotaConfig {
     StorageType storage_type = 1;
     int64 capacity = 2;
+    string mode = 3; // empty/fixed: legacy fixed bytes; auto: backend capacity * ratio
+    double ratio = 4; // required in auto mode: (0, 1]
 }
 
 message InstanceGroupQuota {
     int64 capacity = 1;
-    repeated QuotaConfig quota_config = 2; // TODO 该字段暂且没使用
+    repeated QuotaConfig quota_config = 2;
+}
+
+message StorageTypeQuotaStatus {
+    StorageType storage_type = 1;
+    string mode = 2;
+    double ratio = 3;
+    int64 effective_capacity = 4; // -1 before the first complete capacity sample
+    int64 backend_capacity = 5; // -1 when unknown/unsupported
+    bool refresh_success = 6;
+    int64 last_success_time_s = 7;
+}
+
+message GroupQuotaStatus {
+    bool total_bytes_limit_enabled = 1;
+    int64 reference_capacity = 2; // -1 when incomplete; display separately from quota.capacity
+    repeated StorageTypeQuotaStatus storage_types = 3;
 }
 
 message CacheReclaimStrategy {
@@ -241,6 +262,11 @@ enum MigrationMarkClearPolicy {
     MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
 }
 
+enum MigrationCopyExecutionMode {
+    MIGRATION_COPY_SYNC = 0;
+    MIGRATION_COPY_ASYNC_REQUIRED = 1;
+}
+
 // 执行方式配置（Config 后缀用于区分 MigrationMethod 请求枚举）。
 
 // Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
@@ -271,8 +297,19 @@ message MigrationStrategy {
 
 message MigrationConfig {
     repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
-    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级同步 Copy 并发上限
     MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
+    MigrationCopyExecutionMode copy_execution_mode = 4;
+    google.protobuf.UInt64Value copy_max_inflight_bytes = 5;
+    reserved 6, 7;
+    reserved "copy_max_quarantine_operations", "copy_max_quarantine_bytes";
+    google.protobuf.Int64Value copy_operation_deadline_ms = 8;
+    google.protobuf.Int64Value copy_poll_initial_interval_ms = 9;
+    google.protobuf.Int64Value copy_poll_max_interval_ms = 10;
+    google.protobuf.Int64Value copy_connect_timeout_ms = 11;
+    google.protobuf.Int64Value copy_submit_timeout_ms = 12;
+    google.protobuf.Int64Value copy_query_timeout_ms = 13;
+    google.protobuf.Int32Value async_copy_max_concurrency = 14; // instance group 级异步 Copy 并发上限
 }
 
 enum CachePreferStrategy {
@@ -296,6 +333,7 @@ message MetaStorageBackendConfig {
     google.protobuf.BoolValue force_deleting_async_enqueue = 4;
 }
 
+// Obsolete search-cache configuration; retained for protocol compatibility only.
 message MetaCachePolicyConfig {
     int64 capacity = 1;
     string type = 2;
@@ -308,6 +346,7 @@ message MetaIndexerConfig {
     int64 mutex_shard_num = 2;
     int64 batch_key_size = 3;
     MetaStorageBackendConfig meta_storage_backend_config = 4;
+    // Obsolete search-cache setting; ignored by the server.
     MetaCachePolicyConfig meta_cache_policy_config = 5;
     // google.protobuf.Int64Value as a wrapper for tracking presence of
     // scalar fields in older proto3 versions (v3.12.0, before which
@@ -340,6 +379,7 @@ message InstanceGroup {
     string extra_info = 9; // opaque JSON passed through to clients
     repeated string event_report_storage_candidates = 10; // backends that handle ReportEvent
     string revisit_interval_buckets = 11; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
+    GroupQuotaStatus runtime_quota = 12; // read-only observations; never persisted or used as configuration
 }
 
 message CreateInstanceGroupRequest {
@@ -390,6 +430,8 @@ message GetCacheMetaRequest {
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
     int32 detail_level = 6;   // 返回数据的详细级别,越大获取的信息越多,暂定为数字
+    // Opt in to checksum fields on returned locations.
+    bool include_checksums = 7;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -400,6 +442,8 @@ message GetCacheMetaRequest {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Opaque checksum of this spec's independently stored payload; empty means absent.
+    string checksum = 3;
 }
 
 message CacheLocation {
@@ -487,6 +531,7 @@ message InstanceInfo {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    bool disable_write_session = 9;
 }
 
 message RegisterInstanceRequest {
@@ -498,6 +543,7 @@ message RegisterInstanceRequest {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    oneof write_session_config { bool disable_write_session = 9; }
 }
 
 message RemoveInstanceRequest {
