@@ -5,9 +5,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
-#include <string_view>
 
-#include "autil/MemUtil.h"
 #include "autil/StringUtil.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 
@@ -20,16 +18,18 @@ constexpr int64_t kMaxSampleAgeMs = 1000;
 constexpr uint64_t kBodyMemoryMultiplier = 8;
 constexpr uint64_t kBytesPerKiB = 1024;
 
-bool ReadAvailableMemory(const char *meminfo_path, uint64_t &bytes) {
-    constexpr std::string_view kField = "MemAvailable:";
+bool ReadMemoryInfo(const char *meminfo_path, uint64_t &total_bytes, uint64_t &available_bytes) {
     std::ifstream input(meminfo_path);
+    bool found_total = false;
+    bool found_available = false;
     std::string line;
     while (std::getline(input, line)) {
-        if (line.compare(0, kField.size(), kField) != 0) {
+        std::istringstream fields(line);
+        std::string name;
+        if (!(fields >> name) || (name != "MemTotal:" && name != "MemAvailable:")) {
             continue;
         }
 
-        std::istringstream fields(line.substr(kField.size()));
         std::string number;
         std::string unit;
         std::string extra;
@@ -40,10 +40,15 @@ bool ReadAvailableMemory(const char *meminfo_path, uint64_t &bytes) {
             kib > std::numeric_limits<uint64_t>::max() / kBytesPerKiB) {
             return false;
         }
-        bytes = kib * kBytesPerKiB;
-        return true;
+        if (name == "MemTotal:") {
+            total_bytes = kib * kBytesPerKiB;
+            found_total = true;
+        } else {
+            available_bytes = kib * kBytesPerKiB;
+            found_available = true;
+        }
     }
-    return false;
+    return found_total && found_available;
 }
 
 } // namespace
@@ -55,15 +60,17 @@ ReportEventBodyBudget::ReportEventBodyBudget(size_t configured_bytes)
 
 void ReportEventBodyBudget::Refresh() {
     if (automatic_) {
-        RefreshFromMemInfo("/proc/meminfo", autil::MemUtil::getMachineTotalMem());
+        RefreshFromMemInfo("/proc/meminfo");
     }
 }
 
-void ReportEventBodyBudget::RefreshFromMemInfo(const char *meminfo_path, uint64_t total_bytes) {
+void ReportEventBodyBudget::RefreshFromMemInfo(const char *meminfo_path) {
     const int64_t now_ms = TimestampUtil::GetSteadyTimeMs();
+    uint64_t total_bytes = 0;
     uint64_t available_bytes = 0;
     size_t bytes = kMinAutoBytes;
-    if (total_bytes > 0 && ReadAvailableMemory(meminfo_path, available_bytes) && available_bytes <= total_bytes) {
+    if (ReadMemoryInfo(meminfo_path, total_bytes, available_bytes) && total_bytes > 0 &&
+        available_bytes <= total_bytes) {
         const uint64_t reserve = std::max(kMinReserveBytes, total_bytes / 100);
         const uint64_t headroom = available_bytes > reserve ? available_bytes - reserve : 0;
         bytes = std::clamp<uint64_t>(headroom / kBodyMemoryMultiplier, kMinAutoBytes, kMaxBytes);

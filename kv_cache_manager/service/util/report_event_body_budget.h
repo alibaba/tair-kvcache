@@ -23,7 +23,7 @@ public:
     uint64_t TakeRejected() { return rejected_.exchange(0, std::memory_order_relaxed); }
 
 private:
-    void RefreshFromMemInfo(const char *meminfo_path, uint64_t total_bytes);
+    void RefreshFromMemInfo(const char *meminfo_path);
 
     const bool automatic_;
     std::atomic<size_t> limit_;

@@ -29,7 +29,6 @@ cc_library(
     hdrs = ["report_event_body_budget.h"],
     deps = [
         "//kv_cache_manager/common:timestamp_util",
-        "@havenask//aios/autil:mem_util",
         "@havenask//aios/autil:string_helper",
     ],
 )
