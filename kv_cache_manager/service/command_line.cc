@@ -11,6 +11,7 @@
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/crash_handler.h"
 #include "kv_cache_manager/service/server.h"
+#include "kv_cache_manager/service/process_extension.h"
 #include "kv_cache_manager/service/server_config.h"
 namespace kv_cache_manager {
 
@@ -18,6 +19,10 @@ namespace kv_cache_manager {
 // Only notify here; the Run thread owns blocking shutdown and joins.
 static std::atomic<int> G_STOP_SIGNAL{0};
 static_assert(std::atomic<int>::is_always_lock_free);
+
+CommandLine::CommandLine() = default;
+CommandLine::CommandLine(std::unique_ptr<ProcessExtension> extension) : extension_(std::move(extension)) {}
+CommandLine::~CommandLine() = default;
 
 void CommandArgs::ParseCmdLine(int argc, char *const argv[]) {
     int opt;
@@ -126,28 +131,41 @@ int CommandLine::Run(int argc, const char *argv[]) {
 
     RegisterSignal();
 
-    server_.reset(new Server);
-    if (!server_->Init(config)) {
-        fprintf(stderr, "Server init failed.\n");
-        server_.reset();
-        LoggerBroker::DestroyLogger();
-        return -1;
+    int result = -1;
+    try {
+        if (!extension_) {
+            extension_ = CreateProcessExtension();
+        }
+        if (!extension_ || !extension_->Start({args.GetConfigFile(), args.GetEnviron()})) {
+            fprintf(stderr, "Process extension start failed.\n");
+        } else {
+            server_.reset(new Server);
+            if (!server_->Init(config)) {
+                fprintf(stderr, "Server init failed.\n");
+            } else if (!server_->Start()) {
+                fprintf(stderr, "Server start failed.\n");
+            } else {
+                WaitForTerminationSignal();
+                KVCM_LOG_INFO("received signal %d, stopping server", G_STOP_SIGNAL.load(std::memory_order_relaxed));
+                result = 0;
+            }
+        }
+    } catch (...) {
+        fprintf(stderr, "Process startup or service execution failed.\n");
     }
-    if (!server_->Start()) {
-        fprintf(stderr, "Server start failed.\n");
+    // Main's Run thread owns shutdown; the extension outlives every Server
+    // dependency, including election callbacks and partially started services.
+    if (server_) {
         server_->Stop();
         server_->Wait();
         server_.reset();
-        LoggerBroker::DestroyLogger();
-        return -1;
     }
-    WaitForTerminationSignal();
-    KVCM_LOG_INFO("received signal %d, stopping server", G_STOP_SIGNAL.load(std::memory_order_relaxed));
-    server_->Stop();
-    server_->Wait();
-    server_.reset();
+    if (extension_) {
+        extension_->Stop();
+        extension_.reset();
+    }
     LoggerBroker::DestroyLogger();
-    return 0;
+    return result;
 }
 
 bool CommandLine::StartDaemon() {

@@ -1,6 +1,16 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "ProcessExtensionTest",
+    srcs = ["process_extension_test.cc"],
+    deps = [
+        "//kv_cache_manager/service",
+        "//kv_cache_manager/service:process_extension",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "ServerRedisHealthMetricsTest",
     srcs = ["server_redis_health_metrics_test.cc"],
     copts = ["-fno-access-control"],

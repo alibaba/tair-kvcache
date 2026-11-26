@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
@@ -21,6 +22,7 @@ __/\\\________/\\\__/\\\________/\\\________/\\\\\\\\\__/\\\\____________/\\\\
 )D";
 
 class Server;
+class ProcessExtension;
 class CommandLine;
 
 class CommandArgs {
@@ -47,6 +49,9 @@ private:
 
 class CommandLine {
 public:
+    CommandLine();
+    explicit CommandLine(std::unique_ptr<ProcessExtension> extension);
+    ~CommandLine();
     int Run(int argc, const char *argv[]);
 
 private:
@@ -57,6 +62,7 @@ private:
     bool StartDaemon();
 
 private:
+    std::unique_ptr<ProcessExtension> extension_;
     std::shared_ptr<Server> server_;
 };
 

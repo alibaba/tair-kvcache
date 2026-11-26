@@ -42,6 +42,7 @@ class ReportEventBodyBudget;
 
 class Server {
 public:
+    ~Server();
     bool Init(const ServerConfig &config);
     bool Start();
     bool Wait();

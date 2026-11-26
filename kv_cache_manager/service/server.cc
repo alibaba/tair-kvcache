@@ -44,6 +44,16 @@
 
 namespace kv_cache_manager {
 
+Server::~Server() {
+    Stop();
+    Wait();
+    // Election callbacks capture this and use service/manager members. Join
+    // them while all those members are still alive, including on startup error.
+    if (leader_elector_) {
+        leader_elector_->Stop();
+    }
+}
+
 bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
 

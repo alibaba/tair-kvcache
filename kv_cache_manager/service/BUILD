@@ -1,5 +1,10 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "process_extension",
+    hdrs = ["process_extension.h"],
+)
+
 config_setting(
     name = "client_only_header",
     values = {"define": "CLIENT_ONLY_HEADER=true"},
@@ -23,6 +28,8 @@ cc_library(
     ],
     deps = [
         ":service_request_executor",
+        ":process_extension",
+        "//stub_source/kv_cache_manager/service:process_extension",
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",

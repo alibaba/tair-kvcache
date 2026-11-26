@@ -1,8 +1,10 @@
 #include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/event/optimizer_event_publisher.h"
@@ -30,6 +32,37 @@ void EnableOptimizerPublisher(Server *server) {
 } // namespace
 
 class ServerEventPublisherTest : public TESTBASE {};
+
+TEST_F(ServerEventPublisherTest, DestructionStopsElectionBeforeReleasingProcessDependencies) {
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    std::promise<void> release;
+    auto released = release.get_future();
+    auto server = std::make_unique<Server>();
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    ASSERT_TRUE(server->Init(config));
+    // A service may retain the elector. Server teardown must explicitly join
+    // its callbacks, rather than rely on the last shared_ptr being released.
+    auto elector = server->leader_elector_;
+    elector->SetBecomeLeaderHandler([&] {
+        entered.set_value();
+        released.wait();
+    });
+    elector->SetNoLongerLeaderHandler([] {});
+    ASSERT_TRUE(elector->Start());
+    if (entered_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        release.set_value();
+        FAIL() << "Election callback did not start";
+    }
+    auto destruction = std::async(std::launch::async, [server = std::move(server)]() mutable { server.reset(); });
+    EXPECT_EQ(destruction.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(destruction.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    destruction.get();
+    EXPECT_TRUE(elector->GetLeaderNodeID().empty());
+    elector->Stop();
+}
 
 TEST_F(ServerEventPublisherTest, TestOptimizerPublisherIsRegisteredByDefault) {
     Server server;
