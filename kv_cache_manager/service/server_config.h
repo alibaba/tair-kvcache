@@ -21,6 +21,7 @@ public:
     bool Check();
     const std::string &WorkerType() const { return worker_type_; }
     const std::string &ProxyCluster() const { return proxy_cluster_; }
+    uint32_t PartitionCount() const { return partition_count_; }
     uint32_t ProxyRouteVersion() const { return proxy_route_version_; }
     const std::string &ProxyControlAddress() const { return proxy_control_address_; }
     const std::string &ProxyDiscoveryUri() const { return proxy_discovery_uri_; }
@@ -121,6 +122,7 @@ private:
     std::string registry_storage_uri_;
     std::string worker_type_ = "kvcm";
     std::string proxy_cluster_;
+    uint32_t partition_count_ = 0;
     uint32_t proxy_route_version_ = 0;
     std::string proxy_control_address_;
     std::string proxy_discovery_uri_;

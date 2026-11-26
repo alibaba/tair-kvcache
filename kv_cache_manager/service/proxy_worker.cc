@@ -24,8 +24,8 @@ constexpr auto kReplicaLease = std::chrono::seconds(10);
 
 class ProxyControl final : public proto::proxy::ProxyControlService::Service {
 public:
-    ProxyControl(RoutingTable &routes, std::string cluster, uint64_t version)
-        : routes_(routes), cluster_(std::move(cluster)), version_(version) {}
+    ProxyControl(RoutingTable &routes, std::string cluster, uint64_t version, uint32_t columns)
+        : routes_(routes), cluster_(std::move(cluster)), version_(version), columns_(columns) {}
 
     grpc::Status ReportReplica(grpc::ServerContext *context,
                                const proto::proxy::ReplicaReport *report,
@@ -34,22 +34,18 @@ public:
         if (context->IsCancelled() || context->deadline() <= std::chrono::system_clock::now()) {
             return {grpc::StatusCode::DEADLINE_EXCEEDED, "registration expired"};
         }
-        if (target.cluster() != cluster_ || target.version() != version_) {
+        if (report->cluster() != cluster_ || report->version() != version_ || report->partition_count() != columns_) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "unexpected cluster or active route version"};
         }
-        const auto &owners = target.bucket_owners();
         if (report->process_id().empty() || report->grpc_endpoint().empty() || !report->sequence() ||
-            std::find(owners.begin(), owners.end(), target.partition()) == owners.end()) {
+            target.role_case() != proto::proxy::PartitionTarget::kPartition || target.partition() >= columns_) {
             return {grpc::StatusCode::INVALID_ARGUMENT, "invalid replica registration"};
-        }
-        if (!routes_.ApplyAssignment({target.version(), {owners.begin(), owners.end()}})) {
-            return {grpc::StatusCode::FAILED_PRECONDITION, "conflicting bucket assignment"};
         }
         const auto now = RoutingTable::Clock::now();
         routes_.Expire(now, kReplicaLease);
         if (!routes_.Report({target.partition(),
                              report->process_id(),
-                             target.version(),
+                             report->version(),
                              report->sequence(),
                              report->grpc_endpoint(),
                              report->serving_leader()},
@@ -63,12 +59,13 @@ private:
     RoutingTable &routes_;
     const std::string cluster_;
     const uint64_t version_;
+    const uint32_t columns_;
 };
 } // namespace
 
 struct ProxyWorker::Runtime {
     ServerConfig config;
-    RoutingTable routes{std::make_shared<InstanceBucketPolicy>()};
+    RoutingTable routes{std::make_shared<HashBucketPolicy>()};
     std::shared_ptr<MetricsRegistry> metrics = std::make_shared<MetricsRegistry>();
     std::shared_ptr<MetricsReporter> reporter;
     std::shared_ptr<ServiceRequestExecutor> executor = std::make_shared<ServiceRequestExecutor>();
@@ -95,6 +92,10 @@ bool ProxyWorker::Init(const ServerConfig &config) {
         KVCM_LOG_ERROR("proxy requires cluster, route_version, control_address and distinct public RPC/HTTP ports");
         return false;
     }
+    if (!r.routes.Configure(config.ProxyRouteVersion(), config.PartitionCount())) {
+        KVCM_LOG_ERROR("proxy requires a positive partition_count");
+        return false;
+    }
     proto::meta::MetaNodeEndpoint self;
     MetricsReporterFactory factory;
     factory.Init(nullptr, r.metrics);
@@ -109,7 +110,8 @@ bool ProxyWorker::Init(const ServerConfig &config) {
     self.set_node_id(self.host() + ":" + std::to_string(self.meta_rpc_port()));
     r.forwarder =
         std::make_shared<MetaForwarder>(r.routes, self, kReplicaLease, config.GetServiceWorkerQueueCapacity());
-    r.control = std::make_unique<ProxyControl>(r.routes, config.ProxyCluster(), config.ProxyRouteVersion());
+    r.control = std::make_unique<ProxyControl>(
+        r.routes, config.ProxyCluster(), config.ProxyRouteVersion(), config.PartitionCount());
     r.grpc_meta = std::make_unique<MetaServiceGRpc>(r.metrics, nullptr, nullptr, r.executor);
     r.grpc_meta->SetForwarder(r.forwarder);
     const auto configured_budget = config.GetHttpReportEventBodyBudgetBytes();

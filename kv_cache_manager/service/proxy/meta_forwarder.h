@@ -91,8 +91,11 @@ private:
     template <typename Response>
     struct Call;
     template <typename Request, typename Response, typename Start>
+    void Send(const Request &request, Response &response, Deadline deadline, Done done, Start start);
+
+    template <typename Request, typename Response, typename Start>
     void
-    Send(const char *method, const Request &request, Response &response, Deadline deadline, Done done, Start start);
+    SendOne(const Route &route, const Request &request, Response &response, Deadline deadline, Done done, Start start);
 
     RoutingTable &routes_;
     const proto::meta::MetaNodeEndpoint self_;

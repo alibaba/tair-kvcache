@@ -5,10 +5,8 @@ package kv_cache_manager.proto.proxy;
 // The controller gives all replicas of a partition the same activated target.
 // PartitionId is a logical identity, independent of a process or address.
 message PartitionTarget {
-    string cluster = 1;
-    uint32 version = 2;
-    repeated uint32 bucket_owners = 3;
-    uint32 partition = 4;
+    reserved 1, 2, 3;
+    oneof role { uint32 partition = 4; } // distinguishes an explicit role zero from an empty target
 }
 
 message ReplicaReport {
@@ -17,6 +15,9 @@ message ReplicaReport {
     uint64 sequence = 3;
     string grpc_endpoint = 4;
     bool serving_leader = 5;
+    string cluster = 6;
+    uint32 version = 7;
+    uint32 partition_count = 8;
 }
 
 message ReportAck {}

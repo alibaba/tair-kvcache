@@ -292,7 +292,7 @@ private:
                 const grpc::Status *reason = nullptr;
                 try {
                     const auto &guard = owner_->service_->route_guard_;
-                    if (guard && !guard(call->context, call->request.instance_id())) {
+                    if (guard && !guard(call->context, MetaRoute(call->request))) {
                         call->response.mutable_header()->set_request_id(context->request_id());
                         auto *status = call->response.mutable_header()->mutable_status();
                         status->set_code(proto::meta::SERVICE_NOT_READY);

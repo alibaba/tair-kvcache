@@ -39,7 +39,7 @@ KVCache Manager 采用中心化元数据管理 + 去中心化数据搬运：KVCM
 ### 服务端核心（自上而下的调用链）
 
 服务进程支持两种 Worker。默认的 KVCM Worker 装配 CacheManager 和选主，ProxyWorker 复用 Meta 的
-HTTP/gRPC 接入层，使用 `routing/` 按 Bucket 选择 Partition 和可服务的 Replica。
+HTTP/gRPC 接入层，使用 `routing/` 按业务键选列、广播所有列、固定 role 0 或随机选择就绪列；每列只向 Leader 转发。
 部署示例、角色目标和扩展入口见[分区代理](partition_proxy.md)。
 
 | 模块 | 目录 | 职责 |

@@ -7,6 +7,7 @@
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
+#include "kv_cache_manager/service/proxy/meta_route.h"
 
 namespace kv_cache_manager {
 
@@ -30,7 +31,7 @@ public:
 
     void Init();
     void SetForwarder(std::shared_ptr<MetaForwarder> forwarder) { forwarder_ = std::move(forwarder); }
-    using RouteGuard = std::function<bool(const grpc::ServerContext &, const std::string &)>;
+    using RouteGuard = std::function<bool(const grpc::ServerContext &, const RouteKey &)>;
     void SetRouteGuard(RouteGuard guard) { route_guard_ = std::move(guard); }
     // Prepare before BuildAndStart; post application requests only after it succeeds.
     bool PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count = 1);

@@ -14,12 +14,25 @@
 #include "kv_cache_manager/routing/routing_table.h"
 
 namespace kv_cache_manager {
-bool PartitionReporter::OwnsInstance(std::string_view instance) const {
-    const auto bucket = InstanceBucketPolicy().GetBucket({{}, instance}, target_.bucket_owners_size());
-    return bucket && target_.bucket_owners(*bucket) == target_.partition();
+bool PartitionReporter::Accepts(const RouteKey &route) const {
+    if (route.placement == Placement::RoleZero) {
+        return target_.partition() == 0;
+    }
+    if (route.placement != Placement::Hash) {
+        return true;
+    }
+    auto bucket = HashBucketPolicy().GetBucket(route.key, columns_);
+    return bucket && (*bucket == target_.partition() || (route.global_event && target_.partition() == 0));
 }
 
-bool PartitionReporter::Init(const std::string &target_file, const std::string &discovery_uri) {
+bool PartitionReporter::Init(const std::string &target_file,
+                             const std::string &discovery_uri,
+                             std::string cluster,
+                             uint32_t version,
+                             uint32_t columns) {
+    cluster_ = std::move(cluster);
+    version_ = version;
+    columns_ = columns;
     std::ifstream stream(target_file);
     if (!stream) {
         KVCM_LOG_ERROR("cannot open partition target %s", target_file.c_str());
@@ -27,9 +40,8 @@ bool PartitionReporter::Init(const std::string &target_file, const std::string &
     }
     const std::string json{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
     auto status = google::protobuf::util::JsonStringToMessage(json, &target_);
-    if (!status.ok() || target_.cluster().empty() || target_.version() == 0 ||
-        std::find(target_.bucket_owners().begin(), target_.bucket_owners().end(), target_.partition()) ==
-            target_.bucket_owners().end()) {
+    if (!status.ok() || cluster_.empty() || !version_ ||
+        target_.role_case() != proto::proxy::PartitionTarget::kPartition || target_.partition() >= columns_) {
         KVCM_LOG_ERROR("invalid partition target %s", target_file.c_str());
         return false;
     }
@@ -43,6 +55,9 @@ void PartitionReporter::Start(std::string endpoint, std::function<bool()> servin
         std::unordered_map<std::string, std::shared_ptr<Stub>> stubs;
         proto::proxy::ReplicaReport report;
         *report.mutable_target() = target_;
+        report.set_cluster(cluster_);
+        report.set_version(version_);
+        report.set_partition_count(columns_);
         report.set_process_id(StringUtil::GenerateRandomString(32));
         report.set_grpc_endpoint(endpoint);
         for (;;) {

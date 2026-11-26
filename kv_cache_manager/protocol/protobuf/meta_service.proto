@@ -337,6 +337,11 @@ enum QueryType {
 }
 
 message GetCacheLocationRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     QueryType query_type = 3;
@@ -367,6 +372,11 @@ message BackendLocationSelector {
 }
 
 message GetCacheLocationsByBackendRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     QueryType query_type = 3;              // 当前仅支持 QT_BATCH_GET
@@ -385,6 +395,11 @@ message GetCacheLocationsByBackendResponse {
 }
 
 message GetCacheLocationLenRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     QueryType query_type = 3;
@@ -404,6 +419,11 @@ message GetCacheLocationLenResponse {
 }
 
 message GetCacheMetaRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     repeated int64 block_keys = 3;
@@ -431,6 +451,11 @@ message StorageReplicaRequirement {
 
 // 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
 message StartWriteCacheRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     repeated int64 block_keys = 3;
@@ -470,6 +495,11 @@ message LocationSpecChecksumBatch {
 // 服务端会视为写入失败并将本次Request所有meta清除. 客户端调用完这个接口后,
 // 服务端还会对所有 blockKeys 进行检查
 message FinishWriteCacheRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     string write_session_id = 3;
@@ -486,6 +516,11 @@ message FinishWriteCacheRequest {
 
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况
 message RemoveCacheRequest {
+    // Proxy placement. Independent of the instance namespace and of write_session_id.
+    oneof routing_key {
+        string session_id = 30;
+        string emb_key = 31;
+    }
     string trace_id = 1;
     string instance_id = 2;
     repeated int64 block_keys = 3;

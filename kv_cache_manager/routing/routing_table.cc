@@ -3,17 +3,18 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 
 #include "kv_cache_manager/common/hash/hash.h"
 
 namespace kv_cache_manager {
 
-std::optional<BucketId> InstanceBucketPolicy::GetBucket(RouteKey key, uint32_t bucket_count) const {
-    if (key.instance_id.empty() || bucket_count == 0) {
+std::optional<BucketId> HashBucketPolicy::GetBucket(std::string_view key, uint32_t bucket_count) const {
+    if (key.empty() || bucket_count == 0) {
         return std::nullopt;
     }
-    return Hash64(key.instance_id.data(), key.instance_id.size(), 0) % bucket_count;
+    return Hash64(key.data(), key.size(), 0) % bucket_count;
 }
 
 RoutingTable::RoutingTable(std::shared_ptr<const BucketPolicy> policy) : policy_(std::move(policy)) {
@@ -22,24 +23,20 @@ RoutingTable::RoutingTable(std::shared_ptr<const BucketPolicy> policy) : policy_
     }
 }
 
-bool RoutingTable::ApplyAssignment(BucketAssignment assignment) {
-    if (assignment.version == 0 || assignment.owners.empty() ||
-        assignment.owners.size() > std::numeric_limits<BucketId>::max()) {
+bool RoutingTable::Configure(uint64_t version, uint32_t columns) {
+    if (!version || !columns) {
         return false;
     }
     std::unique_lock lock(mutex_);
-    if (assignment.version == assignment_.version) {
-        return assignment.owners == assignment_.owners;
+    if (version == version_) {
+        return columns == columns_;
     }
-    if (assignment.version < assignment_.version ||
-        (!assignment_.owners.empty() && assignment.owners.size() != assignment_.owners.size())) {
+    if (version < version_) {
         return false;
     }
-    assignment_ = std::move(assignment);
-    replicas_.clear(); // each new target requires a fresh readiness report
-    for (const auto partition : assignment_.owners) {
-        replicas_.try_emplace(partition);
-    }
+    version_ = version;
+    columns_ = columns;
+    replicas_.clear();
     return true;
 }
 
@@ -48,11 +45,10 @@ bool RoutingTable::Report(ReplicaReport report, Clock::time_point now) {
         return false;
     }
     std::unique_lock lock(mutex_);
-    const auto partition = replicas_.find(report.partition);
-    if (partition == replicas_.end() || report.version != assignment_.version) {
+    if (report.partition >= columns_ || report.version != version_) {
         return false;
     }
-    auto &entries = partition->second;
+    auto &entries = replicas_[report.partition];
     const auto current = entries.find(report.process_id);
     if (current != entries.end() && report.sequence <= current->second.report.sequence) {
         return false;
@@ -62,15 +58,49 @@ bool RoutingTable::Report(ReplicaReport report, Clock::time_point now) {
     return true;
 }
 
-std::optional<Route> RoutingTable::Resolve(RouteKey key, Clock::time_point now, Clock::duration lease) const {
+std::vector<Route> RoutingTable::Resolve(const RouteKey &key, Clock::time_point now, Clock::duration lease) const {
     std::shared_lock lock(mutex_);
-    const auto bucket = policy_->GetBucket(key, static_cast<uint32_t>(assignment_.owners.size()));
-    if (!bucket || *bucket >= assignment_.owners.size()) {
+    std::vector<Route> routes;
+    if (key.placement == Placement::Hash || key.placement == Placement::RoleZero) {
+        PartitionId partition = 0;
+        if (key.placement == Placement::Hash) {
+            auto bucket = policy_->GetBucket(key.key, columns_);
+            if (!bucket || *bucket >= columns_) {
+                return {};
+            }
+            partition = *bucket;
+        }
+        if (auto route = Leader(partition, now, lease)) {
+            routes.push_back(std::move(*route));
+        }
+        return routes;
+    }
+    if (key.placement == Placement::All && replicas_.size() != columns_) {
+        return {};
+    }
+    for (const auto &partition : replicas_) {
+        auto route = Leader(partition.first, now, lease);
+        if (route) {
+            routes.push_back(std::move(*route));
+        } else if (key.placement == Placement::All) {
+            return {}; // A missing member cannot turn a broadcast into a successful partial write.
+        }
+    }
+    if (key.placement == Placement::RandomReady && !routes.empty()) {
+        thread_local std::mt19937 random(std::random_device{}());
+        return {routes[std::uniform_int_distribution<size_t>(0, routes.size() - 1)(random)]};
+    }
+    std::sort(routes.begin(), routes.end(), [](const Route &a, const Route &b) { return a.partition < b.partition; });
+    return routes;
+}
+
+std::optional<Route> RoutingTable::Leader(PartitionId partition, Clock::time_point now, Clock::duration lease) const {
+    const auto part = replicas_.find(partition);
+    if (part == replicas_.end()) {
         return std::nullopt;
     }
-    const auto partition = assignment_.owners[*bucket];
     const Entry *leader = nullptr;
-    for (const auto &item : replicas_.at(partition)) {
+    for (const auto &item : part->second) {
         const auto &entry = item.second;
         if (entry.report.serving_leader && now - entry.received < lease) {
             if (leader) {
@@ -82,7 +112,7 @@ std::optional<Route> RoutingTable::Resolve(RouteKey key, Clock::time_point now, 
     if (!leader) {
         return std::nullopt;
     }
-    return Route{assignment_.version, *bucket, partition, leader->report.endpoint};
+    return Route{version_, partition, leader->report.endpoint};
 }
 
 void RoutingTable::Expire(Clock::time_point now, Clock::duration lease) {

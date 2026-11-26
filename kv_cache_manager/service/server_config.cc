@@ -67,6 +67,9 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->proxy_cluster_ = value;
          return true;
      }},
+    {"kvcm.proxy.partition_count", [](const std::string &value, ServerConfig *config) {
+         return ParseUint32Setting(value, config->partition_count_) && config->partition_count_ > 0;
+     }},
     {"kvcm.proxy.route_version", [](const std::string &value, ServerConfig *config) {
          return ParseUint32Setting(value, config->proxy_route_version_) && config->proxy_route_version_ > 0;
      }},

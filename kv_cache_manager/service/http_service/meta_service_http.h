@@ -8,6 +8,7 @@
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
+#include "kv_cache_manager/service/proxy/meta_route.h"
 
 namespace kv_cache_manager {
 
@@ -30,7 +31,7 @@ public:
 
     void Init() override;
     void SetForwarder(std::shared_ptr<MetaForwarder> forwarder) { forwarder_ = std::move(forwarder); }
-    void SetPartitionChecker(std::function<bool(std::string_view)> checker) { owns_instance_ = std::move(checker); }
+    void SetPartitionChecker(std::function<bool(const RouteKey &)> checker) { accepts_route_ = std::move(checker); }
     void RegisterHandler() override;
 
     async_simple::coro::Lazy<HttpDispatchResult> RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -95,7 +96,7 @@ private:
 
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
     std::shared_ptr<MetaForwarder> forwarder_;
-    std::function<bool(std::string_view)> owns_instance_;
+    std::function<bool(const RouteKey &)> accepts_route_;
     std::shared_ptr<ServiceRequestExecutor> executor_;
     std::shared_ptr<ReportEventBodyBudget> report_event_body_budget_;
     std::function<void()> report_body_budget_rejection_;

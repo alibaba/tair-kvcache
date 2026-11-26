@@ -63,7 +63,11 @@ bool Server::Init(const ServerConfig &config) {
 
     if (!config.PartitionTargetFile().empty() || !config.ProxyDiscoveryUri().empty()) {
         partition_reporter_ = std::make_shared<PartitionReporter>();
-        if (!partition_reporter_->Init(config.PartitionTargetFile(), config.ProxyDiscoveryUri())) {
+        if (!partition_reporter_->Init(config.PartitionTargetFile(),
+                                       config.ProxyDiscoveryUri(),
+                                       config.ProxyCluster(),
+                                       config.ProxyRouteVersion(),
+                                       config.PartitionCount())) {
             KVCM_LOG_ERROR("partitioned KVCM requires a valid target and proxy discovery URI");
             return false;
         }
@@ -342,7 +346,8 @@ bool Server::StartRpcServer() {
         metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
     if (partition_reporter_) {
         meta_service_->SetRouteGuard(
-            [reporter = partition_reporter_](const grpc::ServerContext &context, const std::string &instance) {
+            [reporter = partition_reporter_, version = config_.ProxyRouteVersion()](const grpc::ServerContext &context,
+                                                                                    const RouteKey &route) {
                 const auto &target = reporter->target();
                 const auto &metadata = context.client_metadata();
                 auto matches = [&](const char *name, uint64_t value) {
@@ -350,7 +355,7 @@ bool Server::StartRpcServer() {
                     return it != metadata.end() &&
                            std::string_view(it->second.data(), it->second.size()) == std::to_string(value);
                 };
-                return reporter->OwnsInstance(instance) && matches("kvcm-route-version", target.version()) &&
+                return reporter->Accepts(route) && matches("kvcm-route-version", version) &&
                        matches("kvcm-partition", target.partition());
             });
     }
@@ -462,7 +467,7 @@ bool Server::StartHttpServer() {
 
     if (partition_reporter_) {
         meta_http_service_->SetPartitionChecker(
-            [reporter = partition_reporter_](std::string_view instance) { return reporter->OwnsInstance(instance); });
+            [reporter = partition_reporter_](const RouteKey &route) { return reporter->Accepts(route); });
     }
     meta_http_service_->Init();
     admin_http_service_->Init();
@@ -602,7 +607,7 @@ bool Server::CreateLeaderElector() {
     auto lock_key = kLeaderLockKey;
     if (partition_reporter_) {
         const auto &target = partition_reporter_->target();
-        const auto scope = target.cluster() + "/" + std::to_string(target.partition());
+        const auto scope = config_.ProxyCluster() + "/" + std::to_string(target.partition());
         lock_key += "/" + scope;
         node_id = scope + "/" + node_id;
     }

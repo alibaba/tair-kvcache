@@ -1,81 +1,78 @@
-# KVCM 分区代理
+# KVCM 分区 Proxy
 
-Client 从服务发现获取 Proxy 地址。Proxy 接收现有 MetaService HTTP 和 gRPC 请求，经分区内的 Leader
-执行元数据操作。CacheLocation 和写会话仍由 KVCM 分配，客户端继续直连存储传输数据。
+Client 从 VipServer 发现 Proxy。Proxy 用 HTTP/gRPC 接收 MetaService 请求，使用内部 gRPC 连接 KVCM；Client 拿到 CacheLocation 后直接访问存储。Proxy 可以独立部署，也可以和 KVCM 在一个容器内以两个进程运行。
 
-## 模块和接口
+## 按操作选择路由
 
-| 代码 | 职责 |
+Bucket 的输入只有业务路由键。默认策略按 `Hash64(key, seed=0) % partition_count` 选列，列号从 0 开始。`instance_id` 保留实例命名空间，`instance_group` 选择实例组配置；两者都不参与哈希。不同实例使用相同业务键会选到同一列，各实例的数据仍按命名空间隔离。
+
+| 操作 | 目标与结果 |
 | --- | --- |
-| `service/worker.h`、`command_line.cc` | 按 `kvcm.service.worker_type` 选择进程角色。默认值 `kvcm` 启动原有 Server |
-| `service/proxy_worker.cc` | 装配 Proxy 的公共 Meta 监听、内部注册监听、请求执行器、路由和转发器 |
-| `routing/routing_table.h` | `BucketPolicy::GetBucket` 提取逻辑桶。`ApplyAssignment` 校验版本和完整分配，`Report` 接收 Replica 状态，`Resolve` 返回唯一的有效 Leader |
-| `protocol/protobuf/proxy_control_service.proto`、`service/proxy/partition_reporter.cc` | 接收管控生成的 PartitionTarget。KVCM 发现所有 Proxy 注册端口，向每个端点独立上报目标、进程标识和就绪状态 |
-| `service/proxy/meta_forwarder.cc` | HTTP/gRPC 共用按类型定义的异步 Meta 转发。下游 gRPC 完成时释放入口请求。GetClusterInfo 在 Proxy 上返回自身对外地址 |
+| 创建 instance（RegisterInstance） | 广播到本 Proxy 管理的每一列，每列仅发给唯一就绪的 Leader。全部成功后合并客户端存储配置 |
+| 节点注册、心跳、下线 | role 0 处理全局生命周期。若上报 IP 的属列不同，role 0 成功后，原始批次交给该属列，以维护该列现有的 reporter 登记、快照及生命周期检查 |
+| EventReport 写入 | 从请求的 `host_ip_port` 提取并规范化 IP 后选列。同 IP 不同端口同列；保留完整端点标识不同 reporter。完整快照只在属列生效 |
+| EventReport 查询 | `GetHostCacheState` 查询所有分区，按完整 reporter 端点合并 local 命中。跨列 Top-K 联合远端前缀仍需逐块证据，目前显式返回 UNSUPPORTED |
+| 普通 KVCache | 查询、Start、Finish、按 key 删除携带同一业务 `session_id`。Start 返回的 `write_session_id` 仍标识后端写会话。缺少业务键返回 INVALID_ARGUMENT |
+| EmbCache | `RouteKey::Embedding(emb_key)` 按对象键固定选列。MetaService 的按键操作也可携带 `emb_key`。独立 KVMeta 入口、跨列批写和子会话归并由接入方实现 |
+| 独立 PACE allocate | `RouteKey::PaceAllocate()` 从有唯一就绪 Leader 的列中随机选一列。供独立 allocate 入口使用；普通 KVCache 写入仍按 session 选列 |
+| 其他元数据操作 | GetInstanceInfo 去 role 0，实例级 TrimCache 广播，GetClusterInfo 由 Proxy 返回自身公共地址 |
 
-当前策略使用 `Hash64(instance_id, seed=0) % bucket_count`。相同实例的 Register、Query、Start、
-Finish 和 ReportEvent 落在同一 Partition。一次请求只选择一个后端。每个 Proxy 独立维护内存路由表，
-重启后靠后端重新上报恢复。每个进程启动时生成新的注册标识，心跳使用递增序号。两个有效进程同时
-宣告同一 Partition 的 Leader 时，该分区暂时返回 `SERVICE_NOT_READY`。其余分区继续服务。
+广播先检查公共配置中的全部列。某列缺少唯一就绪 Leader 时返回 SERVICE_NOT_READY。子请求发出后若部分失败，调用方收到失败，已成功创建的实例会保留；可对相同配置重试。各列返回的存储配置按 `global_unique_name` 合并，同名配置或组的 `extra_info` 冲突会报错。
 
-## 配置示例
+## 管控如何指定列号
 
-对外的服务发现只发布 Proxy。KVCM 另行发现 Proxy 的内部注册端口，该端口应位于受信任的服务网络中。
-注册端点需要能在公共入口放量前被发现。以下是单机联调的两个进程配置片段。
+每个 KVCM 的角色目标只有一个字段，例如 `{"partition": 1}`。同一列的所有 Replica 收到相同目标。集群名、版本和总列数是 Proxy 与 KVCM 一致使用的公共部署配置。管控无需计算或下发 bucket owner 表。
+
+| 信息 | 来源 | 使用方 |
+| --- | --- | --- |
+| 当前列号 | 每个 KVCM 的角色目标 | KVCM 校验列号、隔离选主键、向所有 Proxy 上报 |
+| cluster、route_version、partition_count | 公共部署配置 | Proxy 预先知道完整列集合；集群、版本或列数不一致的上报被拒绝 |
+| Replica 的地址、就绪状态、心跳序号 | 各 KVCM 主动上报 | Proxy 为每列挑选唯一有效 Leader。每轮结束后等待 2 秒，注册 RPC 截止时间 1 秒，租约 10 秒 |
+| 业务键的归属 | Proxy 和后端执行同一哈希规则 | 后端校验转发的版本、目标列与业务键。调整列数会改变映射，需要数据交接、写会话排空并切换版本 |
+
+## 配置与部署
+
+公共配置示例，两个 Worker 均需配置。
 
 ```ini
-# Proxy
+kvcm.proxy.cluster=example
+kvcm.proxy.route_version=2
+kvcm.proxy.partition_count=2
+```
+
+Proxy 进程：
+
+```ini
 kvcm.service.worker_type=proxy
 kvcm.service.advertised_host=127.0.0.1
 kvcm.service.rpc_port=9100
 kvcm.service.http_port=9101
 kvcm.proxy.control_address=127.0.0.1:9102
-kvcm.proxy.cluster=example
-kvcm.proxy.route_version=1
 ```
 
+KVCM 进程：
+
 ```ini
-# KVCM，为每个 Partition 配置独立的 registry 和 metadata 范围
 kvcm.service.worker_type=kvcm
 kvcm.service.advertised_host=127.0.0.1
 kvcm.service.rpc_port=9200
 kvcm.service.http_port=9201
 kvcm.service.admin_rpc_port=9202
 kvcm.service.admin_http_port=9203
-kvcm.partition.target_file=/path/to/partition-0.json
+kvcm.partition.target_file=/path/to/partition-1.json
 kvcm.proxy.discovery_uri=static://127.0.0.1:9102
 ```
 
-管控给同一 Partition 的所有 Replica 下发相同的文件。下面的目标把桶 0、2 分给 Partition 0，
-桶 1、3 分给 Partition 1。Partition 1 的文件只需把 `partition` 改为 1。每个 Replica 使用自己可直连的
-地址。多 Proxy 联调时，`static://` 可列出逗号分隔的多个控制端点；部署环境也可以使用已实现的
-ServiceDiscovery 提供方。独立容器与同容器使用相同的注册与转发路径。
+以上地址用于单机联调。部署侧发布 Proxy 的公共端点，KVCM 通过受信任网络发现所有 Proxy 的内部注册端点。每列的 Registry、索引、GC 与配额需要按部署隔离，同一列的 Replica 则需共享协调后端及可恢复的元数据。
 
-```json
-{"cluster":"example","version":1,"partition":0,"bucketOwners":[0,1,0,1]}
-```
+## 代码入口
 
-## 故障与版本
+| 模块 | 职责 |
+| --- | --- |
+| `service/worker.h`、`service/proxy_worker.cc` | 装配两种 Worker，建立公共协议入口与内部注册监听 |
+| `service/proxy/meta_route.h`、`meta_route.cc` | 从具体请求提取操作与业务键，HTTP 与 gRPC 共用 |
+| `routing/routing_table.h` | 解析哈希、全列广播、role 0 或随机单选；从版本与租约快照取得目标 |
+| `service/proxy/meta_forwarder.cc` | 异步转发、等待广播子请求、聚合响应，处理 role 0 与属列之间的生命周期操作 |
+| `service/proxy/partition_reporter.cc` | 读取列号、上报就绪状态并校验请求归属 |
 
-- 同一 Partition 的 Replica 共享支持选主的协调后端及可恢复的 Registry/元数据。选主键按集群和
-  Partition 隔离。后端在完成恢复并打开业务门禁后才上报可服务状态。进程内协调适合单 Replica。
-- Proxy 从配置获得生效版本，只接受这个版本的注册。热路径按同一份分配计算 Bucket。后端校验
-  转发请求的版本和归属。首版在启动时加载目标。跨 Partition 移交所有权需要先摘流、排空写会话、
-  停止旧持有者、完成数据交接，再启用新目标。心跳只更新可达性和就绪状态。
-- 更换 Proxy 可以继续原写会话。后端进程故障可能丢失未完成会话，Proxy 不自动重放结果未知的写入。
-  一个后端失联会在租约过期前返回下游错误，过期后返回该分区未就绪。
-- Admin、Debug、Optimizer 订阅仍由 KVCM 的内部入口提供。各 Partition 的 Registry、索引、GC 和配额
-  应按部署隔离。同一资源池上的跨 Partition 配额、在线迁桶和全局 Admin 聚合留给后续实现。
-
-## 后续开发与回归
-
-- **管控对接**。将 PartitionTarget 的文件交付接入部署系统，发布 Proxy 公共端点和内部注册端点。
-  在线更新需要同时处理旧 owner 摘流、数据恢复和版本激活。
-- **策略扩展**。若要拆分一个热门实例，先定义跨桶前缀查询、写会话和完整事件快照的语义，再实现
-  对应 BucketPolicy 和后端归属校验。
-- **运行验证**。`//kv_cache_manager/routing:RoutingTableTest` 检查版本、冲突和过期。
-  `//integration_test/proxy:partition_proxy_test` 启动真实进程，检查分区归属、跨 Proxy 完成写入、
-  后端故障与同目标 Replica 接管。`//integration_test/service_dispatch:service_dispatch_smoke`
-  覆盖默认 KVCM 的 HTTP/gRPC 入口。
-- **容量验证**。HTTP 请求在 Proxy 解析后通过 gRPC 转发。上线前需要按实际最大 ReportEvent 快照
-  和查询响应验证下游消息大小限制、在途内存以及两跳延迟。
+切换 Proxy 后，Client 用相同的业务键和写会话 ID 可以继续向原 Leader 提交。KVCM 进程失效后，未提交的写会话可能丢失；Proxy 不自动重放结果未知的写入。

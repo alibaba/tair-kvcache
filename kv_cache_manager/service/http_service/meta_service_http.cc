@@ -191,7 +191,7 @@ ForwardHttpRequest(MetaForwarder &forwarder, ServiceRequestExecutor &executor, R
 template <typename Request, typename Response, typename Callback>
 async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult> MetaServiceHttp::DispatchRequest(
     coro_http::coro_http_connection *http_conn, Request *request, Response *response, Callback prepare_and_run) {
-    if (owns_instance_ && !owns_instance_(request->instance_id())) {
+    if (accepts_route_ && !accepts_route_(MetaRoute(*request))) {
         auto *status = InitProxyStatus(request->trace_id(), response->mutable_header());
         status->set_code(proto::meta::SERVICE_NOT_READY);
         status->set_message("request is outside this partition");
