@@ -19,6 +19,12 @@ private:
 public:
     bool Parse(const std::string &config_file, const EnvironMap &environ);
     bool Check();
+    const std::string &WorkerType() const { return worker_type_; }
+    const std::string &ProxyCluster() const { return proxy_cluster_; }
+    uint32_t ProxyRouteVersion() const { return proxy_route_version_; }
+    const std::string &ProxyControlAddress() const { return proxy_control_address_; }
+    const std::string &ProxyDiscoveryUri() const { return proxy_discovery_uri_; }
+    const std::string &PartitionTargetFile() const { return partition_target_file_; }
 
 public:
     const std::string &GetRegistryStorageUri() const { return registry_storage_uri_; }
@@ -113,6 +119,12 @@ private:
 
 private:
     std::string registry_storage_uri_;
+    std::string worker_type_ = "kvcm";
+    std::string proxy_cluster_;
+    uint32_t proxy_route_version_ = 0;
+    std::string proxy_control_address_;
+    std::string proxy_discovery_uri_;
+    std::string partition_target_file_;
     std::string coordination_uri_;
     std::string leader_elector_node_id_;
     int64_t leader_elector_lease_ms_ = 0;

@@ -20,6 +20,7 @@ public:
     void DisableLeaderOnlyRequests();
     void EnableLeaderOnlyRequests();
     void WaitForAllLeaderOnlyRequestsToComplete();
+    bool AcceptingLeaderRequests() const { return is_accepting_leader_only_requests_.load(); }
 
 protected:
     bool CheckAndIncrementRequestCount(bool is_leader_only);

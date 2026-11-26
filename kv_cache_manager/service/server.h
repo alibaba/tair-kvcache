@@ -9,6 +9,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/service/server_config.h"
 #include "kv_cache_manager/service/service_request_executor.h"
+#include "kv_cache_manager/service/worker.h"
 
 namespace grpc {
 class Server;
@@ -40,12 +41,15 @@ struct MetricsLifecycle;
 class LoopThread;
 class ReportEventBodyBudget;
 
-class Server {
+class PartitionReporter;
+
+// The existing KVCM worker owns the metadata and storage services.
+class Server : public Worker {
 public:
-    bool Init(const ServerConfig &config);
-    bool Start();
-    bool Wait();
-    void Stop();
+    bool Init(const ServerConfig &config) override;
+    bool Start() override;
+    bool Wait() override;
+    void Stop() override;
 
 private:
     bool StartRpcServer();
@@ -91,6 +95,7 @@ private:
     std::shared_ptr<LeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
+    std::shared_ptr<PartitionReporter> partition_reporter_;
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;

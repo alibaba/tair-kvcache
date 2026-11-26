@@ -12,6 +12,7 @@
 namespace kv_cache_manager {
 
 class MetaServiceImpl;
+class MetaForwarder;
 class MetricsRegistry;
 class ReportEventBodyBudget;
 class RequestContext;
@@ -28,6 +29,8 @@ public:
                     std::function<void()> report_body_budget_rejection);
 
     void Init() override;
+    void SetForwarder(std::shared_ptr<MetaForwarder> forwarder) { forwarder_ = std::move(forwarder); }
+    void SetPartitionChecker(std::function<bool(std::string_view)> checker) { owns_instance_ = std::move(checker); }
     void RegisterHandler() override;
 
     async_simple::coro::Lazy<HttpDispatchResult> RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -91,6 +94,8 @@ private:
                                                                  Callback prepare_and_run);
 
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
+    std::shared_ptr<MetaForwarder> forwarder_;
+    std::function<bool(std::string_view)> owns_instance_;
     std::shared_ptr<ServiceRequestExecutor> executor_;
     std::shared_ptr<ReportEventBodyBudget> report_event_body_budget_;
     std::function<void()> report_body_budget_rejection_;

@@ -13,6 +13,9 @@
 ```mermaid
 flowchart TD
     main["main.cpp"] --> service["service（接入层/装配入口/Request 工作池/请求门禁）"]
+    service --> proxy["ProxyWorker（Meta 转发 / Replica 注册）"]
+    proxy --> routing["routing（Bucket 策略 / Partition 归属 / Replica 选择）"]
+    proxy -->|Meta gRPC| backend["分区内的 KVCM Worker"]
     service --> manager["manager（CacheManager）"]
     manager --> meta["meta（索引/CacheLocation）"]
     meta --> config["config（注册表/选主）"]

@@ -39,6 +39,7 @@
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/proxy/partition_reporter.h"
 #include "kv_cache_manager/service/service_request_executor.h"
 #include "kv_cache_manager/service/util/report_event_body_budget.h"
 
@@ -60,6 +61,13 @@ bool Server::Init(const ServerConfig &config) {
         return false;
     }
 
+    if (!config.PartitionTargetFile().empty() || !config.ProxyDiscoveryUri().empty()) {
+        partition_reporter_ = std::make_shared<PartitionReporter>();
+        if (!partition_reporter_->Init(config.PartitionTargetFile(), config.ProxyDiscoveryUri())) {
+            KVCM_LOG_ERROR("partitioned KVCM requires a valid target and proxy discovery URI");
+            return false;
+        }
+    }
     if (!CreateLeaderElector()) {
         return false;
     }
@@ -289,6 +297,15 @@ bool Server::Start() {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
     }
+    if (partition_reporter_) {
+        auto host = config_.GetAdvertisedHost();
+        if (host.empty()) {
+            host = NetUtil::GetLocalIp();
+        }
+        partition_reporter_->Start(host + ":" + std::to_string(config_.GetServiceRpcPort()), [this] {
+            return leader_elector_->IsLeader() && meta_impl_->AcceptingLeaderRequests();
+        });
+    }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
                   kKvcmArt,
                   kKvcmFullVersion,
@@ -323,6 +340,20 @@ bool Server::StartRpcServer() {
 
     meta_service_ = std::make_shared<MetaServiceGRpc>(
         metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
+    if (partition_reporter_) {
+        meta_service_->SetRouteGuard(
+            [reporter = partition_reporter_](const grpc::ServerContext &context, const std::string &instance) {
+                const auto &target = reporter->target();
+                const auto &metadata = context.client_metadata();
+                auto matches = [&](const char *name, uint64_t value) {
+                    const auto it = metadata.find(name);
+                    return it != metadata.end() &&
+                           std::string_view(it->second.data(), it->second.size()) == std::to_string(value);
+                };
+                return reporter->OwnsInstance(instance) && matches("kvcm-route-version", target.version()) &&
+                       matches("kvcm-partition", target.partition());
+            });
+    }
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
 
@@ -429,6 +460,10 @@ bool Server::StartHttpServer() {
                                                              config_.prometheus_common_tags());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);
 
+    if (partition_reporter_) {
+        meta_http_service_->SetPartitionChecker(
+            [reporter = partition_reporter_](std::string_view instance) { return reporter->OwnsInstance(instance); });
+    }
     meta_http_service_->Init();
     admin_http_service_->Init();
     debug_http_service_->Init();
@@ -564,8 +599,15 @@ bool Server::CreateLeaderElector() {
         return false;
     }
 
+    auto lock_key = kLeaderLockKey;
+    if (partition_reporter_) {
+        const auto &target = partition_reporter_->target();
+        const auto scope = target.cluster() + "/" + std::to_string(target.partition());
+        lock_key += "/" + scope;
+        node_id = scope + "/" + node_id;
+    }
     leader_elector_ = std::make_shared<LeaderElector>(coordination_backend_,
-                                                      kLeaderLockKey,
+                                                      lock_key,
                                                       node_id,
                                                       config_.GetLeaderElectorLeaseMs(),
                                                       config_.GetLeaderElectorLoopIntervalMs());
@@ -728,6 +770,9 @@ void Server::ReportMetrics(bool final_snapshot) {
 void Server::Stop() {
     if (stop_.exchange(true)) {
         return;
+    }
+    if (partition_reporter_) {
+        partition_reporter_->Stop();
     }
     KVCM_LOG_INFO("server stopping...");
     if (redis_health_thread_) {

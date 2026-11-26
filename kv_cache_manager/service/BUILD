@@ -9,11 +9,14 @@ cc_library(
     name = "service",
     srcs = [
         "command_line.cc",
+        "proxy_worker.cc",
         "server.cc",
         "server_config.cc",
     ],
     hdrs = [
         "command_line.h",
+        "proxy_worker.h",
+        "worker.h",
         "server.h",
         "server_config.h",
     ],
@@ -23,6 +26,10 @@ cc_library(
     ],
     deps = [
         ":service_request_executor",
+        "//kv_cache_manager/service/proxy:meta_forwarder",
+        "//kv_cache_manager/service/proxy:partition_reporter",
+        "//kv_cache_manager/routing",
+        "//kv_cache_manager/protocol/protobuf:proxy_control_grpc",
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",

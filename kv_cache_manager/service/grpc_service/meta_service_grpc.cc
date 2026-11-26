@@ -22,6 +22,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/proxy/meta_forwarder.h"
 #include "kv_cache_manager/service/service_request_executor.h"
 #include "kv_cache_manager/service/util/common.h"
 
@@ -233,8 +234,9 @@ private:
                                        std::to_string(TimestampUtil::GetCurrentTimeUs()));
             }
             const bool full = reason == ServiceRequestExecutor::SubmitResult::kFull;
-            // Unexecuted requests can use the client's existing leader failover.
-            header->mutable_status()->set_code(full ? proto::meta::SERVICE_BUSY : proto::meta::SERVER_NOT_LEADER);
+            const auto stopping =
+                owner_->service_->forwarder_ ? proto::meta::SERVICE_NOT_READY : proto::meta::SERVER_NOT_LEADER;
+            header->mutable_status()->set_code(full ? proto::meta::SERVICE_BUSY : stopping);
             header->mutable_status()->set_message(full ? "service request queue is full" : "service is stopping");
             Finish(call);
         }
@@ -279,7 +281,7 @@ private:
             call->request_context = std::make_shared<RequestContext>(call->request.trace_id());
             call->request_context->set_client_ip(ExtractIpFromPeer(call->context.peer()));
             ServiceRequestExecutor::Request task;
-            task.run = [this, call](ServiceRequestExecutor::CompletionToken) {
+            task.run = [this, call](ServiceRequestExecutor::CompletionToken completion) {
                 // Expired queued calls have not started business work yet.
                 // Avoid spending worker capacity on a result the caller cannot receive.
                 if (const auto *reason = StopReason(*call)) {
@@ -289,6 +291,22 @@ private:
                 auto *context = call->request_context.get();
                 const grpc::Status *reason = nullptr;
                 try {
+                    const auto &guard = owner_->service_->route_guard_;
+                    if (guard && !guard(call->context, call->request.instance_id())) {
+                        call->response.mutable_header()->set_request_id(context->request_id());
+                        auto *status = call->response.mutable_header()->mutable_status();
+                        status->set_code(proto::meta::SERVICE_NOT_READY);
+                        status->set_message("partition target does not match forwarded request");
+                        Finish(call);
+                        return;
+                    }
+                    if (const auto &forwarder = owner_->service_->forwarder_) {
+                        forwarder->Forward(call->request,
+                                           call->response,
+                                           call->context.deadline(),
+                                           [this, call, completion](grpc::Status status) { Finish(call, status); });
+                        return;
+                    }
                     const bool prepared = prepare_(context, &call->request, &call->response);
                     reason = StopReason(*call);
                     if (prepared && !reason) {
@@ -379,7 +397,11 @@ MetaServiceGRpc::MetaServiceGRpc(std::shared_ptr<MetricsRegistry> metrics_regist
 
 MetaServiceGRpc::~MetaServiceGRpc() = default;
 
-void MetaServiceGRpc::Init() { MetaServiceMetricsBase::InitMetrics(); }
+void MetaServiceGRpc::Init() {
+    if (!forwarder_) {
+        MetaServiceMetricsBase::InitMetrics();
+    }
+}
 
 bool MetaServiceGRpc::PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count) {
     return async_calls_->PrepareCompletionQueue(builder, poller_count);

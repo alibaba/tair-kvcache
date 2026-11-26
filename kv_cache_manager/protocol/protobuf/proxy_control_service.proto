@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.proxy;
+
+// The controller gives all replicas of a partition the same activated target.
+// PartitionId is a logical identity, independent of a process or address.
+message PartitionTarget {
+    string cluster = 1;
+    uint32 version = 2;
+    repeated uint32 bucket_owners = 3;
+    uint32 partition = 4;
+}
+
+message ReplicaReport {
+    PartitionTarget target = 1;
+    string process_id = 2;
+    uint64 sequence = 3;
+    string grpc_endpoint = 4;
+    bool serving_leader = 5;
+}
+
+message ReportAck {}
+
+// Bind on the internal registration listener. This service is independent of
+// the public MetaService and of its legacy leader-discovery contract.
+service ProxyControlService {
+    rpc ReportReplica(ReplicaReport) returns (ReportAck);
+}

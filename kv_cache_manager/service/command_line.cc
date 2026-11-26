@@ -10,6 +10,7 @@
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/crash_handler.h"
+#include "kv_cache_manager/service/proxy_worker.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/server_config.h"
 namespace kv_cache_manager {
@@ -126,7 +127,11 @@ int CommandLine::Run(int argc, const char *argv[]) {
 
     RegisterSignal();
 
-    server_.reset(new Server);
+    if (config.WorkerType() == "proxy") {
+        server_ = std::make_shared<ProxyWorker>();
+    } else {
+        server_ = std::make_shared<Server>();
+    }
     if (!server_->Init(config)) {
         fprintf(stderr, "Server init failed.\n");
         server_.reset();

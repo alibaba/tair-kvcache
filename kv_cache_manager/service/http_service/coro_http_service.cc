@@ -126,6 +126,10 @@ void CoroHttpService::RegisterPostHandler(const std::string &api, HandlerType ha
 }
 
 bool CoroHttpService::Start(int32_t port, size_t thread_num) {
+    return StartListening(port, thread_num) && WaitForExit();
+}
+
+bool CoroHttpService::StartListening(int32_t port, size_t thread_num) {
     server_ = std::make_unique<coro_http::coro_http_server>(thread_num, static_cast<unsigned short>(port), "0.0.0.0");
 
     // 注册所有 GET/POST handler
@@ -136,15 +140,23 @@ bool CoroHttpService::Start(int32_t port, size_t thread_num) {
         server_->set_http_handler<coro_http::POST>(path, WrapWithLogger(path, handler));
     }
 
-    auto ec = server_->async_start().get(); // 注意这里用 get()
+    exit_result_.emplace(server_->async_start());
+    auto ec = server_->get_errc();
     if (ec) {
         KVCM_LOG_ERROR("HTTP server start failed on port [%d]: %s", port, ec.message().c_str());
         return false;
     }
 
-    KVCM_LOG_INFO("http server exit on port [%d]", port);
-
     return true;
+}
+
+bool CoroHttpService::WaitForExit() {
+    if (!exit_result_) {
+        return true;
+    }
+    auto result = std::move(*exit_result_);
+    exit_result_.reset();
+    return !std::move(result).get();
 }
 
 void CoroHttpService::MergeFrom(const CoroHttpService &other) {

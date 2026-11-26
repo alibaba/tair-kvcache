@@ -157,6 +157,19 @@ tf_proto_library_cc(
 )
 
 tf_proto_library_cc(
+    name = "proxy_control_service",
+    srcs = ["proxy_control_service.proto"],
+    cc_grpc_version = True,
+    default_header = True,
+)
+
+cc_library(
+    name = "proxy_control_grpc",
+    visibility = ["//visibility:public"],
+    deps = [":proxy_control_service_cc_impl"],
+)
+
+tf_proto_library_cc(
     name = "optimizer_service",
     srcs = [
         "optimizer_service.proto",

@@ -11,6 +11,7 @@
 namespace kv_cache_manager {
 
 class MetaServiceImpl;
+class MetaForwarder;
 class ServiceRequestExecutor;
 class MetricsRegistry;
 struct MetricsLifecycle;
@@ -28,6 +29,9 @@ public:
     ~MetaServiceGRpc() override;
 
     void Init();
+    void SetForwarder(std::shared_ptr<MetaForwarder> forwarder) { forwarder_ = std::move(forwarder); }
+    using RouteGuard = std::function<bool(const grpc::ServerContext &, const std::string &)>;
+    void SetRouteGuard(RouteGuard guard) { route_guard_ = std::move(guard); }
     // Prepare before BuildAndStart; post application requests only after it succeeds.
     bool PrepareCompletionQueue(grpc::ServerBuilder &builder, std::size_t poller_count = 1);
     void StartAccepting();
@@ -86,6 +90,8 @@ private:
 private:
     class AsyncCalls;
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
+    std::shared_ptr<MetaForwarder> forwarder_;
+    RouteGuard route_guard_;
     std::unique_ptr<AsyncCalls> async_calls_;
 };
 

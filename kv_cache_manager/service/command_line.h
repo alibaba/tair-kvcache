@@ -20,7 +20,7 @@ __/\\\________/\\\__/\\\________/\\\________/\\\\\\\\\__/\\\\____________/\\\\
         _\///________\///________\///______________\/////////__\///______________\///_
 )D";
 
-class Server;
+class Worker;
 class CommandLine;
 
 class CommandArgs {
@@ -57,7 +57,7 @@ private:
     bool StartDaemon();
 
 private:
-    std::shared_ptr<Server> server_;
+    std::shared_ptr<Worker> server_;
 };
 
 } // namespace kv_cache_manager

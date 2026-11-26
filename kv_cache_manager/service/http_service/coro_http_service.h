@@ -41,6 +41,8 @@ public:
     virtual void RegisterHandler() = 0;
 
     bool Start(int32_t port, size_t thread_num = std::thread::hardware_concurrency());
+    bool StartListening(int32_t port, size_t thread_num);
+    bool WaitForExit();
     void Stop();
 
     void MergeFrom(const CoroHttpService &other);
@@ -77,6 +79,7 @@ private:
     std::unordered_map<std::string, HandlerType> get_handlers_{};
     std::unordered_map<std::string, HandlerType> post_handlers_{};
     std::unique_ptr<coro_http::coro_http_server> server_{};
+    std::optional<async_simple::Future<std::error_code>> exit_result_;
 };
 
 template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>

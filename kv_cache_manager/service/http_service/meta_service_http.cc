@@ -6,12 +6,15 @@
 #include <string>
 #include <utility>
 
+#include "async_simple/Promise.h"
+#include "async_simple/coro/FutureAwaiter.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/proxy/meta_forwarder.h"
 #include "kv_cache_manager/service/util/common.h"
 #include "kv_cache_manager/service/util/report_event_body_budget.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
@@ -31,8 +34,8 @@ CoroHttpService::CachedJsonResponse MetaServiceHttp::TryRejectRequest(bool over_
     proto::meta::CommonResponse response;
     response.mutable_header()->set_request_id("_" + std::to_string(TimestampUtil::GetCurrentTimeUs()));
     auto *status = response.mutable_header()->mutable_status();
-    status->set_code(*rejection == ServiceRequestExecutor::SubmitResult::kFull ? proto::meta::SERVICE_BUSY
-                                                                               : proto::meta::SERVER_NOT_LEADER);
+    const auto stopping = forwarder_ ? proto::meta::SERVICE_NOT_READY : proto::meta::SERVER_NOT_LEADER;
+    status->set_code(*rejection == ServiceRequestExecutor::SubmitResult::kFull ? proto::meta::SERVICE_BUSY : stopping);
     status->set_message(*rejection == ServiceRequestExecutor::SubmitResult::kClosed ? "service is stopping"
                         : over_body_budget ? "ReportEvent body budget is exhausted"
                                            : "service request queue is full");
@@ -143,9 +146,60 @@ MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regist
     assert(report_event_body_budget_);
 }
 
+namespace {
+async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult> ImmediateReply() {
+    co_return CoroHttpService::HttpDispatchResult{};
+}
+
+template <typename Request, typename Response>
+async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult>
+ForwardHttpRequest(MetaForwarder &forwarder, ServiceRequestExecutor &executor, Request *request, Response *response) {
+    using Result = CoroHttpService::HttpDispatchResult;
+    async_simple::Promise<Result> promise;
+    auto future = promise.getFuture();
+    const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(30);
+    ServiceRequestExecutor::Request task;
+    task.run =
+        [&forwarder, request, response, promise, deadline](ServiceRequestExecutor::CompletionToken token) mutable {
+            try {
+                forwarder.Forward(
+                    *request, *response, deadline, [request, response, promise, token](grpc::Status status) mutable {
+                        if (!status.ok()) {
+                            auto *error = InitProxyStatus(request->trace_id(), response->mutable_header());
+                            error->set_code(proto::meta::IO_ERROR);
+                            error->set_message(status.error_message());
+                        }
+                        promise.setValue(Result{std::nullopt, false, token});
+                    });
+            } catch (...) { promise.setValue(Result{std::nullopt, true, token}); }
+        };
+    task.on_discard = [request, response, promise](ServiceRequestExecutor::CompletionToken token) mutable {
+        InitProxyStatus(request->trace_id(), response->mutable_header())->set_code(proto::meta::SERVICE_NOT_READY);
+        promise.setValue(Result{std::nullopt, false, token});
+    };
+    const auto result = executor.TrySubmit(std::move(task));
+    if (result != ServiceRequestExecutor::SubmitResult::kAccepted) {
+        auto *status = InitProxyStatus(request->trace_id(), response->mutable_header());
+        status->set_code(result == ServiceRequestExecutor::SubmitResult::kFull ? proto::meta::SERVICE_BUSY
+                                                                               : proto::meta::SERVICE_NOT_READY);
+        co_return Result{};
+    }
+    co_return co_await std::move(future);
+}
+} // namespace
+
 template <typename Request, typename Response, typename Callback>
 async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult> MetaServiceHttp::DispatchRequest(
     coro_http::coro_http_connection *http_conn, Request *request, Response *response, Callback prepare_and_run) {
+    if (owns_instance_ && !owns_instance_(request->instance_id())) {
+        auto *status = InitProxyStatus(request->trace_id(), response->mutable_header());
+        status->set_code(proto::meta::SERVICE_NOT_READY);
+        status->set_message("request is outside this partition");
+        return ImmediateReply();
+    }
+    if (forwarder_) {
+        return ForwardHttpRequest(*forwarder_, *executor_, request, response);
+    }
     // Capture only arrival timing and peer information on IO. Collector lookup,
     // logging and business execution belong to the worker. The outer HTTP
     // coroutine retains the protobuf messages, including their arena.
@@ -166,7 +220,11 @@ async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult> MetaServiceHttp::D
         context);
 }
 
-void MetaServiceHttp::Init() { MetaServiceMetricsBase::InitMetrics(); }
+void MetaServiceHttp::Init() {
+    if (!forwarder_) {
+        MetaServiceMetricsBase::InitMetrics();
+    }
+}
 
 void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
@@ -307,6 +365,12 @@ MetaServiceHttp::StartWriteCache(coro_http::coro_http_connection *http_conn,
     // The raw JSON is backed by the connection. Pass only the validation result to the worker.
     const auto *validation_error =
         request->has_storage_replica_requirement() ? ValidateReplicaTypeJson(json_body) : nullptr;
+    if (forwarder_ && validation_error) {
+        auto *status = InitProxyStatus(request->trace_id(), response->mutable_header());
+        status->set_code(proto::meta::INVALID_ARGUMENT);
+        status->set_message(validation_error);
+        return ImmediateReply();
+    }
     return DispatchRequest(
         http_conn,
         request,

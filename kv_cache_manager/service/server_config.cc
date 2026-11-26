@@ -59,6 +59,29 @@ const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
 
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
+    {"kvcm.service.worker_type", [](const std::string &value, ServerConfig *config) {
+         config->worker_type_ = value;
+         return value == "kvcm" || value == "proxy";
+     }},
+    {"kvcm.proxy.cluster", [](const std::string &value, ServerConfig *config) {
+         config->proxy_cluster_ = value;
+         return true;
+     }},
+    {"kvcm.proxy.route_version", [](const std::string &value, ServerConfig *config) {
+         return ParseUint32Setting(value, config->proxy_route_version_) && config->proxy_route_version_ > 0;
+     }},
+    {"kvcm.proxy.control_address", [](const std::string &value, ServerConfig *config) {
+         config->proxy_control_address_ = value;
+         return true;
+     }},
+    {"kvcm.proxy.discovery_uri", [](const std::string &value, ServerConfig *config) {
+         config->proxy_discovery_uri_ = value;
+         return true;
+     }},
+    {"kvcm.partition.target_file", [](const std::string &value, ServerConfig *config) {
+         config->partition_target_file_ = value;
+         return true;
+     }},
     {"kvcm.registry_storage.uri",
      [](const std::string &value, ServerConfig *config) {
          config->registry_storage_uri_ = value;
@@ -466,6 +489,12 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    worker_type_ = "kvcm";
+    proxy_cluster_.clear();
+    proxy_route_version_ = 0;
+    proxy_control_address_.clear();
+    proxy_discovery_uri_.clear();
+    partition_target_file_.clear();
     service_grpc_max_threads_ = 0;
     service_grpc_memory_quota_bytes_ = 0;
     http_report_event_body_budget_bytes_ = 0;
