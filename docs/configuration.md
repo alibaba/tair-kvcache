@@ -168,8 +168,8 @@ kvcm.cache_reclaimer.key_sampling_size_total=100
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 
 # 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
-kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
-kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
+kvcm.cache_reclaimer.pending_location_limit_per_group_type=40000
+kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=2199023255552
 
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024

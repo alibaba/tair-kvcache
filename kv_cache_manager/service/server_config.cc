@@ -495,8 +495,8 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_idle_interval_ms_ = 100;
     cache_reclaimer_worker_size_ = 16;
     cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
-    cache_reclaimer_pending_location_limit_per_group_type_ = 20000;
-    cache_reclaimer_pending_bytes_limit_per_group_type_ = 1ULL * 1024 * 1024 * 1024 * 1024;
+    cache_reclaimer_pending_location_limit_per_group_type_ = 40000;
+    cache_reclaimer_pending_bytes_limit_per_group_type_ = 2ULL * 1024 * 1024 * 1024 * 1024;
     cache_reclaimer_pending_delete_handler_limit_ = 1024;
     cache_reclaimer_pending_bytes_limit_ = 4ULL * 1024 * 1024 * 1024 * 1024;
     cache_reclaimer_group_lru_max_sampling_size_ = 65536;

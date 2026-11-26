@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | V1 已实现，包含 `CacheMetaDelRequest` 异步接口；未来扩展未纳入 |
-| 更新时间 | 2026-09-03 |
+| 更新时间 | 2026-11-26 |
 | 涉及模块 | `manager`、`meta`、`metrics`、`service` |
 | 关联需求 | [CacheReclaimer 过度逐出优化](https://project.aone.alibaba-inc.com/v2/project/2137612/req/74289896)、[Reclaimer 删除请求提交异步化改造](https://project.aone.alibaba-inc.com/v2/project/2137612/req/80484236) |
 | 历史参考 | [PR #161](https://github.com/alibaba/tair-kvcache/pull/161) |
@@ -416,8 +416,8 @@ V1 默认参数：
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
 | `inflight_delete_timeout_ms` | 60000 | 删除 delay 之外允许 credit 继续生效的时间 |
-| `pending_location_limit_per_group_type` | 20000 | 单 Group × BaseStorageType 的 pending Location 上限 |
-| `pending_bytes_limit_per_group_type` | 1 TiB | 单 Group × BaseStorageType 的 pending bytes 上限 |
+| `pending_location_limit_per_group_type` | 40000 | 单 Group × BaseStorageType 的 pending Location 上限 |
+| `pending_bytes_limit_per_group_type` | 2 TiB | 单 Group × BaseStorageType 的 pending bytes 上限 |
 | `pending_delete_handler_limit` | 1024 | 进程级 pending 请求上限 |
 | `pending_bytes_limit` | 4 TiB | 进程级 pending bytes 上限 |
 
