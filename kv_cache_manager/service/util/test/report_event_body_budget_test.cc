@@ -44,64 +44,65 @@ protected:
         ASSERT_TRUE(out);
     }
 
-    void Refresh(ReportEventBodyBudget &budget, uint64_t total_bytes) {
-        budget.RefreshFromMemInfo((root_ / "meminfo").c_str(), total_bytes);
-    }
+    void Refresh(ReportEventBodyBudget &budget) { budget.RefreshFromMemInfo((root_ / "meminfo").c_str()); }
 
     std::filesystem::path root_;
 };
 
 TEST_F(ReportEventBodyBudgetTest, UsesAvailableMemoryAndReservesSpaceBasedOnTotalMemory) {
     ReportEventBodyBudget budget(0);
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemFree: 1048576 kB\nMemAvailable: 4194304 kB"));
-    Refresh(budget, 4 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 4194304 kB\nMemFree: 1048576 kB\nMemAvailable: 4194304 kB"));
+    Refresh(budget);
     EXPECT_EQ((4 * kGiB - 512 * kMiB) / 8, budget.Limit());
 
-    Refresh(budget, 100 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 104857600 kB\nMemAvailable: 4194304 kB"));
+    Refresh(budget);
     EXPECT_EQ((4 * kGiB - kGiB) / 8, budget.Limit());
 
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 16777216 kB"));
-    Refresh(budget, 16 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 16777216 kB\nMemAvailable: 16777216 kB"));
+    Refresh(budget);
     EXPECT_EQ(kGiB, budget.Limit());
 }
 
 TEST_F(ReportEventBodyBudgetTest, InvalidMemorySamplesUseFixedFallbackAndRecover) {
     ReportEventBodyBudget budget(0);
-    Refresh(budget, 4 * kGiB);
-    EXPECT_EQ(64 * kMiB, budget.Limit());
-
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 4194304 kB"));
-    Refresh(budget, 0);
+    Refresh(budget);
     EXPECT_EQ(64 * kMiB, budget.Limit());
 
     const std::string_view invalid[] = {
+        "MemTotal: 4194304 kB",
         "MemFree: 4194304 kB",
-        "MemAvailable: 4194305 kB",
-        "MemAvailable: 4194304 MB",
-        "MemAvailable: 4194304x kB",
-        "MemAvailable: -1 kB",
-        "MemAvailable: 18446744073709551615 kB",
+        "MemTotal: 0 kB\nMemAvailable: 4194304 kB",
+        "MemTotal: 4194304 kB\nMemAvailable: 4194305 kB",
+        "MemTotal: 4194304 MB\nMemAvailable: 4194304 kB",
+        "MemTotal: 4194304x kB\nMemAvailable: 4194304 kB",
+        "MemTotal: -1 kB\nMemAvailable: 4194304 kB",
+        "MemTotal: 18446744073709551615 kB\nMemAvailable: 4194304 kB",
+        "MemTotal: 4194304 kB\nMemAvailable: 4194304 MB",
+        "MemTotal: 4194304 kB\nMemAvailable: 4194304x kB",
+        "MemTotal: 4194304 kB\nMemAvailable: -1 kB",
+        "MemTotal: 4194304 kB\nMemAvailable: 18446744073709551615 kB",
     };
     for (std::string_view contents : invalid) {
         SCOPED_TRACE(contents);
-        ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 4194304 kB"));
-        Refresh(budget, 4 * kGiB);
+        ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 4194304 kB\nMemAvailable: 4194304 kB"));
+        Refresh(budget);
         ASSERT_GT(budget.Limit(), 64 * kMiB);
 
         ASSERT_NO_FATAL_FAILURE(WriteMemInfo(contents));
-        Refresh(budget, 4 * kGiB);
+        Refresh(budget);
         EXPECT_EQ(64 * kMiB, budget.Limit());
     }
 }
 
 TEST_F(ReportEventBodyBudgetTest, ContractionPreservesExistingReservationsAndBlocksNewBodies) {
     ReportEventBodyBudget budget(0);
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 4194304 kB"));
-    Refresh(budget, 4 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 4194304 kB\nMemAvailable: 4194304 kB"));
+    Refresh(budget);
     ASSERT_TRUE(budget.TryReserve(128 * kMiB));
 
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 917504 kB"));
-    Refresh(budget, 4 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 4194304 kB\nMemAvailable: 917504 kB"));
+    Refresh(budget);
     EXPECT_FALSE(budget.TryReserve(1));
     EXPECT_EQ(128 * kMiB, budget.InUse());
     budget.Release(128 * kMiB);
@@ -115,12 +116,12 @@ TEST_F(ReportEventBodyBudgetTest, ContractionPreservesExistingReservationsAndBlo
 
 TEST_F(ReportEventBodyBudgetTest, StaleSampleCapsBudgetUntilNextRefresh) {
     ReportEventBodyBudget budget(0);
-    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemAvailable: 16777216 kB"));
-    Refresh(budget, 16 * kGiB);
+    ASSERT_NO_FATAL_FAILURE(WriteMemInfo("MemTotal: 16777216 kB\nMemAvailable: 16777216 kB"));
+    Refresh(budget);
     ASSERT_EQ(kGiB, budget.Limit());
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     EXPECT_EQ(64 * kMiB, budget.Limit());
-    Refresh(budget, 16 * kGiB);
+    Refresh(budget);
     EXPECT_EQ(kGiB, budget.Limit());
 }
 
