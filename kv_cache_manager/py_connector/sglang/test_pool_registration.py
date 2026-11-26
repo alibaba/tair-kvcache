@@ -28,7 +28,11 @@ process group:
 * the whole control plane an instance hands to the Manager and the SDK client
   -- spec names, sizes, groups, iov size, client config -- matches a literal
   golden table for every pool combination, on MLA and non-MLA models, on every
-  rank.
+  rank;
+* the registered spec set is exactly the set the ranks' data paths use, and a
+  pool registers one spec per rank that writes it -- the CPU half of
+  "allocated == used"; the half that needs a Manager and a run (was a location
+  really written) belongs to the e2e harness.
 
 Prerequisites: a sglang runtime that can import its own backend (``sgl_kernel``
 and friends) and ``kv_cache_manager`` importable from the repository root on
@@ -260,6 +264,28 @@ def _register_instance_payload(connector: HiCacheKVCM) -> dict:
     payload = dict(call.args[0])
     payload.pop("trace_id")
     return payload
+
+
+def _connector_with_pools(
+    pools: tuple, *, is_mla: bool, tp_rank: int, tp_size: int = 2
+) -> HiCacheKVCM:
+    """One rank of one pool combination, registered: the spec set is frozen."""
+    with _patched_parallel_context():
+        connector = _connector(tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla)
+        connector.register_mem_pool_host(
+            FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
+        )
+        for name, bytes_per_token in pools:
+            connector.register_mem_host_pool_v2(
+                FakeHostPool(
+                    bytes_per_token=bytes_per_token,
+                    dtype=torch.float32,
+                    page_size=POOL_PAGE_SIZES.get(name, PAGE_SIZE),
+                ),
+                name,
+            )
+        connector.batch_exists(["block-0"])
+    return connector
 
 
 class TestRegistrationOrders(unittest.TestCase):
@@ -521,6 +547,12 @@ class TestPoolSpecTable(unittest.TestCase):
 # This table is the non-MLA layout: every pool registers one spec per TP rank.
 # An MLA model registers a replicated pool for rank 0 alone -- ``_MLA_COMBO_GOLDEN``
 # carries the differing fields of the same combinations.
+#
+# What these two tables pin is the exact names, order, sizes and groups (a
+# rename or a reorder is a wire change).  What they do not pin is the rule that
+# decides how many specs a pool registers: that rule is asserted from the write
+# protocol in ``TestAllocationMatchesUsage``, so a new row or a tp size these
+# tables do not reach needs no edit here.
 _COMBO_GOLDEN: dict[tuple, tuple] = {
     (): (
         [("tp_0", KV_SPEC_BYTES), ("tp_1", KV_SPEC_BYTES)],
@@ -759,24 +791,10 @@ class TestControlPlaneGolden(unittest.TestCase):
     def _control_plane(
         self, pools: tuple, *, is_mla: bool, tp_rank: int, tp_size: int = 2
     ) -> dict:
-        """Drive the real initialization for one rank of one pool combination."""
-        with _patched_parallel_context():
-            connector = _connector(
-                tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla
-            )
-            connector.register_mem_pool_host(
-                FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
-            )
-            for name, bytes_per_token in pools:
-                connector.register_mem_host_pool_v2(
-                    FakeHostPool(
-                        bytes_per_token=bytes_per_token,
-                        dtype=torch.float32,
-                        page_size=POOL_PAGE_SIZES.get(name, PAGE_SIZE),
-                    ),
-                    name,
-                )
-            connector.batch_exists(["block-0"])
+        """The control-plane facts one rank of one pool combination hands out."""
+        connector = _connector_with_pools(
+            pools, is_mla=is_mla, tp_rank=tp_rank, tp_size=tp_size
+        )
 
         payload = _register_instance_payload(connector)
         return {
@@ -900,6 +918,198 @@ class TestControlPlaneGolden(unittest.TestCase):
             "a flat stack must not send the field older Managers reject",
         )
         self.assertEqual(control_plane["location_spec_name"], "tp_0")
+
+
+##################################################
+# Allocation == usage
+##################################################
+
+# Every pool combination the allocation invariant is held for: flat, a hybrid
+# stack with each table sidecar, both sidecars, a pool the table derives, and a
+# derived pool beside a sharded one (the anchor's hybrid naming then keys off a
+# sidecar no row knows).
+_ALLOCATION_COMBOS: tuple = (
+    (),
+    ((UNMANAGED_POOL, 256),),
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),),
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),),
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ),
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN), (UNMANAGED_POOL, 256)),
+)
+
+# The pools sglang hands to every TP rank, each writing its own slice: written
+# down here so the table is checked against this rather than believed.  Every
+# other pool is written from rank 0 alone on an MLA model, which is the same
+# statement ``_PoolSpec.shared_across_ranks`` carries for the data path.
+_SHARDED_POOLS = frozenset({PoolName.MAMBA})
+
+
+class TestAllocationMatchesUsage(unittest.TestCase):
+    """The connector's half of "alloc == used": what it registers is what its
+    ranks use.
+
+    Both sides are values the connector produces itself, so this is a
+    consistency check, not an observation: whether a location is really written
+    is the e2e harness's half of the same invariant (``kvcme2e/alloc_ledger.py``,
+    check ``alloc==used``), and nothing on CPU can see it.
+    """
+
+    def setUp(self) -> None:
+        _mock_kvcm.reset_mock()
+        HiCacheKVCM._reported_pools.clear()
+
+    def _ranks(self, pools: tuple, *, is_mla: bool, tp_size: int) -> list:
+        """Every rank of one instance, each through the real initialization."""
+        return [
+            _connector_with_pools(pools, is_mla=is_mla, tp_rank=rank, tp_size=tp_size)
+            for rank in range(tp_size)
+        ]
+
+    def _in_use(self, connector: HiCacheKVCM) -> dict:
+        """The spec each pool's data path is wired to on this rank."""
+        return {
+            name: (
+                connector.location_spec_name
+                if row.spec.anchor
+                else connector._get_extra_pool_spec_name(name)
+            )
+            for name, row in connector.pool_specs.items()
+        }
+
+    def test_every_rank_registers_the_same_layout(self) -> None:
+        """The Manager compares the spec infos against the copy it stored.
+
+        Element by element, so a rank that registers a different layout fails
+        its own registration -- one instance has exactly one spec set.
+        """
+        for pools in _ALLOCATION_COMBOS:
+            for is_mla in (False, True):
+                for tp_size in (1, 2, 4):
+                    scenario = f"pools={pools} mla={is_mla} tp_size={tp_size}"
+                    with self.subTest(scenario=scenario):
+                        ranks = self._ranks(pools, is_mla=is_mla, tp_size=tp_size)
+                        registered = [
+                            (spec["name"], spec["size"])
+                            for spec in ranks[0].location_spec_infos
+                        ]
+                        for rank, connector in enumerate(ranks[1:], start=1):
+                            self.assertEqual(
+                                [
+                                    (spec["name"], spec["size"])
+                                    for spec in connector.location_spec_infos
+                                ],
+                                registered,
+                                f"{scenario}: rank {rank} registers a different "
+                                "layout than rank 0",
+                            )
+
+    def test_every_registered_spec_is_owned_by_a_rank(self) -> None:
+        """The registered set is the set the ranks' data paths use, and no more.
+
+        A registered spec no rank is wired to is a location nobody writes, and
+        the Manager allocates a general area per (key, spec) of the requested
+        group: capacity reserved for nothing.  The data path cannot notice -- it
+        writes the right bytes into the spec it does own, and every read goes
+        through that one.
+        """
+        for pools in _ALLOCATION_COMBOS:
+            for is_mla in (False, True):
+                for tp_size in (1, 2, 4):
+                    scenario = f"pools={pools} mla={is_mla} tp_size={tp_size}"
+                    with self.subTest(scenario=scenario):
+                        ranks = self._ranks(pools, is_mla=is_mla, tp_size=tp_size)
+                        # A pool that registers nothing is not backed at all,
+                        # which is a different failure; hold the pool set first
+                        # so the equality below cannot pass by dropping one.
+                        self.assertEqual(
+                            set(ranks[0].pool_specs),
+                            {PoolName.KV} | {name for name, _ in pools},
+                            f"{scenario}: the backed pools",
+                        )
+                        registered = {
+                            spec["name"] for spec in ranks[0].location_spec_infos
+                        }
+                        used = {
+                            spec
+                            for connector in ranks
+                            for spec in self._in_use(connector).values()
+                        }
+                        self.assertEqual(
+                            sorted(registered),
+                            sorted(used),
+                            f"{scenario}: registered but used by no rank: "
+                            f"{sorted(registered - used)}; used by a rank but not "
+                            f"registered: {sorted(used - registered)}",
+                        )
+
+    def test_registered_spec_count_follows_the_write_protocol(self) -> None:
+        """One spec per writing rank -- and the one accepted exception, named.
+
+        A sharded pool keeps one spec per TP rank whatever the engine version
+        hands it to (see ``_RegisteredPool``), so on a sglang that calls rank 0
+        alone the peer specs are allocated and never written.  That difference
+        is asserted here as such instead of being read as the rule; every other
+        difference between the registered count and the number of writing ranks
+        is a defect.
+        """
+        sharded_written_by_all = connector_module._sidecars_are_written_by_every_rank()
+        for pools in _ALLOCATION_COMBOS:
+            for is_mla in (False, True):
+                for tp_size in (1, 2, 4):
+                    for tp_rank, connector in enumerate(
+                        self._ranks(pools, is_mla=is_mla, tp_size=tp_size)
+                    ):
+                        for name, row in connector.pool_specs.items():
+                            scenario = (
+                                f"pools={pools} mla={is_mla} tp_size={tp_size} "
+                                f"tp_rank={tp_rank} pool={name}"
+                            )
+                            with self.subTest(scenario=scenario):
+                                sharded = name in _SHARDED_POOLS
+                                self.assertEqual(
+                                    row.spec.shared_across_ranks,
+                                    not sharded,
+                                    f"{scenario}: the row's sharing mode",
+                                )
+                                self.assertEqual(
+                                    len(row.names),
+                                    tp_size if sharded or not is_mla else 1,
+                                    f"{scenario}: registered spec count",
+                                )
+                                # The write path, not the registration, says how
+                                # many ranks really write the pool.
+                                writers = (
+                                    tp_size
+                                    if connector._transfer_is_written_by_every_rank(
+                                        PoolTransfer(name=name)
+                                    )
+                                    else 1
+                                )
+                                # The one accepted difference (see the test
+                                # docstring): a sharded pool keeps one spec per
+                                # rank whatever the engine version hands it to.
+                                stale_peers = (
+                                    is_mla
+                                    and sharded
+                                    and not sharded_written_by_all
+                                    and tp_size > 1
+                                )
+                                self.assertEqual(
+                                    len(row.names) == writers,
+                                    not stale_peers,
+                                    f"{scenario}: {len(row.names)} spec(s) registered "
+                                    f"for {writers} writing rank(s)",
+                                )
+                                # One spec for every rank means each rank has to
+                                # read its own; a single spec is rank 0's.
+                                self.assertEqual(
+                                    row.own_rank,
+                                    0 if len(row.names) == 1 else tp_rank,
+                                    f"{scenario}: the spec this rank uses",
+                                )
 
 
 class TestInitializationTiming(unittest.TestCase):
