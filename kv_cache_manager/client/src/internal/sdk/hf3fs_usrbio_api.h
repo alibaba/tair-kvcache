@@ -17,6 +17,7 @@ public:
         struct hf3fs_iov *iov, const char *hf3fs_mount_point, size_t size, size_t block_size, int numa) const {
         return ::hf3fs_iovcreate(iov, hf3fs_mount_point, size, block_size, numa);
     }
+    virtual void Hf3fsIovUnlink(struct hf3fs_iov *iov) const { ::hf3fs_iovunlink(iov); }
     virtual void Hf3fsIovDestroy(struct hf3fs_iov *iov) const { ::hf3fs_iovdestroy(iov); }
     virtual int Hf3fsIorCreate(struct hf3fs_ior *ior,
                                const char *hf3fs_mount_point,

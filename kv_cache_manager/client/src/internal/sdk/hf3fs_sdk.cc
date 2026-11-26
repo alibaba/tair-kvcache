@@ -358,6 +358,8 @@ struct hf3fs_iov *Hf3fsSdk::CreateIov(const std::string &mountpoint, size_t iov_
         iov = nullptr;
         return nullptr;
     }
+    // Drop the shared memory name so the buffer can be reclaimed after an abnormal exit.
+    usrbio_api_->Hf3fsIovUnlink(iov);
     return iov;
 }
 

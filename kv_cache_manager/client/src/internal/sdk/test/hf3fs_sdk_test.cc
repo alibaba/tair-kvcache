@@ -1073,6 +1073,7 @@ TEST_F(Hf3fsSdkTest, CreateIov_ReturnNull_CreateFail) {
     ASSERT_TRUE(mock != nullptr);
     EXPECT_CALL(*mock, Hf3fsIovCreate(::testing::NotNull(), ::testing::_, ::testing::_, ::testing::_, ::testing::_))
         .WillOnce(::testing::Return(-1));
+    EXPECT_CALL(*mock, Hf3fsIovUnlink(::testing::_)).Times(0);
     EXPECT_CALL(*mock, Hf3fsIovDestroy(::testing::_)).Times(0);
     auto *iov = sdk_->CreateIov(mount_point_, 8192, 4096);
     EXPECT_EQ(iov, nullptr);
@@ -1081,10 +1082,14 @@ TEST_F(Hf3fsSdkTest, CreateIov_ReturnNull_CreateFail) {
 TEST_F(Hf3fsSdkTest, CreateIov_ReturnPtr_Success) {
     auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
     ASSERT_TRUE(mock != nullptr);
+    ::hf3fs_iov *unlinked_iov = nullptr;
+    ::testing::InSequence sequence;
     EXPECT_CALL(*mock, Hf3fsIovCreate(::testing::NotNull(), ::testing::_, ::testing::_, ::testing::_, ::testing::_))
         .WillOnce(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsIovUnlink(::testing::NotNull())).WillOnce(::testing::SaveArg<0>(&unlinked_iov));
     auto *iov = sdk_->CreateIov(mount_point_, 16384, 4096);
     ASSERT_NE(iov, nullptr);
+    EXPECT_EQ(unlinked_iov, iov);
     EXPECT_CALL(*mock, Hf3fsIovDestroy(iov)).Times(1);
     sdk_->DestroyIov(iov);
 }
