@@ -15,6 +15,7 @@ public:
                 Hf3fsIovCreate,
                 (::hf3fs_iov * iov, const char *mount, size_t size, size_t block_size, int numa),
                 (const, override));
+    MOCK_METHOD(void, Hf3fsIovUnlink, (::hf3fs_iov * iov), (const, override));
     MOCK_METHOD(void, Hf3fsIovDestroy, (::hf3fs_iov * iov), (const, override));
 
     MOCK_METHOD(int,
