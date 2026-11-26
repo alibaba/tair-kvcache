@@ -1,3 +1,7 @@
+#include <unistd.h>
+
+#include <chrono>
+#include <csignal>
 #include <thread>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -56,17 +60,34 @@ TEST_F(CommandLineTest, TestParseCmdLine) {
 }
 
 TEST_F(CommandLineTest, TerminationSignalOnWorkerOnlyNotifiesMainThread) {
-    // RegisterSignal also installs crash handlers and alternate signal-stack
-    // state. Keep all of those process-wide side effects in the child.
+    // InstallSignalPolicy installs crash handlers and alternate signal-stack state.
+    // Keep all of those process-wide side effects in the child.
     ASSERT_EXIT(
         {
             CommandLine command;
-            command.RegisterSignal();
-            // No Server is installed: stopping inside the handler would fail.
+            // Same order as CommandLine::Run: mask first, then start the controller.
+            if (!ShutdownController::BlockExitSignals()) {
+                _exit(1);
+            }
+            if (!command.InstallSignalPolicy()) {
+                _exit(1);
+            }
+            // raise() only marks the signal pending on the raising thread. Exit signals
+            // are blocked in every thread, so the worker runs no shutdown logic and the
+            // controller thread is not woken up.
             std::thread worker([] { std::raise(SIGTERM); });
-            command.WaitForTerminationSignal();
             worker.join();
-            _exit(0);
+            if (command.controller_.IsShutdownRequested()) {
+                _exit(1);
+            }
+            // Only a process-directed signal is picked up by the controller thread,
+            // which then wakes the main thread to run the blocking shutdown.
+            kill(getpid(), SIGTERM);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!command.controller_.IsShutdownRequested() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            _exit(command.controller_.ReceivedSignal() == SIGTERM ? 0 : 1);
         },
         ::testing::ExitedWithCode(0),
         "");
