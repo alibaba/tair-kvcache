@@ -34,7 +34,8 @@ def history(repo, revision):
 
 def generate(workspace, status):
     revision = status.get("STABLE_GIT_COMMIT_FULL", "unknown")
-    output = history(workspace, revision)
+    branch = status.get("STABLE_GIT_BRANCH", "unknown")
+    output = "=== workspace (branch: {}) ===\n\n".format(branch) + history(workspace, revision)
     stub = workspace / "stub_source"
     stub_revision = status.get("STABLE_STUB_GIT_COMMIT_FULL", "unknown")
     if stub_revision == "unknown":
@@ -44,7 +45,8 @@ def generate(workspace, status):
     same_repository = repository_id(workspace) == repository_id(stub)
     if same_repository and revision == stub_revision:
         return output
-    return output + "\n=== stub_source ===\n\n" + history(stub, stub_revision)
+    stub_branch = status.get("STABLE_STUB_GIT_BRANCH", "unknown")
+    return output + "\n=== stub_source (branch: {}) ===\n\n".format(stub_branch) + history(stub, stub_revision)
 
 
 def main():
