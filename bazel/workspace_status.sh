@@ -9,10 +9,12 @@
 emit_git_status() {
     local prefix=$1
     local directory=$2
+    local branch=${3:-}
     if [[ -z "$directory" ]]; then
         echo "${prefix}_COMMIT unknown"
         echo "${prefix}_COMMIT_FULL unknown"
         echo "${prefix}_REPO unknown"
+        echo "${prefix}_BRANCH unknown"
         return
     fi
     echo "${prefix}_COMMIT $(git -C "$directory" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
@@ -22,11 +24,22 @@ emit_git_status() {
     # Checkout URLs may contain credentials; never stamp URL userinfo.
     repository_url=$(printf '%s' "$repository_url" | sed -E 's|^([[:alpha:]][[:alnum:]+.-]*://)[^/?#]*@|\1|')
     echo "${prefix}_REPO $repository_url"
+    if [[ -z "$branch" ]]; then
+        branch=$(git -C "$directory" symbolic-ref --quiet --short HEAD 2>/dev/null)
+        if [[ -z "$branch" ]]; then
+            if git -C "$directory" rev-parse --verify HEAD >/dev/null 2>&1; then
+                branch="detached HEAD"
+            else
+                branch=unknown
+            fi
+        fi
+    fi
+    echo "${prefix}_BRANCH $branch"
 }
 
-emit_git_status STABLE_GIT .
+emit_git_status STABLE_GIT . "${KVCM_GIT_BRANCH:-}"
 stub_directory=$(cd ./stub_source 2>/dev/null && pwd -P)
-emit_git_status STABLE_STUB_GIT "$stub_directory"
+emit_git_status STABLE_STUB_GIT "$stub_directory" "${KVCM_STUB_GIT_BRANCH:-}"
 echo "STABLE_KVCM_VERSION 0.0.1"
 # Used by py_wheel version templates; keep stable so repeat packaging for the
 # same commit invalidates the cached wheel action and gets a fresh version.

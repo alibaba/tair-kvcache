@@ -237,3 +237,19 @@ userinfo，避免把 checkout 凭据写进版本文件；SCP 风格的 SSH 地�
 Git 历史或 stub 版本无法读取时，构建日志会输出 warning，同时保留降级产物。
 `STABLE_STUB_GIT_*` 变化会使依赖 workspace status 的 stamped 目标重新生成，
 可能包括二进制版本信息和 wheel，不只是提交日志文件。
+
+## 提交历史中的分支名
+
+workspace status 新增 STABLE_GIT_BRANCH 和 STABLE_STUB_GIT_BRANCH，
+并由现有规则自动写入 git_commit。git_commit_log 在各段标题中展示分支，
+例如 === workspace (branch: main) === 和
+=== stub_source (branch: feature/backend) ===，不重复列出 status 字段。
+
+默认读取各仓库当前 symbolic HEAD；按 SHA 检出的 detached HEAD 明确显示
+detached HEAD，不从包含该 SHA 的分支猜测来源。无 Git 信息时为 unknown。
+同仓库同 SHA 仍只输出 workspace 历史一段。
+
+CI 若明确知道每个仓库的来源分支，可分别通过 KVCM_GIT_BRANCH、
+KVCM_STUB_GIT_BRANCH 显式传入，优先于本地 HEAD。不会自动套用通用 CI 分支变量，
+避免把另一个仓库的分支误标到当前仓库。现有仅传 SHA 的流水线无需修改，
+将显示 detached HEAD。分支标签来自本次采集的 status，不在日志生成时重新推断。

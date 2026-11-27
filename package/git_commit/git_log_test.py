@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,23 +41,28 @@ class GitLogTest(unittest.TestCase):
         self.git(repo, "init")
         self.git(repo, "remote", "add", "origin", "https://example.invalid/" + name)
         self.commit(repo, name)
+        self.git(repo, "branch", "-M", "main")
 
     def commit(self, repo, message):
         self.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                  "commit", "--allow-empty", "-m", message)
 
-    def status(self):
+    def status(self, overrides=None):
+        env = os.environ.copy()
+        env.pop("KVCM_GIT_BRANCH", None)
+        env.pop("KVCM_STUB_GIT_BRANCH", None)
+        env.update(overrides or {})
         text = subprocess.check_output(["bash", "bazel/workspace_status.sh"],
-            cwd=str(self.workspace), universal_newlines=True)
+            cwd=str(self.workspace), universal_newlines=True, env=env)
         return dict(line.split(" ", 1) for line in text.splitlines())
 
     def test_default_stub_records_workspace_without_duplicate_history(self):
         status = self.status()
-        for suffix in ("COMMIT", "COMMIT_FULL", "REPO"):
+        for suffix in ("COMMIT", "COMMIT_FULL", "REPO", "BRANCH"):
             self.assertEqual(status["STABLE_GIT_" + suffix], status["STABLE_STUB_GIT_" + suffix])
         output = git_log.generate(self.workspace, status)
         self.assertEqual(output.count("commit " + status["STABLE_GIT_COMMIT_FULL"]), 1)
-        self.assertNotIn("=== stub_source ===", output)
+        self.assertNotIn("=== stub_source (branch:", output)
         self.assertNotIn("https://example.invalid/parent", output)
 
     def test_separate_stub_uses_stamped_revisions_and_git_file(self):
@@ -73,7 +79,7 @@ class GitLogTest(unittest.TestCase):
         output = git_log.generate(self.workspace, status)
         self.assertIn("commit " + status["STABLE_GIT_COMMIT_FULL"], output)
         self.assertIn("commit " + expected, output)
-        self.assertIn("=== stub_source ===", output)
+        self.assertIn("=== stub_source (branch:", output)
         self.assertNotIn("later parent change", output)
         self.assertNotIn("later workspace change", output)
         self.stub.unlink()
@@ -93,15 +99,15 @@ class GitLogTest(unittest.TestCase):
             with self.subTest(pretty=pretty):
                 self.git(self.workspace, "config", "format.pretty", pretty)
                 output = git_log.generate(self.workspace, status)
-                self.assertIn("=== stub_source ===", output)
-                stub_history = output.split("=== stub_source ===", 1)[1].strip()
+                self.assertIn("=== stub_source (branch:", output)
+                stub_history = output.split("=== stub_source (branch: detached HEAD) ===", 1)[1].strip()
                 self.assertEqual(stub_history, self.git(worktree, "log", "-10", earlier))
 
     def test_missing_stub_does_not_fall_back_to_workspace(self):
         self.stub.unlink()
         status = self.status()
         self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], "unknown")
-        self.assertNotIn("=== stub_source ===", git_log.generate(self.workspace, status))
+        self.assertNotIn("=== stub_source (branch:", git_log.generate(self.workspace, status))
 
     def test_checkout_url_credentials_are_removed_from_both_repositories(self):
         self.stub.unlink()
@@ -148,7 +154,7 @@ class GitLogTest(unittest.TestCase):
         self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], self.git(self.parent, "rev-parse", "HEAD"))
         self.assertEqual(git_log.repository_id(self.stub), (self.workspace / ".git/modules/stub_source").resolve())
         output = git_log.generate(self.workspace, status)
-        self.assertIn("=== stub_source ===", output)
+        self.assertIn("=== stub_source (branch:", output)
         self.assertIn("commit " + status["STABLE_STUB_GIT_COMMIT_FULL"], output)
 
     def test_separate_repositories_with_same_sha_keep_both_histories(self):
@@ -159,13 +165,62 @@ class GitLogTest(unittest.TestCase):
         status = self.status()
         self.assertEqual(status["STABLE_GIT_COMMIT_FULL"], status["STABLE_STUB_GIT_COMMIT_FULL"])
         output = git_log.generate(self.workspace, status)
-        self.assertIn("=== stub_source ===", output)
+        self.assertIn("=== stub_source (branch:", output)
         self.assertEqual(output.count("commit " + status["STABLE_GIT_COMMIT_FULL"]), 2)
+
+    def test_named_branches_are_stamped_independently(self):
+        self.stub.unlink()
+        self.stub.symlink_to("..")
+        self.git(self.workspace, "checkout", "-b", "feature/log-branches")
+        self.git(self.parent, "checkout", "-b", "release/backend")
+        status = self.status()
+        self.assertEqual(status["STABLE_GIT_BRANCH"], "feature/log-branches")
+        self.assertEqual(status["STABLE_STUB_GIT_BRANCH"], "release/backend")
+        self.git(self.workspace, "checkout", "main")
+        self.git(self.parent, "checkout", "main")
+        output = git_log.generate(self.workspace, status)
+        self.assertTrue(output.startswith("=== workspace (branch: feature/log-branches) ===\n"))
+        self.assertIn("=== stub_source (branch: release/backend) ===", output)
+
+    def test_detached_head_does_not_guess_a_containing_branch(self):
+        self.stub.unlink()
+        self.stub.symlink_to("..")
+        self.git(self.workspace, "checkout", "--detach", "HEAD")
+        self.git(self.parent, "checkout", "--detach", "HEAD")
+        status = self.status()
+        self.assertEqual(status["STABLE_GIT_BRANCH"], "detached HEAD")
+        self.assertEqual(status["STABLE_STUB_GIT_BRANCH"], "detached HEAD")
+        output = git_log.generate(self.workspace, status)
+        self.assertTrue(output.startswith("=== workspace (branch: detached HEAD) ===\n"))
+        self.assertIn("=== stub_source (branch: detached HEAD) ===", output)
+
+    def test_explicit_ci_branches_override_detached_head_per_repository(self):
+        self.stub.unlink()
+        self.stub.symlink_to("..")
+        self.git(self.workspace, "checkout", "--detach", "HEAD")
+        self.git(self.parent, "checkout", "--detach", "HEAD")
+        status = self.status({"KVCM_GIT_BRANCH": "feature/ci", "KVCM_STUB_GIT_BRANCH": "release/ci"})
+        self.assertEqual(status["STABLE_GIT_BRANCH"], "feature/ci")
+        self.assertEqual(status["STABLE_STUB_GIT_BRANCH"], "release/ci")
+        output = git_log.generate(self.workspace, status)
+        self.assertIn("=== workspace (branch: feature/ci) ===", output)
+        self.assertIn("=== stub_source (branch: release/ci) ===", output)
+        self.assertNotIn("STABLE_STUB_", output)
+        status = self.status({"KVCM_GIT_BRANCH": "feature/ci"})
+        self.assertEqual(status["STABLE_STUB_GIT_BRANCH"], "detached HEAD")
+
+    def test_missing_branch_status_uses_unknown(self):
+        status = self.status()
+        del status["STABLE_GIT_BRANCH"]
+        output = git_log.generate(self.workspace, status)
+        self.assertTrue(output.startswith("=== workspace (branch: unknown) ===\n"))
 
     def test_source_archive_without_git(self):
         shutil.rmtree(str(self.parent / ".git"))
         shutil.rmtree(str(self.workspace / ".git"))
         status = self.status()
+        self.assertEqual(status["STABLE_GIT_BRANCH"], "unknown")
+        self.assertEqual(status["STABLE_STUB_GIT_BRANCH"], "unknown")
         self.assertEqual(status["STABLE_GIT_COMMIT_FULL"], "unknown")
         self.assertEqual(status["STABLE_STUB_GIT_COMMIT_FULL"], "unknown")
         warning = io.StringIO()
