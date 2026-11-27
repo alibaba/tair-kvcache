@@ -11,6 +11,7 @@
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
+#include "kv_cache_manager/config/coordination_memory_backend.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -72,6 +73,9 @@ bool Server::Init(const ServerConfig &config) {
     }
 
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
+    if (dynamic_cast<CoordinationMemoryBackend *>(coordination_backend_.get()) != nullptr) {
+        cache_manager_->EnableIdleInstanceReclaim();
+    }
     CacheReclaimerAsyncDeleteConfig async_delete_config;
     async_delete_config.inflight_delete_timeout_ms = config_.GetCacheReclaimerInflightDeleteTimeoutMs();
     async_delete_config.pending_location_limit_per_group_type =
@@ -175,8 +179,10 @@ void Server::OnBecomeLeader() {
     }
     cache_manager_->ResumeReclaimer();
     cache_manager_->StartMigrationManager();
+    cache_manager_->StartIdleInstanceReclaim();
 
     if (leader_elector_->RunIfCurrentPromotionValid([this]() {
+            cache_manager_->AllowIdleInstanceReclaim();
             meta_impl_->EnableLeaderOnlyRequests();
             admin_impl_->EnableLeaderOnlyRequests();
             if (optimizer_event_service_) {
@@ -195,6 +201,7 @@ void Server::OnNoLongerLeader() {
         optimizer_event_service_->DisableSubscriptions();
     }
     cache_manager_->RequestStopCacheGarbageCollector();
+    cache_manager_->RequestStopIdleInstanceReclaim();
     cache_manager_->PauseReclaimer();
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -204,6 +211,7 @@ void Server::OnNoLongerLeader() {
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
 
     cache_manager_->JoinCacheGarbageCollector();
+    cache_manager_->JoinIdleInstanceReclaim();
     // Stop migration after leader-only requests drain and after GC has stopped consulting
     // active Copy reservations.
     cache_manager_->StopMigrationManager();
@@ -572,6 +580,7 @@ bool Server::CreateLeaderElector() {
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
     leader_elector_->SetLeadershipLostHandler([this]() {
+        cache_manager_->RequestStopIdleInstanceReclaim();
         meta_impl_->DisableLeaderOnlyRequests();
         admin_impl_->DisableLeaderOnlyRequests();
     });

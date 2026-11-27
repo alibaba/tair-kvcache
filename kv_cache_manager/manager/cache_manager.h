@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/concurrent_hash_map.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
@@ -30,6 +32,8 @@
 namespace kv_cache_manager {
 
 class RegistryManager;
+class InstanceGroup;
+class LoopThread;
 class MetaSearcherManager;
 class MetaIndexerManager;
 class MetaIndexer;
@@ -283,6 +287,14 @@ public:
     void PauseReclaimer();
     void ResumeReclaimer();
     ErrorCode StartCacheGarbageCollector();
+    void EnableIdleInstanceReclaim() noexcept { idle_reclaim_supported_ = true; }
+    void StartIdleInstanceReclaim();
+    void AllowIdleInstanceReclaim() noexcept { idle_reclaim_running_.store(idle_reclaim_supported_); }
+    void RequestStopIdleInstanceReclaim() noexcept { idle_reclaim_running_.store(false); }
+    void JoinIdleInstanceReclaim();
+    std::shared_ptr<void> TrackIdleInstanceRequest(const std::string &instance_id,
+                                                  bool *closing,
+                                                  bool record_activity = true);
     void RequestStopCacheGarbageCollector();
     void JoinCacheGarbageCollector();
 
@@ -304,6 +316,40 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    struct IdleInstanceActivity {
+        std::mutex mutex;
+        InstanceInfoConstPtr instance;
+        std::shared_ptr<const InstanceGroup> group;
+        std::chrono::steady_clock::time_point last_access;
+        uint64_t revision = 0;
+        std::atomic<bool> observing{false};
+        bool closing = false;
+    };
+
+    struct IdleInstanceProbe {
+        InstanceInfoConstPtr instance;
+        std::shared_ptr<const InstanceGroup> group;
+        std::weak_ptr<MetaIndexer> indexer;
+        uint64_t activity_revision = 0;
+        uint64_t metadata_revision = 0;
+        std::string cursor = "0";
+    };
+
+    void RememberIdleInstance(const InstanceInfoConstPtr &instance);
+    std::optional<IdleInstanceProbe> StartIdleInstanceProbe(RequestContext *request_context,
+                                                          const InstanceInfoConstPtr &instance,
+                                                          const std::shared_ptr<const InstanceGroup> &group);
+    bool AdvanceIdleInstanceProbe(RequestContext *request_context);
+    void RunIdleInstanceReclaim();
+    void CommitIdleInstanceRemoval(RequestContext *request_context,
+                                   const IdleInstanceProbe &probe,
+                                   std::shared_ptr<MetaIndexer> expected_indexer);
+    bool idle_reclaim_supported_ = false;
+    std::atomic<bool> idle_reclaim_running_{false};
+    std::shared_ptr<LoopThread> idle_reclaim_worker_;
+    ConcurrentHashMap<std::string, std::shared_ptr<IdleInstanceActivity>> idle_activities_;
+    std::optional<IdleInstanceProbe> idle_probe_;
+    std::string idle_scan_after_;
     class ReportEventProcessor;
     static ErrorCode ValidateReportEventRequest(const std::string &trace_id,
                                                 const proto::meta::ReportEventRequest &request,

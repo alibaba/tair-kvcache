@@ -17,6 +17,7 @@
 - [KVCM × PACE CopyGA 异步化设计](design/async_copyga.md) - 缓存异步迁移的执行流程、并发与容量控制、数据一致性及异常处理
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
+- [长期静默空实例自动回收设计](design/idle_empty_instance_gc.md) - 组级超时、RTP-LLM 活跃度与单进程条件删除
 - [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到
 - [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata

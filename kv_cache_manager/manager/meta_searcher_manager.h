@@ -24,6 +24,7 @@ public:
                                                         SubmitDelReqFunc submit_del_req);
     std::shared_ptr<MetaSearcher> GetMetaSearcher(const std::string &instance_id) const;
     std::shared_ptr<MetaSearcher> ExtractMetaSearcher(const std::string &instance_id);
+    void RestoreMetaSearcher(const std::string &instance_id, const std::shared_ptr<MetaSearcher> &searcher);
     void RestoreRetiringMetaSearcher(const std::string &instance_id, std::shared_ptr<MetaSearcher> searcher);
     // Callers drain creation and instance management before cleanup.
     void DoCleanup();

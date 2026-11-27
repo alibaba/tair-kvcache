@@ -476,6 +476,16 @@ public:
                                std::string &out_next_cursor,
                                KeyTypeVec &out_keys) noexcept = 0;
 
+    virtual ErrorCode ProbeIdleReclaimKeys(RequestContext *request_context,
+                                           const std::string &cursor,
+                                           std::string &next_cursor,
+                                           bool &has_keys) noexcept {
+        KeyTypeVec keys;
+        const auto ec = ListKeys(request_context, cursor, 256, next_cursor, keys);
+        has_keys = !keys.empty();
+        return ec;
+    }
+
     // Scan keys and their full CacheLocationMap for background maintenance.
     // Unlike the online ListKeys/GetLocations path, this operation must not
     // update access/LRU/revisit state or populate another cache tier.

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,8 @@ public:
     const std::vector<std::string> &storage_candidates() const { return storage_candidates_; }
     const std::string &global_quota_group_name() const { return global_quota_group_name_; }
     int64_t max_instance_count() const { return max_instance_count_; }
+    int64_t empty_instance_idle_timeout_seconds() const { return empty_instance_idle_timeout_seconds_.value_or(0); }
+    bool has_empty_instance_idle_timeout_seconds() const { return empty_instance_idle_timeout_seconds_.has_value(); }
     const InstanceGroupQuota &quota() const { return quota_; }
     CacheConfigConstPtr cache_config() const { return cache_config_; }
     const std::string &user_data() const { return user_data_; }
@@ -36,6 +39,7 @@ public:
         global_quota_group_name_ = global_quota_group_name;
     }
     void set_max_instance_count(int64_t max_instance_count) { max_instance_count_ = max_instance_count; }
+    void set_empty_instance_idle_timeout_seconds(int64_t seconds) { empty_instance_idle_timeout_seconds_ = seconds; }
     void set_quota(const InstanceGroupQuota &quota) { quota_ = quota; }
     void set_cache_config(const std::shared_ptr<CacheConfig> &cache_config) { cache_config_ = cache_config; }
     void set_user_data(const std::string &user_data) { user_data_ = user_data; }
@@ -63,6 +67,7 @@ private:
     std::vector<std::string> storage_candidates_;
     std::string global_quota_group_name_;
     int64_t max_instance_count_;
+    std::optional<int64_t> empty_instance_idle_timeout_seconds_;
     InstanceGroupQuota quota_;
     std::shared_ptr<CacheConfig> cache_config_;
     std::string user_data_;

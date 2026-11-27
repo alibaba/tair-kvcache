@@ -169,6 +169,10 @@ public:
                                  int64_t limit,
                                  std::string &out_next_cursor,
                                  KeyTypeVec &out_keys) noexcept;
+    ErrorCode ProbeIdleReclaimKeys(RequestContext *request_context,
+                                   const std::string &cursor,
+                                   std::string &next_cursor,
+                                   bool &has_keys) noexcept;
     // Scan the in-memory cache when dual-backend metadata is configured;
     // single-backend deployments scan their only persistent backend.
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,

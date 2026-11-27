@@ -673,6 +673,20 @@ ErrorCode MetaAsyncRedisBackend::ListKeys(RequestContext * /*request_context*/,
     return EC_OK;
 }
 
+ErrorCode MetaAsyncRedisBackend::ProbeIdleReclaimKeys(RequestContext * /*request_context*/,
+                                               const std::string &cursor,
+                                               std::string &next_cursor,
+                                               bool &has_keys) noexcept {
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        return EC_TIMEOUT;
+    }
+    std::vector<std::string> keys;
+    const auto ec = handle->Scan(EscapeRedisScanPrefix(cache_key_prefix_), cursor, 256, next_cursor, keys);
+    has_keys = !keys.empty();
+    return ec;
+}
+
 ErrorCode MetaAsyncRedisBackend::ScanLocationsForMaintenance(RequestContext *request_context,
                                                              const std::string &cursor,
                                                              const int64_t limit,

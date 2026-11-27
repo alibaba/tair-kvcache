@@ -2165,6 +2165,27 @@ ErrorCode MetaStorageBackendManager::ListPersistentKeys(RequestContext *request_
     return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
 }
 
+ErrorCode MetaStorageBackendManager::ProbeIdleReclaimKeys(RequestContext *request_context,
+                                                          const std::string &cursor,
+                                                          std::string &next_cursor,
+                                                          bool &has_keys) noexcept {
+    constexpr std::string_view persistent_prefix = "persistent:";
+    if (cache_backend_ && std::string_view(cursor).substr(0, persistent_prefix.size()) != persistent_prefix) {
+        const auto ec = cache_backend_->ProbeIdleReclaimKeys(request_context, cursor, next_cursor, has_keys);
+        if (ec == EC_OK && !has_keys && next_cursor == SCAN_BASE_CURSOR) {
+            next_cursor = std::string(persistent_prefix) + SCAN_BASE_CURSOR;
+        }
+        return ec;
+    }
+    const auto persistent_cursor = cache_backend_ ? cursor.substr(persistent_prefix.size()) : cursor;
+    const auto ec =
+        persistent_backend_->ProbeIdleReclaimKeys(request_context, persistent_cursor, next_cursor, has_keys);
+    if (ec == EC_OK && cache_backend_ && !next_cursor.empty() && next_cursor != SCAN_BASE_CURSOR) {
+        next_cursor.insert(0, persistent_prefix);
+    }
+    return ec;
+}
+
 ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext *request_context,
                                                                  const std::string &cursor,
                                                                  const int64_t limit,

@@ -127,6 +127,12 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std
     return node.empty() ? nullptr : std::move(node.mapped());
 }
 
+void MetaSearcherManager::RestoreMetaSearcher(const std::string &instance_id,
+                                              const std::shared_ptr<MetaSearcher> &searcher) {
+    std::scoped_lock guard(mutex_);
+    meta_searcher_map_.emplace(instance_id, searcher);
+}
+
 void MetaSearcherManager::RestoreRetiringMetaSearcher(const std::string &instance_id,
                                                       std::shared_ptr<MetaSearcher> searcher) {
     auto instance_mutex = GetInstanceMutex(instance_id);

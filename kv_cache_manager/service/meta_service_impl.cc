@@ -319,6 +319,10 @@ MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
     , leader_elector_(std::move(leader_elector))
     , access_log_options_(access_log_options) {}
 
+std::shared_ptr<void> MetaServiceImpl::TrackIdleInstanceRequest(const std::string &instance_id, bool *closing) {
+    return cache_manager_->TrackIdleInstanceRequest(instance_id, closing);
+}
+
 void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                        const proto::meta::RegisterInstanceRequest *request,
                                        proto::meta::RegisterInstanceResponse *response) {

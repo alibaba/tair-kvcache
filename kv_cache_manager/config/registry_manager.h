@@ -82,6 +82,11 @@ public:
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
     // Keep a durable deletion intent until cache and persistent metadata have been reclaimed.
     ErrorCode BeginRemoveInstance(RequestContext *request_context, const std::string &instance_id);
+    ErrorCode BeginIdleInstanceRemoval(const std::shared_ptr<const InstanceInfo> &expected_instance,
+                                       const std::shared_ptr<const InstanceGroup> &expected_group,
+                                       const std::string &removal_id);
+    using IdleReclaimCandidate = std::pair<std::shared_ptr<const InstanceInfo>, std::shared_ptr<const InstanceGroup>>;
+    std::vector<IdleReclaimCandidate> ListIdleReclaimCandidates() const;
     ErrorCode CompleteRemoveInstance(const std::string &instance_id);
     bool IsInstanceRemovalRetired(const std::string &instance_id) const;
     std::shared_ptr<const InstanceInfo> GetRemovingInstanceInfo(const std::string &instance_id) const;
@@ -111,6 +116,7 @@ private:
     static bool ValidateSimpleInstanceConfig(const InstanceGroup &instance_group,
                                              const std::vector<LocationSpecInfo> &location_spec_infos,
                                              std::string &error_message);
+    ErrorCode BeginRemoveInstanceUnsafe(const std::string &instance_id, const std::string &idle_removal_id);
     ErrorCode UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
     ErrorCode DeleteRegistryField(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);

@@ -14,6 +14,18 @@ namespace kv_cache_manager {
 
 inline constexpr uint64_t kDefaultMetaShardHashSeed = 0x9E3779B97F4A7C15ULL;
 
+inline std::string EscapeRedisScanPrefix(const std::string &prefix) {
+    std::string escaped;
+    escaped.reserve(prefix.size());
+    for (char ch : prefix) {
+        if (ch == '*' || ch == '?' || ch == '[' || ch == ']' || ch == '\\') {
+            escaped += '\\';
+        }
+        escaped += ch;
+    }
+    return escaped;
+}
+
 inline uint64_t HashKey(KeyType key) noexcept {
     return Hash64(reinterpret_cast<const char *>(&key), sizeof(key), kDefaultMetaShardHashSeed);
 }

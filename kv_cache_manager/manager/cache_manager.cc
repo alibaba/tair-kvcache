@@ -26,6 +26,7 @@
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
@@ -528,6 +529,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
+    JoinIdleInstanceReclaim();
     if (cache_garbage_collector_) {
         // Stop admitting new GC work before detaching legacy EventReport
         // callbacks and joining the shared maintenance loop.
@@ -678,6 +680,11 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                QueryType default_query_type,
                                std::optional<bool> disable_write_session) {
     SPAN_TRACER(request_context);
+    bool closing = false;
+    auto visit = TrackIdleInstanceRequest(instance_id, &closing);
+    if (closing) {
+        return {EC_INSTANCE_NOT_EXIST, {}};
+    }
     std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
     const auto &trace_id = request_context->trace_id();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
@@ -723,6 +730,317 @@ CacheManager::RegisterInstance(RequestContext *request_context,
     return {ec, GetStorageConfigStr(request_context, instance_id)};
 }
 
+void CacheManager::RememberIdleInstance(const InstanceInfoConstPtr &instance) {
+    if (!idle_reclaim_supported_ || !instance) {
+        return;
+    }
+    const auto &id = instance->instance_id();
+    std::shared_ptr<IdleInstanceActivity> current;
+    if (idle_activities_.Get(id, current) && current->instance == instance) {
+        return;
+    }
+    auto activity = std::make_shared<IdleInstanceActivity>();
+    activity->instance = instance;
+    activity->last_access = std::chrono::steady_clock::now();
+    if (current) {
+        idle_activities_.Upsert(id, activity);
+    } else {
+        idle_activities_.TryEmplace(id, std::move(activity));
+    }
+}
+
+std::shared_ptr<void> CacheManager::TrackIdleInstanceRequest(const std::string &instance_id,
+                                                            bool *closing,
+                                                            bool record_activity) {
+    if (!idle_reclaim_supported_ || instance_id.empty()) {
+        return {};
+    }
+    std::shared_ptr<IdleInstanceActivity> activity;
+    if (!idle_activities_.Get(instance_id, activity)) {
+        return {};
+    }
+    // Retain the admitted request even before the group is enabled. An older
+    // queued request must still keep the instance alive once observation starts.
+    if (!activity->observing.load()) {
+        return activity;
+    }
+    std::lock_guard lock(activity->mutex);
+    if (closing) {
+        *closing = activity->closing;
+        if (*closing) {
+            return {};
+        }
+    }
+    if (record_activity) {
+        activity->last_access = std::chrono::steady_clock::now();
+        ++activity->revision;
+    }
+    return activity;
+}
+
+void CacheManager::StartIdleInstanceReclaim() {
+    if (idle_reclaim_supported_) {
+        idle_reclaim_worker_ =
+            LoopThread::CreateLoopThread([this] { RunIdleInstanceReclaim(); }, 1000000, "IdleInstanceGC", true);
+    }
+}
+
+void CacheManager::JoinIdleInstanceReclaim() {
+    RequestStopIdleInstanceReclaim();
+    if (idle_reclaim_worker_) {
+        idle_reclaim_worker_->Stop();
+        idle_reclaim_worker_.reset();
+    }
+    idle_activities_.Clear();
+    idle_probe_.reset();
+    idle_scan_after_.clear();
+}
+
+std::optional<CacheManager::IdleInstanceProbe>
+CacheManager::StartIdleInstanceProbe(RequestContext *request_context,
+                                     const InstanceInfoConstPtr &instance,
+                                     const std::shared_ptr<const InstanceGroup> &group) {
+    const auto &id = instance->instance_id();
+    uint64_t activity_revision = 0;
+    if (group) {
+        std::shared_ptr<IdleInstanceActivity> activity;
+        if (!idle_activities_.Get(id, activity) || activity->instance != instance) {
+            // A recovered instance becomes eligible when its searcher is registered.
+            return std::nullopt;
+        }
+        std::lock_guard lock(activity->mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (activity->group != group) {
+            activity->group = group;
+            activity->last_access = now;
+            activity->observing.store(true);
+            return std::nullopt;
+        }
+        const auto idle_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - activity->last_access);
+        if (activity->closing || activity.use_count() != 2 ||
+            idle_seconds.count() < group->empty_instance_idle_timeout_seconds()) {
+            return std::nullopt;
+        }
+        activity_revision = activity->revision;
+    } else if (registry_manager_->IsInstanceRemovalRetired(id)) {
+        CommitIdleInstanceRemoval(request_context, IdleInstanceProbe{instance, {}, {}}, {});
+        return std::nullopt;
+    }
+
+    auto indexer = meta_indexer_manager_->GetMetaIndexer(id);
+    if (!indexer && !group) {
+        // A persisted auto-removal may be recovered before an indexer was opened.
+        InstanceRemovalGuard removal_guard(*metrics_lifecycle_, id);
+        if (!removal_guard.acquired() || registry_manager_->GetRemovingInstanceInfo(id) != instance) {
+            return std::nullopt;
+        }
+        const auto config = registry_manager_->GetInstanceGroupConfig(instance->instance_group_name());
+        if (config && config->cache_config()) {
+            meta_indexer_manager_->CreateMetaIndexer(
+                id, config->cache_config()->meta_indexer_config(), config->revisit_interval_buckets(), instance);
+        }
+        return std::nullopt;
+    }
+    if (!indexer || indexer->IsRecovering()) {
+        return std::nullopt;
+    }
+    return IdleInstanceProbe{instance, group, indexer, activity_revision};
+}
+
+bool CacheManager::AdvanceIdleInstanceProbe(RequestContext *request_context) {
+    auto &probe = *idle_probe_;
+    const auto &id = probe.instance->instance_id();
+    auto indexer = probe.indexer.lock();
+    if (!indexer || indexer->IsRecovering()) {
+        return false;
+    }
+    if (probe.group) {
+        std::shared_ptr<IdleInstanceActivity> activity;
+        if (!idle_activities_.Get(id, activity) || activity->instance != probe.instance) {
+            return false;
+        }
+        std::lock_guard lock(activity->mutex);
+        if (activity->revision != probe.activity_revision || activity.use_count() != 2) {
+            return false;
+        }
+    }
+    if (probe.metadata_revision == 0) {
+        probe.metadata_revision = indexer->BeginIdleReclaimProbe();
+        if (!indexer->SyncAll()) {
+            return false;
+        }
+    }
+
+    constexpr int kPagesPerTick = 8;
+    for (int i = 0; i < kPagesPerTick && idle_reclaim_running_.load(); ++i) {
+        if (indexer->IdleReclaimRevision() != probe.metadata_revision) {
+            return false;
+        }
+        bool has_keys = false;
+        std::string next_cursor;
+        const auto ec = indexer->ProbeIdleReclaimKeys(request_context, probe.cursor, next_cursor, has_keys);
+        if (ec != EC_OK || has_keys || next_cursor.empty()) {
+            if (!probe.group) {
+                KVCM_INTERVAL_LOG_WARN(10, "idle instance removal pending, cannot prove empty, instance[%s] ec[%d]",
+                                       id.c_str(), ec);
+            }
+            return false;
+        }
+        if (next_cursor == SCAN_BASE_CURSOR) {
+            CommitIdleInstanceRemoval(request_context, probe, std::move(indexer));
+            return false;
+        }
+        probe.cursor = std::move(next_cursor);
+    }
+    return true;
+}
+
+void CacheManager::RunIdleInstanceReclaim() {
+    if (!idle_reclaim_running_.load() || !registry_manager_->IsRecoverComplete()) {
+        return;
+    }
+    RequestContext request_context("idle_instance_gc");
+    if (!idle_probe_) {
+        auto candidates = registry_manager_->ListIdleReclaimCandidates();
+        for (const auto &pending : registry_manager_->ListRemovingInstanceInfos()) {
+            if (!pending->idle_removal_id().empty()) {
+                candidates.emplace_back(pending, nullptr);
+            }
+        }
+        const auto id = [](const auto &candidate) -> const std::string & { return candidate.first->instance_id(); };
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](const auto &lhs, const auto &rhs) { return id(lhs) < id(rhs); });
+        auto after = std::upper_bound(candidates.begin(), candidates.end(), idle_scan_after_,
+                                      [&](const auto &key, const auto &candidate) { return key < id(candidate); });
+        std::rotate(candidates.begin(), after, candidates.end());
+        for (const auto &[instance, group] : candidates) {
+            if (!idle_reclaim_running_.load()) {
+                return;
+            }
+            idle_scan_after_ = instance->instance_id();
+            idle_probe_ = StartIdleInstanceProbe(&request_context, instance, group);
+            if (idle_probe_ || !group) {
+                break;
+            }
+        }
+    }
+    if (idle_probe_ && !AdvanceIdleInstanceProbe(&request_context)) {
+        idle_probe_.reset();
+    }
+}
+
+void CacheManager::CommitIdleInstanceRemoval(RequestContext *request_context,
+                                             const IdleInstanceProbe &probe,
+                                             std::shared_ptr<MetaIndexer> expected_indexer) {
+    const auto &id = probe.instance->instance_id();
+    InstanceRemovalGuard removal_guard(*metrics_lifecycle_, id);
+    if (!removal_guard.acquired() || !idle_reclaim_running_.load()) {
+        return;
+    }
+    const auto complete = [&] {
+        // Registration stays fenced by the closed activity or the pending
+        // registry entry. The registry I/O needs no metrics lifecycle lock.
+        std::shared_ptr<IdleInstanceActivity> closing_activity;
+        idle_activities_.Get(id, closing_activity);
+        if (registry_manager_->CompleteRemoveInstance(id) == EC_OK) {
+            if (closing_activity) {
+                idle_activities_.Erase(id);
+            }
+            KVCM_LOG_INFO("removed idle empty instance[%s]", id.c_str());
+        }
+    };
+    if (!probe.group) {
+        if (registry_manager_->GetRemovingInstanceInfo(id) != probe.instance) {
+            return;
+        }
+        if (registry_manager_->IsInstanceRemovalRetired(id)) {
+            complete();
+            return;
+        }
+    }
+
+    struct ReopenOnExit {
+        std::shared_ptr<IdleInstanceActivity> activity;
+        bool reopen = false;
+        ~ReopenOnExit() {
+            if (reopen) {
+                std::lock_guard lock(activity->mutex);
+                activity->closing = false;
+            }
+        }
+    } gate;
+    if (probe.group) {
+        if (!idle_activities_.Get(id, gate.activity) || gate.activity->instance != probe.instance) {
+            return;
+        }
+        std::lock_guard lock(gate.activity->mutex);
+        if (gate.activity->closing || gate.activity.use_count() != 2 ||
+            gate.activity->revision != probe.activity_revision) {
+            return;
+        }
+        gate.activity->closing = true;
+        gate.reopen = true;
+    }
+
+    const auto end_drain = [&id](MigrationManager *manager) { manager->EndDrainingInstance(id); };
+    std::unique_ptr<MigrationManager, decltype(end_drain)> drain(migration_manager_.get(), end_drain);
+    if (drain) {
+        drain->BeginDrainingInstance(id);
+        if (!drain->GetActiveBlockKeysForInstance(id).empty()) {
+            return;
+        }
+    }
+
+    std::shared_ptr<MetaSearcher> searcher;
+    std::shared_ptr<MetaIndexer> indexer;
+    const auto restore = [&](bool active) {
+        if (indexer) {
+            meta_indexer_manager_->RestoreMetaIndexer(id, indexer);
+        }
+        if (searcher && active) {
+            meta_searcher_manager_->RestoreMetaSearcher(id, searcher);
+        } else if (searcher) {
+            meta_searcher_manager_->RestoreRetiringMetaSearcher(id, searcher);
+        }
+    };
+    {
+        std::unique_lock lock(metrics_lifecycle_->mut_);
+        searcher = meta_searcher_manager_->ExtractMetaSearcher(id);
+        indexer = meta_indexer_manager_->ExtractMetaIndexer(id);
+        const bool matches = indexer && indexer == expected_indexer;
+        expected_indexer.reset();
+        // The detached searcher holds the only other legitimate indexer reference.
+        if (!matches || (searcher && searcher.use_count() != 1) || indexer.use_count() != (searcher ? 2 : 1) ||
+            indexer->IdleReclaimRevision() != probe.metadata_revision || !idle_reclaim_running_.load()) {
+            restore(static_cast<bool>(probe.group));
+            return;
+        }
+    }
+
+    const auto ec = probe.group ? registry_manager_->BeginIdleInstanceRemoval(
+                                     probe.instance, probe.group, StringUtil::GenerateRandomString(24))
+                                : registry_manager_->BeginRemoveInstance(request_context, id);
+    const bool pending = ec == EC_OK || registry_manager_->GetRemovingInstanceInfo(id);
+    gate.reopen = probe.group && !pending;
+    if (ec != EC_OK) {
+        std::unique_lock lock(metrics_lifecycle_->mut_);
+        restore(!pending);
+        return;
+    }
+    searcher.reset();
+    if (indexer->Retire() != EC_OK) {
+        meta_indexer_manager_->RestoreMetaIndexer(id, indexer);
+        KVCM_LOG_WARN("idle instance retirement failed, instance[%s]", id.c_str());
+        return;
+    }
+    indexer.reset();
+    {
+        std::unique_lock lock(metrics_lifecycle_->mut_);
+        InvalidateInstanceMetrics(id);
+    }
+    complete();
+}
+
 ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                                        const std::string & /*instance_group*/,
                                        const std::string &instance_id) {
@@ -741,7 +1059,11 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
 
     // Retire already removed persistent metadata; retry only the registry tail.
     if (registry_manager_->IsInstanceRemovalRetired(instance_id)) {
-        return registry_manager_->CompleteRemoveInstance(instance_id);
+        const auto ec = registry_manager_->CompleteRemoveInstance(instance_id);
+        if (ec == EC_OK && idle_reclaim_supported_) {
+            idle_activities_.Erase(instance_id);
+        }
+        return ec;
     }
 
     // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
@@ -919,6 +1241,9 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     lifecycle_guard.lock();
     ec = registry_manager_->CompleteRemoveInstance(instance_id);
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: complete registry removal");
+    if (idle_reclaim_supported_) {
+        idle_activities_.Erase(instance_id);
+    }
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;
 }
@@ -1733,8 +2058,10 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         std::move(location_ids),
         std::move(write_location_spec_names),
         std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
-        [this, trace_id, instance_id, write_session_id](
+        [this, trace_id, instance_id, write_session_id,
+         idle_visit = TrackIdleInstanceRequest(instance_id, nullptr, false)](
             std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info) {
+            static_cast<void>(idle_visit);
             RequestContext temp_request_context(trace_id + "_timeout_callback");
             BlockMaskOffset succeed_block = 0;
             auto ec = this->FinishWriteCache(
@@ -4745,7 +5072,9 @@ private:
                          requested_type_ = requested_type_,
                          cleanup_backend,
                          cleanup_state,
-                         cleanup_epoch] {
+                         cleanup_epoch,
+                         idle_visit = manager->TrackIdleInstanceRequest(instance_id_, nullptr, false)] {
+                            static_cast<void>(idle_visit);
                             std::shared_lock<std::shared_mutex> cleanup_lease(cleanup_state->mutex);
                             if (!cleanup_state->accepting || cleanup_state->epoch != cleanup_epoch) {
                                 return;
@@ -4801,7 +5130,9 @@ private:
                                           requested_type_ = requested_type_,
                                           event_backend_ = event_backend_,
                                           cleanup_state,
-                                          cleanup_epoch] {
+                                          cleanup_epoch,
+                                          idle_visit = manager->TrackIdleInstanceRequest(instance_id_, nullptr, false)] {
+                        static_cast<void>(idle_visit);
                         std::shared_lock<std::shared_mutex> cleanup_lease(cleanup_state->mutex);
                         if (!cleanup_state->accepting || cleanup_state->epoch != cleanup_epoch) {
                             return;
@@ -5199,6 +5530,15 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
 
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {
     SPAN_TRACER(request_context);
+    std::shared_ptr<void> visit;
+    if (idle_reclaim_supported_) {
+        RememberIdleInstance(registry_manager_->GetInstanceInfo(request_context, instance_id));
+        bool closing = false;
+        visit = TrackIdleInstanceRequest(instance_id, &closing, false);
+        if (closing) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+    }
     const std::string &trace_id = request_context->trace_id();
     const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);

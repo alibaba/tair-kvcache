@@ -78,6 +78,10 @@ public:
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept override;
+    ErrorCode ProbeIdleReclaimKeys(RequestContext *request_context,
+                                   const std::string &cursor,
+                                   std::string &next_cursor,
+                                   bool &has_keys) noexcept override;
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           int64_t limit,
