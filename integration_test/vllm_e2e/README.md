@@ -60,6 +60,7 @@ Hybrid specifics verified:
 | `test_tp` | 2 | 2 | TP coordination; for full-attention models also `preferred_block_size=32` != vLLM block size (16), forcing real cross-block translation |
 | `test_partial_hit` | 1 | 1 | Phase 2 extends the prompt mid-block: partial external hit |
 | `test_full_hit` | 1 | 1 | Phase 2 resends the identical prompt: full-prompt hit is capped so >= 1 token is recomputed |
+| `test_prefill_only` | 1 | 2 | A max_tokens=1 request on an otherwise idle engine (a PD prefill node) must still commit all its blocks: its last save session arrives on a step with no forward pass |
 | `test_multi_turn` | 1 | 1 | Growing conversation: each turn loads the previous turns' blocks and saves new ones |
 | `test_cross_request_prefix` | 1 | 2 | Request B is a strict token prefix of saved request A, ending inside one of A's blocks. Hybrid: B's match must be truncated to the last block whose recurrent state was really materialized, and B's output must be token-identical to a no-cache reference |
 | `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes |

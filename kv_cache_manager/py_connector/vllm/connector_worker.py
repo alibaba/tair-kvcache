@@ -84,6 +84,10 @@ class ConnectorWorker:
         # no mirrored request table (every instruction is self-contained).
         self._pending_saves: dict = {}
         self._finish_pending: set = set()
+        # Epoch of the last metadata whose saves were submitted. vLLM skips
+        # wait_for_save on steps with no scheduled tokens
+        # (kv_connector_no_forward), so get_finished submits them instead.
+        self._saves_submitted_epoch: Optional[int] = None
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -569,8 +573,9 @@ class ConnectorWorker:
         pass
 
     def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
-        if not meta.to_save_requests:
+        if not meta.to_save_requests or self._saves_submitted_epoch == meta.epoch:
             return
+        self._saves_submitted_epoch = meta.epoch
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
 
@@ -650,6 +655,14 @@ class ConnectorWorker:
         finish_write_cache). The scheduler's FinishRequest -- sent when its
         own ledger says the request is settled -- either reports immediately
         or defers until the last session lands."""
+        # A step with no scheduled tokens runs kv_connector_no_forward, which
+        # calls get_finished but not wait_for_save. A save session handed over
+        # on such a step -- typically the last one of a request that finished
+        # in its prefill step while the engine is otherwise idle -- would never
+        # be submitted nor committed. Submitting it here also counts it in
+        # _pending_saves, so the request's FinishRequest (a later step) waits
+        # for it and the blocks stay allocated until the save lands.
+        self.wait_for_save(meta)
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
                 self._pending_saves.pop(finish_req.req_id, None)
