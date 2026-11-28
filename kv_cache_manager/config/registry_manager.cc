@@ -328,10 +328,13 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
             return EC_BADARGS;
         }
     }
-    // save to storage backend
-    auto ec = UpsertRegistryField(kRegistryGroupKey, instance_group_name, &instance_group);
+    auto updated = std::make_shared<InstanceGroup>(instance_group);
+    if (!updated->has_empty_instance_idle_timeout_seconds()) {
+        updated->set_empty_instance_idle_timeout_seconds(iter->second->empty_instance_idle_timeout_seconds());
+    }
+    auto ec = UpsertRegistryField(kRegistryGroupKey, instance_group_name, updated.get());
     RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "upsert instance group failed");
-    instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
+    iter->second = std::move(updated);
     PREFIX_LOG_G(INFO, "update instance group OK");
     return EC_OK;
 }
@@ -510,6 +513,41 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
 
 ErrorCode RegistryManager::BeginRemoveInstance(RequestContext * /*request_context*/, const std::string &instance_id) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    return BeginRemoveInstanceUnsafe(instance_id, {});
+}
+
+ErrorCode RegistryManager::BeginIdleInstanceRemoval(const std::shared_ptr<const InstanceInfo> &expected_instance,
+                                                    const std::shared_ptr<const InstanceGroup> &expected_group,
+                                                    const std::string &removal_id) {
+    std::unique_lock lock(mutex_);
+    const auto &id = expected_instance->instance_id();
+    const auto instance = instance_infos_.find(id);
+    const auto group = instance_group_configs_.find(expected_instance->instance_group_name());
+    if (instance == instance_infos_.end() || instance->second != expected_instance ||
+        group == instance_group_configs_.end() || group->second != expected_group ||
+        expected_group->empty_instance_idle_timeout_seconds() <= 0) {
+        return EC_MISMATCH;
+    }
+    return BeginRemoveInstanceUnsafe(id, removal_id);
+}
+
+std::vector<RegistryManager::IdleReclaimCandidate> RegistryManager::ListIdleReclaimCandidates() const {
+    std::shared_lock lock(mutex_);
+    std::vector<IdleReclaimCandidate> candidates;
+    const auto enabled = [](const auto &entry) { return entry.second->empty_instance_idle_timeout_seconds() > 0; };
+    if (std::none_of(instance_group_configs_.begin(), instance_group_configs_.end(), enabled)) {
+        return candidates;
+    }
+    for (const auto &[id, instance] : instance_infos_) {
+        const auto group = instance_group_configs_.find(instance->instance_group_name());
+        if (group != instance_group_configs_.end() && enabled(*group)) {
+            candidates.emplace_back(instance, group->second);
+        }
+    }
+    return candidates;
+}
+
+ErrorCode RegistryManager::BeginRemoveInstanceUnsafe(const std::string &instance_id, const std::string &idle_removal_id) {
     auto pending = removing_instance_infos_.find(instance_id);
     if (pending == removing_instance_infos_.end()) {
         const auto active = instance_infos_.find(instance_id);
@@ -518,6 +556,7 @@ ErrorCode RegistryManager::BeginRemoveInstance(RequestContext * /*request_contex
         }
         auto removing_info = std::make_shared<InstanceInfo>(*active->second);
         removing_info->set_state(InstanceInfo::State::kDeleting);
+        removing_info->set_idle_removal_id(idle_removal_id);
         removing_instance_infos_[instance_id] = {std::move(removing_info)};
         instance_infos_.erase(active);
         pending = removing_instance_infos_.find(instance_id);

@@ -1014,6 +1014,59 @@ TEST_F(CacheManagerTest, TestInitRejectsInvalidMigrationWorkerBudget) {
     }
 }
 
+TEST_F(CacheManagerTest, IdleInstanceRemovalWaitsForRequestAndAllowsRegistrationAfterCompletion) {
+    const std::string id = "test_instance";
+    auto instance = registry_manager_->GetInstanceInfo(request_context_.get(), id);
+    ASSERT_NE(nullptr, instance);
+    cache_manager_->EnableIdleInstanceReclaim();
+    cache_manager_->AllowIdleInstanceReclaim();
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    cache_manager_->RunIdleInstanceReclaim();
+    EXPECT_EQ(instance, registry_manager_->GetInstanceInfo(request_context_.get(), id));
+
+    const auto group = registry_manager_->GetInstanceGroupConfig(instance->instance_group_name());
+    ASSERT_NE(nullptr, group);
+    auto enabled = *group;
+    enabled.set_version(group->version() + 1);
+    enabled.set_empty_instance_idle_timeout_seconds(1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), enabled, group->version()));
+    cache_manager_->RunIdleInstanceReclaim();
+
+    bool closing = false;
+    auto request = cache_manager_->TrackIdleInstanceRequest(id, &closing);
+    ASSERT_NE(nullptr, request);
+    ASSERT_FALSE(closing);
+    {
+        std::shared_ptr<CacheManager::IdleInstanceActivity> activity;
+        ASSERT_TRUE(cache_manager_->idle_activities_.Get(id, activity));
+        std::lock_guard lock(activity->mutex);
+        activity->last_access -= std::chrono::seconds(2);
+    }
+    cache_manager_->RunIdleInstanceReclaim();
+    EXPECT_EQ(instance, registry_manager_->GetInstanceInfo(request_context_.get(), id));
+
+    request.reset();
+    cache_manager_->RunIdleInstanceReclaim();
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), id));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer(id));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo(id));
+
+    EXPECT_EQ(EC_OK, cache_manager_->RegisterInstance(request_context_.get(),
+                                                     instance->instance_group_name(),
+                                                     id,
+                                                     instance->block_size(),
+                                                     instance->location_spec_infos(),
+                                                     instance->model_deployment(),
+                                                     instance->location_spec_groups(),
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     std::nullopt)
+                         .first);
+    cache_manager_->RunIdleInstanceReclaim();
+    const auto registered_again = registry_manager_->GetInstanceInfo(request_context_.get(), id);
+    EXPECT_NE(nullptr, registered_again);
+    EXPECT_NE(instance, registered_again);
+}
+
 TEST_F(CacheManagerTest, TestRegisterInstance) {
     // register same instance in each round
     {

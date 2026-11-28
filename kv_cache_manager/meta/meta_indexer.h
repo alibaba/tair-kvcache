@@ -226,6 +226,12 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
     bool SyncAll() noexcept;
+    uint64_t BeginIdleReclaimProbe() noexcept;
+    uint64_t IdleReclaimRevision() const noexcept { return idle_reclaim_revision_.load(); }
+    ErrorCode ProbeIdleReclaimKeys(RequestContext *request_context,
+                                   const std::string &cursor,
+                                   std::string &next_cursor,
+                                   bool &has_keys) noexcept;
 
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
@@ -337,6 +343,9 @@ private:
     std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
+    // Activated on the first idle probe. Closing a write batch invalidates a probe,
+    // including batches that were already in progress when the probe started.
+    std::atomic<uint64_t> idle_reclaim_revision_{0};
     std::atomic<int64_t> location_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;

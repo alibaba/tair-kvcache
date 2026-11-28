@@ -122,6 +122,9 @@ public:
         }
     }
     ~ScopedBatchLock() {
+        if (indexer_.idle_reclaim_revision_.load() != 0) {
+            indexer_.idle_reclaim_revision_.fetch_add(1);
+        }
         if (out_lock_hold_time_us_ != nullptr) {
             *out_lock_hold_time_us_ += std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_);
         }
@@ -2770,6 +2773,18 @@ size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetM
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
 
 bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
+
+uint64_t MetaIndexer::BeginIdleReclaimProbe() noexcept {
+    uint64_t revision = 0;
+    return idle_reclaim_revision_.compare_exchange_strong(revision, 1) ? 1 : revision;
+}
+
+ErrorCode MetaIndexer::ProbeIdleReclaimKeys(RequestContext *request_context,
+                                            const std::string &cursor,
+                                            std::string &next_cursor,
+                                            bool &has_keys) noexcept {
+    return backend_manager_->ProbeIdleReclaimKeys(request_context, cursor, next_cursor, has_keys);
+}
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();

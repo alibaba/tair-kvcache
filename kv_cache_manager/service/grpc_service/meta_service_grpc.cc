@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <type_traits>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -278,8 +279,13 @@ private:
             // lock, so all preparation that can block belongs on a worker.
             call->request_context = std::make_shared<RequestContext>(call->request.trace_id());
             call->request_context->set_client_ip(ExtractIpFromPeer(call->context.peer()));
+            bool closing = false;
+            auto visit = owner_->service_->meta_service_impl_->TrackIdleInstanceRequest(
+                call->request.instance_id(),
+                std::is_same_v<Request, proto::meta::GetClusterInfoRequest> ? nullptr : &closing);
             ServiceRequestExecutor::Request task;
-            task.run = [this, call](ServiceRequestExecutor::CompletionToken) {
+            task.run = [this, call, visit = std::move(visit), closing](ServiceRequestExecutor::CompletionToken) {
+                static_cast<void>(visit);
                 // Expired queued calls have not started business work yet.
                 // Avoid spending worker capacity on a result the caller cannot receive.
                 if (const auto *reason = StopReason(*call)) {
@@ -287,6 +293,14 @@ private:
                     return;
                 }
                 auto *context = call->request_context.get();
+                if (closing) {
+                    auto *header = call->response.mutable_header();
+                    header->set_request_id(context->request_id());
+                    header->mutable_status()->set_code(proto::meta::INSTANCE_NOT_EXIST);
+                    header->mutable_status()->set_message("instance removal in progress");
+                    Finish(call, grpc::Status::OK);
+                    return;
+                }
                 const grpc::Status *reason = nullptr;
                 try {
                     const bool prepared = prepare_(context, &call->request, &call->response);

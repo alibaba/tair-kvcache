@@ -30,6 +30,8 @@ cc_library(
         ":write_location_manager",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:bounded_parallel",
+        "//kv_cache_manager/common:concurrent_hash_map",
+        "//kv_cache_manager/common:loop_thread",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",

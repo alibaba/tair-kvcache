@@ -26,6 +26,7 @@ public:
                     std::shared_ptr<LeaderElector> leader_elector,
                     AccessLogOptions access_log_options);
     ~MetaServiceImpl() override = default;
+    std::shared_ptr<void> TrackIdleInstanceRequest(const std::string &instance_id, bool *closing);
 
     // 实现所有MetaService的接口方法
     void RegisterInstance(RequestContext *request_context,

@@ -4,6 +4,7 @@
 #include <charconv>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -151,9 +152,22 @@ async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult> MetaServiceHttp::D
     // coroutine retains the protobuf messages, including their arena.
     auto context = std::make_shared<RequestContext>(request->trace_id());
     context->set_client_ip(GetHttpClientIp(http_conn));
+    bool closing = false;
+    auto visit = meta_service_impl_->TrackIdleInstanceRequest(
+        request->instance_id(), std::is_same_v<Request, proto::meta::GetClusterInfoRequest> ? nullptr : &closing);
     return DispatchHttpRequest(
         *executor_,
-        [context, run = std::move(prepare_and_run)] { return run(context.get()); },
+        [context, run = std::move(prepare_and_run), visit = std::move(visit), closing, response] {
+            static_cast<void>(visit);
+            if (closing) {
+                auto *header = response->mutable_header();
+                header->set_request_id(context->request_id());
+                header->mutable_status()->set_code(proto::meta::INSTANCE_NOT_EXIST);
+                header->mutable_status()->set_message("instance removal in progress");
+                return CachedJsonResponse{};
+            }
+            return run(context.get());
+        },
         [context, response](ServiceRequestExecutor::SubmitResult reason, const char *message) {
             auto *header = response->mutable_header();
             header->set_request_id(context->request_id());

@@ -155,6 +155,7 @@ public:
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
     int32_t default_query_type() const { return default_query_type_; }
     State state() const { return state_; }
+    const std::string &idle_removal_id() const { return idle_removal_id_; }
     bool disable_write_session() const noexcept { return disable_write_session_; }
     void set_quota_group_name(const std::string &quota_group_name) { quota_group_name_ = quota_group_name; }
     void set_instance_group_name(const std::string &instance_group_name) { instance_group_name_ = instance_group_name; }
@@ -170,6 +171,7 @@ public:
     }
     void set_default_query_type(int32_t default_query_type) { default_query_type_ = default_query_type; }
     void set_state(State state) { state_ = state; }
+    void set_idle_removal_id(const std::string &id) { idle_removal_id_ = id; }
     void set_disable_write_session(bool value) noexcept { disable_write_session_ = value; }
     // Returns field names that differ from the given values.
     // Returns empty vector if all fields match.
@@ -214,6 +216,7 @@ private:
     std::vector<LocationSpecGroup> location_spec_groups_;
     int32_t default_query_type_{0};
     State state_{State::kServing};
+    std::string idle_removal_id_;
     bool disable_write_session_ = false;
 };
 
